@@ -62,6 +62,12 @@ bool ds4q_can_quantize(ds4q_type type);
 int64_t ds4q_block_size(ds4q_type type);
 size_t ds4q_row_size(ds4q_type type, int64_t ne);
 bool ds4q_requires_imatrix(ds4q_type type);
+void ds4q_dequantize_iq2_xxs(const void *blocks, float *out, int64_t n);
+void ds4q_dequantize_q2_k(const void *blocks, float *out, int64_t n);
+void ds4q_dequantize_q4_k(const void *blocks, float *out, int64_t n);
+void ds4q_dequantize_q3_k(const void *blocks, float *out, int64_t n);
+void ds4q_dequantize_q5_k(const void *blocks, float *out, int64_t n);
+void ds4q_dequantize_q6_k(const void *blocks, float *out, int64_t n);
 void ds4q_quantize_init(ds4q_type type);
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,

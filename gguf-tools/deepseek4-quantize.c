@@ -1691,6 +1691,8 @@ typedef struct {
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
+    char *mse_probe_file;   /* ds4-spark: --mse-probe OUT.json (MSE oracle) */
+    int probe_sample;       /* experts sampled per tensor (0 => default 8) */
 } params;
 
 static void usage(const char *argv0) {
@@ -1704,6 +1706,8 @@ static void usage(const char *argv0) {
     printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
     printf("  --overwrite            replace --out if it already exists\n");
     printf("  --dry-run              print output plan without reading HF tensor data\n");
+    printf("  --mse-probe FILE      MSE oracle: per-(tensor,format) imatrix-weighted error -> JSON\n");
+    printf("  --probe-sample N      experts sampled per tensor for --mse-probe (default 8)\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
@@ -1764,6 +1768,10 @@ static params parse_args(int argc, char **argv) {
             p.overwrite = true;
         } else if (strcmp(arg, "--dry-run") == 0) {
             p.dry_run = true;
+        } else if (strcmp(arg, "--mse-probe") == 0) {
+            p.mse_probe_file = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--probe-sample") == 0) {
+            p.probe_sample = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
@@ -1864,6 +1872,144 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     free_gguf_file(&ref);
 }
 
+/* ============================================================
+ * ds4-spark: MSE oracle (--mse-probe). For each routed expert tensor, sample
+ * experts, round-trip the FP4-dequantized source through each candidate format
+ * (quantize -> dequantize), and report imatrix-weighted relative error per
+ * (tensor, format). Emits mse.json for prisma_alloc.py --mse. The FP4 source is
+ * ground truth: this is the error each format ADDS on top of the source, which
+ * is exactly what the bit-allocation knapsack trades. */
+static const ds4q_type PROBE_CANDS[] = {
+    DS4Q_TYPE_IQ2_XXS, DS4Q_TYPE_Q2_K, DS4Q_TYPE_Q3_K,
+    DS4Q_TYPE_Q4_K, DS4Q_TYPE_Q5_K, DS4Q_TYPE_Q6_K,
+};
+static const char *PROBE_NAMES[] = { "IQ2_XXS","Q2_K","Q3_K","Q4_K","Q5_K","Q6_K" };
+#define PROBE_NCAND ((int)(sizeof(PROBE_CANDS)/sizeof(PROBE_CANDS[0])))
+
+static void probe_dequant(ds4q_type t, const void *blocks, float *out, int64_t n) {
+    switch (t) {
+    case DS4Q_TYPE_IQ2_XXS: ds4q_dequantize_iq2_xxs(blocks, out, n); break;
+    case DS4Q_TYPE_Q2_K:    ds4q_dequantize_q2_k(blocks, out, n); break;
+    case DS4Q_TYPE_Q3_K:    ds4q_dequantize_q3_k(blocks, out, n); break;
+    case DS4Q_TYPE_Q4_K:    ds4q_dequantize_q4_k(blocks, out, n); break;
+    case DS4Q_TYPE_Q5_K:    ds4q_dequantize_q5_k(blocks, out, n); break;
+    case DS4Q_TYPE_Q6_K:    ds4q_dequantize_q6_k(blocks, out, n); break;
+    default: die("probe: unsupported candidate type");
+    }
+}
+
+static void probe_one_tensor(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
+                             const imatrix_store *im, int n_experts, int sample,
+                             double mse_out[PROBE_NCAND]) {
+    expert_tensor e = parse_expert_tensor(gguf_name);
+    const char *wid = expert_part_name(e.part);
+    const int64_t ncols = tmpl->ne[0], nrows = tmpl->ne[1];
+    double wse[PROBE_NCAND]; for (int c = 0; c < PROBE_NCAND; c++) wse[c] = 0.0;
+    double wsum = 0.0;
+    int step = n_experts / sample; if (step < 1) step = 1;
+    for (int xid = 0; xid < n_experts; xid += step) {
+        char prefix[256], wn[320], sn[320];
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", e.layer, xid, wid);
+        snprintf(wn, sizeof(wn), "%s.weight", prefix);
+        snprintf(sn, sizeof(sn), "%s.scale", prefix);
+        st_value w = db_read(db, wn), s = db_read(db, sn);
+        int64_t n = 0;
+        float *f32 = dequant_fp4_weight(&w, &s, &n);
+        const char *names[3] = { gguf_name, wn, NULL };
+        const float *imat = imatrix_find(im, names, 2, ncols, xid, n_experts);
+        float *rt = xmalloc((size_t)n * sizeof(float));
+        for (int c = 0; c < PROBE_NCAND; c++) {
+            byte_buf q = f32_to_type(f32, n, PROBE_CANDS[c], ncols, imat);
+            probe_dequant(PROBE_CANDS[c], q.data, rt, n);
+            double se = 0.0;
+            for (int64_t r = 0; r < nrows; r++) {
+                const float *xr = f32 + (size_t)r * ncols, *rr = rt + (size_t)r * ncols;
+                for (int64_t col = 0; col < ncols; col++) {
+                    double wc = imat ? imat[col] : 1.0, d = (double)xr[col] - (double)rr[col];
+                    se += wc * d * d;
+                }
+            }
+            wse[c] += se;
+            free(q.data);
+        }
+        double en = 0.0;
+        for (int64_t r = 0; r < nrows; r++) {
+            const float *xr = f32 + (size_t)r * ncols;
+            for (int64_t col = 0; col < ncols; col++) {
+                double wc = imat ? imat[col] : 1.0;
+                en += wc * (double)xr[col] * (double)xr[col];
+            }
+        }
+        wsum += en;
+        free(rt); free(f32); st_value_free(&w); st_value_free(&s);
+    }
+    for (int c = 0; c < PROBE_NCAND; c++) mse_out[c] = wsum > 0 ? wse[c] / wsum : 0.0;
+}
+
+typedef struct {
+    st_db *db; const gguf_file *tmpl; const imatrix_store *im;
+    int n_experts, sample;
+    const int *work; int n_work;
+    double (*mse)[PROBE_NCAND];
+    int next, done; pthread_mutex_t lock;
+} probe_job;
+
+static void *probe_worker(void *arg) {
+    probe_job *j = arg;
+    for (;;) {
+        pthread_mutex_lock(&j->lock);
+        int wi = j->next++;
+        pthread_mutex_unlock(&j->lock);
+        if (wi >= j->n_work) break;
+        int ti = j->work[wi];
+        probe_one_tensor(j->db, j->tmpl->tensors[ti].name, &j->tmpl->tensors[ti],
+                         j->im, j->n_experts, j->sample, j->mse[wi]);
+        pthread_mutex_lock(&j->lock);
+        int d = ++j->done;
+        fprintf(stderr, "mse-probe: %d/%d %s\n", d, j->n_work, j->tmpl->tensors[ti].name);
+        pthread_mutex_unlock(&j->lock);
+    }
+    return NULL;
+}
+
+static void run_mse_probe(st_db *db, const gguf_file *tmpl, const imatrix_store *im,
+                          int n_experts, int n_threads, int sample, const char *out_path) {
+    if (sample <= 0) sample = 8;
+    for (int c = 0; c < PROBE_NCAND; c++) ds4q_quantize_init(PROBE_CANDS[c]);
+    int *work = xmalloc((size_t)tmpl->n_tensors * sizeof(int));
+    int n_work = 0;
+    for (uint64_t i = 0; i < tmpl->n_tensors; i++)
+        if (parse_expert_tensor(tmpl->tensors[i].name).is_expert)
+            work[n_work++] = (int)i;
+    fprintf(stderr, "mse-probe: %d routed expert tensors, sample=%d experts, %d candidates\n",
+            n_work, sample, PROBE_NCAND);
+    double (*mse)[PROBE_NCAND] = xmalloc((size_t)n_work * sizeof(*mse));
+    probe_job job = { .db = db, .tmpl = tmpl, .im = im, .n_experts = n_experts,
+                      .sample = sample, .work = work, .n_work = n_work, .mse = mse };
+    pthread_mutex_init(&job.lock, NULL);
+    int wc = n_threads > 0 ? n_threads : 8;
+    if (wc > n_work) wc = n_work;
+    if (wc < 1) wc = 1;
+    pthread_t *th = xcalloc((size_t)wc, sizeof(th[0]));
+    for (int i = 1; i < wc; i++) pthread_create(&th[i], NULL, probe_worker, &job);
+    probe_worker(&job);
+    for (int i = 1; i < wc; i++) pthread_join(th[i], NULL);
+    pthread_mutex_destroy(&job.lock); free(th);
+    FILE *fp = fopen(out_path, "w");
+    if (!fp) die_errno("open mse-probe out", out_path);
+    fputc('{', fp);
+    for (int wi = 0; wi < n_work; wi++) {
+        fprintf(fp, "%s\"%s\":{", wi ? "," : "", tmpl->tensors[work[wi]].name);
+        for (int c = 0; c < PROBE_NCAND; c++)
+            fprintf(fp, "%s\"%s\":%.8e", c ? "," : "", PROBE_NAMES[c], mse[wi][c]);
+        fputc('}', fp);
+    }
+    fputc('}', fp);
+    fclose(fp);
+    fprintf(stderr, "mse-probe: wrote %s\n", out_path);
+    free(work); free(mse);
+}
+
 int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     imatrix_store imatrix = {0};
@@ -1887,6 +2033,13 @@ int main(int argc, char **argv) {
 
     st_db db;
     db_open(&db, p.hf_dir);
+    if (p.mse_probe_file) {
+        run_mse_probe(&db, &tmpl, &imatrix, p.n_experts, p.n_threads,
+                      p.probe_sample, p.mse_probe_file);
+        db_close(&db); imatrix_free(&imatrix); free_gguf_file(&tmpl);
+        free(out_ctx.tensors);
+        return 0;
+    }
     if (p.compare_tensor) {
         compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
         db_close(&db);

@@ -46,10 +46,10 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q8_0]    = { "q8_0",    32,  34, true,  false },
     [DS4Q_TYPE_Q8_1]    = { "q8_1",    32,  36, false, false },
     [DS4Q_TYPE_Q2_K]    = { "q2_K",  QK_K,  84, true,  false },
-    [DS4Q_TYPE_Q3_K]    = { "q3_K",  QK_K, 110, false, false },
+    [DS4Q_TYPE_Q3_K]    = { "q3_K",  QK_K, 110, true,  false },
     [DS4Q_TYPE_Q4_K]    = { "q4_K",  QK_K, 144, true,  false },
-    [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, false, false },
-    [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, false, false },
+    [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, true,  false },
+    [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, true,  false },
     [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
@@ -1041,6 +1041,343 @@ bool ds4q_requires_imatrix(ds4q_type type) {
     return ds4q_type_traits[type].requires_imatrix;
 }
 
+/* ---- Q3_K (ported from ggml; layout MUST match ds4's vec_dot_q3_K) ----
+ * block_q3_K (110 B / 256 elems): hmask[32] high bit, qs[64] low 2 bits,
+ * scales[12] (16 signed 6-bit), d (f16). */
+enum { Q3K_hmask_off = 0, Q3K_qs_off = 32, Q3K_scales_off = 96, Q3K_d_off = 108 };
+
+/* RMSE-optimal signed quant of n values to [-nmax, nmax-1], weighted (ggml
+ * make_qx_quants). Returns block scale; L[i] in [0, 2*nmax-1] (offset +nmax). */
+static float ds4q_make_qx_quants(int n, int nmax, const float *x, int8_t *L,
+                                 const float *weights) {
+    float max = 0, amax = 0;
+    for (int i = 0; i < n; i++) { float ax = fabsf(x[i]); if (ax > amax) { amax = ax; max = x[i]; } }
+    if (amax < 1e-30f) { for (int i = 0; i < n; i++) L[i] = (int8_t)nmax; return 0.f; }
+    float iscale = -nmax / max, bscale = iscale, best = 0;
+    for (int is = -9; is <= 9; is++) {
+        float isc = -(nmax + 0.1f * is) / max, sumlx = 0, suml2 = 0;
+        for (int i = 0; i < n; i++) {
+            int l = ds4q_nearest_int(isc * x[i]); l = DS4Q_MAX(-nmax, DS4Q_MIN(nmax - 1, l));
+            float w = weights ? weights[i] : x[i] * x[i];
+            sumlx += w * x[i] * l; suml2 += w * (float)l * l;
+        }
+        if (suml2 > 0 && sumlx * sumlx > best * suml2) { bscale = sumlx / suml2; best = bscale * sumlx; iscale = isc; }
+    }
+    for (int i = 0; i < n; i++) {
+        int l = ds4q_nearest_int(iscale * x[i]); L[i] = (int8_t)(DS4Q_MAX(-nmax, DS4Q_MIN(nmax - 1, l)) + nmax);
+    }
+    return bscale;
+}
+
+static size_t ds4q_quantize_q3_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols, const float *quant_weights) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q3_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t bpr = ncols / QK_K;
+    int8_t L[QK_K]; float scales[QK_K / 16], weight[16];
+    for (int64_t r = 0; r < nrows; r++) {
+        const float *xrow = src + start + (size_t)r * (size_t)ncols;
+        for (int64_t b = 0; b < bpr; b++) {
+            const float *x = xrow + (size_t)b * QK_K;
+            uint8_t *y = out + (size_t)r * row_size + (size_t)b * 110;
+            uint8_t *hmask = y + Q3K_hmask_off, *qs = y + Q3K_qs_off, *sc = y + Q3K_scales_off;
+            float sumx2 = 0; for (int j = 0; j < QK_K; j++) sumx2 += x[j] * x[j];
+            float sigma2 = 2.f * sumx2 / QK_K;
+            for (int j = 0; j < QK_K / 16; j++) {
+                if (quant_weights) {
+                    const float *qw = quant_weights + (size_t)b * QK_K + 16 * j;
+                    for (int l = 0; l < 16; l++) weight[l] = qw[l] * sqrtf(sigma2 + x[16*j+l]*x[16*j+l]);
+                } else for (int l = 0; l < 16; l++) weight[l] = x[16*j+l] * x[16*j+l];
+                scales[j] = ds4q_make_qx_quants(16, 4, x + 16*j, L + 16*j, weight);
+            }
+            memset(sc, 0, 12);
+            float amax = 0, mscale = 0;
+            for (int j = 0; j < 16; j++) if (fabsf(scales[j]) > amax) { amax = fabsf(scales[j]); mscale = scales[j]; }
+            uint16_t hd;
+            if (amax < 1e-30f) { hd = ds4q_f32_to_f16(0.f); memset(qs, 0, 64); memset(hmask, 0, 32); memcpy(y + Q3K_d_off, &hd, 2); continue; }
+            float iscale = -32.f / mscale; int8_t sc6[16];
+            for (int j = 0; j < 16; j++) {
+                int l = DS4Q_MAX(-32, DS4Q_MIN(31, ds4q_nearest_int(iscale * scales[j])));
+                sc6[j] = (int8_t)l; uint8_t u = (uint8_t)(l + 32);
+                if (j < 8) sc[j] = u & 0xF; else sc[j - 8] |= (u & 0xF) << 4;
+                sc[8 + (j % 4)] |= (uint8_t)(((u >> 4) & 3) << (2 * (j / 4)));
+            }
+            hd = ds4q_f32_to_f16(1.f / iscale); memcpy(y + Q3K_d_off, &hd, 2);
+            float dall = ds4q_f16_to_f32(hd);
+            for (int j = 0; j < 16; j++) {
+                float d = dall * sc6[j];
+                if (d == 0.f) { for (int ii = 0; ii < 16; ii++) L[16*j+ii] = 4; continue; }
+                for (int ii = 0; ii < 16; ii++) {
+                    int l = DS4Q_MAX(-4, DS4Q_MIN(3, ds4q_nearest_int(x[16*j+ii] / d)));
+                    L[16*j+ii] = (int8_t)(l + 4);
+                }
+            }
+            memset(hmask, 0, 32);
+            { uint8_t m = 1; int mi = 0;
+              for (int j = 0; j < QK_K; j++) { if (L[j] > 3) hmask[mi] |= m; if (++mi == 32) { mi = 0; m <<= 1; } } }
+            memset(qs, 0, 64);
+            for (int j = 0; j < QK_K; j += 128)
+                for (int l = 0; l < 32; l++)
+                    qs[j/4 + l] = (uint8_t)((L[j+l]&3) | ((L[j+l+32]&3)<<2) | ((L[j+l+64]&3)<<4) | ((L[j+l+96]&3)<<6));
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
+void ds4q_dequantize_q3_k(const void *blocks, float *out, int64_t n) {
+    const uint8_t *p = (const uint8_t *)blocks;
+    const uint32_t km1 = 0x03030303u, km2 = 0x0f0f0f0fu;
+    for (int64_t i = 0; i < n / QK_K; i++) {
+        const uint8_t *y = p + (size_t)i * 110, *hm = y + Q3K_hmask_off, *q = y + Q3K_qs_off;
+        uint16_t hd; memcpy(&hd, y + Q3K_d_off, 2); float dall = ds4q_f16_to_f32(hd);
+        uint32_t aux[4]; memcpy(aux, y + Q3K_scales_off, 12); uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & km2) | (((tmp >> 4) & km1) << 4);
+        aux[3] = ((aux[1] >> 4) & km2) | (((tmp >> 6) & km1) << 4);
+        aux[0] = (aux[0] & km2) | (((tmp >> 0) & km1) << 4);
+        aux[1] = (aux[1] & km2) | (((tmp >> 2) & km1) << 4);
+        const int8_t *scales = (const int8_t *)aux;
+        float *o = out + (size_t)i * QK_K; int is = 0; uint8_t m = 1;
+        for (int n0 = 0; n0 < QK_K; n0 += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                float dl = dall * (scales[is++] - 32);
+                for (int l = 0; l < 16; l++) *o++ = dl * (((q[l]>>shift)&3) - ((hm[l]&m)?0:4));
+                dl = dall * (scales[is++] - 32);
+                for (int l = 0; l < 16; l++) *o++ = dl * (((q[l+16]>>shift)&3) - ((hm[l+16]&m)?0:4));
+                shift += 2; m <<= 1;          /* hmask bit advances per shift-group (ggml) */
+            }
+            q += 32;
+        }
+    }
+}
+
+/* ---- Q6_K (ggml-faithful). 210 B: ql[128] low4, qh[64] high2, scales[16] i8, d f16 ---- */
+enum { Q6K_ql_off = 0, Q6K_qh_off = 128, Q6K_scales_off = 192, Q6K_d_off = 208 };
+
+static size_t ds4q_quantize_q6_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols, const float *quant_weights) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q6_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t bpr = ncols / QK_K;
+    int8_t L[QK_K]; float scales[QK_K / 16], weight[16];
+    for (int64_t r = 0; r < nrows; r++) {
+        const float *xrow = src + start + (size_t)r * (size_t)ncols;
+        for (int64_t b = 0; b < bpr; b++) {
+            const float *x = xrow + (size_t)b * QK_K;
+            uint8_t *y = out + (size_t)r * row_size + (size_t)b * 210;
+            uint8_t *ql = y + Q6K_ql_off, *qh = y + Q6K_qh_off; int8_t *sc = (int8_t *)(y + Q6K_scales_off);
+            float sumx2 = 0; for (int j = 0; j < QK_K; j++) sumx2 += x[j] * x[j];
+            float sigma2 = sumx2 / QK_K, mscale = 0, mabs = 0;
+            for (int ib = 0; ib < 16; ib++) {
+                if (quant_weights) { const float *qw = quant_weights + (size_t)b*QK_K + 16*ib;
+                    for (int l = 0; l < 16; l++) weight[l] = qw[l] * sqrtf(sigma2 + x[16*ib+l]*x[16*ib+l]); }
+                else for (int l = 0; l < 16; l++) weight[l] = x[16*ib+l]*x[16*ib+l];
+                scales[ib] = ds4q_make_qx_quants(16, 32, x + 16*ib, L + 16*ib, weight);
+                if (fabsf(scales[ib]) > mabs) { mabs = fabsf(scales[ib]); mscale = scales[ib]; }
+            }
+            uint16_t hd;
+            if (mabs < 1e-30f) { memset(y, 0, 210); hd = ds4q_f32_to_f16(0.f); memcpy(y + Q6K_d_off, &hd, 2); continue; }
+            float iscale = -128.f / mscale;
+            hd = ds4q_f32_to_f16(1.f / iscale); memcpy(y + Q6K_d_off, &hd, 2);
+            for (int ib = 0; ib < 16; ib++) sc[ib] = (int8_t)DS4Q_MIN(127, ds4q_nearest_int(iscale * scales[ib]));
+            float dall = ds4q_f16_to_f32(hd);
+            for (int j = 0; j < 16; j++) {
+                float d = dall * sc[j]; if (d == 0.f) { for (int ii = 0; ii < 16; ii++) L[16*j+ii] = 32; continue; }
+                for (int ii = 0; ii < 16; ii++) { int l = DS4Q_MAX(-32, DS4Q_MIN(31, ds4q_nearest_int(x[16*j+ii]/d))); L[16*j+ii] = (int8_t)(l + 32); }
+            }
+            for (int j = 0; j < QK_K; j += 128) {
+                for (int l = 0; l < 32; l++) {
+                    uint8_t q1 = L[j+l]&0xF, q2 = L[j+l+32]&0xF, q3 = L[j+l+64]&0xF, q4 = L[j+l+96]&0xF;
+                    ql[l] = q1 | (q3 << 4); ql[l+32] = q2 | (q4 << 4);
+                    qh[l] = (uint8_t)((L[j+l]>>4) | ((L[j+l+32]>>4)<<2) | ((L[j+l+64]>>4)<<4) | ((L[j+l+96]>>4)<<6));
+                }
+                ql += 64; qh += 32;
+            }
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
+void ds4q_dequantize_q6_k(const void *blocks, float *out, int64_t n) {
+    const uint8_t *p = (const uint8_t *)blocks;
+    for (int64_t i = 0; i < n / QK_K; i++) {
+        const uint8_t *y = p + (size_t)i * 210, *ql = y + Q6K_ql_off, *qh = y + Q6K_qh_off;
+        const int8_t *sc = (const int8_t *)(y + Q6K_scales_off);
+        uint16_t hd; memcpy(&hd, y + Q6K_d_off, 2); float d = ds4q_f16_to_f32(hd);
+        float *o = out + (size_t)i * QK_K;
+        for (int nn = 0; nn < QK_K; nn += 128) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l]&0xF) | (((qh[l]>>0)&3)<<4)) - 32;
+                int8_t q2 = (int8_t)((ql[l+32]&0xF) | (((qh[l]>>2)&3)<<4)) - 32;
+                int8_t q3 = (int8_t)((ql[l]>>4) | (((qh[l]>>4)&3)<<4)) - 32;
+                int8_t q4 = (int8_t)((ql[l+32]>>4) | (((qh[l]>>6)&3)<<4)) - 32;
+                o[l] = d*sc[is]*q1; o[l+32] = d*sc[is+2]*q2; o[l+64] = d*sc[is+4]*q3; o[l+96] = d*sc[is+6]*q4;
+            }
+            ql += 64; qh += 32; sc += 8; o += 128;
+        }
+    }
+}
+
+/* ---- Q5_K (ggml-faithful). 176 B: d, dmin, scales[12], qh[32], qs[128]. q4_K + 5th bit ---- */
+enum { Q5K_d_off = 0, Q5K_dmin_off = 2, Q5K_scales_off = 4, Q5K_qh_off = 16, Q5K_qs_off = 48 };
+
+static size_t ds4q_quantize_q5_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols, const float *quant_weights) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q5_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t bpr = ncols / QK_K;
+    uint8_t L[QK_K], Laux[32], Ls[QK_K/32], Lm[QK_K/32];
+    float weights[32], sw[QK_K/32], mins[QK_K/32], scales[QK_K/32];
+    for (int64_t r = 0; r < nrows; r++) {
+        const float *xrow = src + start + (size_t)r * (size_t)ncols;
+        for (int64_t b = 0; b < bpr; b++) {
+            const float *x = xrow + (size_t)b * QK_K;
+            uint8_t *y = out + (size_t)r * row_size + (size_t)b * 176;
+            uint8_t *scales_out = y + Q5K_scales_off, *qh = y + Q5K_qh_off, *qs = y + Q5K_qs_off;
+            float sumx2 = 0; for (int l = 0; l < QK_K; l++) sumx2 += x[l]*x[l];
+            float sigma2 = 2*sumx2/QK_K, avx = sqrtf(sigma2);
+            for (int j = 0; j < QK_K/32; j++) {
+                if (quant_weights) { const float *qw = quant_weights + (size_t)b*QK_K + 32*j;
+                    for (int l = 0; l < 32; l++) weights[l] = qw[l]*sqrtf(sigma2 + x[32*j+l]*x[32*j+l]); }
+                else for (int l = 0; l < 32; l++) weights[l] = avx + fabsf(x[32*j+l]);
+                float s = 0; for (int l = 0; l < 32; l++) s += weights[l]; sw[j] = s;
+                scales[j] = ds4q_make_qkx3_quants(32, 31, x + 32*j, weights, L + 32*j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
+            }
+            float d_block = ds4q_make_qp_quants(QK_K/32, 63, scales, Ls, sw);
+            float m_block = ds4q_make_qp_quants(QK_K/32, 63, mins, Lm, sw);
+            for (int j = 0; j < QK_K/32; j++) {
+                uint8_t ls = Ls[j], lm = Lm[j];
+                if (j < 4) { scales_out[j] = ls; scales_out[j+4] = lm; }
+                else { scales_out[j+4] = (ls&0xF)|((lm&0xF)<<4); scales_out[j-4] |= (uint8_t)((ls>>4)<<6); scales_out[j] |= (uint8_t)((lm>>4)<<6); }
+            }
+            uint16_t d = ds4q_f32_to_f16(d_block), dmin = ds4q_f32_to_f16(m_block);
+            memcpy(y + Q5K_d_off, &d, 2); memcpy(y + Q5K_dmin_off, &dmin, 2);
+            uint8_t sc, m;
+            for (int j = 0; j < QK_K/32; j++) {
+                ds4q_get_scale_min_k4(j, scales_out, &sc, &m);
+                float dd = ds4q_f16_to_f32(d) * sc; if (!dd) continue;
+                float dm = ds4q_f16_to_f32(dmin) * m;
+                for (int ii = 0; ii < 32; ii++) { int l = ds4q_nearest_int((x[32*j+ii]+dm)/dd); l = DS4Q_MAX(0, DS4Q_MIN(31, l)); L[32*j+ii] = (uint8_t)l; }
+            }
+            memset(qh, 0, 32);
+            uint8_t m1 = 1, m2 = 2; uint8_t *qsp = qs;
+            for (int nn = 0; nn < QK_K; nn += 64) {
+                for (int l = 0; l < 32; l++) {
+                    qsp[l] = (L[nn+l]&0xF) | ((L[nn+l+32]&0xF)<<4);
+                    if (L[nn+l] > 15) qh[l] |= m1;
+                    if (L[nn+l+32] > 15) qh[l] |= m2;
+                }
+                m1 <<= 2; m2 <<= 2; qsp += 32;
+            }
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
+void ds4q_dequantize_q5_k(const void *blocks, float *out, int64_t n) {
+    const uint8_t *p = (const uint8_t *)blocks;
+    for (int64_t i = 0; i < n / QK_K; i++) {
+        const uint8_t *y = p + (size_t)i * 176, *qs = y + Q5K_qs_off, *qh = y + Q5K_qh_off, *scales = y + Q5K_scales_off;
+        uint16_t hd, hm; memcpy(&hd, y + Q5K_d_off, 2); memcpy(&hm, y + Q5K_dmin_off, 2);
+        float d = ds4q_f16_to_f32(hd), dmin = ds4q_f16_to_f32(hm);
+        float *o = out + (size_t)i * QK_K; uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K/64; j++) {
+            uint8_t sc, mm;
+            ds4q_get_scale_min_k4(2*j, scales, &sc, &mm); float d1 = d*sc, m1 = dmin*mm;
+            ds4q_get_scale_min_k4(2*j+1, scales, &sc, &mm); float d2 = d*sc, m2 = dmin*mm;
+            for (int l = 0; l < 32; l++) o[l]    = d1 * ((qs[l]&0xF) + ((qh[l]&u1)?16:0)) - m1;
+            for (int l = 0; l < 32; l++) o[l+32] = d2 * ((qs[l]>>4)  + ((qh[l]&u2)?16:0)) - m2;
+            o += 64; qs += 32; u1 <<= 2; u2 <<= 2;
+        }
+    }
+}
+
+/* ds4-spark: dequants for the remaining ladder tiers, needed by the MSE oracle
+ * (round-trip vs FP4 source). q4_K = q5_K without the qh 5th bit; canonical
+ * ggml layouts (d@0 dmin@2 scales@4 qs@16, 144B). */
+void ds4q_dequantize_q4_k(const void *blocks, float *out, int64_t n) {
+    const uint8_t *p = (const uint8_t *)blocks;
+    for (int64_t i = 0; i < n / QK_K; i++) {
+        const uint8_t *y = p + (size_t)i * 144, *scales = y + 4, *qs = y + 16;
+        uint16_t hd, hm; memcpy(&hd, y, 2); memcpy(&hm, y + 2, 2);
+        float d = ds4q_f16_to_f32(hd), dmin = ds4q_f16_to_f32(hm);
+        float *o = out + (size_t)i * QK_K;
+        for (int j = 0; j < QK_K/64; j++) {
+            uint8_t sc, mm;
+            ds4q_get_scale_min_k4(2*j,   scales, &sc, &mm); float d1 = d*sc, m1 = dmin*mm;
+            ds4q_get_scale_min_k4(2*j+1, scales, &sc, &mm); float d2 = d*sc, m2 = dmin*mm;
+            for (int l = 0; l < 32; l++) o[l]    = d1 * (qs[l] & 0xF) - m1;
+            for (int l = 0; l < 32; l++) o[l+32] = d2 * (qs[l] >> 4)  - m2;
+            o += 64; qs += 32;
+        }
+    }
+}
+
+/* q2_K: scales[16]@0, qs[64]@16, d@80, dmin@82 (84B); 2-bit, 16 sub-blocks. */
+void ds4q_dequantize_q2_k(const void *blocks, float *out, int64_t n) {
+    const uint8_t *p = (const uint8_t *)blocks;
+    for (int64_t i = 0; i < n / QK_K; i++) {
+        const uint8_t *y = p + (size_t)i * 84, *scales = y, *q = y + 16;
+        uint16_t hd, hm; memcpy(&hd, y + 80, 2); memcpy(&hm, y + 82, 2);
+        float d = ds4q_f16_to_f32(hd), dmin = ds4q_f16_to_f32(hm);
+        float *o = out + (size_t)i * QK_K; int is = 0;
+        for (int g = 0; g < QK_K; g += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = scales[is++]; float dl = d*(sc&0xF), ml = dmin*(sc>>4);
+                for (int l = 0; l < 16; l++) *o++ = dl * ((q[l]    >> shift) & 3) - ml;
+                sc = scales[is++]; dl = d*(sc&0xF); ml = dmin*(sc>>4);
+                for (int l = 0; l < 16; l++) *o++ = dl * ((q[l+16] >> shift) & 3) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+/* iq2_xxs dequant (oracle floor tier). Inverts ds4q_quantize_iq2_xxs: block is
+ * d(f16)@0 then 8 groups of [u32 grid-indices, u32 signs|scale] (66B total). The
+ * codebook is the global grid built by ds4q_iq2_xxs_init (8 int8 {1,3,5,7} per
+ * entry); signs use the canonical even-parity 7-bit ksigns table. */
+static const uint8_t ds4q_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+void ds4q_dequantize_iq2_xxs(const void *blocks, float *out, int64_t n) {
+    ds4q_iq2_xxs_init();
+    const int8_t *grid = (const int8_t *)ds4q_iq2_xxs_data.grid;
+    static const uint8_t kmask[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+    const uint8_t *p = (const uint8_t *)blocks;
+    for (int64_t i = 0; i < n / QK_K; i++) {
+        const uint8_t *blk = p + (size_t)i * 66;
+        uint16_t hd; memcpy(&hd, blk, 2);
+        const float d = ds4q_f16_to_f32(hd);
+        const uint8_t *q2 = blk + 2;
+        float *y = out + (size_t)i * QK_K;
+        for (int ib = 0; ib < QK_K/32; ib++) {
+            uint32_t aux32[2]; memcpy(aux32, q2 + (size_t)ib * 8, 8);
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+            const float db = d * (float)(2u * (aux32[1] >> 28) + 1u);
+            for (int l = 0; l < 4; l++) {
+                const int8_t *g = grid + (size_t)aux8[l] * 8;
+                const uint8_t signs = ds4q_ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+                for (int j = 0; j < 8; j++)
+                    *y++ = db * (float)g[j] * ((signs & kmask[j]) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+
 void ds4q_quantize_init(ds4q_type type) {
     if (type == DS4Q_TYPE_IQ2_XXS) {
         ds4q_iq2_xxs_init();
@@ -1057,8 +1394,17 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     if (type == DS4Q_TYPE_Q2_K) {
         return ds4q_quantize_q2_k(src, dst, start, nrows, ncols, imatrix);
     }
+    if (type == DS4Q_TYPE_Q3_K) {
+        return ds4q_quantize_q3_k(src, dst, start, nrows, ncols, imatrix);
+    }
     if (type == DS4Q_TYPE_Q4_K) {
         return ds4q_quantize_q4_k(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_Q5_K) {
+        return ds4q_quantize_q5_k(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_Q6_K) {
+        return ds4q_quantize_q6_k(src, dst, start, nrows, ncols, imatrix);
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);
