@@ -37,20 +37,45 @@ new runtime support? Best case: antirez adds DSpark upstream and we inherit it o
 clean fork. Action: watch antirez/main for DSpark; validate original MTP as the baseline
 win meanwhile. Expected ~1.5-2x decode either way.
 
-### P2 — FP8 dense/attention, then FP8 experts  [MEDIUM]
-Light up the idle FP8 cores; matches the FP8 source so it's near-lossless.
-- **2a Dense/attn via cuBLASLt FP8** — ds4 already links cuBLAS; mature API, smallest lift.
-  Lets the allocator drop less-sensitive FP8 attn from Q8_0(8.5) to FP8(~8.25) on hw path.
-- **2b FP8 routed-expert grouped GEMM** — bigger; CUTLASS/vLLM grouped-MoE FP8.
+### P2 — FP8 (the decode/quality track)  [MEDIUM]
+FP8 is the *decode* play: everything read every token (KV, attn proj, always-on shared
+experts, dense FFN) can go FP8 — lossless vs the FP8 source AND on the idle FP8 cores.
+Dependency reality: **all NVIDIA first-party, no vLLM.** The *GEMM* is cuBLASLt (already
+linked); the *storage encoder* is ours in quants.c (FP8 = a near-identity repack since the
+source attn/dense is already E4M3).
+
+- **2a FP8-KV — ALREADY IN antirez, enable + measure first.** `fp8_kv_quantize_kernel`,
+  `ds4_gpu_dsv4_fp8_kv_quantize_tensor`, kvstore quant-aware checkpoints all exist. MLA
+  already compresses KV to a latent; FP8-ing that latent ~halves KV bandwidth/memory →
+  decode win at depth + more context room. Lowest effort, do right after the oracle quant.
+- **2b Profiling GATE** — profile the oracle quant's decode (attn vs shared vs MoE vs KV
+  split) BEFORE building 2c. Earlier nsys put attention ~6.6ms and the real stall was the
+  now-fixed graph bug → decode is likely MoE-memory-bound. If attn/shared is a thin slice,
+  2c is a quality win more than a speed one; if fat, build it.
+- **2c FP8 weights via cuBLASLt** — attn/dense/shared Q8_0(8.5)→E4M3(8.0): lossless,
+  ~6% smaller, FP8-core matmul. `cublasLtMatmul` with FP8 descriptors + scale tensors;
+  dense GEMM, so a library drop-in (TN layout/alignment constraints, no kernel graft).
+  Shared experts are always-on dense GEMMs → decode-relevant. **No vLLM, no CUTLASS.**
 
 ### P3 — NVFP4 experts on FP4 tensor cores  [HARD, the serving play]
 Source experts are FP4; NVFP4 (~4.5 bpw, FP8 per-16 microscale + FP32 global) matches
-them and runs on the 5th-gen FP4 cores (2x FP8 / 4x BF16). Wins **prefill + concurrency**,
-NOT single-stream decode (memory-bound). 
-- Quantizer: NVFP4 encoder (two-level scaling; consider Hadamard rotation à la TRT-LLM).
-- Runtime: **graft vLLM's CUTLASS NVFP4 grouped-MoE GEMM** (Apache-2.0) via a C bridge —
-  same maneuver Entrpi used for llama.cpp mmq. Do NOT hand-write tcgen05 FP4 MMA.
-- Risk: CUTLASS NVFP4 grouped-MoE on sm_121 is bleeding edge (expect toolchain friction).
+them and runs on the 5th-gen FP4 cores (2x FP8 / 4x BF16). **DECODE-NEUTRAL** — same
+4.5 bpw as Q4_K = same bytes = same decode bandwidth. Wins **prefill + concurrency**
+(compute-bound) only. Defer unless the workload becomes prefill-heavy or multi-stream.
+Bonus quality angle: NVFP4's per-16 microscale represents the massive-activation late-down
+experts (blk.42/41/30… — see oracle findings) better than Q4_K's coarser blocks.
+
+Dependency reality: **the math is NVIDIA; vLLM is optional and only for MoE fusion.**
+- GEMM primitive: cuBLASLt added block-scaled FP4 (NVFP4/MXFP4) matmul in CUDA 12.8→13.x
+  for Blackwell — CONFIRM the API covers the grouped/batched-expert case on sm_121 before
+  committing. Otherwise CUTLASS NVFP4 grouped-GEMM collectives (also NVIDIA).
+- The hard part is **MoE routing + fusion** (token→expert gather, per-expert block scales),
+  NOT the matmul. Options: (a) build on CUTLASS directly; (b) **lift vLLM's fused
+  NVFP4-MoE kernel** — itself a CUTLASS wrapper, Apache-2.0, via a C bridge (the maneuver
+  Entrpi used for llama.cpp mmq). vLLM is a shortcut for the fusion, not a requirement.
+- Quantizer: NVFP4 encoder is ours (two-level scaling; consider Hadamard rotation à la
+  TRT-LLM). Do NOT hand-write tcgen05 FP4 MMA.
+- Risk: CUTLASS/cuBLASLt NVFP4 grouped-MoE on sm_121 is bleeding edge (toolchain friction).
 
 ### P4 — Oracle-driven multi-format allocation across the full menu
 Extend `--mse-probe` + prisma to allocate over ALL tensors (experts + dense/attn) and
@@ -102,7 +127,10 @@ Rule: ~5-7 non-redundant, hardware-aligned tiers. The oracle picks; don't stack
 redundant same-bpw formats (e.g. NVFP4 vs Q4_K is a *path* choice, not two slots).
 
 ## Idea verdicts (2026-06-28)
-1. **FP8 + NVFP4 — YES, staged.** FP8 via cuBLASLt (easy); NVFP4 via vLLM/CUTLASS graft (hard).
+1. **FP8 + NVFP4 — YES, staged, both NVIDIA-first (vLLM optional).** FP8 = cuBLASLt
+   dense GEMM, no vLLM/CUTLASS (the decode play; KV already in antirez). NVFP4 = NVIDIA
+   block-scaled FP4 (cuBLASLt/CUTLASS) for the matmul; vLLM only as a shortcut for the
+   MoE routing+fusion (the prefill/concurrency play, decode-neutral). Encoders are ours.
 2. **INT4 / AutoRound — NO for this model.** AutoRound optimizes rounding *from high precision*;
    our experts are FP4 at source, so the gain collapses to RTN. INT4 ≈ Q4_K we already have.
    Revisit only for a bf16-source model.
