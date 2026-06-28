@@ -25,10 +25,17 @@ single-stream decode. Prime suspect: MTP (we run without it).
 
 ## Phases
 
-### P1 — MTP speculative decode  [CHEAP, DO FIRST]
-Hits the actual bottleneck (single-stream decode, memory-bound). DeepSeek-V4-Flash
-has a native MTP head; `ds4-bench`/server take `--mtp DRAFT.gguf`. Expected ~1.5-2x
-decode. Effort: acquire/build the MTP draft + wire serving flags + validate accept rate.
+### P1 — Speculative decode  [HIGHEST LEVERAGE, DO FIRST]
+Hits the actual bottleneck (single-stream decode, memory-bound). Two draft options:
+- **Original MTP** — V4-Flash built-in MTP head; ds4 supports it (`--mtp DRAFT.gguf`).
+- **DSpark (DeepSeek newer method, 2026-06)** — `deepseek-ai/DeepSeek-V4-Flash-DSpark`
+  = same weights + an official pre-trained DSpark draft module (framework
+  github.com/deepseek-ai/DeepSpec; also ships DFlash + Eagle3). Likely higher accept
+  rate than vanilla MTP. "DSpark" = the spec-decode method, NOT DGX Spark (naming clash).
+OPEN Q: does ds4 spec-decode accept a DSpark draft (GGUF-convert + scheme match) or need
+new runtime support? Best case: antirez adds DSpark upstream and we inherit it on the
+clean fork. Action: watch antirez/main for DSpark; validate original MTP as the baseline
+win meanwhile. Expected ~1.5-2x decode either way.
 
 ### P2 — FP8 dense/attention, then FP8 experts  [MEDIUM]
 Light up the idle FP8 cores; matches the FP8 source so it's near-lossless.
