@@ -31,15 +31,28 @@ BLOCK = {
     "F16":     (1, 2),
     "F32":     (1, 4),
 }
-# Candidate menus. ds4-spark widened the fork's routed-expert kernels to the
-# full k-quant ladder (mmq dispatchers in routed_moe_launch + q2_K/q3_K/q5_K/q6_K
-# pair kernels). Remaining hard constraint: gate & up MUST share a type (one
-# fused SwiGLU pair kernel covers both). down is independent. Both roles now
-# span the whole ladder, so the knapsack has fine granularity end to end.
-LADDER       = ["IQ2_XXS", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"]
-GATEUP_CANDS = LADDER                          # gate+up: full ladder (q2_K pair added)
-DOWN_CANDS   = LADDER                          # down: full ladder
-ROUTED_CANDS = LADDER                          # union (display only), bpw-ascending
+# Candidate menu — antirez two-pair law (ds4_cuda.cu routed_moe_launch:12251).
+# The clean antirez runtime's ONLY routed-MoE entry point hard-accepts exactly
+# two per-layer presets and returns 0 ("ffn batch encode failed") for anything
+# else:
+#   q4k_path : gate==Q4_K(12) AND down==Q4_K(12)
+#   else     : gate==IQ2_XXS(16) AND down==Q2_K(10)
+# So a whole MoE layer is the allocation UNIT and it picks ONE of two presets.
+# (The Entrpi fork widened this to the full ladder via the mmq graft; that work
+# is staged for a surgical, oracle-triggered port — see ROADMAP. Until then the
+# allocator MUST emit only these presets or it produces unservable GGUFs, which
+# is exactly how smart-99gb got IQ2_XXS down-projections.)
+PRESETS = {
+    "cheap": {"gate": "IQ2_XXS", "up": "IQ2_XXS", "down": "Q2_K"},   # ~2.06 / 2.6 bpw
+    "rich":  {"gate": "Q4_K",    "up": "Q4_K",    "down": "Q4_K"},   # 4.5 bpw
+}
+PRESET_ORDER = ["cheap", "rich"]               # ascending size; promote cheap->rich
+ROUTED_CANDS = ["IQ2_XXS", "Q2_K", "Q4_K"]     # display only, bpw-ascending
+
+def expert_role(name):
+    if "down_exps" in name: return "down"
+    if "up_exps"   in name: return "up"
+    return "gate"                               # gate_exps
 
 def nelems(shape):
     n = 1
@@ -55,10 +68,12 @@ def bpw(fmt):
     return bb * 8.0 / eb
 
 def candidates(t):
-    """Format menu for a tensor, honoring ds4's gate/up vs down constraints.
-    Non-experts are pinned at their current type (small + already chosen)."""
+    """Per-role format options under the two presets (cheap-first), for routed
+    experts; non-experts pinned at their current type. candidates(t)[0] is the
+    cheap-preset format for the tensor's role (used as the pinned default)."""
     if t["family"] == "routed_expert":
-        return DOWN_CANDS if "down_exps" in t["name"] else GATEUP_CANDS
+        role = expert_role(t["name"])
+        return [PRESETS[p][role] for p in PRESET_ORDER]
     return [t["type"]] if t["type"] in BLOCK else ["F16"]
 
 def synth_sens(t):
@@ -80,73 +95,63 @@ def load(p):
     return json.load(open(p)) if p and os.path.exists(p) else None
 
 def allocate(tensors, sens, mse, budget_bytes):
-    """Greedy-upgrade multiple-choice knapsack. Each routed tensor starts at the
-    cheapest format; we repeatedly apply the upgrade (next format up) with the
-    best dKL-saved-per-extra-byte, while it fits the budget. Optimal for convex
-    per-tensor cost curves; near-optimal otherwise and always budget-respecting."""
+    """Per-layer two-preset knapsack for the antirez two-pair runtime. The unit
+    is a whole MoE layer (its gate_exps+up_exps+down_exps); it chooses 'cheap'
+    (IQ2_XXS gate/up, Q2_K down) or 'rich' (Q4_K all). Start every layer cheap,
+    then greedily promote whole layers to rich by best dKL-saved-per-extra-byte
+    while the budget holds. Two presets => 0/1 per layer; greedy-by-efficiency is
+    exact for the LP relaxation and always budget-respecting."""
     import heapq, collections
-    # CONSTRAINT: gate+up experts in a layer must share a quant type (fused
-    # moe_pair kernel). So the allocation UNIT is (layer, gate+up) or (layer,
-    # down); down is independent. Each unit emits its format to all its tensors.
     fixed_bytes = 0
-    units = collections.OrderedDict()   # unit_key -> {tensors:[(name,n_el,sv,cands)]}
+    layers = collections.OrderedDict()   # layer -> [(name, n_el, sv, role), ...]
     for t in tensors:
-        n_el = nelems(t["shape"]); cands = candidates(t)
-        if t["family"] != "routed_expert" or len(cands) == 1:
-            fixed_bytes += size_bytes(n_el, cands[0]); continue
+        n_el = nelems(t["shape"])
+        if t["family"] != "routed_expert":
+            fixed_bytes += size_bytes(n_el, candidates(t)[0]); continue
         n = t["name"]
         try: layer = n.split("blk.")[1].split(".")[0]
         except Exception: layer = "?"
-        role = "gate_up" if ("gate_exps" in n or "up_exps" in n) else "down"
-        key = (layer, role)
         sv = (sens or {}).get(n, synth_sens(t))
-        units.setdefault(key, {"tensors": []})["tensors"].append((n, n_el, sv, cands))
+        layers.setdefault(layer, []).append((n, n_el, sv, expert_role(n)))
 
-    routed = []   # [names, opts(sorted by size), lvl]
-    for key, u in units.items():
-        ts = u["tensors"]
-        cands = ts[0][3]                       # same menu for gate & up
-        opts = []
-        for f in cands:
-            sz = sum(size_bytes(n_el, f) for (_, n_el, _, _) in ts)
-            dkl = 0.0
-            for (nm, n_el, sv, _) in ts:
-                m = (mse or {}).get(nm, {}).get(f)
-                if m is None: m = synth_mse(n_el, f)
-                dkl += 0.5 * sv * m
-            opts.append((f, sz, dkl))
-        opts.sort(key=lambda o: o[1])
-        routed.append([[nm for (nm, _, _, _) in ts], opts, 0])
+    def preset_cost(ts, preset):
+        sz = 0; dkl = 0.0
+        for (nm, n_el, sv, role) in ts:
+            fmt = PRESETS[preset][role]
+            sz += size_bytes(n_el, fmt)
+            m = (mse or {}).get(nm, {}).get(fmt)
+            if m is None: m = synth_mse(n_el, fmt)
+            dkl += 0.5 * sv * m
+        return sz, dkl
 
-    rsize = sum(o[1][0][1] for o in routed)       # all at cheapest
-    rkl   = sum(o[1][0][2] for o in routed)
+    units = []   # [layer, tensors, {preset:(sz,dkl)}, is_rich]
+    for layer, ts in layers.items():
+        costs = {p: preset_cost(ts, p) for p in PRESET_ORDER}
+        units.append([layer, ts, costs, False])
+
+    rsize = sum(u[2]["cheap"][0] for u in units)   # all cheap
+    rkl   = sum(u[2]["cheap"][1] for u in units)
     budget = budget_bytes - fixed_bytes
 
-    # max-heap (via negation) of upgrade efficiency = dKL_saved / extra_bytes
+    # max-heap (via negation) of promotion efficiency = dKL_saved / extra_bytes
     heap = []
-    for i, (name, opts, lvl) in enumerate(routed):
-        if lvl + 1 < len(opts):
-            ds = opts[lvl+1][1] - opts[lvl][1]
-            dk = opts[lvl][2]  - opts[lvl+1][2]      # KL reduction (>0 if higher fmt better)
-            if ds > 0: heapq.heappush(heap, (-(dk/ds), i))
+    for i, u in enumerate(units):
+        ds = u[2]["rich"][0] - u[2]["cheap"][0]
+        dk = u[2]["cheap"][1] - u[2]["rich"][1]     # KL reduction from cheap->rich
+        if ds > 0: heapq.heappush(heap, (-(dk/ds), i))
     while heap:
         eff, i = heapq.heappop(heap)
-        name, opts, lvl = routed[i]
-        ds = opts[lvl+1][1] - opts[lvl][1]
+        u = units[i]
+        ds = u[2]["rich"][0] - u[2]["cheap"][0]
         if rsize + ds > budget:
-            continue                                # this upgrade doesn't fit; skip
-        # apply upgrade
-        rkl -= (opts[lvl][2] - opts[lvl+1][2]); rsize += ds
-        routed[i][2] = lvl + 1; lvl += 1
-        if lvl + 1 < len(opts):
-            ds2 = opts[lvl+1][1] - opts[lvl][1]
-            dk2 = opts[lvl][2]  - opts[lvl+1][2]
-            if ds2 > 0: heapq.heappush(heap, (-(dk2/ds2), i))
+            continue                                # doesn't fit; try next-best
+        rkl -= (u[2]["cheap"][1] - u[2]["rich"][1]); rsize += ds; u[3] = True
 
     chosen = {}
-    for names, opts, lvl in routed:
-        fmt = opts[lvl][0]
-        for nm in names: chosen[nm] = fmt
+    for layer, ts, costs, is_rich in units:
+        preset = "rich" if is_rich else "cheap"
+        for (nm, _, _, role) in ts:
+            chosen[nm] = PRESETS[preset][role]
     return chosen, fixed_bytes, rsize, rkl
 
 def main():
