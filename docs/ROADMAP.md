@@ -56,9 +56,41 @@ NOT single-stream decode (memory-bound).
 Extend `--mse-probe` + prisma to allocate over ALL tensors (experts + dense/attn) and
 the curated format menu below, picking by imatrix-weighted real error per (tensor,format).
 
+### P5 — Expert pruning (REAP / RIY) — workload-specific capacity  [HIGH VALUE]
+REAP = Router-weighted Expert Activation Pruning (Cerebras): drop underutilized MoE
+experts. RIY ("Reap It Yourself", github.com/flash7777/vllm @riy, `riy_live.py` TUI +
+`--riy-expert-profile`) profiles YOUR workload -> JSON of dead experts -> zeroes them at
+load, reversible via HTTP API. Reported: 5-20% prune to make room/fit; ~70% stable on
+some models, ~90% breaks. PRINCIPLE: profile your own workload, not C4/GSM8K.
+ref: https://forums.developer.nvidia.com/t/why-you-should-reap-it-yourself-live-moe-expert-pruning-in-vllm/364098
+
+WHY IT MATTERS: a SECOND memory lever, orthogonal to quantization, and it directly serves
+the "preserve DeepSeek's FP4, don't crush to IQ2" goal. Pruning a dead expert frees its
+FULL footprint at ~zero quality cost (it's rarely selected) -- STRICTLY better than
+IQ2-crushing it. So pruning is effectively the **0-bit tier at the bottom of the
+allocation ladder**: the cheapest option for the least-active experts, below IQ2. Prune
+the cold experts -> reclaim memory -> keep the hot experts at native FP4/NVFP4.
+
+UNIFYING INSIGHT (the big one): the router-weighted expert-activation profile is the SAME
+signal we want for everything. One per-expert ranking ("how much does this matter for OUR
+workload") drives all three memory levers at once:
+  (a) PRUNE the dead experts (0-bit),
+  (b) QUANTIZE the rest by rank (FP4/NVFP4 hot, Q-quant warm, IQ2 marginal),
+  (c) SSD-STREAM priority (hot in RAM, cold on disk).
+=> Fold expert-activation profiling into the Prisma oracle as the master sensitivity
+signal, replacing/augmenting the imatrix proxy. Profile on the real coding/agentic
+workload, not generic text.
+
+PORT: ds4 (not vLLM), so we bring the CONCEPT, not the code -- a profiler (router-weight
+histogram per expert) + a skip/zero mask on ds4's routed-MoE dispatch. antirez's SSD
+streaming expert cache is the natural home (it already gates experts in/out of RAM by
+activity). CAVEAT: pruning trades general capability for fit -- safe at 5-20%, aggressive
+only for a narrow/fixed workload profile.
+
 ## Curated format menu (every format must earn its kernel)
 | bpw  | format   | hw path        | role |
 |------|----------|----------------|------|
+| 0    | PRUNE    | n/a (skip)     | dead experts for the workload (REAP/RIY) |
 | 2.06 | IQ2_XXS  | int (native)   | bulk experts (memory-bound decode) |
 | 2.6  | Q2_K     | int (native)   | bulk experts |
 | 3.4  | Q3_K     | int (native)   | mid experts (granularity) |
@@ -75,6 +107,9 @@ redundant same-bpw formats (e.g. NVFP4 vs Q4_K is a *path* choice, not two slots
    our experts are FP4 at source, so the gain collapses to RTN. INT4 ≈ Q4_K we already have.
    Revisit only for a bf16-source model.
 3. **Many formats — YES, curated.** Dispatch is free; kernels are the cost. ~5-7 hw-aligned tiers.
+4. **Expert pruning (REAP/RIY) — YES, high value.** Workload-profiled dead-expert removal
+   = the 0-bit tier; reclaims memory to keep live experts at FP4 instead of IQ2. The
+   activation profile becomes the master sensitivity signal for prune+quant+stream.
 
 ## Rejected / parked
 - **CUDA-graph decode capture** — eager wins this (GPU-bound) workload; antirez ships no graphs. Parked.
