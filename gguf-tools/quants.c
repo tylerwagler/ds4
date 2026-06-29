@@ -51,6 +51,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, true,  false },
     [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, true,  false },
     [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
+    [DS4Q_TYPE_FP8_E4M3]= { "fp8_e4m3", 32,  33, true,  false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
     [DS4Q_TYPE_IQ3_XXS] = { "iq3_xxs", QK_K,  98, false, false },
@@ -364,6 +365,75 @@ static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
         out += sizeof(hd) + qk;
     }
     return (size_t)nrows * row_size;
+}
+
+/* ---- MXFP8: E4M3 values + per-32 E8M0 block scale; block = 33 B / 32 elems
+ * (8.25 bpw). byte[0] = E8M0 scale (value = 2^(b-127)); byte[1..32] = E4M3.
+ * Hardware-native on Blackwell MX tensor cores (cuBLASLt VEC32_UE8M0). For the
+ * FP8-source attn/dense/shared weights this is near-lossless and >= Q8_0. ---- */
+static uint8_t ds4q_f32_to_e4m3(float x) {
+    if (x != x) return 0x7f;                          /* NaN */
+    uint8_t s = (x < 0.0f) ? 0x80 : 0x00;
+    float a = fabsf(x);
+    if (a >= 448.0f) return (uint8_t)(s | 0x7e);      /* saturate (incl inf) */
+    if (a == 0.0f)   return s;                        /* signed zero */
+    union { float f; uint32_t u; } v; v.f = a;
+    int32_t exp = (int32_t)((v.u >> 23) & 0xff) - 127;
+    uint32_t sig = (1u << 23) | (v.u & 0x7fffffu);    /* 24-bit significand */
+    int32_t e8 = exp + 7;                             /* E4M3 biased exponent */
+    if (e8 <= 0) {                                    /* subnormal: code * 2^-9 */
+        int code = (int)lrintf(a * 512.0f);
+        if (code > 7) return (uint8_t)(s | (1u << 3));   /* round up to min normal */
+        return (uint8_t)(s | (code & 0x7));
+    }
+    uint32_t mant3 = (sig >> 20) & 0x7;
+    uint32_t rem = sig & ((1u << 20) - 1), half = 1u << 19;
+    if (rem > half || (rem == half && (mant3 & 1))) {     /* round to nearest even */
+        if (++mant3 == 8) { mant3 = 0; e8++; }
+    }
+    if (e8 > 15 || (e8 == 15 && mant3 >= 7)) return (uint8_t)(s | 0x7e); /* saturate */
+    return (uint8_t)(s | ((e8 & 0xf) << 3) | (mant3 & 0x7));
+}
+
+static float ds4q_e4m3_to_f32(uint8_t b) {
+    float sign = (b & 0x80) ? -1.0f : 1.0f;
+    uint32_t e = (b >> 3) & 0xf, m = b & 0x7;
+    if (e == 0) return sign * (float)m * (1.0f / 512.0f);          /* subnormal */
+    if (e == 15 && m == 7) return sign * (float)NAN;
+    return sign * (1.0f + (float)m * 0.125f) * ldexpf(1.0f, (int)e - 7);
+}
+
+static size_t ds4q_quantize_fp8_e4m3(const float *src, void *dst, int64_t start,
+                                     int64_t nrows, int64_t ncols) {
+    const int64_t qk = 32;
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_FP8_E4M3, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t nblocks = nrows * (ncols / qk);
+    for (int64_t b = 0; b < nblocks; b++) {
+        const float *x = src + start + (size_t)b * qk;
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) { float av = fabsf(x[j]); if (av > amax) amax = av; }
+        int scale_exp = -127;
+        if (amax > 0.0f) { int e; frexpf(amax, &e); scale_exp = (e - 1) - 7; } /* max elem -> [128,256) */
+        if (scale_exp < -127) scale_exp = -127;
+        if (scale_exp >  127) scale_exp =  127;
+        out[0] = (uint8_t)(scale_exp + 127);            /* E8M0 */
+        const float inv = ldexpf(1.0f, -scale_exp);
+        for (int j = 0; j < qk; j++) out[1 + j] = ds4q_f32_to_e4m3(x[j] * inv);
+        out += 33;
+    }
+    return (size_t)nrows * row_size;
+}
+
+void ds4q_dequantize_fp8_e4m3(const void *blocks, float *out, int64_t n) {
+    const uint8_t *b = (const uint8_t *)blocks;
+    const int64_t nblocks = n / 32;
+    for (int64_t i = 0; i < nblocks; i++) {
+        const float scale = ldexpf(1.0f, (int)b[0] - 127);
+        for (int j = 0; j < 32; j++) out[i * 32 + j] = ds4q_e4m3_to_f32(b[1 + j]) * scale;
+        b += 33;
+    }
 }
 
 static void ds4q_write_q4_k_block_ref(const float *x, uint8_t *y) {
@@ -1408,6 +1478,10 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_FP8_E4M3) {
+        (void)imatrix;
+        return ds4q_quantize_fp8_e4m3(src, dst, start, nrows, ncols);
     }
     (void)src;
     (void)dst;

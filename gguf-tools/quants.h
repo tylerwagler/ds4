@@ -47,6 +47,7 @@ typedef enum {
     DS4Q_TYPE_BF16    = 30,
     DS4Q_TYPE_TQ1_0   = 34,
     DS4Q_TYPE_TQ2_0   = 35,
+    DS4Q_TYPE_FP8_E4M3 = 38,   /* MXFP8: E4M3 + per-32 E8M0 block scale (33 B/32) */
     DS4Q_TYPE_MXFP4   = 39,
     DS4Q_TYPE_NVFP4   = 40,
     DS4Q_TYPE_Q1_0    = 41,
@@ -68,6 +69,7 @@ void ds4q_dequantize_q4_k(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_q3_k(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_q5_k(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_q6_k(const void *blocks, float *out, int64_t n);
+void ds4q_dequantize_fp8_e4m3(const void *blocks, float *out, int64_t n);
 void ds4q_quantize_init(ds4q_type type);
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,

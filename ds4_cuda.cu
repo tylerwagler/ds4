@@ -1,7 +1,9 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <mma.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
@@ -7659,6 +7661,125 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
 }
+/* ===== MXFP8 (E4M3 + per-32 E8M0) weight matmul via cuBLASLt block-scaling.
+ * Hardware MX tensor cores on GB10 (~2x FP16 prefill). Scale tensor uses the
+ * Blackwell 128x4 tile swizzle (see blackwell_mx_scale_swizzle). ===== */
+static cublasLtHandle_t g_cublaslt = NULL;
+static int g_cublaslt_ready = 0;
+static int cublaslt_ensure(void) {
+    if (g_cublaslt_ready) return 1;
+    if (cublasLtCreate(&g_cublaslt) != CUBLAS_STATUS_SUCCESS) return 0;
+    g_cublaslt_ready = 1; return 1;
+}
+static inline int mx_rup(int x, int n) { return (x + n - 1) / n * n; }
+__device__ __forceinline__ int mx_sfoff(int row, int kb, int KBp) {
+    return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
+           + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
+}
+/* X[rows,K] f32 -> E4M3 data[K,rows]col + swizzled E8M0 scale. one warp per (row,kb). */
+__global__ static void mxfp8_quant_act_kernel(const float *X, int rows, int K, int KBp,
+                                              __nv_fp8_e4m3 *data, unsigned char *scale) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
+    int KB = K / 32; if (warp >= rows * KB) return;
+    int row = warp / KB, kb = warp % KB;
+    float v = X[(size_t)row * K + kb * 32 + lane], a = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    int se = -127; if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
+    if (se < -127) se = -127; if (se > 127) se = 127;
+    data[(size_t)(kb * 32 + lane) + (size_t)row * K] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
+    if (lane == 0) scale[mx_sfoff(row, kb, KBp)] = (unsigned char)(se + 127);
+}
+/* GGUF MXFP8 weight (row-major [out,in], 33B blocks: [E8M0][32xE4M3]) ->
+ * E4M3 data[in,out]col + swizzled E8M0 scale. one warp per (out,kb). */
+__global__ static void mxfp8_weight_convert_kernel(const unsigned char *src, int out_dim, int in_dim,
+                                                   int KBp, __nv_fp8_e4m3 *data, unsigned char *scale) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
+    int KB = in_dim / 32; if (warp >= out_dim * KB) return;
+    int o = warp / KB, kb = warp % KB;
+    const unsigned char *blk = src + ((size_t)o * KB + kb) * 33;
+    data[(size_t)(kb * 32 + lane) + (size_t)o * in_dim] = *(const __nv_fp8_e4m3 *)&blk[1 + lane];
+    if (lane == 0) scale[mx_sfoff(o, kb, KBp)] = blk[0];
+}
+struct fp8_mx_weight { const void *host_base; uint64_t offset, in_dim, out_dim; __nv_fp8_e4m3 *data; unsigned char *scale; };
+static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
+/* lazily de-interleave + swizzle an MXFP8 weight into device buffers, cached by offset. */
+static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t offset, uint64_t weight_bytes,
+                                               uint64_t in_dim, uint64_t out_dim, const char *label) {
+    auto it = g_fp8_mx_by_offset.find(offset);
+    if (it != g_fp8_mx_by_offset.end() && it->second.host_base == model_map &&
+        it->second.in_dim == in_dim && it->second.out_dim == out_dim) return &it->second;
+    const unsigned char *src = (const unsigned char *)cuda_model_range_ptr(model_map, offset, weight_bytes, "fp8_mx");
+    if (!src) return NULL;
+    int KB = (int)(in_dim / 32), KBp = mx_rup(KB, 4);
+    size_t data_bytes = in_dim * out_dim;
+    size_t scale_bytes = (size_t)mx_rup((int)out_dim, 128) * KBp;
+    __nv_fp8_e4m3 *data = NULL; unsigned char *scale = NULL;
+    if (cudaMalloc(&data, data_bytes) != cudaSuccess) return NULL;
+    if (cudaMalloc(&scale, scale_bytes) != cudaSuccess) { cudaFree(data); return NULL; }
+    cudaMemset(scale, 0, scale_bytes);
+    int warps = (int)out_dim * KB;
+    mxfp8_weight_convert_kernel<<<(warps * 32 + 255) / 256, 256>>>(src, (int)out_dim, (int)in_dim, KBp, data, scale);
+    if (!cuda_ok(cudaGetLastError(), "fp8_mx weight convert")) { cudaFree(data); cudaFree(scale); return NULL; }
+    fp8_mx_weight w = { model_map, offset, in_dim, out_dim, data, scale };
+    g_fp8_mx_by_offset[offset] = w;
+    (void)label;
+    return &g_fp8_mx_by_offset[offset];
+}
+static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t n_tok, const char *label) {
+    if (!out || !x || !model_map || in_dim % 32 != 0 || !cublaslt_ensure()) return 0;
+    uint64_t KB = in_dim / 32, weight_bytes = out_dim * KB * 33;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) || out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
+    if (!w) return 0;
+    int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
+    __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)cuda_tmp_alloc(in_dim * (size_t)ntok, "fp8_mx act");
+    size_t sx_bytes = (size_t)mx_rup(ntok, 128) * KBp;
+    unsigned char *sx = (unsigned char *)cuda_tmp_alloc(sx_bytes, "fp8_mx act scale");
+    if (!xq || !sx) return 0;
+    cudaMemset(sx, 0, sx_bytes);
+    int warps = ntok * (int)KB;
+    mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, ntok, (int)in_dim, KBp, xq, sx);
+    if (!cuda_ok(cudaGetLastError(), "fp8_mx act quant")) return 0;
+    cublasLtMatmulDesc_t op; if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
+    cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+    cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
+    cublasLtMatrixLayout_t la, lb, ld;
+    cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, in_dim, out_dim, in_dim);
+    cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, in_dim, ntok, in_dim);
+    cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, out_dim, ntok, out_dim);
+    cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
+    size_t wz = 32u << 20; void *ws = cuda_tmp_alloc(wz, "fp8_mx workspace");
+    cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+    cublasLtMatmulHeuristicResult_t h; int got = 0;
+    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, op, la, lb, ld, ld, pf, 1, &h, &got);
+    int ok = 0;
+    if (hs == CUBLAS_STATUS_SUCCESS && got && ws) {
+        float al = 1.f, be = 0.f;
+        cublasStatus_t st = cublasLtMatmul(g_cublaslt, op, &al, w->data, la, xq, lb, &be,
+                                           out->ptr, ld, out->ptr, ld, &h.algo, ws, wz, 0);
+        ok = (st == CUBLAS_STATUS_SUCCESS);
+        if (!ok) fprintf(stderr, "ds4: cuBLASLt MXFP8 matmul failed: status %d\n", (int)st);
+    }
+    cublasLtMatmulPreferenceDestroy(pf);
+    cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(ld);
+    cublasLtMatmulDescDestroy(op);
+    return ok;
+}
+extern "C" int ds4_gpu_matmul_fp8_mx_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size, weight_offset,
+                                             in_dim, out_dim, x, n_tok, "fp8_mx");
+}
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
