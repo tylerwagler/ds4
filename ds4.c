@@ -2285,6 +2285,21 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             uint32_t span_count) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
+    /* Register each MXFP8 weight's offset so the q8 matmul routes ONLY those to
+     * the FP8 path (per-tensor, not a global flag — attn_output stays Q8 even
+     * though it flows through the same matmul). Runs before the DIRECT_MODEL
+     * early-out so it applies in the mmap path too. */
+    uint64_t n_fp8 = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->type == DS4_TENSOR_FP8_E4M3) {
+            ds4_gpu_register_fp8_weight(t->abs_offset);
+            n_fp8++;
+        }
+    }
+    if (n_fp8 > 0)
+        fprintf(stderr, "ds4: %llu MXFP8 workhorse weights detected -> FP8 matmul path\n",
+                (unsigned long long)n_fp8);
 #ifndef DS4_ROCM_BUILD
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
@@ -3143,7 +3158,11 @@ static void tensor_expect_layout(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (t->type != type) {
+    /* Accept MXFP8 wherever Q8_0 is expected: the workhorse weights (attn_kv/q,
+     * shared experts) may be FP8 (routed to the FP8 matmul via the load-time
+     * flag); attn_output stays Q8 in the file so nothing regresses. */
+    if (t->type != type &&
+        !(type == DS4_TENSOR_Q8_0 && t->type == DS4_TENSOR_FP8_E4M3)) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected %s\n",
                 (int)t->name.len,

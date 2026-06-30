@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ds4_gpu.h"
@@ -7735,10 +7736,20 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
     const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w) return 0;
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
-    __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)cuda_tmp_alloc(in_dim * (size_t)ntok, "fp8_mx act");
     size_t sx_bytes = (size_t)mx_rup(ntok, 128) * KBp;
-    unsigned char *sx = (unsigned char *)cuda_tmp_alloc(sx_bytes, "fp8_mx act scale");
-    if (!xq || !sx) return 0;
+    size_t wz = 32u << 20;
+    /* xq, sx and the cuBLASLt workspace must be DISTINCT buffers, but
+     * cuda_tmp_alloc hands out one shared scratch region (later calls alias or
+     * realloc/free earlier ones). Carve three non-overlapping, 256-aligned
+     * regions from a single allocation instead. */
+    size_t off_xq = 0;
+    size_t off_sx = (in_dim * (size_t)ntok + 255) & ~(size_t)255;
+    size_t off_ws = (off_sx + sx_bytes + 255) & ~(size_t)255;
+    char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "fp8_mx scratch");
+    if (!scratch) return 0;
+    __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)(scratch + off_xq);
+    unsigned char *sx = (unsigned char *)(scratch + off_sx);
+    void *ws = scratch + off_ws;
     cudaMemset(sx, 0, sx_bytes);
     int warps = ntok * (int)KB;
     mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, ntok, (int)in_dim, KBp, xq, sx);
@@ -7757,7 +7768,6 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
     cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, in_dim, ntok, in_dim);
     cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, out_dim, ntok, out_dim);
     cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
-    size_t wz = 32u << 20; void *ws = cuda_tmp_alloc(wz, "fp8_mx workspace");
     cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
     cublasLtMatmulHeuristicResult_t h; int got = 0;
     cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, op, la, lb, ld, ld, pf, 1, &h, &got);
@@ -7780,8 +7790,60 @@ extern "C" int ds4_gpu_matmul_fp8_mx_tensor(ds4_gpu_tensor *out, const void *mod
                                              in_dim, out_dim, x, n_tok, "fp8_mx");
 }
 
+/* Native FP8 decode (mmvq): read the MXFP8 weight 8-bit and dot with the f32
+ * activation (single token). One warp per output row; lane L covers in-dim
+ * positions {L, 32+L, ...}. No f16 expansion -> no decode bandwidth regression
+ * vs Q8. Used when MXFP8 tensor-cores don't apply (n_tok==1). */
+__global__ static void mxfp8_mmvq_kernel(float *out, const unsigned char *w, const float *x,
+                                         int in_dim, int out_dim) {
+    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    int KB = in_dim / 32;
+    const unsigned char *row = w + (size_t)o * KB * 33;
+    float acc = 0.f;
+    for (int kb = 0; kb < KB; kb++) {
+        const unsigned char *blk = row + (size_t)kb * 33;
+        float scale = exp2f((float)blk[0] - 127.f);
+        __half wh = (__half)(*(const __nv_fp8_e4m3 *)&blk[1 + lane]);
+        acc += __half2float(wh) * scale * x[kb * 32 + lane];
+    }
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
+    if (lane == 0) out[o] = acc;
+}
+/* Set when the model's workhorse weights (attn_kv/q_a/q_b + shared experts) are
+ * MXFP8 instead of Q8. attn_output keeps its own (bespoke Q8) path. */
+/* PER-TENSOR routing: only weights whose offset is registered (the FP8 workhorse
+ * tensors, identified at load) take the FP8 path. A global flag was too coarse —
+ * attn_output (Q8) flows through this same matmul and must stay Q8. */
+static std::unordered_set<uint64_t> g_fp8_offsets;
+extern "C" void ds4_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offsets.insert(weight_offset); }
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
+    if (g_fp8_offsets.count(weight_offset)) {
+        const uint64_t fblocks = (in_dim + 31) / 32;
+        const uint64_t fbytes = out_dim * fblocks * 33;
+        if (weight_offset > model_size || fbytes > model_size - weight_offset ||
+            x->bytes < n_tok * in_dim * sizeof(float) ||
+            out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+        /* Prefill (n_tok>1) uses the cuBLASLt MX tensor-core GEMM; decode falls
+         * through to the per-token mmvq kernel below. DS4_FP8_NO_MXCORE forces
+         * the mmvq path everywhere as an operational fallback. */
+        if (n_tok > 1 && getenv("DS4_FP8_NO_MXCORE") == NULL &&
+                cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
+                weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+        const unsigned char *wfp8 = (const unsigned char *)cuda_model_range_ptr(
+                model_map, weight_offset, fbytes, "fp8_mx_mmvq");
+        if (!wfp8) return 0;
+        const unsigned wpb = 8;  /* output rows per block */
+        dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
+        for (uint64_t t = 0; t < n_tok; t++)
+            mxfp8_mmvq_kernel<<<grid, wpb * 32>>>((float *)out->ptr + t * out_dim, wfp8,
+                                                  (const float *)x->ptr + t * in_dim,
+                                                  (int)in_dim, (int)out_dim);
+        return cuda_ok(cudaGetLastError(), "fp8_mx mmvq");
+    }
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
     uint64_t weight_bytes = out_dim * blocks * 34;
@@ -7915,7 +7977,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
         return 0;
     }
-    if (n_tok != 1) {
+    /* The n_tok==1 fused pair kernel reads 34-byte Q8 blocks directly and is not
+     * FP8-aware. For MXFP8 weights (or any batch >1) delegate to the labeled
+     * matmul, which dispatches to the FP8 path per-tensor. */
+    if (n_tok != 1 ||
+        g_fp8_offsets.count(weight0_offset) || g_fp8_offsets.count(weight1_offset)) {
         return cuda_matmul_q8_0_tensor_labeled(out0, model_map, model_size, weight0_offset,
                                                in_dim, out0_dim, x, n_tok, "q8_0_pair0") &&
                cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size, weight1_offset,
@@ -9604,7 +9670,10 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    if (getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") == NULL) {
+    /* The fused Q8 pair kernel is not FP8-aware; if these weights are MXFP8 fall
+     * back to the separate routed matmuls (which dispatch to the FP8 path). */
+    if (getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") == NULL &&
+        !g_fp8_offsets.count(gate_offset) && !g_fp8_offsets.count(up_offset)) {
         return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
                                                  model_map, model_size,
                                                  gate_offset, up_offset,
@@ -13326,7 +13395,10 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    /* Fused Q8 hc-expand kernel is not FP8-aware; fall back to the separate
+     * routed matmul (+ explicit hc-expand) when the down weight is MXFP8. */
+    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL &&
+        !g_fp8_offsets.count(weight_offset)) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
                                                         weight_offset,

@@ -231,6 +231,10 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Route the q8 workhorse matmul (attn_kv/q + shared) to MXFP8 when the model's
+ * those weights are FP8 (set once at load). */
+void ds4_gpu_register_fp8_weight(uint64_t weight_offset);
+
 /* Optional fused GPU operations.
  *
  * These are acceleration hooks, not required backend primitives.  A backend
