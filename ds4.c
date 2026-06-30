@@ -3250,7 +3250,8 @@ static void tensor_expect_f16_or_q8_0_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_FP4_E2M1;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -3258,6 +3259,9 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
+    /* MXFP4: 17 bytes / 32 vals = [1 E8M0 scale][16 bytes = 32x E2M1]. Per-QK_K
+     * (256 vals) = 8 sub-blocks * 17 = 136 bytes, matching the other per-QK_K sizes. */
+    case DS4_TENSOR_FP4_E2M1: return (QK_K / 32) * 17;
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
