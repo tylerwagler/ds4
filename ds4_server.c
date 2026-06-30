@@ -10398,7 +10398,10 @@ decode_again:
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
+        /* Thinking mode normally forces sampling defaults for quality, but an
+         * EXPLICIT temperature==0 (default is 1.0) means the caller wants greedy
+         * decode — honor it so MTP speculative decode (greedy-only) can engage. */
+        if (ds4_think_mode_enabled(j->req.think_mode) && j->req.temperature > 0.0f) {
             temperature = DS4_DEFAULT_TEMPERATURE;
             top_k = 0;
             top_p = DS4_DEFAULT_TOP_P;
