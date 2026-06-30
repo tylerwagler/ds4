@@ -28,6 +28,23 @@ smart-99gb baseline was ~12.7 — the 2x gap was the graph bug + greedy decode, 
 
 ## Phases
 
+### P0 — HF→ds4 GGUF converter  [FOUNDATIONAL — owns both levers]
+Today we re-quantize antirez's pre-made `template.gguf`, inheriting its conversion choices
+(it **dropped the MTP head**; we can't change per-tensor precision at conversion time). Owning
+the HF→ds4 conversion gives full control of speed AND quality: set precision per tensor, include
+MTP, emit FP8/MXFP4 drafts matched to the main model. **De-risked:** the `hc_*` highway tensors
+are present in the HF source (`layers.N.hc_attn_base/fn/scale`, `hc_ffn_*`) — NOT derived — so
+this is a mechanical name-remap + expert-stack + weight/scale→block-pack, not architecture RE.
+- **Source:** `DeepSeek-V4-Flash` HF safetensors (46 shards): `layers.N.attn.{wkv,wq_a,wq_b,wo_a,wo_b}`,
+  `layers.N.hc_*`, `layers.N.ffn.experts.K.w{1,2,3}`, `mtp.0.*` (shard 46) — each `.weight`+`.scale`
+  (native MXFP4 E2M1+E8M0 / FP8 E4M3).
+- **Target:** match `template.gguf`'s exact block layout (reverse-engineer by diffing one known
+  tensor HF-vs-template); remap to `blk.N.*`/`mtp.0.*`, stack experts into `ffn_{gate,up,down}_exps`,
+  write `deepseek4.*` metadata.
+- **Stage:** (1) MTP draft layer only → validates the codec + yields an FP8/MXFP4 draft (higher
+  accept → more spec-decode gain, pairs with P1); (2) full main model incl `mtp.0.*` → feeds P3
+  (MXFP4 experts) and P2d (zero-Q8). Removes the antirez-`template.gguf` dependency entirely.
+
 ### P1 — Speculative decode → DSpark serving  [HIGHEST LEVERAGE, DO FIRST]
 Hits the actual bottleneck (single-stream decode, memory-bound). **Measured ceiling:**
 raw decode tops out at ~25.5 t/s (FP8 path, depth0) ≈ 74% of the ~32 t/s GB10 memory-BW
