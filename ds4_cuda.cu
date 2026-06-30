@@ -10104,8 +10104,16 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
  * = 32x E2M1 nibble]; one Q8_K activation block (256 vals) spans 8 MXFP4 sub-blocks.
  * The E2M1 LUT is kept *2 so the dequantized weights are int8 and usable with __dp4a;
  * the final accumulator is halved to undo it (E2M1 is symmetric, so no min/bsums term). */
-__device__ __constant__ int8_t cuda_e2m1_i8[16] =
-    {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+/* E2M1 nibble -> value*2 (kept integral: {0,1,2,3,4,6,8,12,...}) by arithmetic, not a
+ * __constant__ LUT: divergent nibbles across a warp serialize constant-cache loads,
+ * which dominated the gate/up dot. nib = sign(b3) exp(b2-1) mant(b0). |val|*2 =
+ * e? ((1<<e)|(m<<(e-1))) : m. The ternary guards the e==0 shift-by-(-1). */
+__device__ __forceinline__ static int dev_e2m1_x2(unsigned nib) {
+    const unsigned e = (nib >> 1) & 3u;
+    const unsigned m = nib & 1u;
+    const int mag = e ? (int)((1u << e) | (m << (e - 1u))) : (int)m;
+    return (nib & 8u) ? -mag : mag;
+}
 
 __device__ static float dev_dot_mxfp4_q8_K_block(const unsigned char *x, const cuda_block_q8_K *y) {
     const int8_t *q8 = y->qs;
@@ -10123,10 +10131,10 @@ __device__ static float dev_dot_mxfp4_q8_K_block(const unsigned char *x, const c
             const unsigned char b0 = blk[1 + g * 2];
             const unsigned char b1 = blk[1 + g * 2 + 1];
             const int32_t wpack =
-                  ((uint32_t)(uint8_t)cuda_e2m1_i8[b0 & 0xF])
-                | ((uint32_t)(uint8_t)cuda_e2m1_i8[b0 >> 4]  << 8)
-                | ((uint32_t)(uint8_t)cuda_e2m1_i8[b1 & 0xF] << 16)
-                | ((uint32_t)(uint8_t)cuda_e2m1_i8[b1 >> 4]  << 24);
+                  ((uint32_t)(uint8_t)dev_e2m1_x2(b0 & 0xF))
+                | ((uint32_t)(uint8_t)dev_e2m1_x2(b0 >> 4)  << 8)
+                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 & 0xF) << 16)
+                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 >> 4)  << 24);
             sumi = __dp4a(wpack, *(const int32_t *)(q8 + sb * 32 + g * 4), sumi);
         }
         acc += scale * (float)sumi;
