@@ -38,14 +38,16 @@ on this hardware. Target: **60+ t/s decode** via DSpark.
 "DSpark" = DeepSeek's 2026 spec-decode method (`github.com/deepseek-ai/DeepSpec`, also ships
 DFlash + Eagle3), NOT DGX Spark (naming clash). Staged:
 
-- **P1a — Native MTP baseline (re-quant gate, SMALL lift, do first).**
-  BLOCKER FOUND: the current quant **dropped the MTP head** — metadata declares
-  `deepseek4.nextn_predict_layers = 1` but `blk.43` (the nextn layer) is absent (top blk = 42).
-  So `--mtp` can't run today. Fix: re-quant from source **including `blk.43`** (its own
-  attn + MoE + `eh_proj`/`enorm`/`hnorm`, sharing the embedding/output head; ~+2.5 GB,
-  99→~101.5 GB). Engine already supports `--mtp`. DeepSeek native MTP accepts ~1.8-2.2
-  tok/step → clock-pinned **~45-55 t/s**. Cheap, and it proves the verify/accept loop on
-  THIS model before investing in a custom DSpark runtime.
+- **P1a — Native MTP baseline (OFF-THE-SHELF DRAFT, do first).**
+  The MTP head is NOT embedded in the main GGUF — ds4 loads it as a **separate draft model**
+  (`mtp_weights_bind(&e->mtp_weights, &e->mtp_model)`) via `--mtp FILE`. antirez ships the
+  draft pre-made: **`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`** (~3.5 GB) in
+  `antirez/deepseek-v4-gguf` (`download_model.sh mtp`). So this is a **3.5 GB download**, not a
+  re-quant. (The `nextn_predict_layers=1` metadata in the main quant is a red herring — the
+  HF source ships `mtp.0.*` 1575 tensors but our `template.gguf` dropped them; doesn't matter,
+  the draft is standalone.) Serve `oracle-fp8wh --mtp DRAFT.gguf --mtp-draft 2 --mtp-margin 3`;
+  DeepSeek native MTP accepts ~1.8-2.2 tok/step → clock-pinned **~45-55 t/s**. Proves the
+  verify/accept loop on THIS model before investing in a custom DSpark runtime.
 
 - **P1b — DSpark serving (the 60+ play, BIG lift, two builds).**
   Source: `deepseek-ai/DeepSeek-V4-Flash-DSpark` = same weights + an official pre-trained
