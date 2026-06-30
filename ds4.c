@@ -1585,6 +1585,7 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [38] = {"fp8_e4m3", 32,  33},   /* MXFP8: E4M3 + per-32 E8M0 (8.25 bpw) */
+    [39] = {"mxfp4",    32,  17},   /* MXFP4: E2M1 (2/byte) + per-32 E8M0 (4.25 bpw) */
 };
 
 enum {
@@ -1596,6 +1597,7 @@ enum {
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_FP8_E4M3 = 38,
+    DS4_TENSOR_FP4_E2M1 = 39,
 };
 
 typedef struct {
