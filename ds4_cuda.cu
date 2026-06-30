@@ -10113,7 +10113,10 @@ __device__ static float dev_dot_mxfp4_q8_K_block(const unsigned char *x, const c
     #pragma unroll
     for (int sb = 0; sb < 8; sb++) {
         const unsigned char *blk = x + (size_t)sb * 17;
-        const float scale = exp2f((float)blk[0] - 127.0f);   /* E8M0 */
+        /* E8M0 -> 2^(b-127): a bare float exponent field. Bitcast (b<<23) beats
+         * exp2f (transcendental) — valid for b in [1,254]; real scales never hit
+         * 0 (2^-127, ~0) or 255 (E8M0 NaN). */
+        const float scale = __int_as_float((uint32_t)blk[0] << 23);
         int32_t sumi = 0;
         #pragma unroll
         for (int g = 0; g < 8; g++) {                         /* 8 groups of 4 -> dp4a */
@@ -11514,6 +11517,35 @@ __global__ static void moe_down_mxfp4_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+/* Fused decode down: the 6 selected experts' down-projections summed straight into
+ * the final output row (skips the separate down buffer + moe_sum pass). n_expert==6. */
+__global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const unsigned char *wr = (const unsigned char *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_mxfp4_q8_K_block(wr + (uint64_t)b * 8u * 17u, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = total;
+}
+
 __global__ static void moe_gate_up_mid_q4K_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -12658,7 +12690,7 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
         const uint32_t use_direct_down_sum6 =
-            n_tokens == 1u && n_expert == 6u && !mxfp4_path &&
+            n_tokens == 1u && n_expert == 6u &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
@@ -12972,7 +13004,17 @@ static int routed_moe_launch(
             }
             if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                if (q4k_path) {
+                if (mxfp4_path) {
+                    moe_down_mxfp4_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        selected_ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim);
+                } else if (q4k_path) {
                     moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
