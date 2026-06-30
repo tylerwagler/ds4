@@ -3538,6 +3538,43 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
+/* BF16 is the high 16 bits of f32, so conversions are pure bit ops (no header). */
+__device__ __forceinline__ static float bf16_to_f32(uint16_t b) {
+    return __uint_as_float((uint32_t)b << 16);
+}
+__global__ static void f32_to_bf16_kernel(uint16_t *out, const float *x, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const uint32_t u = __float_as_uint(x[i]);
+        out[i] = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);  /* round-to-nearest-even */
+    }
+}
+__global__ static void matmul_bf16_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+    float sum = 0.0f;
+    const uint16_t *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += bf16_to_f32(wr[i]) * xr[i];
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
@@ -3770,6 +3807,21 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
+/* MXFP8 weight block (33B: [E8M0][32 e4m3]) . pre-quantized Q8 activation block.
+ * The attn-output fused kernels are not FP8-aware; this lets them consume MXFP8
+ * weights. Mixes e4m3 weight (float) with int8 activation -> float MAC (no dp4a).
+ * Returns wscale*sum(e4m3*act); caller multiplies by the activation's xscale. */
+__device__ __forceinline__ static float dev_dot_fp8mx_q8_block(
+        const unsigned char *wblk, const int8_t *xq, uint64_t bn) {
+    const float wscale = __int_as_float((uint32_t)wblk[0] << 23);   /* E8M0 */
+    float s = 0.0f;
+    for (uint64_t i = 0; i < bn; i++) {
+        const __half wh = (__half)(*(const __nv_fp8_e4m3 *)&wblk[1 + i]);
+        s += __half2float(wh) * (float)xq[i];
+    }
+    return wscale * s;
+}
+
 __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *out_hc,
         float *block_out,
@@ -3785,20 +3837,26 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         uint32_t n_hc,
         uint64_t blocks,
         int has_add,
-        int use_dp4a) {
+        int use_dp4a,
+        int is_fp8) {
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= out_dim) return;
-    const unsigned char *wr = w + row * blocks * 34;
+    const uint32_t wstride = is_fp8 ? 33u : 34u;
+    const unsigned char *wr = w + row * blocks * wstride;
     float acc = 0.0f;
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        const __half *scale_h = (const __half *)(wr + b * 34);
-        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
         const int8_t *xqb = xq + b * 32;
-        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        if (is_fp8) {
+            acc += dev_dot_fp8mx_q8_block(wr + b * 33, xqb, bn) * xscale[b];
+        } else {
+            const __half *scale_h = (const __half *)(wr + b * 34);
+            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        }
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) {
@@ -3900,7 +3958,8 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         uint32_t n_groups,
         uint32_t n_tokens,
         uint64_t blocks,
-        int use_dp4a) {
+        int use_dp4a,
+        int is_fp8) {
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
@@ -3909,7 +3968,8 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
 
     const uint64_t group = row / rank;
     const uint64_t row_in_group = row - group * rank;
-    const unsigned char *wr = w + (group * rank + row_in_group) * blocks * 34;
+    const uint32_t wstride = is_fp8 ? 33u : 34u;
+    const unsigned char *wr = w + (group * rank + row_in_group) * blocks * wstride;
     const uint64_t xrow = tok * (uint64_t)n_groups + group;
     const int8_t *xqr = xq + xrow * blocks * 32;
     const float *xsr = xscale + xrow * blocks;
@@ -3918,11 +3978,15 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
-        const __half *scale_h = (const __half *)(wr + b * 34);
-        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
         const int8_t *xqb = xqr + b * 32;
-        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+        if (is_fp8) {
+            acc += dev_dot_fp8mx_q8_block(wr + b * 33, xqb, bn) * xsr[b];
+        } else {
+            const __half *scale_h = (const __half *)(wr + b * 34);
+            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+        }
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) low[tok * low_dim + row] = acc;
@@ -8067,9 +8131,11 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         out_dim != (uint64_t)n_embd) {
         return 0;
     }
+    const int is_fp8 = g_fp8_offsets.count(weight_offset) ? 1 : 0;
+    const uint64_t wstride = is_fp8 ? 33u : 34u;
     const uint64_t blocks = (in_dim + 31) / 32;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
-    const uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * wstride)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * wstride;
     const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
     const uint64_t split_bytes = (uint64_t)(2u * n_hc + n_hc * n_hc) * sizeof(float);
     if (weight_bytes > model_size - weight_offset ||
@@ -8109,7 +8175,8 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             n_hc,
             blocks,
             block_add ? 1 : 0,
-            use_dp4a);
+            use_dp4a,
+            is_fp8);
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
 }
 
@@ -8174,6 +8241,40 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
+    if (!wptr) return 0;
+    const uint16_t *w = (const uint16_t *)wptr;
+    if (g_cublas_ready && n_tok > 1 && getenv("DS4_CUDA_SERIAL_BF16_MATMUL") == NULL) {
+        const uint64_t xb_count = n_tok * in_dim;
+        uint16_t *xb = (uint16_t *)cuda_tmp_alloc(xb_count * sizeof(uint16_t), "bf16 gemm activations");
+        if (!xb) return 0;
+        f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>(xb, (const float *)x->ptr, xb_count);
+        if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(g_cublas,
+                                         CUBLAS_OP_T, CUBLAS_OP_N,
+                                         (int)out_dim, (int)n_tok, (int)in_dim,
+                                         &alpha,
+                                         w, CUDA_R_16BF, (int)in_dim,
+                                         xb, CUDA_R_16BF, (int)in_dim,
+                                         &beta,
+                                         out->ptr, CUDA_R_32F, (int)out_dim,
+                                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return cublas_ok(st, "bf16 matmul");
+    }
+    dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
+    matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_pair_tensor(
@@ -9451,11 +9552,13 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
         return 0;
     }
+    const int is_fp8_a = g_fp8_offsets.count(out_a_offset) ? 1 : 0;
+    const int is_fp8_b = g_fp8_offsets.count(out_b_offset) ? 1 : 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
     const uint64_t blocks_b = (low_dim + 31) / 32;
-    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 34;
-    const uint64_t out_b_bytes = out_dim * blocks_b * 34;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * (is_fp8_a ? 33u : 34u);
+    const uint64_t out_b_bytes = out_dim * blocks_b * (is_fp8_b ? 33u : 34u);
     if (out_a_offset > model_size || out_b_offset > model_size ||
         out_a_bytes > model_size - out_a_offset ||
         out_b_bytes > model_size - out_b_offset ||
@@ -9479,6 +9582,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
     }
     if (!g_quality_mode &&
+        !is_fp8_a &&   /* cuBLAS path dequants Q8->f16; MXFP8 uses the warp8 fallback below */
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
@@ -9561,7 +9665,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                           n_groups,
                                                           n_tokens,
                                                           blocks_a,
-                                                          use_dp4a);
+                                                          use_dp4a,
+                                                          is_fp8_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
     }
 
@@ -9610,7 +9715,8 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     }
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
-    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 34;
+    const int is_fp8 = g_fp8_offsets.count(out_a_offset) ? 1 : 0;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * (is_fp8 ? 33u : 34u);
     if (out_a_offset > model_size ||
         out_a_bytes > model_size - out_a_offset ||
         heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float) ||
@@ -9647,7 +9753,8 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       n_groups,
                                                       1,
                                                       blocks_a,
-                                                      use_dp4a);
+                                                      use_dp4a,
+                                                      is_fp8);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
 }
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {

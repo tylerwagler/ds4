@@ -1596,6 +1596,7 @@ enum {
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_FP8_E4M3 = 38,
     DS4_TENSOR_FP4_E2M1 = 39,
 };
@@ -3601,7 +3602,12 @@ static void weights_validate_layout(
         tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
         tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        /* Output head may be Q8_0 (quantized from the tied BF16 embed) or BF16
+         * (kept lossless; the engine has a dedicated BF16 matmul). */
+        if (w->output->type == DS4_TENSOR_BF16)
+            tensor_expect_layout(w->output,      DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        else
+            tensor_expect_layout(w->output,      DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -16142,14 +16148,16 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
-                                              model->map,
-                                              model->size,
-                                              weights->output->abs_offset,
-                                              DS4_N_EMBD,
-                                              vocab_dim,
-                                              g->output_norm,
-                                              1) != 0;
+    if (ok) {
+        if (weights->output->type == DS4_TENSOR_BF16)
+            ok = ds4_gpu_matmul_bf16_tensor(g->logits, model->map, model->size,
+                                            weights->output->abs_offset, DS4_N_EMBD,
+                                            vocab_dim, g->output_norm, 1) != 0;
+        else
+            ok = ds4_gpu_matmul_q8_0_tensor(g->logits, model->map, model->size,
+                                            weights->output->abs_offset, DS4_N_EMBD,
+                                            vocab_dim, g->output_norm, 1) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
     }
@@ -16231,14 +16239,16 @@ static bool metal_graph_encode_output_head_batch(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits,
-                                              model->map,
-                                              model->size,
-                                              weights->output->abs_offset,
-                                              DS4_N_EMBD,
-                                              vocab_dim,
-                                              output_norm,
-                                              n_tokens) != 0;
+    if (ok) {
+        if (weights->output->type == DS4_TENSOR_BF16)
+            ok = ds4_gpu_matmul_bf16_tensor(logits, model->map, model->size,
+                                            weights->output->abs_offset, DS4_N_EMBD,
+                                            vocab_dim, output_norm, n_tokens) != 0;
+        else
+            ok = ds4_gpu_matmul_q8_0_tensor(logits, model->map, model->size,
+                                            weights->output->abs_offset, DS4_N_EMBD,
+                                            vocab_dim, output_norm, n_tokens) != 0;
+    }
 
     ds4_gpu_tensor_free(logits);
     ds4_gpu_tensor_free(output_norm);
@@ -16328,14 +16338,16 @@ static bool metal_graph_encode_output_head_mtp(
                                                   mtp->norm->abs_offset,
                                                   DS4_N_EMBD,
                                                   DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
-                                              base_model->map,
-                                              base_model->size,
-                                              base_weights->output->abs_offset,
-                                              DS4_N_EMBD,
-                                              vocab_dim,
-                                              g->output_norm,
-                                              1) != 0;
+    if (ok) {
+        if (base_weights->output->type == DS4_TENSOR_BF16)
+            ok = ds4_gpu_matmul_bf16_tensor(g->logits, base_model->map, base_model->size,
+                                            base_weights->output->abs_offset, DS4_N_EMBD,
+                                            vocab_dim, g->output_norm, 1) != 0;
+        else
+            ok = ds4_gpu_matmul_q8_0_tensor(g->logits, base_model->map, base_model->size,
+                                            base_weights->output->abs_offset, DS4_N_EMBD,
+                                            vocab_dim, g->output_norm, 1) != 0;
+    }
     return ok;
 }
 
