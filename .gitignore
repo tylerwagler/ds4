@@ -24,3 +24,4 @@ __pycache__/
 /converter/mxfp4_pack_source_cli
 /converter/*_test
 /converter/__pycache__/
+/ds4_agent_test

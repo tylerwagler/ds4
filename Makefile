@@ -17,7 +17,9 @@ CUTLASS_DIR ?= $(CURDIR)/cutlass
 CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o ds4_mxfp4_cutlass.o
+ENGINE_SRCS = $(wildcard engine/*.c)
+ENGINE_OBJS = $(ENGINE_SRCS:.c=.o)
+CORE_OBJS = $(ENGINE_OBJS) ds4_distributed.o ds4_ssd.o ds4_cuda.o ds4_mxfp4_cutlass.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
@@ -65,8 +67,8 @@ ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJ
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
-	$(CC) $(CFLAGS) -c -o $@ ds4.c
+engine/%.o: engine/%.c engine/ds4_engine_internal.h ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
@@ -140,4 +142,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test tests/test_q4k_dot *.o engine/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

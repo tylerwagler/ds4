@@ -1,0 +1,245 @@
+#include "ds4_engine_internal.h"
+
+
+
+bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
+    return g && g->power_percent > 0 && g->power_percent < 100;
+}
+
+
+
+static double graph_power_update_avg(double avg, double sample) {
+    if (sample <= 0.0 || !isfinite(sample)) return avg;
+    if (avg <= 0.0 || !isfinite(avg)) return sample;
+    return avg * 0.875 + sample * 0.125;
+}
+
+
+
+static void graph_power_sleep(double work_sec, uint32_t power_percent) {
+    if (power_percent == 0 || power_percent >= 100) return;
+    /* Target duty cycle: work / (work + sleep) = power / 100.
+     * At --power 50 this sleeps for one measured work interval; at 25 it
+     * sleeps for three. */
+    const double sleep = work_sec * (100.0 - (double)power_percent) /
+                         (double)power_percent;
+    sleep_sec(sleep);
+}
+
+
+
+void graph_power_note_prefill_layer(ds4_gpu_graph *g,
+                                           uint32_t il,
+                                           double elapsed_sec) {
+    if (!graph_power_throttle_enabled(g)) return;
+    if (il >= DS4_N_LAYER) return;
+    g->prefill_layer_avg_sec[il] =
+        graph_power_update_avg(g->prefill_layer_avg_sec[il], elapsed_sec);
+    graph_power_sleep(g->prefill_layer_avg_sec[il], g->power_percent);
+}
+
+
+
+void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
+    if (!graph_power_throttle_enabled(g)) return;
+    g->decode_token_avg_sec =
+        graph_power_update_avg(g->decode_token_avg_sec, elapsed_sec);
+    graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
+}
+
+
+
+/* Release every Metal tensor owned by the whole-model graph runtime. */
+void gpu_graph_free(ds4_gpu_graph *g) {
+    ds4_gpu_tensor_free(g->directional_steering_dirs);
+    ds4_gpu_tensor_free(g->batch_ffn_out);
+    ds4_gpu_tensor_free(g->batch_routed_out);
+    ds4_gpu_tensor_free(g->batch_routed_down);
+    ds4_gpu_tensor_free(g->batch_routed_mid);
+    ds4_gpu_tensor_free(g->batch_routed_up);
+    ds4_gpu_tensor_free(g->batch_routed_gate);
+    ds4_gpu_tensor_free(g->batch_router_weights);
+    ds4_gpu_tensor_free(g->prefill_seed_router_selected);
+    ds4_gpu_tensor_free(g->batch_router_selected);
+    ds4_gpu_tensor_free(g->batch_router_probs);
+    ds4_gpu_tensor_free(g->batch_router_logits);
+    ds4_gpu_tensor_free(g->batch_shared_out);
+    ds4_gpu_tensor_free(g->batch_shared_mid);
+    ds4_gpu_tensor_free(g->batch_shared_up);
+    ds4_gpu_tensor_free(g->batch_shared_gate);
+    ds4_gpu_tensor_free(g->batch_ffn_norm);
+    ds4_gpu_tensor_free(g->batch_ffn_cur);
+    ds4_gpu_tensor_free(g->batch_after_attn_hc);
+    ds4_gpu_tensor_free(g->batch_low_tmp);
+    ds4_gpu_tensor_free(g->batch_group_tmp);
+    ds4_gpu_tensor_free(g->batch_attn_out);
+    ds4_gpu_tensor_free(g->batch_attn_low);
+    ds4_gpu_tensor_free(g->batch_heads);
+    ds4_gpu_tensor_free(g->batch_indexer_weights);
+    ds4_gpu_tensor_free(g->batch_indexer_q);
+    ds4_gpu_tensor_free(g->batch_comp_sc);
+    ds4_gpu_tensor_free(g->batch_comp_kv);
+    ds4_gpu_tensor_free(g->batch_kv);
+    ds4_gpu_tensor_free(g->batch_kv_raw);
+    ds4_gpu_tensor_free(g->batch_q_half);
+    ds4_gpu_tensor_free(g->batch_q);
+    ds4_gpu_tensor_free(g->batch_qr_norm);
+    ds4_gpu_tensor_free(g->batch_qr);
+    ds4_gpu_tensor_free(g->batch_attn_norm);
+    ds4_gpu_tensor_free(g->batch_attn_cur);
+    ds4_gpu_tensor_free(g->batch_hc_split);
+    ds4_gpu_tensor_free(g->batch_hc_mix);
+    ds4_gpu_tensor_free(g->batch_flat_hc);
+    ds4_gpu_tensor_free(g->batch_next_hc);
+    ds4_gpu_tensor_free(g->batch_cur_hc);
+    ds4_gpu_tensor_free(g->prefill_tokens);
+    ds4_gpu_tensor_free(g->logits);
+    ds4_gpu_tensor_free(g->mtp_raw_cache);
+    ds4_gpu_tensor_free(g->mtp_next_hc);
+    ds4_gpu_tensor_free(g->mtp_state_hc);
+    ds4_gpu_tensor_free(g->mtp_input_hc);
+    ds4_gpu_tensor_free(g->mtp_hproj_hc);
+    ds4_gpu_tensor_free(g->mtp_hnorm_hc);
+    ds4_gpu_tensor_free(g->mtp_eproj_hc);
+    ds4_gpu_tensor_free(g->mtp_eproj);
+    ds4_gpu_tensor_free(g->mtp_enorm);
+    ds4_gpu_tensor_free(g->mtp_embed);
+    ds4_gpu_tensor_free(g->spec_logits);
+    ds4_gpu_tensor_free(g->output_norm);
+    ds4_gpu_tensor_free(g->output_embd);
+    ds4_gpu_tensor_free(g->output_weights);
+    ds4_gpu_tensor_free(g->output_pre);
+    ds4_gpu_tensor_free(g->after_ffn_hc);
+    ds4_gpu_tensor_free(g->ffn_out);
+    ds4_gpu_tensor_free(g->routed_out);
+    ds4_gpu_tensor_free(g->routed_down);
+    ds4_gpu_tensor_free(g->routed_mid);
+    ds4_gpu_tensor_free(g->routed_up);
+    ds4_gpu_tensor_free(g->routed_gate);
+    ds4_gpu_tensor_free(g->router_weights);
+    ds4_gpu_tensor_free(g->router_selected);
+    ds4_gpu_tensor_free(g->router_probs);
+    ds4_gpu_tensor_free(g->router_logits);
+    ds4_gpu_tensor_free(g->shared_out);
+    ds4_gpu_tensor_free(g->shared_mid);
+    ds4_gpu_tensor_free(g->shared_up);
+    ds4_gpu_tensor_free(g->shared_gate);
+    ds4_gpu_tensor_free(g->ffn_norm);
+    ds4_gpu_tensor_free(g->ffn_cur);
+    ds4_gpu_tensor_free(g->after_attn_hc);
+    ds4_gpu_tensor_free(g->attn_out);
+    ds4_gpu_tensor_free(g->attn_low);
+    ds4_gpu_tensor_free(g->heads);
+    ds4_gpu_tensor_free(g->comp_sc_cur);
+    ds4_gpu_tensor_free(g->comp_kv_cur);
+    ds4_gpu_tensor_free(g->attn_comp_stage);
+    ds4_gpu_tensor_free(g->comp_mask);
+    ds4_gpu_tensor_free(g->comp_selected);
+    ds4_gpu_tensor_free(g->indexer_scores);
+    ds4_gpu_tensor_free(g->indexer_weights);
+    ds4_gpu_tensor_free(g->indexer_q);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_raw_cache[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_attn_state_score[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_index_state_kv[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_index_state_score[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->spec_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_index_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_index_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
+    }
+    ds4_gpu_tensor_free(g->kv);
+    ds4_gpu_tensor_free(g->kv_raw);
+    ds4_gpu_tensor_free(g->q);
+    ds4_gpu_tensor_free(g->qr_norm);
+    ds4_gpu_tensor_free(g->qr);
+    ds4_gpu_tensor_free(g->attn_norm);
+    ds4_gpu_tensor_free(g->attn_cur);
+    ds4_gpu_tensor_free(g->hc_comb);
+    ds4_gpu_tensor_free(g->hc_post);
+    ds4_gpu_tensor_free(g->hc_pre);
+    ds4_gpu_tensor_free(g->hc_split);
+    ds4_gpu_tensor_free(g->hc_mix);
+    ds4_gpu_tensor_free(g->flat_hc);
+    ds4_gpu_tensor_free(g->cur_hc);
+    free(g->cpu_router_norm);
+    memset(g, 0, sizeof(*g));
+}
+
+
+
+bool gpu_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
+    return ds4_gpu_tensor_fill_f32(t, v, n) != 0;
+}
+
+
+
+/* =========================================================================
+ * Directional Steering.
+ * =========================================================================
+ *
+ * A steering file contains one normalized 4096-wide direction per layer.  When
+ * enabled, the Metal graph edits selected block outputs in-place:
+ *
+ *     y = y - scale * v * dot(v, y)
+ *
+ * Positive scales remove the represented direction from the activation.
+ * Negative scales add it.  This is deliberately explicit and opt-in; with zero
+ * scales, the release graph does not allocate the direction tensor and follows
+ * the normal inference path.
+ */
+
+bool gpu_graph_load_directional_steering(
+        ds4_gpu_graph *g,
+        const char      *path,
+        float            attn_scale,
+        float            ffn_scale) {
+    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        return false;
+    }
+
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    bool ok = read_f32_binary_file(path, dirs, n);
+    if (ok) {
+        g->directional_steering_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        ok = g->directional_steering_dirs != NULL &&
+             ds4_gpu_tensor_write(g->directional_steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+    }
+    free(dirs);
+
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return false;
+    }
+    g->directional_steering_attn_scale = attn_scale;
+    g->directional_steering_ffn_scale = ffn_scale;
+    fprintf(stderr, "ds4: directional steering enabled: %s attn=%g ffn=%g\n",
+            path, (double)attn_scale, (double)ffn_scale);
+    return true;
+}
+
