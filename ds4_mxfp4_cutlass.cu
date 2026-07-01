@@ -165,10 +165,35 @@ extern "C" size_t ds4_cutlass_weight_sf_count(int N, int K){
 
 #ifdef DS4_MXFP4_REPACK_CLI
 #include <cstdlib>
+#include <cstring>
+#include <algorithm>
 #include <vector>
-// Offline converter CLI: SOURCE E2M1+E8M0 arrays -> CUTLASS (ColumnMajor data + swizzled SF) files.
+// Offline converter CLI. Two modes:
+//   per-expert: e2m1.bin e8m0.bin N K out_data.bin out_sf.bin
+//   stacked   : --stacked e2m1_stacked.bin e8m0_stacked.bin N K n_expert out_blob.bin
+//               (in: [ne,N,K/2] + [ne,N,K/32]; out: per expert data||sf, expert-major)
 int main(int argc, char **argv){
-  if(argc<7){ fprintf(stderr,"usage: %s e2m1.bin e8m0.bin N K out_data.bin out_sf.bin\n",argv[0]); return 1; }
+  if(argc>=8 && strcmp(argv[1],"--stacked")==0){
+    int N=atoi(argv[4]), K=atoi(argv[5]), ne=atoi(argv[6]);
+    size_t e2each=(size_t)N*(K/2), e8each=(size_t)N*(K/32);
+    std::vector<uint8_t> e2(e2each*ne), e8(e8each*ne);
+    FILE*f1=fopen(argv[2],"rb"); if(!f1||fread(e2.data(),1,e2.size(),f1)!=e2.size()){ fprintf(stderr,"e2m1 read fail\n"); return 1; } fclose(f1);
+    FILE*f2=fopen(argv[3],"rb"); if(!f2||fread(e8.data(),1,e8.size(),f2)!=e8.size()){ fprintf(stderr,"e8m0 read fail\n"); return 1; } fclose(f2);
+    size_t sfn=ds4_cutlass_weight_sf_count(N,K);
+    FILE*fo=fopen(argv[7],"wb"); if(!fo){ fprintf(stderr,"out open fail\n"); return 1; }
+    std::vector<uint8_t> Bd((size_t)N*K/2); std::vector<ElementSF> Bsf(sfn);
+    for(int i=0;i<ne;i++){
+      std::fill(Bd.begin(),Bd.end(),(uint8_t)0);
+      std::fill(Bsf.begin(),Bsf.end(),ElementSF::bitcast(127));
+      ds4_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data()+(size_t)i*e2each, e8.data()+(size_t)i*e8each, N, K);
+      fwrite(Bd.data(),1,Bd.size(),fo); fwrite(Bsf.data(),sizeof(ElementSF),sfn,fo);
+    }
+    fclose(fo);
+    printf("stacked N=%d K=%d ne=%d -> per-expert data=%zuB sf=%zuB total=%zuB\n",
+           N,K,ne, Bd.size(), sfn*sizeof(ElementSF), (size_t)ne*(Bd.size()+sfn*sizeof(ElementSF)));
+    return 0;
+  }
+  if(argc<7){ fprintf(stderr,"usage: %s e2m1.bin e8m0.bin N K out_data.bin out_sf.bin\n       %s --stacked e2m1_stacked.bin e8m0_stacked.bin N K n_expert out_blob.bin\n",argv[0],argv[0]); return 1; }
   int N=atoi(argv[3]), K=atoi(argv[4]);
   size_t e2n=(size_t)N*(K/2), e8n=(size_t)N*(K/32);
   std::vector<uint8_t> e2(e2n), e8(e8n);
