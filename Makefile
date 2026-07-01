@@ -21,6 +21,8 @@ ENGINE_SRCS = $(wildcard engine/*.c)
 ENGINE_OBJS = $(ENGINE_SRCS:.c=.o)
 AGENT_SRCS = $(wildcard agent/*.c)
 AGENT_OBJS = $(AGENT_SRCS:.c=.o)
+SERVER_SRCS = $(wildcard server/*.c)
+SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 CORE_OBJS = $(ENGINE_OBJS) ds4_distributed.o ds4_ssd.o ds4_cuda.o ds4_mxfp4_cutlass.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
@@ -54,7 +56,7 @@ cuda:
 ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
+ds4-server: $(SERVER_OBJS) ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 ds4-bench: ds4_bench.o ds4_help.o $(CORE_OBJS)
@@ -75,6 +77,9 @@ engine/%.o: engine/%.c engine/ds4_engine_internal.h ds4.h ds4_ssd.h ds4_distribu
 agent/%.o: agent/%.c agent/ds4_agent_internal.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
+server/%.o: server/%.c server/ds4_server_internal.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
@@ -86,9 +91,6 @@ ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
 
 ds4_help.o: ds4_help.c ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c
-
-ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
@@ -102,8 +104,8 @@ ds4_web.o: ds4_web.c ds4_web.h
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
-	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
+ds4_test.o: tests/ds4_test.c $(SERVER_SRCS) server/ds4_server_internal.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+	$(CC) $(CFLAGS) -I. -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 ds4_agent_test.o: tests/ds4_agent_test.c $(AGENT_SRCS) agent/ds4_agent_internal.h ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -I. -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
@@ -144,4 +146,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test tests/test_q4k_dot *.o engine/*.o agent/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test tests/test_q4k_dot *.o engine/*.o agent/*.o server/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
