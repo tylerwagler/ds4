@@ -963,12 +963,6 @@ static bool web_scroll_dynamic_page(cdp_ws *ws, char *err, size_t err_len) {
 static char *web_chrome_executable(void) {
     const char *env = getenv("DS4_CHROME");
     if (env && env[0]) return web_xstrdup(env);
-#ifdef __APPLE__
-    if (access("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", X_OK) == 0)
-        return web_xstrdup("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-    if (access("/Applications/Chromium.app/Contents/MacOS/Chromium", X_OK) == 0)
-        return web_xstrdup("/Applications/Chromium.app/Contents/MacOS/Chromium");
-#endif
     const char *paths[] = {
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
@@ -1009,16 +1003,6 @@ static char *web_chrome_executable(void) {
     return web_xstrdup("google-chrome");
 }
 
-#ifdef __APPLE__
-static const char *web_macos_chrome_app_name(void) {
-    if (getenv("DS4_CHROME")) return NULL;
-    if (access("/Applications/Google Chrome.app", F_OK) == 0)
-        return "Google Chrome";
-    if (access("/Applications/Chromium.app", F_OK) == 0)
-        return "Chromium";
-    return NULL;
-}
-#endif
 
 static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     if (!web_mkdir_p(web->profile_dir)) {
@@ -1027,12 +1011,7 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
         return false;
     }
     char *exe = web_chrome_executable();
-#ifdef __APPLE__
-    const char *mac_app_name = web_macos_chrome_app_name();
-    bool launched_via_open = mac_app_name != NULL && access("/usr/bin/open", X_OK) == 0;
-#else
     bool launched_via_open = false;
-#endif
     char port_arg[64], profile_arg[PATH_MAX + 64];
     snprintf(port_arg, sizeof(port_arg), "--remote-debugging-port=%d", web->port);
     snprintf(profile_arg, sizeof(profile_arg), "--user-data-dir=%s", web->profile_dir);
@@ -1049,20 +1028,6 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
             dup2(nullfd, STDERR_FILENO);
             if (nullfd > 2) close(nullfd);
         }
-#ifdef __APPLE__
-        if (launched_via_open) {
-            execlp("/usr/bin/open", "open", "-g", "-na", mac_app_name,
-                   "--args", port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
-                   "--disable-sync", "--use-mock-keychain", "--password-store=basic",
-                   "--mute-audio", "about:blank", (char *)NULL);
-        } else {
-            execlp(exe, exe, port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
-                   "--disable-sync", "--use-mock-keychain", "--password-store=basic",
-                   "--mute-audio", "about:blank", (char *)NULL);
-        }
-#else
         if (geteuid() == 0) {
             execlp(exe, exe, port_arg, "--remote-allow-origins=*",
                    profile_arg, "--no-first-run", "--no-default-browser-check",
@@ -1074,7 +1039,6 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
                    "--disable-sync", "--password-store=basic",
                    "--mute-audio", "about:blank", (char *)NULL);
         }
-#endif
         _exit(127);
     }
     free(exe);

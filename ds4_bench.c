@@ -28,7 +28,6 @@ typedef struct {
     const char *chat_prompt_path;
     const char *system;
     const char *csv_path;
-    const char *expert_profile_path;
     ds4_backend backend;
     int threads;
     int ctx_start;
@@ -100,30 +99,15 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 }
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
-    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
-#ifdef DS4_ROCM_BUILD
-    fprintf(stderr, "ds4-bench: valid backends are: metal, rocm, cpu\n");
-#else
-    fprintf(stderr, "ds4-bench: valid backends are: metal, cuda, cpu\n");
-#endif
+    fprintf(stderr, "ds4-bench: valid backends are: cuda, cpu\n");
     exit(2);
 }
 
 static ds4_backend default_backend(void) {
-#ifdef DS4_NO_GPU
-    return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
-#else
     return DS4_BACKEND_CUDA;
-#endif
 }
 
 static char *read_file(const char *path) {
@@ -226,21 +210,12 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--expert-profile")) {
-            c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--metal")) {
-            c.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.backend = DS4_BACKEND_CUDA;
-#else
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
-#endif
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -522,7 +497,6 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
-        .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };
     char dist_err[256];

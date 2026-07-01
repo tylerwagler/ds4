@@ -474,7 +474,6 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 }
 
 static ds4_backend parse_backend(const char *s) {
-    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-agent: invalid backend: %s\n", s);
@@ -482,13 +481,7 @@ static ds4_backend parse_backend(const char *s) {
 }
 
 static ds4_backend default_backend(void) {
-#ifdef DS4_NO_GPU
-    return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
-#else
     return DS4_BACKEND_CUDA;
-#endif
 }
 
 static double now_sec(void) {
@@ -590,8 +583,6 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
-        } else if (!strcmp(arg, "--metal")) {
-            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--cpu")) {
