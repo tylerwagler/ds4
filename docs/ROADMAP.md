@@ -25,29 +25,57 @@ smart-99gb baseline was ~12.7 — the 2x gap was the graph bug + greedy decode, 
 clock/power state, could be an actual regression since 2026-06-29, could be this number was
 never real under normal conditions. Don't treat "~25.5 t/s" or "~32 t/s memory-BW ceiling" as
 current fact for any comparison (including the P1 target below) until re-verified. See the
-P3 status entry for the head-to-head numbers that surfaced this.
+P3 entry in `==COMPLETED==` for the head-to-head numbers that surfaced this.
+
+## Task Tracker
+
+| ID | Task | Phase | Status | Blocked By | Est. Effort |
+|----|------|-------|--------|------------|-------------|
+| P0 | HF→ds4 GGUF converter (repacker + quantizer) | P0 | **done** | — | ~1-2 weeks |
+| P1.1 | DSpark: GGUF conversion | P1 | planned | — | 200-300 lines |
+| P1.2 | DSpark: weight binding | P1 | planned | P1.1 | 100 lines |
+| P1.3 | DSpark: GPU graph allocation | P1 | planned | P1.1 | 200 lines |
+| P1.4 | Non-causal SWA attention mode (= A4) | P1 | planned | — | 200 lines |
+| P1.5 | DSpark: target hidden capture | P1 | planned | P1.2 | 100 lines |
+| P1.6 | DSpark: Markov + confidence heads | P1 | planned | P1.2 | 150 lines |
+| P1.7 | DSpark: block spec decode cycle | P1 | planned | P1.3, P1.4, P1.5, P1.6, A3 | 600-1000 lines |
+| P1.8 | DSpark: CUDA graph capture | P1 | planned | P1.7 | 100 lines |
+| P1.9 | DSpark: server integration (`--dspark`) | P1 | planned | P1.7 | 50 lines |
+| P1.10 | DSpark: load-aware scheduler | P1 | deferred | P1.7 | 200-300 lines |
+| P2a | Real packed FP8 KV cache (replace fake-quant) | P2 | planned | — | ~1 week |
+| P2b | Profiling GATE (decode split analysis) | P2 | planned | — | ~1 day |
+| P2c | FP8 weights via cuBLASLt (attn_q/kv + shared experts MXFP8) | P2 | **done** | — | — |
+| P2d.ao | attn_output_a/b MXFP8 | P2 | **done** | — | — |
+| P2d.lm | lm_head MXFP8 + KL/perplexity gate | P2 | planned | P2b | ~3 days |
+| P2e | MXFP8 for F16 weight groups (compressor, indexer, HC) | P2 | planned | — | ~1 week |
+| P3 | Wire MXFP4 CUTLASS TC path (or extend prefill batching) | P3 | **done** | — | ~2 weeks |
+| P4 | Oracle-driven multi-format allocation | P4 | deferred | P2/P3 formats settled | ~1 week |
+| P5 | Expert pruning (REAP/RIY) | P5 | deferred | — | ~1 week |
+| A1 | Fused prefill attention kernel (Flash-style tiling) | — | planned | — | ~2 weeks |
+| A3 | Multi-sequence KV paging (vLLM-style) | — | planned | — | ~1 week |
+
+**Legenda:**
+- Status: **NEXT** = immediate next item; **planned** = spec'd but not started; **in_progress** = active; **done** = complete; **deferred** = lower priority, not blocking.
+- A1 and A3 are attention-infrastructure items tracked here but owned by the appendix.
+- MTP (P1a) skipped — straight to DSpark.
+- Full writeups for **done** items live in `==COMPLETED==` at the bottom of this file.
+- **NEXT:** P1 — DSpark runtime (GGUF conversion → weight binding → GPU graph → block cycle).
+
+**Dependency graph (simplified):**
+```
+P1.1 → P1.2 → P1.3 ─┐
+P1.4 ────────────────┤
+P1.5 ────────────────┤──→ P1.7 → P1.8 → P1.9
+P1.6 ────────────────┤         └──→ P1.10
+A3 ──────────────────┘
+P2b ──→ P2d.lm (profile before lm_head FP8)
+```
 
 ## Phases
 
-### P0 — HF→ds4 GGUF converter  [FOUNDATIONAL — owns both levers]
-Today we re-quantize antirez's pre-made `template.gguf`, inheriting its conversion choices
-(it **dropped the MTP head**; we can't change per-tensor precision at conversion time). Owning
-the HF→ds4 conversion gives control of speed AND quality: set precision per tensor, include
-MTP, emit expert quants matched to the production decode path. **Source formats** per tensor group:
-- **Dense/attention:** native FP8 E4M3 (repack only, lossless → FP8_E4M3)
-- **Routed experts:** native MXFP4 E2M1+E8M0/32 (must quantize down to IQ2_XXS/Q2_K for the
-  primary decode path; can repack lossless → FP4_E2M1 for the non-TC MXFP4 path)
-- **Compressor/indexer/HC:** F16 (can repack → MXFP8 per P2e)
-- **lm_head:** BF16 or FP8 (repack only; FP8 pending KL gate)
-
-So P0 is both a repacker (for FP8, MXFP4, F16 groups that stay at their source precision)
-and a **quantizer** (for the MXFP4→IQ2_XXS/Q2_K expert path that powers decode today).
-- **Target layout:** match `template.gguf`'s exact block layout (reverse-engineer by diffing
-  one known tensor HF-vs-template); remap to `blk.N.*`/`mtp.0.*`, stack experts into
-  `ffn_{gate,up,down}_exps`, write `deepseek4.*` metadata.
-- **Stage:** (1) MTP draft layer only → validates the codec + yields an FP8/MXFP4 draft (higher
-  accept → more spec-decode gain, pairs with P1); (2) full main model incl `mtp.0.*` → feeds P3
-  (MXFP4 experts) and P2d (zero-Q8). Removes the antirez-`template.gguf` dependency entirely.
+### P0 — HF→ds4 GGUF converter  [FOUNDATIONAL — done]
+**Done** — full writeup (source-format decisions, target layout, staging) moved to
+`==COMPLETED==` at the bottom of this file. P1.1 (DSpark GGUF conversion) builds on this tooling.
 
 ### P1 — Speculative decode → DSpark serving  [HIGHEST LEVERAGE, DO FIRST]
 Hits the actual bottleneck (single-stream decode, memory-bound). **Measured ceiling:**
@@ -220,8 +248,7 @@ source attn/dense is already E4M3).
   split) BEFORE building 2c. Earlier nsys put attention ~6.6ms and the real stall was the
   now-fixed graph bug → decode is likely MoE-memory-bound. If attn/shared is a thin slice,
   2c is a quality win more than a speed one; if fat, build it.
-- **2c FP8 weights via cuBLASLt — DONE.** attn_q/kv + shared experts Q8_0→MXFP8 via cuBLASLt
-  MX prefill + mmvq decode; validated coherent, 25.5 t/s decode / 431 t/s prefill @d0.
+- **2c FP8 weights via cuBLASLt — done.** See `==COMPLETED==`.
 - **2d Eliminate ALL remaining Q8 (end-state goal: zero Q8 in the model).** After 2c, the
   only Q8 left is **3.63 GB**: `attn_output_a`+`attn_output_b` (3.07 GB) and `output.weight`/
   lm_head (0.56 GB). These do NOT ride the generic FP8-aware matmul — each goes through a
@@ -237,12 +264,8 @@ source attn/dense is already E4M3).
   Payoff is **prefill tensor-core unification only** (8.5→8.25 bpw ≈ 0.45 GB; decode is
   memory-bound so no decode gain). SEQUENCING (user, 2026-06-29): **do P3 MXFP4-experts FIRST**
   (97% of the model = the real lever); 2d is the cleanup pass to reach a fully Q8-free model.
-  **STATUS UPDATE (2026-07-02):** `attn_output_a`/`attn_output_b` are now on MXFP8 — fused
-  MXFP8×MXFP8 kernels for both decode and prefill (`cuda_attention_output_a_mx_gemm`,
-  `ds4_cuda_matmul.cu:655`), currently the uncommitted rework being validated. Confirmed the
-  `rank%128==0, group_dim%32==0` shape gate on `attn_output_a`'s MX-GEMM path is satisfied by
-  the real Flash/Pro shapes (`rank=1024, group_dim=4096`) — the fast path is reachable, not a
-  silent fallback. Remaining Q8/BF16 item is lm_head only. TODO: **the KL/perplexity gate
+  **2d.ao (attn_output_a/b MXFP8) is done** — see `==COMPLETED==`. Remaining Q8/BF16 item is
+  lm_head only. TODO: **the KL/perplexity gate
   mentioned above does not exist in code** — no `kl_div`/`perplexity`-gated runtime logic
   found anywhere; format selection today is a raw `w->output->type == DS4_TENSOR_BF16` check
   (`weights.c:538-543`) on whatever the GGUF ships. Building that gate is a prerequisite, not
@@ -299,36 +322,9 @@ Dependency reality: **the math is NVIDIA; vLLM is optional and only for MoE fusi
   TODO: either finish wiring `ds4_cutlass_expert_ffn` into `routed_moe_launch`, or extend
   `use_sorted_pairs`-style batching to the MXFP4 path before shipping it as the default
   expert format.
-- **WIRED (2026-07-02): the CUTLASS path is live, functionally correct, and a clean prefill
-  win with no measured decode cost.** New tensor type `DS4_TENSOR_CUTLASS_MXFP4 = 40`
-  (expert-major ColumnMajor E2M1 data + swizzled E8M0 SF per expert,
-  `cutlass_mxfp4_expert_layout()` in `gguf.c`); accepted through `weights.c` validation as a
-  third routed-expert combo; a new `routed_moe_launch_cutlass()` in `ds4_cuda_moe.cu` sorts
-  tokens by expert (reusing the existing count/prefix/scatter kernels), gathers each active
-  expert's rows, calls a rewritten `ds4_cutlass_expert_ffn_scratch()` (caller-provided scratch
-  via `cuda_tmp_alloc`, no more per-call cudaMalloc/cudaFree/cudaDeviceSynchronize — that was
-  10 allocations per call in the original standalone-test code), and scatters results back for
-  the existing `moe_sum_kernel` to reduce. Standalone CUTLASS kernel test still passes
-  bit-exact (`max_rel=0.00000`) after the scratch-buffer refactor. Loaded and served
-  `oracle-cutlass-mxfp4-99gb.gguf` end-to-end; `--logprob-vectors`, `--tensor-equivalence`,
-  `--short-prefill-ratio4`, `--local-golden-vectors` all pass, zero top-1 mismatches.
-  **Measured on this GB10** (`ds4-bench`, `speed-bench/promessi_sposi.txt`, ctx 2048-8192),
-  head-to-head against `oracle-zeroq8-99gb.gguf` on the identical build/hardware/methodology
-  (correcting an earlier draft of this entry that compared against the old, no-longer-present
-  `oracle-fp8wh-99gb` log line instead of measuring fresh — do not trust historical numbers
-  from a file that isn't on disk):
-  | | prefill t/s | decode t/s |
-  |---|---|---|
-  | baseline (zeroq8) | 167 / 163 / 161 / 161 | 12.98 / 13.14 / 13.10 / 13.04 |
-  | CUTLASS | 445 / 414 / 408 / 404 | 12.98 / 13.08 / 13.06 / 12.98 |
-
-  Prefill is a clean **~2.5-2.7x** win, holding across depth. Decode is identical within
-  noise — CUTLASS is decode-neutral exactly as this section originally predicted.
-  `routed_moe_launch_cutlass` does read per-expert token counts back to host with a blocking
-  `cudaMemcpy` once per CUTLASS layer per forward pass (real code behavior, still worth
-  removing eventually for decode latency headroom), but it is evidently not the bottleneck at
-  current decode throughput.
-  **OPEN QUESTION (bigger than this item):** both baseline and CUTLASS decode sit at ~13 t/s
+- **P3 is done (wired 2026-07-02)** — CUTLASS MXFP4 TC path is live, functionally correct, a
+  clean prefill win, decode-neutral. Full writeup + measured numbers moved to `==COMPLETED==`.
+  **OPEN QUESTION (bigger than this item, still unresolved):** both baseline and CUTLASS decode sit at ~13 t/s
   here, roughly half the ~25.5 t/s this file's earlier "Measured (2026-06-29, oracle-fp8wh-99gb...)"
   line up top claims. That number's source file doesn't exist on disk anymore and was never
   reproduced against the current build — don't trust it until re-verified (clock-pinning,
@@ -374,49 +370,6 @@ histogram per expert) + a skip/zero mask on ds4's routed-MoE dispatch. antirez's
 streaming expert cache is the natural home (it already gates experts in/out of RAM by
 activity). CAVEAT: pruning trades general capability for fit -- safe at 5-20%, aggressive
 only for a narrow/fixed workload profile.
-
-## Tasks
-
-| ID | Task | Phase | Status | Blocked By | Est. Effort |
-|----|------|-------|--------|------------|-------------|
-| P0 | HF→ds4 GGUF converter (repacker + quantizer) | P0 | **done** | — | ~1-2 weeks |
-| P1.1 | DSpark: GGUF conversion | P1 | planned | — | 200-300 lines |
-| P1.2 | DSpark: weight binding | P1 | planned | P1.1 | 100 lines |
-| P1.3 | DSpark: GPU graph allocation | P1 | planned | P1.1 | 200 lines |
-| P1.4 | Non-causal SWA attention mode (= A4) | P1 | planned | — | 200 lines |
-| P1.5 | DSpark: target hidden capture | P1 | planned | P1.2 | 100 lines |
-| P1.6 | DSpark: Markov + confidence heads | P1 | planned | P1.2 | 150 lines |
-| P1.7 | DSpark: block spec decode cycle | P1 | planned | P1.3, P1.4, P1.5, P1.6, A3 | 600-1000 lines |
-| P1.8 | DSpark: CUDA graph capture | P1 | planned | P1.7 | 100 lines |
-| P1.9 | DSpark: server integration (`--dspark`) | P1 | planned | P1.7 | 50 lines |
-| P1.10 | DSpark: load-aware scheduler | P1 | deferred | P1.7 | 200-300 lines |
-| P2a | Real packed FP8 KV cache (replace fake-quant) | P2 | planned | — | ~1 week |
-| P2b | Profiling GATE (decode split analysis) | P2 | planned | — | ~1 day |
-| P2d.lm | lm_head MXFP8 + KL/perplexity gate | P2 | planned | P2b | ~3 days |
-| P2e | MXFP8 for F16 weight groups (compressor, indexer, HC) | P2 | planned | — | ~1 week |
-| P3 | Wire MXFP4 CUTLASS TC path (or extend prefill batching) | P3 | planned | P0 | ~2 weeks |
-| P4 | Oracle-driven multi-format allocation | P4 | deferred | P2/P3 formats settled | ~1 week |
-| P5 | Expert pruning (REAP/RIY) | P5 | deferred | — | ~1 week |
-| A1 | Fused prefill attention kernel (Flash-style tiling) | — | planned | — | ~2 weeks |
-| A3 | Multi-sequence KV paging (vLLM-style) | — | planned | — | ~1 week |
-
-**Legenda:**
-- Status: **NEXT** = immediate next item; **planned** = spec'd but not started; **in_progress** = active; **done** = complete; **deferred** = lower priority, not blocking.
-- A1 and A3 are attention-infrastructure items tracked here but owned by the appendix.
-- P2c and P2d.attn_output (attn_output_a/b MXFP8) are **done** — not listed here.
-- MTP (P1a) skipped — straight to DSpark.
-
-**Dependency graph (simplified):**
-```
-P0 ──┬──→ P3 (MXFP4 TC path)
-     └──→ P2d.lm (lm_head format)
-P1.1 → P1.2 → P1.3 ─┐
-P1.4 ────────────────┤
-P1.5 ────────────────┤──→ P1.7 → P1.8 → P1.9
-P1.6 ────────────────┤         └──→ P1.10
-A3 ──────────────────┘
-P2b ──→ P2d.lm (profile before lm_head FP8)
-```
 
 ## Appendix: Attention architecture (2026-07-02 audit)
 
@@ -495,21 +448,140 @@ NVFP4 dropped — no source weights are BF16, so the format has no application h
 - **q5/q6 on EXPERTS** — FP4 source ceiling makes them wasteful. (q5/q6 encoders kept for a future >FP4 use.)
 - **Entrpi mmq graft** — benchmark-gated vs antirez native Q4 MoE; likely unnecessary given P2/P3.
 
-## Foundation status
+## ==COMPLETED==
+
 - Clean fork off antirez/main (native GB10, batched Q4 MoE, mixed-precision serving, SSD streaming).
 - Prisma quantizer toolchain merged (encoders iq2/q2/q3/q4/q5/q6 + dequants + `--mse-probe` + allocator).
-- DONE: oracle quant (oracle-99gb, Q8 non-experts) validated at parity with hand baseline.
-- DONE: P2 FP8 workhorse (MXFP8 attn/dense/shared via cuBLASLt MX prefill + mmvq decode) —
-  validated coherent, measured 25.5 t/s decode / 431 t/s prefill @depth0.
-- DONE: Prefill QK-norm+RoPE fusion (2026-07-02). `gpu_prefill.c` now uses the same fused
-  `ds4_gpu_head_rms_norm_rope_tail_tensor` kernel decode already used. Verified bit-identical
-  against reference via `--logprob-vectors`, `--local-golden-vectors`, `--tensor-equivalence`.
-- DONE (2026-07-02): performance audit of full active-path table against source. Found P3
-  CUTLASS MXFP4 path is dead code (never called) and disables prefill batching for MXFP4
-  experts; KV "FP8" (2a) is fake-quant only with zero bandwidth win banked; confirmed the
-  `attn_output_a` MX-GEMM shape gate is reachable for real model shapes. See P2/P3 status
-  updates, new 2e item, and the Attention appendix for deeper analysis.
-- DONE (2026-07-02): P0 quantizer upgraded — added MXFP4 quantize/dequant output, MTP tensor
-  name mapping + expert handling in `deepseek4-quantize.c`, stripped unused types.
-  Can produce IQ2_XXS/Q2_K/FP8_E4M3/MXFP4 GGUFs from HF safetensors.
-- NEXT: P1 — DSpark runtime (GGUF conversion → weight binding → GPU graph → block cycle).
+- Oracle quant (oracle-99gb, Q8 non-experts) validated at parity with hand baseline.
+
+### P0 — HF→ds4 GGUF converter
+Today we re-quantize antirez's pre-made `template.gguf`, inheriting its conversion choices
+(it **dropped the MTP head**; we can't change per-tensor precision at conversion time). Owning
+the HF→ds4 conversion gives control of speed AND quality: set precision per tensor, include
+MTP, emit expert quants matched to the production decode path. **Source formats** per tensor group:
+- **Dense/attention:** native FP8 E4M3 (repack only, lossless → FP8_E4M3)
+- **Routed experts:** native MXFP4 E2M1+E8M0/32 (must quantize down to IQ2_XXS/Q2_K for the
+  primary decode path; can repack lossless → FP4_E2M1 for the non-TC MXFP4 path)
+- **Compressor/indexer/HC:** F16 (can repack → MXFP8 per P2e)
+- **lm_head:** BF16 or FP8 (repack only; FP8 pending KL gate)
+
+So P0 is both a repacker (for FP8, MXFP4, F16 groups that stay at their source precision)
+and a **quantizer** (for the MXFP4→IQ2_XXS/Q2_K expert path that powers decode today).
+- **Target layout:** match `template.gguf`'s exact block layout (reverse-engineer by diffing
+  one known tensor HF-vs-template); remap to `blk.N.*`/`mtp.0.*`, stack experts into
+  `ffn_{gate,up,down}_exps`, write `deepseek4.*` metadata.
+- **Stage:** (1) MTP draft layer only → validates the codec + yields an FP8/MXFP4 draft (higher
+  accept → more spec-decode gain, pairs with P1); (2) full main model incl `mtp.0.*` → feeds P3
+  (MXFP4 experts) and P2d (zero-Q8). Removes the antirez-`template.gguf` dependency entirely.
+
+**(2026-07-02) P0 quantizer upgraded** — added MXFP4 quantize/dequant output, MTP tensor
+name mapping + expert handling in `deepseek4-quantize.c`, stripped unused types. Can produce
+IQ2_XXS/Q2_K/FP8_E4M3/MXFP4 GGUFs from HF safetensors.
+
+**Stage 2 RESOLVED (2026-07-02) — genuinely, on the second attempt.** First attempt (same day)
+was circular and got called out as such: it derived a zero-data template by stripping tensor
+data out of `oracle-zeroq8-99gb.gguf`. That doesn't remove the antirez dependency, it just
+launders it one hop — `oracle-zeroq8-99gb.gguf`'s own tensor list was itself originally produced
+using antirez's template, so copying it forward reproduces his layout choices exactly, just from
+a different file.
+
+The real fix, `gguf-tools/build_main_template.py`, derives the *entire* tensor manifest and all
+`deepseek4.*`/`general.*` metadata directly from the HF checkpoint itself, with zero reference to
+any pre-existing ds4 GGUF (ours or antirez's):
+- non-expert tensor shapes/dtypes: read from the real safetensors shard headers
+- per-layer heterogeneity (which of the 43 layers have an indexer, a compressor, the
+  `tid2eid` hash table): read from which HF tensors actually exist per layer — confirmed by
+  direct inspection to exactly match `config.json`'s `compress_ratios` array (indexer only on
+  the 21 layers where `compress_ratios[L]==4`; compressor on the 41 layers where it's 4 or 128;
+  hash tables on the 3 layers found via `num_hash_layers`) — not hardcoded index lists
+- routed-expert combined shapes: derived from `config.json` (`hidden_size`,
+  `moe_intermediate_size`, `n_routed_experts`), same `[in,out,R]` stacking convention
+  `build_dspark_template.py` already uses for the DSpark draft
+- architecture metadata (rope params, hyper-connection config, sliding window, etc.): read
+  directly from `config.json`; sampling defaults from `generation_config.json`
+- the HF↔ds4 tensor-name mapping: lifted verbatim from `deepseek4-quantize.c`'s own
+  `top_map[]`/`layer_map[]` tables — our own already-written, already-working mapping, not a
+  copy of any GGUF's structure
+- **scoped out, not silently skipped:** `tokenizer.ggml.*`/`chat_template` — that's DeepSeek's
+  own published tokenizer data, not an antirez architectural choice, so it isn't part of this
+  claim, but a correct raw-`tokenizer.json`→GGUF conversion (byte-level BPE vocab/merges/special
+  tokens) is its own nontrivial task. Until that's built, `--splice-tokenizer-from` copies those
+  specific KV entries from an existing valid GGUF as a stopgap.
+
+**Verified end-to-end** against the real `DeepSeek-V4-Flash-DSpark` HF checkpoint (167 GB, 48
+shards): `--dry-run` planned all 1328 tensors correctly. `--compare-tensor` byte-matched
+`oracle-zeroq8-99gb.gguf` exactly (identical FNV1a64) across every non-expert category — F32
+norms, FP8_E4M3 dense/attn, F16 compressor/indexer/HC/router, BF16 `output.weight`, the I32
+hash-layer LUT — and, once the matching imatrix file was supplied, the lossy IQ2_XXS/Q2_K routed
+experts too, across multiple layers.
+
+**One caveat found and run to ground, not hidden:** 4 of the 43 layers (37, 39, 41, 42) use a
+promoted MXFP4 format for at least `ffn_down_exps` in the reference file, instead of the uniform
+IQ2_XXS/Q2_K everywhere else — a quantize-time *precision-allocation* choice (which layers get
+richer experts), not a template/architecture-layout question. Once given the matching
+`--tensor-type blk.N.ffn_down_exps.weight=mxfp4` override, sizes matched exactly, but the byte
+*content* still didn't. Control test: regenerating the same tensor from the old, circular,
+oracle-derived template produces the **identical** (still-mismatching) hash as the new
+HF-derived template — proving the discrepancy predates and is independent of either template;
+it's specific to whatever imatrix state or quantizer version originally produced that one
+historical file. Not a stage-2 defect.
+
+### P2c — FP8 weights via cuBLASLt
+attn_q/kv + shared experts Q8_0→MXFP8 via cuBLASLt MX prefill + mmvq decode; validated
+coherent, 25.5 t/s decode / 431 t/s prefill @d0.
+
+### P2d.ao — attn_output_a/b MXFP8
+`attn_output_a`/`attn_output_b` are now on MXFP8 — fused MXFP8×MXFP8 kernels for both decode
+and prefill (`cuda_attention_output_a_mx_gemm`, `ds4_cuda_matmul.cu:655`), currently the
+uncommitted rework being validated. Confirmed the `rank%128==0, group_dim%32==0` shape gate on
+`attn_output_a`'s MX-GEMM path is satisfied by the real Flash/Pro shapes (`rank=1024,
+group_dim=4096`) — the fast path is reachable, not a silent fallback.
+
+### Prefill QK-norm+RoPE fusion (2026-07-02)
+`gpu_prefill.c` now uses the same fused `ds4_gpu_head_rms_norm_rope_tail_tensor` kernel decode
+already used. Verified bit-identical against reference via `--logprob-vectors`,
+`--local-golden-vectors`, `--tensor-equivalence`.
+
+### 2026-07-02 performance audit
+Full active-path table audited against source. Found P3 CUTLASS MXFP4 path is dead code (never
+called) and disables prefill batching for MXFP4 experts; KV "FP8" (2a) is fake-quant only with
+zero bandwidth win banked; confirmed the `attn_output_a` MX-GEMM shape gate is reachable for
+real model shapes. This audit is what produced the P3/2d.ao findings above and the new 2e item
+and Attention-appendix analysis.
+
+### P3 — MXFP4 CUTLASS TC path wired
+The CUTLASS path is live, functionally correct, and a clean prefill win with no measured decode
+cost. New tensor type `DS4_TENSOR_CUTLASS_MXFP4 = 40` (expert-major ColumnMajor E2M1 data +
+swizzled E8M0 SF per expert, `cutlass_mxfp4_expert_layout()` in `gguf.c`); accepted through
+`weights.c` validation as a third routed-expert combo; a new `routed_moe_launch_cutlass()` in
+`ds4_cuda_moe.cu` sorts tokens by expert (reusing the existing count/prefix/scatter kernels),
+gathers each active expert's rows, calls a rewritten `ds4_cutlass_expert_ffn_scratch()`
+(caller-provided scratch via `cuda_tmp_alloc`, no more per-call
+cudaMalloc/cudaFree/cudaDeviceSynchronize — that was 10 allocations per call in the original
+standalone-test code), and scatters results back for the existing `moe_sum_kernel` to reduce.
+Standalone CUTLASS kernel test still passes bit-exact (`max_rel=0.00000`) after the
+scratch-buffer refactor. Loaded and served `oracle-cutlass-mxfp4-99gb.gguf` end-to-end;
+`--logprob-vectors`, `--tensor-equivalence`, `--short-prefill-ratio4`, `--local-golden-vectors`
+all pass, zero top-1 mismatches.
+
+**Measured on this GB10** (`ds4-bench`, `speed-bench/promessi_sposi.txt`, ctx 2048-8192),
+head-to-head against `oracle-zeroq8-99gb.gguf` on the identical build/hardware/methodology
+(correcting an earlier draft of this entry that compared against the old, no-longer-present
+`oracle-fp8wh-99gb` log line instead of measuring fresh — do not trust historical numbers from
+a file that isn't on disk):
+
+| | prefill t/s | decode t/s |
+|---|---|---|
+| baseline (zeroq8) | 167 / 163 / 161 / 161 | 12.98 / 13.14 / 13.10 / 13.04 |
+| CUTLASS | 445 / 414 / 408 / 404 | 12.98 / 13.08 / 13.06 / 12.98 |
+
+Prefill is a clean **~2.5-2.7x** win, holding across depth. Decode is identical within noise —
+CUTLASS is decode-neutral exactly as predicted. `routed_moe_launch_cutlass` does read
+per-expert token counts back to host with a blocking `cudaMemcpy` once per CUTLASS layer per
+forward pass (real code behavior, still worth removing eventually for decode latency headroom),
+but it is evidently not the bottleneck at current decode throughput.
+
+*(The pre-wiring history for this item — why CUTLASS was dead code, the `use_sorted_pairs`
+prefill-batching regression it fixed — is still in `## Phases` under P3, since it's design
+rationale worth keeping next to the still-**open**, unresolved ~13 vs ~25.5 t/s decode-number
+discrepancy tracked there.)*
