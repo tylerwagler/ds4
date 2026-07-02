@@ -8,7 +8,7 @@
  * - safetensors index/header loading;
  * - FP8 E4M3 + E8M0 dequantization for dense tensors;
  * - packed FP4 + E8M0 dequantization for routed experts;
- * - local Q8_0, Q4_K, Q2_K, and IQ2_XXS quantization;
+ * - local Q2_K and IQ2_XXS quantization;
  * - GGUF metadata/tensor-order reuse from an existing template GGUF.
  *
  * The optional imatrix is the legacy llama.cpp binary .dat format emitted by
@@ -874,6 +874,7 @@ typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
 
 typedef struct {
     bool is_expert;
+    bool is_mtp;
     int layer;
     expert_part part;
 } expert_tensor;
@@ -889,6 +890,24 @@ static expert_tensor parse_expert_tensor(const char *name) {
         if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
             e.is_expert = true;
             e.layer = layer;
+            e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
+        }
+    } else if (sscanf(name, "dspark.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
+               && rest == (int)strlen(name) && layer >= 0 && layer <= 2)
+    {
+        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+            e.is_expert = true;
+            e.is_mtp = true;
+            e.layer = layer;
+            e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
+        }
+    } else if (sscanf(name, "mtp.0.ffn_%15[^_]_exps.weight%n", kind, &rest) == 1
+               && rest == (int)strlen(name))
+    {
+        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+            e.is_expert = true;
+            e.is_mtp = true;
+            e.layer = 0;
             e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
         }
     }
@@ -952,11 +971,54 @@ static const name_map layer_map[] = {
     { "ffn_gate_inp.weight",              "ffn.gate.weight" },
     { "exp_probs_b.bias",                 "ffn.gate.bias" },
     { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
+    { "hc_head_base.weight",              "hc_head_base" },
+    { "hc_head_fn.weight",                "hc_head_fn" },
+    { "hc_head_scale.weight",             "hc_head_scale" },
+    { "main_proj.weight",                 "main_proj.weight" },
+    { "main_norm.weight",                 "main_norm.weight" },
+    { "norm.weight",                      "norm.weight" },
+    { "markov_head.markov_w1.weight",     "markov_head.markov_w1.weight" },
+    { "markov_head.markov_w2.weight",     "markov_head.markov_w2.weight" },
+    { "confidence_head.proj.weight",      "confidence_head.proj.weight" },
 };
+
+/* Map a dspark.N.* or mtp.N.* GGUF tensor name to its HF name (mtp.N.*). */
+static bool dspark_hf_name(const char *gguf_name, char *hf_out, size_t hf_sz) {
+    /* dspark.main_proj.weight → mtp.0.main_proj.weight */
+    const char *prefixes[] = { "dspark.", "mtp.", NULL };
+    for (int pi = 0; prefixes[pi]; pi++) {
+        size_t plen = strlen(prefixes[pi]);
+        if (strncmp(gguf_name, prefixes[pi], plen) != 0) continue;
+        const char *rest = gguf_name + plen;
+        /* Check for numbered sub-module: dspark.0.xxx or dspark.1.xxx or dspark.2.xxx */
+        int idx;
+        if (sscanf(rest, "%d.", &idx) == 1 && idx >= 0 && idx <= 2) {
+            const char *suffix = strchr(rest, '.') + 1;
+            /* Try layer_map suffix mapping first (attn_q_a.weight → attn.wq_a.weight) */
+            for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
+                if (strcmp(suffix, layer_map[i].gguf) == 0) {
+                    snprintf(hf_out, hf_sz, "mtp.%d.%s", idx, layer_map[i].hf);
+                    return true;
+                }
+            }
+            /* Fallback: identity (GGUF name == HF name under mtp.N.*) */
+            snprintf(hf_out, hf_sz, "mtp.%d.%s", idx, suffix);
+            return true;
+        }
+        /* Top-level dspark tensors: dspark.main_proj.weight → mtp.0.main_proj.weight */
+        snprintf(hf_out, hf_sz, "mtp.0.%s", rest);
+        return true;
+    }
+    return false;
+}
 
 static char *hf_name_for_regular(const char *gguf_name) {
     for (size_t i = 0; i < sizeof(top_map) / sizeof(top_map[0]); i++) {
         if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
+    }
+    char hf_buf[512];
+    if (dspark_hf_name(gguf_name, hf_buf, sizeof(hf_buf))) {
+        return xstrdup(hf_buf);
     }
     int layer = -1;
     const char *p = gguf_name;
@@ -1152,12 +1214,14 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
 
 static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
     int nd = tensor_n_dims(tmpl);
-    if (info->n_dims != nd) {
+    int skip = 0;
+    while (info->n_dims - skip > nd && info->shape[skip] == 1) skip++;
+    if (info->n_dims - skip != nd) {
         fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
         exit(1);
     }
     for (int i = 0; i < nd; i++) {
-        if (tmpl->ne[i] != info->shape[nd - 1 - i]) {
+        if (tmpl->ne[i] != info->shape[info->n_dims - 1 - i]) {
             fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
             exit(1);
         }
@@ -1223,7 +1287,10 @@ typedef struct {
 
 static void generate_one_expert(expert_job *j, int xid) {
     char prefix[256];
-    snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    if (j->expert.is_mtp)
+        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    else
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
     char weight_name[320];
     char scale_name[320];
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
@@ -1723,7 +1790,7 @@ static void usage(const char *argv0) {
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
-    printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
+    printf("\nTYPE examples: f16, f32, bf16, q2_k, iq2_xxs, fp8_e4m3, mxfp4\n");
 }
 
 static char *need_value(int argc, char **argv, int *i, const char *arg) {
@@ -1879,25 +1946,18 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
  * (tensor, format). Emits mse.json for prisma_alloc.py --mse. The FP4 source is
  * ground truth: this is the error each format ADDS on top of the source, which
  * is exactly what the bit-allocation knapsack trades. */
-/* Probe ONLY what antirez can serve today: the two-pair menu IQ2_XXS, Q2_K,
- * Q4_K. Q3_K (a possible "widen-later" middle rung) and Q5_K/Q6_K (dead tiers on
- * an FP4 source) are intentionally excluded — re-add Q3_K here only if/when we
- * actually weigh porting a Q3_K kernel. Probe set == servable set == allocator
- * menu, so mse.json maps 1:1 onto the allocation. */
+/* Probe ONLY what we serve: the IQ2_XXS/Q2_K combo. FP8_E4M3 and MXFP4 are
+ * lossless relative to the FP4/FP8 source so they don't need MSE probing. */
 static const ds4q_type PROBE_CANDS[] = {
-    DS4Q_TYPE_IQ2_XXS, DS4Q_TYPE_Q2_K, DS4Q_TYPE_Q4_K,
+    DS4Q_TYPE_IQ2_XXS, DS4Q_TYPE_Q2_K,
 };
-static const char *PROBE_NAMES[] = { "IQ2_XXS","Q2_K","Q4_K" };
+static const char *PROBE_NAMES[] = { "IQ2_XXS","Q2_K" };
 #define PROBE_NCAND ((int)(sizeof(PROBE_CANDS)/sizeof(PROBE_CANDS[0])))
 
 static void probe_dequant(ds4q_type t, const void *blocks, float *out, int64_t n) {
     switch (t) {
     case DS4Q_TYPE_IQ2_XXS: ds4q_dequantize_iq2_xxs(blocks, out, n); break;
     case DS4Q_TYPE_Q2_K:    ds4q_dequantize_q2_k(blocks, out, n); break;
-    case DS4Q_TYPE_Q3_K:    ds4q_dequantize_q3_k(blocks, out, n); break;
-    case DS4Q_TYPE_Q4_K:    ds4q_dequantize_q4_k(blocks, out, n); break;
-    case DS4Q_TYPE_Q5_K:    ds4q_dequantize_q5_k(blocks, out, n); break;
-    case DS4Q_TYPE_Q6_K:    ds4q_dequantize_q6_k(blocks, out, n); break;
     default: die("probe: unsupported candidate type");
     }
 }

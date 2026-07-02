@@ -23,31 +23,20 @@ import argparse, json, math, os
 BLOCK = {
     "IQ2_XXS": (256, 66),   # 2.0625 bpw
     "Q2_K":    (256, 84),   # 2.625
-    "Q3_K":    (256, 110),  # 3.4375  (pending encoder)
-    "Q4_K":    (256, 144),  # 4.5
-    "Q5_K":    (256, 176),  # 5.5
-    "Q6_K":    (256, 210),  # 6.5625
-    "Q8_0":    (32, 34),    # 8.5
-    "F16":     (1, 2),
-    "F32":     (1, 4),
+    "MXFP4":   (32,  17),   # 4.25 — lossless vs source
+    "FP8_E4M3":(32,  33),   # 8.25
+    "F16":     ( 1,   2),
+    "F32":     ( 1,   4),
 }
-# Candidate menu — antirez two-pair law (ds4_cuda.cu routed_moe_launch:12251).
-# The clean antirez runtime's ONLY routed-MoE entry point hard-accepts exactly
-# two per-layer presets and returns 0 ("ffn batch encode failed") for anything
-# else:
-#   q4k_path : gate==Q4_K(12) AND down==Q4_K(12)
-#   else     : gate==IQ2_XXS(16) AND down==Q2_K(10)
-# So a whole MoE layer is the allocation UNIT and it picks ONE of two presets.
-# (The Entrpi fork widened this to the full ladder via the mmq graft; that work
-# is staged for a surgical, oracle-triggered port — see ROADMAP. Until then the
-# allocator MUST emit only these presets or it produces unservable GGUFs, which
-# is exactly how smart-99gb got IQ2_XXS down-projections.)
+# Candidate presets. Each MoE layer picks one: cheap (IQ2_XXS/Q2_K) or rich
+# (MXFP4 all three, lossless vs the HF source).  No Q4_K/Q3_K/Q5_K/Q6_K/Q8_0
+# — those are no longer producible or servable.
 PRESETS = {
     "cheap": {"gate": "IQ2_XXS", "up": "IQ2_XXS", "down": "Q2_K"},   # ~2.06 / 2.6 bpw
-    "rich":  {"gate": "Q4_K",    "up": "Q4_K",    "down": "Q4_K"},   # 4.5 bpw
+    "rich":  {"gate": "MXFP4",   "up": "MXFP4",   "down": "MXFP4"},  # 4.25 bpw, lossless
 }
 PRESET_ORDER = ["cheap", "rich"]               # ascending size; promote cheap->rich
-ROUTED_CANDS = ["IQ2_XXS", "Q2_K", "Q4_K"]     # display only, bpw-ascending
+ROUTED_CANDS = ["IQ2_XXS", "Q2_K", "MXFP4"]    # display only, bpw-ascending
 
 def expert_role(name):
     if "down_exps" in name: return "down"
@@ -68,19 +57,14 @@ def bpw(fmt):
     return bb * 8.0 / eb
 
 def candidates(t):
-    """Per-role format options under the two presets (cheap-first), for routed
-    experts; non-experts pinned at their current type. candidates(t)[0] is the
-    cheap-preset format for the tensor's role (used as the pinned default)."""
     if t["family"] == "routed_expert":
         role = expert_role(t["name"])
         return [PRESETS[p][role] for p in PRESET_ORDER]
     return [t["type"]] if t["type"] in BLOCK else ["F16"]
 
 def synth_sens(t):
-    """Synthetic sensitivity fallback (NOT real). Heuristic: down-proj and later
-    layers matter more — purely to exercise the knapsack until imatrix lands."""
     n = t["name"]; s = 1.0
-    if "ffn_down" in n: s *= 1.6           # down-proj is MoE-sensitive
+    if "ffn_down" in n: s *= 1.6
     try:
         layer = int(n.split("blk.")[1].split(".")[0]); s *= 1.0 + layer / 60.0
     except Exception:
@@ -88,22 +72,23 @@ def synth_sens(t):
     return s
 
 def synth_mse(n_el, fmt):
-    """Synthetic round-trip MSE fallback (NOT real): ~ exp falloff with bpw."""
+    """Synthetic round-trip MSE fallback (NOT real). MXFP4 is lossless vs the
+    FP4 source, so its MSE is effectively zero.  IQ2_XXS/Q2_K get the old
+    exponential falloff with bpw gap from MXFP4."""
+    if fmt == "MXFP4":
+        return 1e-12   # lossless
     return math.exp(-1.4 * (bpw(fmt) - 2.0))
 
 def load(p):
     return json.load(open(p)) if p and os.path.exists(p) else None
 
 def allocate(tensors, sens, mse, budget_bytes):
-    """Per-layer two-preset knapsack for the antirez two-pair runtime. The unit
-    is a whole MoE layer (its gate_exps+up_exps+down_exps); it chooses 'cheap'
-    (IQ2_XXS gate/up, Q2_K down) or 'rich' (Q4_K all). Start every layer cheap,
-    then greedily promote whole layers to rich by best dKL-saved-per-extra-byte
-    while the budget holds. Two presets => 0/1 per layer; greedy-by-efficiency is
-    exact for the LP relaxation and always budget-respecting."""
+    """Per-layer two-preset knapsack.  Unit = whole MoE layer (gate+up+down);
+    picks 'cheap' (IQ2_XXS/Q2_K) or 'rich' (MXFP4).  Start cheap, then
+    greedily promote layers by best dKL-saved-per-extra-byte."""
     import heapq, collections
     fixed_bytes = 0
-    layers = collections.OrderedDict()   # layer -> [(name, n_el, sv, role), ...]
+    layers = collections.OrderedDict()
     for t in tensors:
         n_el = nelems(t["shape"])
         if t["family"] != "routed_expert":
@@ -124,27 +109,26 @@ def allocate(tensors, sens, mse, budget_bytes):
             dkl += 0.5 * sv * m
         return sz, dkl
 
-    units = []   # [layer, tensors, {preset:(sz,dkl)}, is_rich]
+    units = []
     for layer, ts in layers.items():
         costs = {p: preset_cost(ts, p) for p in PRESET_ORDER}
         units.append([layer, ts, costs, False])
 
-    rsize = sum(u[2]["cheap"][0] for u in units)   # all cheap
+    rsize = sum(u[2]["cheap"][0] for u in units)
     rkl   = sum(u[2]["cheap"][1] for u in units)
     budget = budget_bytes - fixed_bytes
 
-    # max-heap (via negation) of promotion efficiency = dKL_saved / extra_bytes
     heap = []
     for i, u in enumerate(units):
         ds = u[2]["rich"][0] - u[2]["cheap"][0]
-        dk = u[2]["cheap"][1] - u[2]["rich"][1]     # KL reduction from cheap->rich
+        dk = u[2]["cheap"][1] - u[2]["rich"][1]
         if ds > 0: heapq.heappush(heap, (-(dk/ds), i))
     while heap:
         eff, i = heapq.heappop(heap)
         u = units[i]
         ds = u[2]["rich"][0] - u[2]["cheap"][0]
         if rsize + ds > budget:
-            continue                                # doesn't fit; try next-best
+            continue
         rkl -= (u[2]["cheap"][1] - u[2]["rich"][1]); rsize += ds; u[3] = True
 
     chosen = {}
@@ -168,13 +152,11 @@ def main():
     for gb in a.pareto:
         chosen, fixed, rtot, kl = allocate(tensors, sens, mse, gb * 1e9)
         total = (fixed + rtot) / 1e9
-        # full manifest (experts allocated, others pinned at current type)
         man = {}
         for t in tensors:
             man[t["name"]] = chosen.get(t["name"], (candidates(t)[0]))
         outp = os.path.join(a.out_dir, f"manifest.{int(gb)}gb.json")
         json.dump(man, open(outp, "w"), indent=0)
-        # per-format routed counts
         from collections import Counter
         c = Counter(chosen.values())
         cnt = "  ".join(f"{k}:{c.get(k,0)}" for k in ROUTED_CANDS)

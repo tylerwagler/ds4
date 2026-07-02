@@ -32,7 +32,7 @@ P3 entry in `==COMPLETED==` for the head-to-head numbers that surfaced this.
 | ID | Task | Phase | Status | Blocked By | Est. Effort |
 |----|------|-------|--------|------------|-------------|
 | P0 | HF→ds4 GGUF converter (repacker + quantizer) | P0 | **done** | — | ~1-2 weeks |
-| P1.1 | DSpark: GGUF conversion | P1 | planned | — | 200-300 lines |
+| P1.1 | DSpark: GGUF conversion | P1 | **done** | — | 200-300 lines |
 | P1.2 | DSpark: weight binding | P1 | planned | P1.1 | 100 lines |
 | P1.3 | DSpark: GPU graph allocation | P1 | planned | P1.1 | 200 lines |
 | P1.4 | Non-causal SWA attention mode (= A4) | P1 | planned | — | 200 lines |
