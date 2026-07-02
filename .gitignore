@@ -27,3 +27,4 @@ __pycache__/
 /ds4_agent_test
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
+.claude/

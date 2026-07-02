@@ -1,6 +1,6 @@
 # Agent Notes
 
-DwarfStar (`ds4`) is a DeepSeek V4 Flash/PRO specific inference engine, not a
+DwarfStar (`ds4`) is a DeepSeek V4 Flash specific inference engine, not a
 generic GGUF runner. This tree is the **CUDA-only fork** of antirez's upstream
 project, targeting the NVIDIA DGX Spark (GB10, `sm_121`, ~121 GB usable
 unified memory). The Metal and ROCm backends were fully removed. The two
