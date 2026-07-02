@@ -17,18 +17,18 @@ CUTLASS_DIR ?= $(CURDIR)/cutlass
 CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 
-DS4_INC = -I. -Ilib -Ivendor
+DS4_INC = -Isrc -Isrc/lib -Isrc/vendor
 
-ENGINE_SRCS = $(wildcard engine/*.c)
+ENGINE_SRCS = $(wildcard src/engine/*.c)
 ENGINE_OBJS = $(ENGINE_SRCS:.c=.o)
-AGENT_SRCS = $(wildcard agent/*.c)
+AGENT_SRCS = $(wildcard src/agent/*.c)
 AGENT_OBJS = $(AGENT_SRCS:.c=.o)
-SERVER_SRCS = $(wildcard server/*.c)
+SERVER_SRCS = $(wildcard src/server/*.c)
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
-CUDA_SRCS = $(filter-out cuda/ds4_mxfp4_cutlass.cu,$(wildcard cuda/*.cu))
+CUDA_SRCS = $(filter-out src/cuda/ds4_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
-LIB_HDRS = lib/ds4_distributed.h lib/ds4_help.h lib/ds4_kvstore.h lib/ds4_ssd.h lib/ds4_web.h
-CORE_OBJS = $(ENGINE_OBJS) lib/ds4_distributed.o lib/ds4_ssd.o $(CUDA_OBJS) cuda/ds4_mxfp4_cutlass.o
+LIB_HDRS = src/lib/ds4_distributed.h src/lib/ds4_help.h src/lib/ds4_kvstore.h src/lib/ds4_ssd.h src/lib/ds4_web.h
+CORE_OBJS = $(ENGINE_OBJS) src/lib/ds4_distributed.o src/lib/ds4_ssd.o $(CUDA_OBJS) src/cuda/ds4_mxfp4_cutlass.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
@@ -58,67 +58,67 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
-ds4: cli/ds4_cli.o lib/ds4_help.o vendor/linenoise.o $(CORE_OBJS)
+ds4: src/cli/ds4_cli.o src/lib/ds4_help.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-server: $(SERVER_OBJS) lib/ds4_help.o lib/ds4_kvstore.o vendor/rax.o $(CORE_OBJS)
+ds4-server: $(SERVER_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-bench: cli/ds4_bench.o lib/ds4_help.o $(CORE_OBJS)
+ds4-bench: src/cli/ds4_bench.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-eval: cli/ds4_eval.o lib/ds4_help.o $(CORE_OBJS)
+ds4-eval: src/cli/ds4_eval.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-agent: $(AGENT_OBJS) lib/ds4_help.o lib/ds4_web.o lib/ds4_kvstore.o vendor/linenoise.o $(CORE_OBJS)
+ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_web.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
-engine/%.o: engine/%.c engine/ds4_engine_internal.h ds4.h lib/ds4_ssd.h lib/ds4_distributed.h ds4_gpu.h
+src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/lib/ds4_ssd.h src/lib/ds4_distributed.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
-agent/%.o: agent/%.c agent/ds4_agent_internal.h ds4.h $(LIB_HDRS) vendor/linenoise.h
+src/agent/%.o: src/agent/%.c src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
-server/%.o: server/%.c server/ds4_server_internal.h ds4.h $(LIB_HDRS) vendor/rax.h
+src/server/%.o: src/server/%.c src/server/ds4_server_internal.h src/ds4.h $(LIB_HDRS) src/vendor/rax.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
-cli/%.o: cli/%.c ds4.h lib/ds4_ssd.h lib/ds4_distributed.h lib/ds4_help.h vendor/linenoise.h
+src/cli/%.o: src/cli/%.c src/ds4.h src/lib/ds4_ssd.h src/lib/ds4_distributed.h src/lib/ds4_help.h src/vendor/linenoise.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
-lib/%.o: lib/%.c ds4.h $(LIB_HDRS)
+src/lib/%.o: src/lib/%.c src/ds4.h $(LIB_HDRS)
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
-vendor/%.o: vendor/%.c vendor/linenoise.h vendor/rax.h vendor/rax_malloc.h
+src/vendor/%.o: src/vendor/%.c src/vendor/linenoise.h src/vendor/rax.h src/vendor/rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-tests/ds4_test.o: tests/ds4_test.c $(SERVER_SRCS) server/ds4_server_internal.h ds4.h $(LIB_HDRS) vendor/rax.h
+tests/ds4_test.o: tests/ds4_test.c $(SERVER_SRCS) src/server/ds4_server_internal.h src/ds4.h $(LIB_HDRS) src/vendor/rax.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
-tests/ds4_agent_test.o: tests/ds4_agent_test.c $(AGENT_SRCS) agent/ds4_agent_internal.h ds4.h $(LIB_HDRS) vendor/linenoise.h
+tests/ds4_agent_test.o: tests/ds4_agent_test.c $(AGENT_SRCS) src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
 
-tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
+tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c src/ds4_gpu.h
+	$(CC) $(CFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.c
 
-cuda/%.o: cuda/%.cu cuda/ds4_cuda_internal.h ds4_gpu.h cuda/ds4_iq2_tables_cuda.inc
-	$(NVCC) $(NVCCFLAGS) -I. -c -o $@ $<
+src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/ds4_iq2_tables_cuda.inc
+	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
 
 # CUTLASS MXFP4 tensor-core expert FFN (GB10/sm_120f). Requires -arch=sm_120f (family mode) for the
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
-cuda/ds4_mxfp4_cutlass.o: cuda/ds4_mxfp4_cutlass.cu
-	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda $(CUTLASS_INC) -c -o $@ cuda/ds4_mxfp4_cutlass.cu
+src/cuda/ds4_mxfp4_cutlass.o: src/cuda/ds4_mxfp4_cutlass.cu
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda $(CUTLASS_INC) -c -o $@ src/cuda/ds4_mxfp4_cutlass.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_test: tests/ds4_test.o lib/ds4_help.o lib/ds4_kvstore.o vendor/rax.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_test.o lib/ds4_help.o lib/ds4_kvstore.o vendor/rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
-ds4_agent_test: tests/ds4_agent_test.o lib/ds4_help.o lib/ds4_web.o lib/ds4_kvstore.o vendor/linenoise.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_agent_test.o lib/ds4_help.o lib/ds4_web.o lib/ds4_kvstore.o vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
+ds4_agent_test: tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_web.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_web.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
 test: ds4_test ds4_agent_test ds4-eval
 	./ds4-eval --self-test-extractors
@@ -126,4 +126,4 @@ test: ds4_test ds4_agent_test ds4-eval
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test engine/*.o agent/*.o server/*.o cuda/*.o cli/*.o lib/*.o vendor/*.o tests/*.o tests/cuda_long_context_smoke
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke

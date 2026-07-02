@@ -1,21 +1,21 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
-#include "../server/util.c"
-#include "../server/request.c"
-#include "../server/prompt_render.c"
-#include "../server/api_parse.c"
-#include "../server/genmsg.c"
-#include "../server/openai_stream.c"
-#include "../server/responses_stream.c"
-#include "../server/anthropic_stream.c"
-#include "../server/tool_memory.c"
-#include "../server/kv_cache.c"
-#include "../server/trace.c"
-#include "../server/generate.c"
-#include "../server/http_server.c"
-#include "../server/cli_main.c"
+#include "../src/server/util.c"
+#include "../src/server/request.c"
+#include "../src/server/prompt_render.c"
+#include "../src/server/api_parse.c"
+#include "../src/server/genmsg.c"
+#include "../src/server/openai_stream.c"
+#include "../src/server/responses_stream.c"
+#include "../src/server/anthropic_stream.c"
+#include "../src/server/tool_memory.c"
+#include "../src/server/kv_cache.c"
+#include "../src/server/trace.c"
+#include "../src/server/generate.c"
+#include "../src/server/http_server.c"
+#include "../src/server/cli_main.c"
 #ifndef DS4_NO_GPU
-#include "../ds4_gpu.h"
+#include "../src/ds4_gpu.h"
 #include <math.h>
 
 static ds4_engine *test_engine_fast;
