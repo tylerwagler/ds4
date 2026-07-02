@@ -25,16 +25,27 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
+QUANTIZE_SRCS := $(wildcard quantize/dsq_*.c)
+QUANTIZE_OBJS := $(QUANTIZE_SRCS:.c=.o)
+QUANTS_SRCS := quants_common.c quants_fp.c quants_kquants.c
+QUANTS_OBJS := $(QUANTS_SRCS:.c=.o)
+
 .PHONY: all clean quality-score
 
 all: deepseek4-quantize
 
-deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
+quantize/%.o: quantize/%.c quantize/dsq_internal.h quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -Iquantize -c -o $@ $<
+
+%.o: %.c quants_internal.h quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -c -o $@ $<
+
+deepseek4-quantize: $(QUANTIZE_OBJS) $(QUANTS_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(QUANTIZE_OBJS) $(QUANTS_OBJS) -lm -pthread
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize quality-testing/score_official
+	rm -f deepseek4-quantize quality-testing/score_official quantize/*.o *.o
