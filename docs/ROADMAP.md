@@ -18,6 +18,15 @@ is ~74% of the ~32 t/s memory-BW ceiling (14B active) — the graph bug is fixed
 near the bandwidth wall, so the remaining single-stream win is spec decode, not quant. (Old
 smart-99gb baseline was ~12.7 — the 2x gap was the graph bug + greedy decode, now closed.)
 
+**UNVERIFIED (2026-07-02): this ~25.5 t/s decode number does not currently reproduce.**
+`oracle-fp8wh-99gb` doesn't exist on disk anymore. Fresh `ds4-bench` runs today against
+`oracle-zeroq8-99gb.gguf` on this same GB10 show decode at ~13 t/s (12.98-13.14 across
+2k-8k context) — roughly half this line's claim. Root cause not yet investigated: could be
+clock/power state, could be an actual regression since 2026-06-29, could be this number was
+never real under normal conditions. Don't treat "~25.5 t/s" or "~32 t/s memory-BW ceiling" as
+current fact for any comparison (including the P1 target below) until re-verified. See the
+P3 status entry for the head-to-head numbers that surfaced this.
+
 ## Phases
 
 ### P0 — HF→ds4 GGUF converter  [FOUNDATIONAL — owns both levers]
@@ -290,38 +299,41 @@ Dependency reality: **the math is NVIDIA; vLLM is optional and only for MoE fusi
   TODO: either finish wiring `ds4_cutlass_expert_ffn` into `routed_moe_launch`, or extend
   `use_sorted_pairs`-style batching to the MXFP4 path before shipping it as the default
   expert format.
-- **WIRED (2026-07-02): the CUTLASS path is now live and functionally correct, prefill wins,
-  decode regresses.** New tensor type `DS4_TENSOR_CUTLASS_MXFP4 = 40` (expert-major
-  ColumnMajor E2M1 data + swizzled E8M0 SF per expert, `cutlass_mxfp4_expert_layout()` in
-  `gguf.c`); accepted through `weights.c` validation as a third routed-expert combo; a new
-  `routed_moe_launch_cutlass()` in `ds4_cuda_moe.cu` sorts tokens by expert (reusing the
-  existing count/prefix/scatter kernels), gathers each active expert's rows, calls a
-  rewritten `ds4_cutlass_expert_ffn_scratch()` (caller-provided scratch via `cuda_tmp_alloc`,
-  no more per-call cudaMalloc/cudaFree/cudaDeviceSynchronize — that was 10 allocations per
-  call in the original standalone-test code), and scatters results back for the existing
-  `moe_sum_kernel` to reduce. Standalone CUTLASS kernel test still passes bit-exact
-  (`max_rel=0.00000`) after the scratch-buffer refactor. Loaded and served
+- **WIRED (2026-07-02): the CUTLASS path is live, functionally correct, and a clean prefill
+  win with no measured decode cost.** New tensor type `DS4_TENSOR_CUTLASS_MXFP4 = 40`
+  (expert-major ColumnMajor E2M1 data + swizzled E8M0 SF per expert,
+  `cutlass_mxfp4_expert_layout()` in `gguf.c`); accepted through `weights.c` validation as a
+  third routed-expert combo; a new `routed_moe_launch_cutlass()` in `ds4_cuda_moe.cu` sorts
+  tokens by expert (reusing the existing count/prefix/scatter kernels), gathers each active
+  expert's rows, calls a rewritten `ds4_cutlass_expert_ffn_scratch()` (caller-provided scratch
+  via `cuda_tmp_alloc`, no more per-call cudaMalloc/cudaFree/cudaDeviceSynchronize — that was
+  10 allocations per call in the original standalone-test code), and scatters results back for
+  the existing `moe_sum_kernel` to reduce. Standalone CUTLASS kernel test still passes
+  bit-exact (`max_rel=0.00000`) after the scratch-buffer refactor. Loaded and served
   `oracle-cutlass-mxfp4-99gb.gguf` end-to-end; `--logprob-vectors`, `--tensor-equivalence`,
   `--short-prefill-ratio4`, `--local-golden-vectors` all pass, zero top-1 mismatches.
-  **Measured on this GB10** (`ds4-bench`, `speed-bench/promessi_sposi.txt`, ctx 2048-8192):
-  prefill **404-445 t/s** (matches/slightly beats the 431 t/s FP8-only baseline — expected,
-  since only 6/43 layers are CUTLASS) but decode is **~13 t/s, roughly HALF the ~25.5 t/s
-  baseline** — a real regression, not the "decode-neutral" this section predicted.
-  **ROOT CAUSE (diagnosed, not yet fixed):** CUTLASS's dense `GemmUniversal` interface needs
-  each expert's token count as a host-side int at GEMM-launch time (unlike the qwarp32 path,
-  which processes (token,expert) pairs independently on-device). `routed_moe_launch_cutlass`
-  reads the sorted-pairs `offsets[]` back with a blocking `cudaMemcpy` once per CUTLASS layer
-  per forward pass. For decode (n_tokens=1, 6 rich layers) that's 6 host syncs added to every
-  decode step; the measured throughput is nearly flat across context depth (12.98→13.08→
-  13.06→12.98 t/s @ 2k/4k/6k/8k) instead of declining the way the depth-dependent KV-read
-  baseline does (25.5→24.5→21.6 @ d0/4k/8k) — consistent with a fixed per-token sync cost
-  dominating over the real, small, depth-dependent component. TODO before shipping this as
-  the default expert path: eliminate the decode-time sync, most likely by special-casing
-  n_tokens==1 (a single token's routing to ≤n_expert distinct experts needs no sorting at
-  all) and sourcing the routing decision from wherever it's already host-visible in the
-  decode path rather than a fresh readback, or by having CUTLASS accept a device-side/fixed
-  worst-case M and avoid the host round-trip entirely. Until fixed, do not point production
-  decode traffic at a CUTLASS-typed GGUF.
+  **Measured on this GB10** (`ds4-bench`, `speed-bench/promessi_sposi.txt`, ctx 2048-8192),
+  head-to-head against `oracle-zeroq8-99gb.gguf` on the identical build/hardware/methodology
+  (correcting an earlier draft of this entry that compared against the old, no-longer-present
+  `oracle-fp8wh-99gb` log line instead of measuring fresh — do not trust historical numbers
+  from a file that isn't on disk):
+  | | prefill t/s | decode t/s |
+  |---|---|---|
+  | baseline (zeroq8) | 167 / 163 / 161 / 161 | 12.98 / 13.14 / 13.10 / 13.04 |
+  | CUTLASS | 445 / 414 / 408 / 404 | 12.98 / 13.08 / 13.06 / 12.98 |
+
+  Prefill is a clean **~2.5-2.7x** win, holding across depth. Decode is identical within
+  noise — CUTLASS is decode-neutral exactly as this section originally predicted.
+  `routed_moe_launch_cutlass` does read per-expert token counts back to host with a blocking
+  `cudaMemcpy` once per CUTLASS layer per forward pass (real code behavior, still worth
+  removing eventually for decode latency headroom), but it is evidently not the bottleneck at
+  current decode throughput.
+  **OPEN QUESTION (bigger than this item):** both baseline and CUTLASS decode sit at ~13 t/s
+  here, roughly half the ~25.5 t/s this file's earlier "Measured (2026-06-29, oracle-fp8wh-99gb...)"
+  line up top claims. That number's source file doesn't exist on disk anymore and was never
+  reproduced against the current build — don't trust it until re-verified (clock-pinning,
+  `--power` state, or an actual regression since 2026-06-29 are all still open explanations).
+  Chase this before optimizing further against it.
 
 **NVFP4** (E2M1 + E4M3 per-16 microscale + FP32 global, ~4.5 bpw) stays in our pocket for
 quantizing *from high precision* (bf16) — e.g. if we ever push attn/dense below FP8 — where
