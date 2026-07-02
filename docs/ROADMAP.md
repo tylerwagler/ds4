@@ -265,11 +265,12 @@ source attn/dense is already E4M3).
   memory-bound so no decode gain). SEQUENCING (user, 2026-06-29): **do P3 MXFP4-experts FIRST**
   (97% of the model = the real lever); 2d is the cleanup pass to reach a fully Q8-free model.
   **2d.ao (attn_output_a/b MXFP8) is done** — see `==COMPLETED==`. Remaining Q8/BF16 item is
-  lm_head only. TODO: **the KL/perplexity gate
-  mentioned above does not exist in code** — no `kl_div`/`perplexity`-gated runtime logic
-  found anywhere; format selection today is a raw `w->output->type == DS4_TENSOR_BF16` check
-  (`weights.c:538-543`) on whatever the GGUF ships. Building that gate is a prerequisite, not
-  a formality, before flipping lm_head to FP8.
+  lm_head only. **The KL gate now exists (2026-07-02):** `ds4 --kl-file CALIB --kl-ref-dump
+  REF.bin` / `--kl-score REF.bin` measures full-vocab mean KL (+ block-bootstrap stderr)
+  between any two model configurations on calibration text — built for the P4 measured-KL
+  allocator, directly usable as this gate. To gate lm_head: dump the reference with BF16
+  lm_head, quantize an FP8-lm_head variant, `--kl-score`, and require the delta to be
+  indistinguishable from zero (within ~2 stderr) before shipping it.
 - **2e Extend MXFP8 to the remaining F16 GEMM weight groups (2026-07-02 audit, NEW).**
   The KV compressor (`attn_compressor_{ape,kv,gate}`, 41/43 layers), the DSA indexer
   (`indexer_attn_q_b`/`indexer_proj`/`indexer_compressor_*`, 21/43 ratio-4 layers), and
@@ -339,6 +340,18 @@ already E8M0/32, so NVFP4's finer scale can't recover detail that isn't there.
 ### P4 — Oracle-driven multi-format allocation across the full menu
 Extend `--mse-probe` + prisma to allocate over ALL tensors (experts + dense/attn) and
 the curated format menu below, picking by imatrix-weighted real error per (tensor,format).
+**AURA-era update (2026-07-02, from the RobTand/prismaquant comparison):** for routed
+experts, the allocator now prefers **measured end-to-end KL** over any proxy — upstream's
+own finding is that gradient/imatrix proxies are structurally blind to router flips, and
+their MoE ship path is empirical per-serving-unit KL. Built: `--expert-overlay` (swap one
+layer's expert tensors from a donor GGUF at load), `--kl-file`/`--kl-ref-dump`/`--kl-score`
+(full-vocab KL vs a reference logit dump, with block-bootstrap stderr),
+`prisma/measure_layer_kl.py` (43-run harness → `kl.json`), exact 0/1 DP knapsack +
+optional `--ucb-z` uncertainty charge in `prisma_alloc.py`, and the previously-missing
+`--format-map` manifest consumer in the quantizer. When P4 extends to dense/attn tensors,
+the same measured-KL machinery applies (dense tensors are smooth, so upstream's AURA
+gradient probe would also work there — but it needs backprop we can't run at 284B locally;
+measured KL per candidate is the hardware-honest equivalent).
 
 ### P5 — Expert pruning (REAP / RIY) — workload-specific capacity  [HIGH VALUE]
 REAP = Router-weighted Expert Activation Pruning (Cerebras): drop underutilized MoE
