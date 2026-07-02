@@ -201,7 +201,7 @@ static float test_f16_to_f32(uint16_t h) {
     return f;
 }
 
-static void test_metal_f16_matvec_fast_nr0_4(void) {
+static void test_f16_matvec_fast_nr0_4(void) {
     /*
      * This is the short regression for the long-context repetition failure.
      * Decode uses one-token F16 matvecs for several DS4 projections; the fast
@@ -279,7 +279,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(weights_raw);
 }
 
-static void test_metal_f16_prefill_matmul(void) {
+static void test_f16_prefill_matmul(void) {
     const uint32_t in_dim = 128;
     const uint32_t out_dim = 64;
     const uint32_t n_tok = 128;
@@ -370,12 +370,12 @@ static void test_metal_f16_prefill_matmul(void) {
     free(weights_raw);
 }
 
-static void test_metal_kernel_group(void) {
-    test_metal_f16_matvec_fast_nr0_4();
-    test_metal_f16_prefill_matmul();
+static void test_f16_kernel_group(void) {
+    test_f16_matvec_fast_nr0_4();
+    test_f16_prefill_matmul();
 }
 
-static void test_metal_short_prefill_ratio4(void) {
+static void test_short_prefill_ratio4(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
 
@@ -847,55 +847,6 @@ static void test_official_logprob_vectors(void) {
     test_official_logprob_vectors_run(NULL);
 }
 
-static void test_metal_ssd_streaming_cache_pressure(void) {
-#ifndef __APPLE__
-    fprintf(stderr,
-            "ds4-test: Metal SSD streaming cache-pressure repro skipped "
-            "(Metal-only)\n");
-#else
-    /*
-     * Regression repro for GitHub issue #384.
-     *
-     * The bug needs the Metal SSD-streaming decode layer-batch path and a small
-     * routed-expert cache. Under pressure, a cache entry referenced by an
-     * already-encoded-but-not-yet-executed layer can be reused for a later
-     * layer in the same command buffer, producing deterministic wrong logits.
-     */
-    char *saved_streaming = test_save_env("DS4_TEST_SSD_STREAMING");
-    char *saved_cache_gb = test_save_env("DS4_TEST_SSD_STREAMING_CACHE_GB");
-    char *saved_cache_experts =
-        test_save_env("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS");
-    char *saved_disable_layer_batch =
-        test_save_env("DS4_CUDA_DISABLE_STREAMING_LAYER_BATCH");
-    char *saved_disable_static_decode =
-        test_save_env("DS4_CUDA_DISABLE_STREAMING_STATIC_DECODE_MAP");
-    char *saved_one_stage =
-        test_save_env("DS4_CUDA_MOE_ONE_STAGE_PROFILE");
-
-    setenv("DS4_TEST_SSD_STREAMING", "1", 1);
-    setenv("DS4_TEST_SSD_STREAMING_CACHE_GB", "16", 1);
-    unsetenv("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS");
-    unsetenv("DS4_CUDA_DISABLE_STREAMING_LAYER_BATCH");
-    unsetenv("DS4_CUDA_DISABLE_STREAMING_STATIC_DECODE_MAP");
-    unsetenv("DS4_CUDA_MOE_ONE_STAGE_PROFILE");
-
-    fprintf(stderr,
-            "ds4-test: Metal SSD streaming cache-pressure repro "
-            "(16GiB cache, layer-batched decode, short_code_completion)\n");
-    test_official_logprob_vectors_run("short_code_completion");
-
-    test_restore_env("DS4_CUDA_MOE_ONE_STAGE_PROFILE", saved_one_stage);
-    test_restore_env("DS4_CUDA_DISABLE_STREAMING_STATIC_DECODE_MAP",
-                     saved_disable_static_decode);
-    test_restore_env("DS4_CUDA_DISABLE_STREAMING_LAYER_BATCH",
-                     saved_disable_layer_batch);
-    test_restore_env("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS",
-                     saved_cache_experts);
-    test_restore_env("DS4_TEST_SSD_STREAMING_CACHE_GB", saved_cache_gb);
-    test_restore_env("DS4_TEST_SSD_STREAMING", saved_streaming);
-#endif
-}
-
 static void test_logits_topk(const float *logits, int n, int *out, int k);
 static bool test_topk_contains(const int *top, int k, int id);
 
@@ -1224,7 +1175,7 @@ static float test_top_union_max_abs(const float *ref, const float *cand,
 }
 
 /*
- * Metal4/TensorOps equivalence is a smoke test, not a demand for bitwise local
+ * Tensor-core equivalence is a smoke test, not a demand for bitwise local
  * logits.  Tensor kernels change precision and reduction order, so the useful
  * invariant here is: no NaNs, same first greedy token, and same short greedy
  * continuation.  Larger logit drift is still printed so it can be compared with
@@ -1497,7 +1448,7 @@ static void test_run_mpp_candidate(const char *label,
     test_mpp_summary_print(&summary);
 }
 
-static void test_metal_mpp_equivalence(void) {
+static void test_mpp_equivalence(void) {
     test_close_engines();
 
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
@@ -1999,7 +1950,7 @@ static const char *test_mtp_copy_prompt(void) {
 
 #define TEST_MTP_MAXGEN 256
 
-/* Regression for the swapped top-k arguments in metal_graph_verify_suffix_tops
+/* Regression for the swapped top-k arguments in gpu_graph_verify_suffix_tops
  * at draft depth > 2.  Replays the committed speculative tokens through plain
  * decode and requires each to be a (near-)argmax: that is the verify invariant,
  * and unlike comparing token streams it tolerates the near-greedy tie
@@ -2111,12 +2062,11 @@ static const ds4_test_entry test_entries[] = {
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "forced </think> recovery when a tool call starts inside thinking", test_think_tool_recovery},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
-    {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
-    {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
-    {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
-    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
-    {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
+    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
+    {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long prefill", test_local_golden_vectors},
+    {"--short-prefill-ratio4", "short-prefill-ratio4", "ratio-4 short prefill regression", test_short_prefill_ratio4},
+    {"--f16-kernels", "f16-kernels", "isolated F16 matmul kernel numeric regressions", test_f16_kernel_group},
+    {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--cont-argmax-gap", "cont-argmax-gap", "DS4_MTP_CONTINUOUS commits autoregressive-identical tokens", test_cont_argmax_gap},
@@ -2135,14 +2085,14 @@ static void test_print_help(const char *prog) {
     puts("  --list");
     puts("      Print test names only.");
 #ifndef DS4_NO_GPU
-    puts("  --metal-mpp-equivalence");
-    puts("      Compatibility alias for --metal-tensor-equivalence.");
+    puts("  --mpp-equivalence");
+    puts("      Compatibility alias for --tensor-equivalence.");
 #endif
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
-    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through Metal SSD streaming.");
+    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through SSD streaming.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
@@ -2155,8 +2105,8 @@ static void test_print_help(const char *prog) {
 
 static const ds4_test_entry *test_find_entry(const char *arg) {
 #ifndef DS4_NO_GPU
-    if (!strcmp(arg, "--metal-mpp-equivalence")) {
-        arg = "--metal-tensor-equivalence";
+    if (!strcmp(arg, "--mpp-equivalence")) {
+        arg = "--tensor-equivalence";
     }
 #endif
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
