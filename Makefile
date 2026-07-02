@@ -23,7 +23,9 @@ AGENT_SRCS = $(wildcard agent/*.c)
 AGENT_OBJS = $(AGENT_SRCS:.c=.o)
 SERVER_SRCS = $(wildcard server/*.c)
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
-CORE_OBJS = $(ENGINE_OBJS) ds4_distributed.o ds4_ssd.o ds4_cuda.o ds4_mxfp4_cutlass.o
+CUDA_SRCS = $(wildcard cuda/*.cu)
+CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
+CORE_OBJS = $(ENGINE_OBJS) ds4_distributed.o ds4_ssd.o $(CUDA_OBJS) ds4_mxfp4_cutlass.o
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
@@ -119,15 +121,15 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
-	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
+cuda/%.o: cuda/%.cu cuda/ds4_cuda_internal.h ds4_gpu.h ds4_iq2_tables_cuda.inc
+	$(NVCC) $(NVCCFLAGS) -I. -c -o $@ $<
 
 # CUTLASS MXFP4 tensor-core expert FFN (GB10/sm_120f). Requires -arch=sm_120f (family mode) for the
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
 ds4_mxfp4_cutlass.o: ds4_mxfp4_cutlass.cu
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda $(CUTLASS_INC) -c -o $@ ds4_mxfp4_cutlass.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -146,4 +148,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test tests/test_q4k_dot *.o engine/*.o agent/*.o server/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test tests/test_q4k_dot *.o engine/*.o agent/*.o server/*.o cuda/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

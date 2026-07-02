@@ -1,0 +1,250 @@
+/* ds4_cuda_internal.h — internal shared declarations for the cuda/ translation units.
+ * Produced by the multi-TU split of ds4_cuda.cu; edit freely (the
+ * generator is not part of the build).
+ *
+ * No -rdc: __global__/__device__/__constant__ symbols never cross TU
+ * boundaries. The shared __device__ helpers below are static
+ * __forceinline__, so each TU gets its own copy. */
+#ifndef DS4_CUDA_INTERNAL_H
+#define DS4_CUDA_INTERNAL_H
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <mma.h>
+#include <cublas_v2.h>
+#include <cublasLt.h>
+#include <cub/block/block_radix_sort.cuh>
+
+#include <stdint.h>
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "ds4_gpu.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define CUDA_QK_K 256
+#define DS4_CUDA_UNUSED __attribute__((unused))
+
+enum {
+    /* attention_decode_mixed_kernel stores raw-window scores plus visible
+     * compressed scores in shared memory.  The host routes larger unmasked
+     * decode calls to the online attention kernel so this fixed buffer never
+     * becomes an out-of-bounds write at long context. */
+    DS4_CUDA_ATTENTION_SCORE_CAP = 8192u,
+    DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
+    DS4_CUDA_TOPK_MERGE_GROUP = 8u,
+    DS4_CUDA_STREAM_EXPERT_DEFAULT = 8u * 64u,
+    DS4_CUDA_STREAM_EXPERT_MAX = 61u * 384u
+};
+
+struct ds4_gpu_tensor {
+    void *ptr;
+    uint64_t bytes;
+    int owner;
+};
+
+typedef struct {
+    uint8_t scales[CUDA_QK_K / 16];
+    uint8_t qs[CUDA_QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} cuda_block_q2_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[CUDA_QK_K / 2];
+} cuda_block_q4_K;
+
+typedef struct {
+    float d;
+    int8_t qs[CUDA_QK_K];
+    int16_t bsums[CUDA_QK_K / 16];
+} cuda_block_q8_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[CUDA_QK_K / 8];
+} cuda_block_iq2_xxs;
+
+/* ---- shared types ---- */
+
+struct cuda_model_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t bytes;
+    char *device_ptr;
+    void *registered_base;
+    char *registered_device_base;
+    uint64_t registered_bytes;
+    int host_registered;
+    int arena_allocated;
+};
+
+struct cuda_model_arena {
+    char *device_ptr;
+    uint64_t bytes;
+    uint64_t used;
+};
+
+struct cuda_q8_f16_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    __half *device_ptr;
+};
+
+struct cuda_q8_f32_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    float *device_ptr;
+};
+
+struct cuda_stream_selected_cache {
+    int valid;
+    const void *model_map;
+    uint32_t layer;
+    uint32_t n_total_expert;
+    uint32_t n_selected;
+    uint32_t slot_count;
+    uint32_t compact_count;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    char *gate_ptr;
+    char *up_ptr;
+    char *down_ptr;
+    uint64_t gate_capacity;
+    uint64_t up_capacity;
+    uint64_t down_capacity;
+    int32_t *slot_selected_ptr;
+    uint64_t slot_selected_capacity;
+    ds4_gpu_tensor slot_selected_tensor;
+};
+
+struct cuda_stream_expert_cache_slot {
+    int valid;
+    const void *model_map;
+    uint64_t model_size;
+    uint32_t layer;
+    uint32_t n_total_expert;
+    uint32_t expert;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t age;
+};
+
+struct cuda_stream_expert_cache {
+    int valid;
+    uint32_t capacity;
+    uint32_t count;
+    uint64_t tick;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    char *gate_ptr;
+    char *up_ptr;
+    char *down_ptr;
+    uint64_t gate_capacity;
+    uint64_t up_capacity;
+    uint64_t down_capacity;
+    std::vector<cuda_stream_expert_cache_slot> slots;
+};
+
+struct fp8_mx_weight { const void *host_base; uint64_t offset, in_dim, out_dim; __nv_fp8_e4m3 *data; unsigned char *scale; };
+
+/* ---- shared host globals ---- */
+
+extern cublasHandle_t g_cublas;
+extern int g_cublas_ready;
+extern int g_quality_mode;
+extern int g_ssd_streaming_mode;
+extern cuda_stream_selected_cache g_stream_selected_cache;
+extern cublasLtHandle_t g_cublaslt;
+extern std::unordered_set<uint64_t> g_fp8_offsets;
+
+/* ---- shared host functions ---- */
+
+void *cuda_tmp_alloc(uint64_t bytes, const char *what);
+int cuda_attention_score_buffer_fits(uint32_t n_comp);
+const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
+void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes);
+int cuda_q8_use_dp4a(void);
+const __half *cuda_q8_f16_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const char *label);
+float *cuda_q8_f32_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const char *label);
+int cuda_ok(cudaError_t err, const char *what);
+int cublas_ok(cublasStatus_t st, const char *what);
+int cuda_matmul_q8_0_hc_expand_tensor_labeled(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        const char             *label);
+
+/* ---- shared __device__ inline helpers (per-TU copies; no -rdc) ---- */
+
+__device__ static __forceinline__ float warp_sum_f32(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+__device__ static __forceinline__ float warp_max_f32(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
+    }
+    return v;
+}
+
+__device__ static __forceinline__ float dot4_f32(float4 a, float4 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+#endif /* DS4_CUDA_INTERNAL_H */
