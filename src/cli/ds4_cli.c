@@ -39,6 +39,10 @@ typedef struct {
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
+    const char *kl_file_path;
+    const char *kl_ref_dump_path;
+    const char *kl_score_path;
+    int kl_stride;
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
     int imatrix_max_prompts;
@@ -855,6 +859,205 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
+/* --kl-file mode: teacher-force calibration text (same fixed prefix and walk
+ * as --perplexity-file) and either dump full-vocab logits at every kl_stride'th
+ * scored position (--kl-ref-dump) or read such a dump back and report
+ * mean KL(ref || candidate) with a block-bootstrap stderr (--kl-score).
+ * Dump format: magic "DS4KLRF1", u32 vocab, u32 stride, u32 prefix_len,
+ * u32 n_positions, then n_positions * vocab float32 logits. */
+#define DS4_KL_MAGIC "DS4KLRF1"
+#define DS4_KL_BLOCK 64
+
+static int run_kl_file(ds4_engine *engine, const cli_config *cfg) {
+    const bool dumping = cfg->gen.kl_ref_dump_path != NULL;
+    const bool scoring = cfg->gen.kl_score_path != NULL;
+    if (dumping == scoring) {
+        fprintf(stderr, "ds4: --kl-file needs exactly one of --kl-ref-dump or --kl-score\n");
+        return 1;
+    }
+    const int stride = cfg->gen.kl_stride > 0 ? cfg->gen.kl_stride : 4;
+    const int vocab = ds4_engine_vocab_size(engine);
+
+    char *text = read_prompt_file(cfg->gen.kl_file_path, true);
+    ds4_tokens tokens = {0};
+    ds4_tokenize_text(engine, text, &tokens);
+    free(text);
+
+    const int prefix_len = 32;
+    if (tokens.len <= prefix_len) {
+        fprintf(stderr, "ds4: --kl-file needs more than %d tokens\n", prefix_len);
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+    int scored = tokens.len - prefix_len;
+    if (cfg->gen.n_predict > 0 && scored > cfg->gen.n_predict) scored = cfg->gen.n_predict;
+    if (scored > cfg->gen.ctx_size - prefix_len) scored = cfg->gen.ctx_size - prefix_len;
+    if (scored <= 0) {
+        fprintf(stderr, "ds4: context too small for KL scoring\n");
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+
+    FILE *fp = NULL;
+    uint32_t ref_positions = 0;
+    if (dumping) {
+        fp = fopen(cfg->gen.kl_ref_dump_path, "wb");
+        if (!fp) {
+            fprintf(stderr, "ds4: cannot open --kl-ref-dump output: %s\n",
+                    cfg->gen.kl_ref_dump_path);
+            ds4_tokens_free(&tokens);
+            return 1;
+        }
+        const uint32_t hdr[4] = { (uint32_t)vocab, (uint32_t)stride,
+                                  (uint32_t)prefix_len, 0 /* patched at end */ };
+        if (fwrite(DS4_KL_MAGIC, 1, 8, fp) != 8 || fwrite(hdr, 4, 4, fp) != 4) {
+            fprintf(stderr, "ds4: --kl-ref-dump header write failed\n");
+            fclose(fp);
+            ds4_tokens_free(&tokens);
+            return 1;
+        }
+    } else {
+        fp = fopen(cfg->gen.kl_score_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "ds4: cannot open --kl-score reference: %s\n",
+                    cfg->gen.kl_score_path);
+            ds4_tokens_free(&tokens);
+            return 1;
+        }
+        char magic[8];
+        uint32_t hdr[4];
+        if (fread(magic, 1, 8, fp) != 8 || memcmp(magic, DS4_KL_MAGIC, 8) != 0 ||
+            fread(hdr, 4, 4, fp) != 4 || hdr[0] != (uint32_t)vocab ||
+            hdr[1] != (uint32_t)stride || hdr[2] != (uint32_t)prefix_len) {
+            fprintf(stderr, "ds4: --kl-score reference is missing/incompatible "
+                            "(check vocab/--kl-stride/prefix match)\n");
+            fclose(fp);
+            ds4_tokens_free(&tokens);
+            return 1;
+        }
+        ref_positions = hdr[3];
+    }
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --kl-file requires a graph session backend\n");
+        fclose(fp);
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+
+    ds4_tokens prefix = {0};
+    for (int i = 0; i < prefix_len; i++) ds4_tokens_push(&prefix, tokens.v[i]);
+    char err[160];
+    int rc = 1;
+    float *logits = malloc((size_t)vocab * sizeof(float));
+    float *ref_logits = scoring ? malloc((size_t)vocab * sizeof(float)) : NULL;
+    double *pos_kl = scoring ? malloc(((size_t)scored / stride + 1) * sizeof(double)) : NULL;
+    uint32_t n_pos = 0;
+    if (!logits || (scoring && (!ref_logits || !pos_kl))) {
+        fprintf(stderr, "ds4: --kl-file allocation failed\n");
+        goto done;
+    }
+    if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: --kl-file prefix prefill failed: %s\n", err);
+        goto done;
+    }
+
+    for (int j = 0; j < scored; j++) {
+        const int i = prefix_len + j;
+        if ((j % stride) == 0) {
+            if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+                fprintf(stderr, "ds4: --kl-file logit capture failed at token %d\n", i);
+                goto done;
+            }
+            if (dumping) {
+                if (fwrite(logits, sizeof(float), (size_t)vocab, fp) != (size_t)vocab) {
+                    fprintf(stderr, "ds4: --kl-ref-dump write failed at token %d\n", i);
+                    goto done;
+                }
+            } else {
+                if (n_pos >= ref_positions) {
+                    fprintf(stderr, "ds4: --kl-score reference has only %u positions\n",
+                            ref_positions);
+                    goto done;
+                }
+                if (fread(ref_logits, sizeof(float), (size_t)vocab, fp) != (size_t)vocab) {
+                    fprintf(stderr, "ds4: --kl-score reference read failed\n");
+                    goto done;
+                }
+                /* KL(ref || cand) over softmaxed logits, f64 accumulation. */
+                double rmax = ref_logits[0], cmax = logits[0];
+                for (int v = 1; v < vocab; v++) {
+                    if (ref_logits[v] > rmax) rmax = ref_logits[v];
+                    if (logits[v] > cmax) cmax = logits[v];
+                }
+                double rsum = 0.0, csum = 0.0;
+                for (int v = 0; v < vocab; v++) {
+                    rsum += exp((double)ref_logits[v] - rmax);
+                    csum += exp((double)logits[v] - cmax);
+                }
+                const double rlog = rmax + log(rsum), clog = cmax + log(csum);
+                double kl = 0.0;
+                for (int v = 0; v < vocab; v++) {
+                    const double lp_r = (double)ref_logits[v] - rlog;
+                    const double p_r = exp(lp_r);
+                    if (p_r > 0.0) kl += p_r * (lp_r - ((double)logits[v] - clog));
+                }
+                pos_kl[n_pos] = kl;
+            }
+            n_pos++;
+        }
+        if (((j + 1) % 256) == 0 || j + 1 == scored) {
+            fprintf(stderr, "ds4: kl %s %d/%d\r", dumping ? "dump" : "score", j + 1, scored);
+            fflush(stderr);
+        }
+        if (j + 1 < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) {
+            fprintf(stderr, "\nds4: --kl-file decode failed at token %d: %s\n", i, err);
+            goto done;
+        }
+    }
+    fputc('\n', stderr);
+
+    if (dumping) {
+        /* Patch n_positions into the header. */
+        if (fseek(fp, 8 + 12, SEEK_SET) != 0 || fwrite(&n_pos, 4, 1, fp) != 1) {
+            fprintf(stderr, "ds4: --kl-ref-dump header patch failed\n");
+            goto done;
+        }
+        printf("kl_ref_dump=%s positions=%u vocab=%d stride=%d\n",
+               cfg->gen.kl_ref_dump_path, n_pos, vocab, stride);
+    } else {
+        double mean = 0.0;
+        for (uint32_t p = 0; p < n_pos; p++) mean += pos_kl[p];
+        mean = n_pos ? mean / n_pos : 0.0;
+        /* Contiguous-block means -> stderr, so short-range correlation between
+         * neighbouring positions doesn't understate the uncertainty. */
+        const uint32_t nblocks = n_pos / DS4_KL_BLOCK;
+        double var = 0.0;
+        for (uint32_t b = 0; b < nblocks; b++) {
+            double bm = 0.0;
+            for (uint32_t k = 0; k < DS4_KL_BLOCK; k++) bm += pos_kl[b * DS4_KL_BLOCK + k];
+            bm /= DS4_KL_BLOCK;
+            var += (bm - mean) * (bm - mean);
+        }
+        const double stderr_est = nblocks > 1 ?
+            sqrt(var / (nblocks * (nblocks - 1.0))) : 0.0;
+        printf("kl_mean=%.9e kl_stderr=%.9e positions=%u blocks=%u stride=%d\n",
+               mean, stderr_est, n_pos, nblocks, stride);
+    }
+    rc = 0;
+
+done:
+    free(logits);
+    free(ref_logits);
+    free(pos_kl);
+    if (fp) fclose(fp);
+    ds4_tokens_free(&prefix);
+    ds4_session_free(session);
+    ds4_tokens_free(&tokens);
+    return rc;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -1443,6 +1646,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-overlay")) {
+            c.engine.expert_overlay = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -1529,6 +1734,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--perplexity-file")) {
             c.gen.perplexity_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kl-file")) {
+            c.gen.kl_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kl-ref-dump")) {
+            c.gen.kl_ref_dump_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kl-score")) {
+            c.gen.kl_score_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kl-stride")) {
+            c.gen.kl_stride = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-dataset")) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {
@@ -1654,6 +1867,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
+    } else if (cfg.gen.kl_file_path) {
+        rc = run_kl_file(engine, &cfg);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

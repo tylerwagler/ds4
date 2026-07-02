@@ -2486,6 +2486,77 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 
 
 
+/* Device-cache a tensor span from an ARBITRARY GGUF file (--expert-overlay
+ * donor). The main weight-cache paths key on the base model's fd/map, so the
+ * overlay's spans are uploaded here explicitly: pread from the overlay's own
+ * fd through a pinned staging buffer, then registered in g_model_ranges under
+ * the overlay's host map so cuda_model_range_ptr resolves them like any other
+ * cached range. Runs at startup only (synchronous). */
+extern "C" int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
+                                            uint64_t offset, uint64_t bytes,
+                                            const char *label) {
+    if (!host_base_key || fd < 0 || bytes == 0) return 0;
+
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA overlay range alloc failed for %s (%.2f MiB): %s\n",
+                label ? label : "overlay", (double)bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    void *stage = NULL;
+    err = cudaMallocHost(&stage, (size_t)(bytes < chunk ? bytes : chunk));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA overlay staging alloc failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaFree(dev);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    for (uint64_t done = 0; done < bytes;) {
+        const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        uint64_t got = 0;
+        while (got < n) {
+            const ssize_t r = pread(fd, (char *)stage + got, (size_t)(n - got),
+                                    (off_t)(offset + done + got));
+            if (r <= 0) {
+                fprintf(stderr, "ds4: CUDA overlay read failed for %s at %.2f MiB: %s\n",
+                        label ? label : "overlay", (double)(done + got) / 1048576.0,
+                        r == 0 ? "unexpected EOF" : strerror(errno));
+                (void)cudaFreeHost(stage);
+                (void)cudaFree(dev);
+                return 0;
+            }
+            got += (uint64_t)r;
+        }
+        err = cudaMemcpy((char *)dev + done, stage, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA overlay upload failed for %s at %.2f MiB: %s\n",
+                    label ? label : "overlay", (double)done / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaFreeHost(stage);
+            (void)cudaFree(dev);
+            (void)cudaGetLastError();
+            return 0;
+        }
+        done += n;
+    }
+    (void)cudaFreeHost(stage);
+
+    g_model_ranges.push_back({host_base_key, offset, bytes, (char *)dev,
+                              NULL, NULL, 0, 0, 0});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    return 1;
+}
+
+
+
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);

@@ -441,6 +441,11 @@ typedef struct {
     uint64_t abs_offset;
     uint64_t elements;
     uint64_t bytes;
+    /* Set only when this entry was swapped in from an overlay GGUF
+     * (--expert-overlay): the payload lives at ext_map + abs_offset inside
+     * the overlay file's mapping instead of the owning model's map. */
+    const uint8_t *ext_map;
+    uint64_t ext_size;
 } ds4_tensor;
 
 typedef struct {
@@ -1218,6 +1223,8 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool gpu_ready;
     bool mtp_ready;
+    ds4_model overlay_model;
+    bool overlay_ready;
 };
 
 typedef struct {
@@ -1339,7 +1346,21 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const uint64_t *span_sizes,
                                             uint32_t span_count);
 const void *tensor_data(const ds4_model *m, const ds4_tensor *t);
+uint32_t model_apply_expert_overlay(ds4_model *base, const ds4_model *overlay,
+                                    const char *prefix);
+bool accelerator_prepare_expert_overlay(ds4_backend backend,
+                                        const ds4_model *base,
+                                        const ds4_model *overlay);
 void model_warm_weights(const ds4_model *m);
+
+/* Mapping that owns a tensor's payload: the overlay file's map for
+ * --expert-overlay swapped tensors, the base model's map otherwise. */
+static inline const void *tensor_map_base(const ds4_model *m, const ds4_tensor *t) {
+    return t->ext_map ? (const void *)t->ext_map : (const void *)m->map;
+}
+static inline uint64_t tensor_map_size(const ds4_model *m, const ds4_tensor *t) {
+    return t->ext_map ? t->ext_size : m->size;
+}
 void f16_round_inplace_cpu(float *x, uint32_t n);
 void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot);
 void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim);

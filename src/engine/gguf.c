@@ -769,9 +769,111 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
 
 
 
-/* Return the in-place tensor payload inside the mapped GGUF. */
+/* Return the in-place tensor payload inside the mapped GGUF (or inside the
+ * overlay file's mapping for --expert-overlay swapped tensors). */
 const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
-    return m->map + t->abs_offset;
+    return (const uint8_t *)tensor_map_base(m, t) + t->abs_offset;
+}
+
+
+
+/* Pre-populate device access for --expert-overlay swapped tensor spans.
+ * Must run at startup: the lazy weight-cache copy path cannot execute inside
+ * GPU graph encode (synchronous cudaMemcpy during capture fails), which is
+ * where an unprepared overlay span would otherwise first be touched. */
+bool accelerator_prepare_expert_overlay(ds4_backend backend,
+                                        const ds4_model *base,
+                                        const ds4_model *overlay) {
+    if (backend != DS4_BACKEND_CUDA) return true;
+    uint64_t prepared = 0;
+    for (uint64_t i = 0; i < base->n_tensors; i++) {
+        const ds4_tensor *t = &base->tensors[i];
+        if (t->ext_map != overlay->map || t->bytes == 0) continue;
+        char label[96];
+        snprintf(label, sizeof(label), "overlay:%.*s",
+                 (int)(t->name.len < 80 ? t->name.len : 80), t->name.ptr);
+        if (ds4_gpu_cache_external_range(overlay->map, overlay->fd,
+                                         t->abs_offset, t->bytes, label) == 0) {
+            fprintf(stderr, "ds4: failed to prepare expert-overlay span for %.*s\n",
+                    (int)t->name.len, t->name.ptr);
+            return false;
+        }
+        prepared += t->bytes;
+    }
+    fprintf(stderr, "ds4: expert overlay prepared %.2f GiB for device access\n",
+            (double)prepared / 1073741824.0);
+    return true;
+}
+
+
+
+/* Swap routed-expert tensor entries in the base model for same-named entries
+ * from an overlay GGUF (--expert-overlay FILE:PREFIX). Only 3D `*_exps.*`
+ * tensors whose name starts with the prefix are swapped, so the overlay never
+ * touches FP8-registered dense weights or streaming offset tables. A swapped
+ * entry keeps the overlay file's abs_offset and records the overlay mapping in
+ * ext_map/ext_size; consumers resolve the payload via tensor_data()/
+ * tensor_map_base(). Returns the number of tensors swapped. */
+static bool str_span_contains(const char *s, size_t len, const char *needle) {
+    const size_t nlen = strlen(needle);
+    if (len < nlen) return false;
+    for (size_t i = 0; i + nlen <= len; i++) {
+        if (memcmp(s + i, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+uint32_t model_apply_expert_overlay(ds4_model *base, const ds4_model *overlay,
+                                    const char *prefix) {
+    const size_t plen = strlen(prefix);
+    uint32_t swapped = 0;
+    for (uint64_t i = 0; i < base->n_tensors; i++) {
+        ds4_tensor *t = &base->tensors[i];
+        if (t->name.len < plen || memcmp(t->name.ptr, prefix, plen) != 0) continue;
+        /* GGUF names are length-prefixed, not NUL-terminated: every match
+         * below must stay bounded by name.len. */
+        if (t->ndim != 3 || !str_span_contains(t->name.ptr, t->name.len, "_exps.")) continue;
+        const ds4_tensor *ov = NULL;
+        for (uint64_t j = 0; j < overlay->n_tensors; j++) {
+            const ds4_tensor *c = &overlay->tensors[j];
+            if (c->name.len == t->name.len &&
+                memcmp(c->name.ptr, t->name.ptr, t->name.len) == 0) {
+                ov = c;
+                break;
+            }
+        }
+        if (!ov) {
+            fprintf(stderr, "ds4: expert overlay is missing tensor: %.*s\n",
+                    (int)t->name.len, t->name.ptr);
+            exit(1);
+        }
+        if (ov->ndim != t->ndim ||
+            memcmp(ov->dim, t->dim, sizeof(ov->dim)) != 0) {
+            fprintf(stderr, "ds4: expert overlay shape mismatch for %.*s\n",
+                    (int)t->name.len, t->name.ptr);
+            exit(1);
+        }
+        if (ov->type == DS4_TENSOR_CUTLASS_MXFP4) {
+            /* The CUTLASS grouped-GEMM prefill path device-asserts when its
+             * expert weights come from an overlay range (observed 2026-07-02,
+             * root cause not yet chased). The measurement harness only needs
+             * plain MXFP4/IQ2/Q2K donors, so refuse rather than corrupt. */
+            fprintf(stderr, "ds4: expert overlay does not support CUTLASS "
+                            "type-40 donor tensors yet (%.*s)\n",
+                    (int)t->name.len, t->name.ptr);
+            exit(1);
+        }
+        t->type = ov->type;
+        t->rel_offset = ov->rel_offset;
+        t->abs_offset = ov->abs_offset;
+        t->elements = ov->elements;
+        t->bytes = ov->bytes;
+        t->ext_map = overlay->map;
+        t->ext_size = overlay->size;
+        if (t->bytes > base->max_tensor_bytes) base->max_tensor_bytes = t->bytes;
+        swapped++;
+    }
+    return swapped;
 }
 
 

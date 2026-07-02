@@ -2244,6 +2244,44 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+    if (opt->expert_overlay && opt->expert_overlay[0]) {
+        if (e->ssd_streaming) {
+            fprintf(stderr, "ds4: --expert-overlay is not compatible with --ssd-streaming\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        const char *sep = strrchr(opt->expert_overlay, ':');
+        if (!sep || sep == opt->expert_overlay || !sep[1]) {
+            fprintf(stderr, "ds4: --expert-overlay expects FILE:PREFIX (e.g. donor.gguf:blk.17.)\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        char overlay_path[4096];
+        const size_t path_len = (size_t)(sep - opt->expert_overlay);
+        if (path_len >= sizeof(overlay_path)) {
+            fprintf(stderr, "ds4: --expert-overlay path is too long\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        memcpy(overlay_path, opt->expert_overlay, path_len);
+        overlay_path[path_len] = '\0';
+        model_open(&e->overlay_model, overlay_path, graph_backend, false);
+        e->overlay_ready = true;
+        const uint32_t swapped =
+            model_apply_expert_overlay(&e->model, &e->overlay_model, sep + 1);
+        if (swapped == 0) {
+            fprintf(stderr, "ds4: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
+                    sep + 1);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr, "ds4: expert overlay: %u tensors swapped in from %s (prefix %s)\n",
+                swapped, overlay_path, sep + 1);
+    }
     weights_bind(&e->weights,
                  &e->model,
                  load_slice,
@@ -2546,6 +2584,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
+        if (e->overlay_ready &&
+            !accelerator_prepare_expert_overlay(e->backend, &e->model,
+                                                &e->overlay_model)) {
+            fprintf(stderr, "ds4: %s failed to prepare expert-overlay spans\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
@@ -2624,6 +2671,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
+    if (e->overlay_ready) model_close(&e->overlay_model);
     model_close(&e->model);
     ds4_gpu_cleanup();
     ds4_ssd_memory_lock_release(&e->simulated_memory);

@@ -93,6 +93,10 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    /* "FILE:PREFIX" — swap routed-expert tensors whose name starts with
+     * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
+     * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */
+    const char *expert_overlay;
     ds4_backend backend;
     int n_threads;
     uint32_t prefill_chunk;
