@@ -108,8 +108,8 @@ src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/
 
 # CUTLASS MXFP4 tensor-core expert FFN (GB10/sm_120f). Requires -arch=sm_120f (family mode) for the
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
-src/cuda/ds4_mxfp4_cutlass.o: src/cuda/ds4_mxfp4_cutlass.cu
-	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda $(CUTLASS_INC) -c -o $@ src/cuda/ds4_mxfp4_cutlass.cu
+src/cuda/ds4_mxfp4_cutlass.o: src/cuda/ds4_mxfp4_cutlass.cu src/ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/ds4_mxfp4_cutlass.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

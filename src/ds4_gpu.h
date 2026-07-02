@@ -2,6 +2,7 @@
 #define DS4_GPU_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -800,6 +801,34 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
+
+/* CUTLASS Sm120 block-scaled MXFP4 grouped-expert FFN (DS4_TENSOR_CUTLASS_MXFP4, type 40).
+ * out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T for T tokens ALL ROUTED TO ONE EXPERT
+ * (the caller gathers per-expert rows via sorted_pairs before calling this, and scatters the
+ * result back). Wg/Wu/Wd are that expert's CUTLASS-packed [data, then SF] blob pointers, sliced
+ * by the caller from cutlass_mxfp4_expert_layout()'s stride/split-point. `scratch` must be at
+ * least ds4_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes; size once for the
+ * layer's shape at the largest T a single expert can see and reuse across every expert and
+ * every CUTLASS-typed layer sharing that shape -- this function does no allocation and no
+ * synchronization, unlike ds4_cutlass_expert_ffn (used only by the standalone test). */
+size_t ds4_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim);
+int ds4_cutlass_expert_ffn_scratch(
+        float          *out,
+        const float    *x,
+        const uint8_t  *Wg_d,
+        const uint8_t  *Wg_sf,
+        const uint8_t  *Wu_d,
+        const uint8_t  *Wu_sf,
+        const uint8_t  *Wd_d,
+        const uint8_t  *Wd_sf,
+        const float    *weights,
+        float           clamp,
+        int             T,
+        int             in_dim,
+        int             mid_dim,
+        int             out_dim,
+        uint8_t        *scratch,
+        size_t          scratch_bytes);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

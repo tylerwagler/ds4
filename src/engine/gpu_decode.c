@@ -1322,7 +1322,6 @@ bool gpu_graph_encode_decode_layer(
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
     const bool compressed = ds4_layer_compress_ratio(il) != 0;
@@ -2014,10 +2013,13 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
-    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
-    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    uint64_t gate_expert_bytes = 0, gate_row_bytes = 0;
+    uint64_t down_expert_bytes = 0, down_row_bytes = 0;
+    if (ok) {
+        ok = routed_expert_gate_down_layout(layer->ffn_gate_exps, layer->ffn_down_exps,
+                                            &gate_expert_bytes, &gate_row_bytes,
+                                            &down_expert_bytes, &down_row_bytes);
+    }
     if (ok && gpu_graph_decode_cpu_router_applicable(g, layer)) {
         ok = gpu_graph_decode_cpu_router(g, model, layer, il, (uint32_t)token);
     } else {

@@ -1832,13 +1832,15 @@ bool gpu_graph_encode_layer_ffn_batch(
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
-    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
-    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    uint64_t gate_expert_bytes = 0, gate_row_bytes = 0;
+    uint64_t down_expert_bytes = 0, down_row_bytes = 0;
+    if (!routed_expert_gate_down_layout(layer->ffn_gate_exps, layer->ffn_down_exps,
+                                        &gate_expert_bytes, &gate_row_bytes,
+                                        &down_expert_bytes, &down_row_bytes)) {
+        return false;
+    }
     const bool layer_stage_profile = gpu_graph_layer_stage_profile_enabled(il);
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_CUDA_PROFILE_FFN_STAGE(name) do { \

@@ -4,20 +4,12 @@
 (GB10/Blackwell, 128 GiB unified): high single-stream decode **and** real
 concurrent serving. Quality + speed are the constraint; cost is not.
 
-## Hardware we are NOT using yet
-| unit | status | our source already uses it? |
-|------|--------|------------------------------|
-| FP8 (E4M3) tensor cores | idle | yes — attn/dense weights are FP8 in the checkpoint |
-| FP4 (NVFP4) tensor cores | idle | yes — routed experts are FP4 (MXFP4) in the checkpoint |
-| MTP head | unused — and DROPPED from current quant (no `blk.43`); needs re-quant | DeepSeek-V4-Flash ships one (`nextn_predict_layers=1`) |
-| DSpark/DFlash drafts | no runtime in ds4 (MTP only) | official DSpark module exists upstream |
-
 ## Bottleneck map (decides which lever helps where)
 - **Single-stream decode** = **memory-bandwidth bound** (read selected experts + KV/token).
   Levers: **MTP** (more useful tokens per memory sweep); smaller quant for the bulk.
   *Tensor cores DON'T help here* (batch=1, no compute to saturate).
-- **Prefill** = **compute bound**. Levers: FP8 / NVFP4 tensor cores.
-- **Concurrency (N streams)** = **compute bound** (batched grouped-GEMM). Lever: **NVFP4**.
+- **Prefill** = **compute bound**. Levers: FP8 / FP4 tensor cores.
+- **Concurrency (N streams)** = **compute bound** (batched grouped-GEMM). Lever: **MXFP4**.
   This is the serving play.
 
 Measured (2026-06-29, oracle-fp8wh-99gb, FP8 workhorse path, no spec decode, un-clock-pinned):
@@ -31,16 +23,19 @@ smart-99gb baseline was ~12.7 — the 2x gap was the graph bug + greedy decode, 
 ### P0 — HF→ds4 GGUF converter  [FOUNDATIONAL — owns both levers]
 Today we re-quantize antirez's pre-made `template.gguf`, inheriting its conversion choices
 (it **dropped the MTP head**; we can't change per-tensor precision at conversion time). Owning
-the HF→ds4 conversion gives full control of speed AND quality: set precision per tensor, include
-MTP, emit FP8/MXFP4 drafts matched to the main model. **De-risked:** the `hc_*` highway tensors
-are present in the HF source (`layers.N.hc_attn_base/fn/scale`, `hc_ffn_*`) — NOT derived — so
-this is a mechanical name-remap + expert-stack + weight/scale→block-pack, not architecture RE.
-- **Source:** `DeepSeek-V4-Flash` HF safetensors (46 shards): `layers.N.attn.{wkv,wq_a,wq_b,wo_a,wo_b}`,
-  `layers.N.hc_*`, `layers.N.ffn.experts.K.w{1,2,3}`, `mtp.0.*` (shard 46) — each `.weight`+`.scale`
-  (native MXFP4 E2M1+E8M0 / FP8 E4M3).
-- **Target:** match `template.gguf`'s exact block layout (reverse-engineer by diffing one known
-  tensor HF-vs-template); remap to `blk.N.*`/`mtp.0.*`, stack experts into `ffn_{gate,up,down}_exps`,
-  write `deepseek4.*` metadata.
+the HF→ds4 conversion gives control of speed AND quality: set precision per tensor, include
+MTP, emit expert quants matched to the production decode path. **Source formats** per tensor group:
+- **Dense/attention:** native FP8 E4M3 (repack only, lossless → FP8_E4M3)
+- **Routed experts:** native MXFP4 E2M1+E8M0/32 (must quantize down to IQ2_XXS/Q2_K for the
+  primary decode path; can repack lossless → FP4_E2M1 for the non-TC MXFP4 path)
+- **Compressor/indexer/HC:** F16 (can repack → MXFP8 per P2e)
+- **lm_head:** BF16 or FP8 (repack only; FP8 pending KL gate)
+
+So P0 is both a repacker (for FP8, MXFP4, F16 groups that stay at their source precision)
+and a **quantizer** (for the MXFP4→IQ2_XXS/Q2_K expert path that powers decode today).
+- **Target layout:** match `template.gguf`'s exact block layout (reverse-engineer by diffing
+  one known tensor HF-vs-template); remap to `blk.N.*`/`mtp.0.*`, stack experts into
+  `ffn_{gate,up,down}_exps`, write `deepseek4.*` metadata.
 - **Stage:** (1) MTP draft layer only → validates the codec + yields an FP8/MXFP4 draft (higher
   accept → more spec-decode gain, pairs with P1); (2) full main model incl `mtp.0.*` → feeds P3
   (MXFP4 experts) and P2d (zero-Q8). Removes the antirez-`template.gguf` dependency entirely.
@@ -53,32 +48,144 @@ spec decode. Reference: Qwen-class (≈10-14B active) with DFlash-grade drafts h
 on this hardware. Target: **60+ t/s decode** via DSpark.
 
 "DSpark" = DeepSeek's 2026 spec-decode method (`github.com/deepseek-ai/DeepSpec`, also ships
-DFlash + Eagle3), NOT DGX Spark (naming clash). Staged:
+DFlash + Eagle3), NOT DGX Spark (naming clash). MTP skipped — straight to DSpark.
 
-- **P1a — Native MTP baseline (OFF-THE-SHELF DRAFT, do first).**
-  The MTP head is NOT embedded in the main GGUF — ds4 loads it as a **separate draft model**
-  (`mtp_weights_bind(&e->mtp_weights, &e->mtp_model)`) via `--mtp FILE`. antirez ships the
-  draft pre-made: **`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`** (~3.5 GB) in
-  `antirez/deepseek-v4-gguf` (`download_model.sh mtp`). So this is a **3.5 GB download**, not a
-  re-quant. (The `nextn_predict_layers=1` metadata in the main quant is a red herring — the
-  HF source ships `mtp.0.*` 1575 tensors but our `template.gguf` dropped them; doesn't matter,
-  the draft is standalone.) Serve `oracle-fp8wh --mtp DRAFT.gguf --mtp-draft 2 --mtp-margin 3`;
-  DeepSeek native MTP accepts ~1.8-2.2 tok/step → clock-pinned **~45-55 t/s**. Proves the
-  verify/accept loop on THIS model before investing in a custom DSpark runtime.
+- **DSpark:**
+  **Reference:** vLLM PR #46995 (benchislett/NVIDIA, merged 2026-07-01 into mainline vLLM),
+  SGLang PR #29538 (adityakamat24, open).
 
-- **P1b — DSpark serving (the 60+ play, BIG lift, two builds).**
-  Source: `deepseek-ai/DeepSeek-V4-Flash-DSpark` = same weights + an official pre-trained
-  DSpark draft module (higher accept than vanilla MTP). Two prerequisites, BOTH currently
-  missing in ds4:
-  1. **DSpark drafter → GGUF.** Convert the DSpark draft module to ds4's draft format.
-     OPEN: confirm a DS4-Flash DSpark/DFlash drafter is published (z-lab hosts DFlash for
-     Qwen3.5/3.6, Kimi; drafter is model-specific — a Qwen one will NOT transfer).
-  2. **DSpark runtime in ds4.c.** ds4 has MTP only — NO DSpark/DFlash/Eagle3 runtime.
-     Needs: draft-model load, the multi-step draft → batched verify → accept loop, and
-     draft attention (tree or linear). This is real engine code, not a flag.
-  BUILD-vs-INHERIT: best case antirez adds DSpark upstream and we inherit on the clean fork
-  — watch `antirez/main`. Otherwise we build the accept-loop ourselves (P1a's `--mtp` path
-  is the scaffold to extend). Decide after P1a's measured native-MTP number.
+  **Source checkpoint:** `deepseek-ai/DeepSeek-V4-Flash-DSpark` on HF — same 284B V4-Flash
+  weights plus a pre-trained DSpark draft module (~9 GB addl) bundled as 48 safetensors shards
+  (167 GB total). Downloaded at `/mnt/pve1-fast/hub/models--deepseek-ai--DeepSeek-V4-Flash-DSpark/`.
+
+  **Actual checkpoint structure (discovered 2026-07-02 from HF weight_map):**
+
+  The DSpark draft module uses `mtp.N.*` namespace (not `model.dspark_model.*` as earlier
+  docs assumed).  Its layers are interleaved in the same 48 shards as the main model.
+
+  ```
+  mtp.0.main_proj          → target hidden projection (FP8, weight + scale)
+  mtp.0.main_norm          → RMS norm after projection
+  mtp.0.{attn,ffn,etc}     → 1st draft decoder layer (full layer: attn + MoE + HC)
+  mtp.1.{attn,ffn,etc}     → 2nd draft decoder layer
+  mtp.2.{attn,ffn,etc}     → 3rd draft decoder layer
+  mtp.2.markov_head        → markov_w1 (vocab→256) + markov_w2 (256→vocab)
+  mtp.2.confidence_head    → proj.weight (4096+256→1, linear)
+  mtp.2.hc_head_*          → HC collapse (base/fn/scale, same pattern as main model)
+  mtp.2.norm               → final RMS norm
+  ```
+
+  Each of the 3 draft decoder layers has its own 256 routed experts (MXFP4, `.weight` + `.scale`)
+  and shared experts (FP8), same architecture as a main model layer but with **compression
+  ratio = 0** (no compressor, no indexer) and **non-causal sliding-window attention**.
+
+  - **Flow**: target layers 40-42 HC states → concat → `main_proj` FP8 matmul → `main_norm` →
+    [decoder layer mtp.0] → [decoder layer mtp.1] → [decoder layer mtp.2] →
+    Markov refine (sequential over 5 positions) → confidence score → HC collapse → lm_head.
+  - **Block size**: 5 draft tokens per speculative step (configurable).
+  - **Draft KV**: 3-layer raw SWA cache (no compressor state, window=128), seeded from
+    target hidden states via `kv_from_hidden`.
+  - vLLM implements non-causal SWA by reusing SparseMLA backends with expanded topk
+    (queries all include each other independent of causality) — avoids custom kernels.
+
+  **vLLM production numbers** (8×B300, DeepSeek-V4-Pro-DSpark): ~250 tok/s at BS1, ~5 avg
+  acceptance length at draft depth 7, 12-42% higher acceptance than MTP across SPEED-Bench
+  categories, ~14ms E2E step time (0.6ms backbone + 0.6ms sampling + 11-13ms verify).
+  Full DFlash backbone + autoregressive sampling captured in one CUDA graph.
+
+  **Implementation (10 sub-items, ~1800-2500 lines C/CUDA):**
+
+  1. **GGUF conversion** — convert the 48-shard HF safetensors to GGUF format for ds4's
+     mmap-backed weight loader. The draft weights live under the `mtp.0.*`, `mtp.1.*`,
+     `mtp.2.*` namespace in the HF checkpoint. Two approaches: (a) combined single GGUF
+     (simpler, but the ~9 GB draft is always mapped), or (b) separate draft GGUF loaded
+     via `--dspark` flag (same pattern as `--mtp`). Reuse `gguf-tools` encoder infra.
+     The main model tensors (`layers.*`, `embed.*`, `output.*`) are already handled by the
+     existing quantizer; the DSpark module adds ~4700 new tensor names under `mtp.*`.
+     *Effort: ~200-300 lines.*
+
+  2. **Weight binding** (`weights.c`) — new `ds4_dspark_weights` struct + binder. Tensors
+     in GGUF format using `dspark.` prefix:
+     - `dspark.main_proj.weight` / `.scale` — target hidden projection (FP8)
+     - `dspark.main_norm.weight` — projection output norm (F32)
+     - `dspark.0.{attn,ffn,hc_*,norm,etc}.*` — 1st decoder layer weights
+     - `dspark.1.*` — 2nd decoder layer weights
+     - `dspark.2.*` — 3rd decoder layer weights
+     - `dspark.2.hc_head_*` / `dspark.2.markov_head.*` / `dspark.2.confidence_head.*`
+     - `dspark.2.norm.weight` — final norm
+     The `deepseek4-quantize.c` MTP name mapping already handles `mtp.N.*`→`mtp.N.*`
+     identity mapping; for GGUF we'll use `dspark.N.*` naming to avoid confusion with
+     the legacy MTP `mtp.0.*` prefix.
+     *Effort: ~100 lines.*
+
+  3. **GPU graph allocation** (`gpu_graph_alloc.c`) — extend `ds4_gpu_graph` with draft
+     model tensor views: 3 decoder layers' working buffers, 3-layer draft KV raw cache
+     (128 SWA window each), hidden state intermediates for projection/Markov/confidence.
+     *Effort: ~200 lines.*
+
+  4. **Draft backbone forward** — `dspark_forward_backbone()`: runs 3 decoder layers via
+     the existing `gpu_graph_encode_decode_layer` pipeline, but with a **non-causal**
+     attention mask. The 5 draft positions form a sliding-window "sentence" where every
+     token attends to every other. This requires adding a 4th attention mode to the fused
+     kernel (alongside causal, SWA, batched). *Effort: ~200 lines kernel mod + orchestration.*
+
+  5. **Target hidden capture** — capture main model's HC state at layers 40, 41, 42 →
+     concat → `dspark.main_proj` FP8 matmul → `dspark.main_norm` RMS norm.
+     The target layers' HC tensors are live in the main graph after each decode step;
+     this reads them before they're overwritten. *Effort: ~100 lines.*
+
+  6. **Markov + confidence heads** — two small CUDA kernels:
+     - `dspark_markov_refine()`: for each of 5 positions, gather `markov_w1[prev_token]`,
+       project via `markov_w2`, add to base logits, argmax. Sequential across positions,
+       but each step is just an embedding lookup + bias add.
+     - `dspark_confidence_score()`: concat hidden + markov embed, linear, sigmoid.
+     *Effort: ~150 lines.*
+
+  7. **Block spec decode cycle** (`session.c`) — new `ds4_session_eval_speculative_block()`,
+     parallel to the existing `ds4_session_eval_speculative_argmax`. Flow per step:
+     (1) capture target hidden states from layers 40-42,
+     (2) `project_main_hidden()` → 3-layer backbone → block hidden,
+     (3) shared norm + lm_head → base logits for all 5 positions,
+     (4) Markov refine + confidence score,
+     (5) submit draft block to target verify (`gpu_graph_verify_suffix_tops`),
+     (6) rejection sampling: accept longest valid prefix,
+     (7) materialize accepted KV rows into draft cache via `kv_from_hidden`,
+     (8) frontier snapshot/restore for partial accept (reuse existing `spec_frontier_*` infra).
+     *Effort: ~600-1000 lines. Crib from vLLM's `speculator.py`/`dspark_worker_v2.py`
+     and SGLang's `dspark_worker_v2.py` — the logic is well-documented Python, transliterate
+     to C/CUDA.*
+
+  8. **CUDA graph capture** — capture the full draft cycle (capture + backbone + markov +
+     verify) in one CUDA graph per decode step, matching vLLM's approach. Reuse the existing
+     CUDA graph infrastructure. *Effort: ~100 lines.*
+
+  9. **Server integration** (`generate.c`, `cli_main.c`) — `--dspark` flag, gating rules:
+     greedy-only (temperature <= 0.0), not with SSD-streaming, conflicts with `--mtp`.
+     Wire to `ds4_session_eval_speculative_block()` in the server's generation loop.
+     *Effort: ~50 lines.*
+
+  10. **Load-aware scheduler** (deferrable) — confidence-threshold based verification
+      budget trim, per P1b measured numbers. The confidence head outputs per-position
+      survival probability; the scheduler uses these + GPU utilization to decide how
+      many of the 5 draft tokens to actually submit for verification. Useful for
+      concurrency; nearly irrelevant for single-stream. *Effort: ~200-300 lines.*
+
+  **GPU memory budget for DSpark draft:**
+  | Component | Size |
+  |-----------|------|
+  | 3 decoder layer weights (FP8 attn/dense/shared, MXFP4 experts) | ~9 GB |
+  | 3-layer draft KV cache (128 SWA × 3) | ~7 MiB |
+  | Hidden state buffers (backbone + projection intermediates) | ~10 MiB |
+  | **Total** | **~9 GB** (vs 97 GB target → ~9% overhead) |
+
+  **Open questions to resolve before P1b build:**
+  1. **GGUF format**: Bundle draft weights in the main GGUF, or load as a separate file
+     (`--dspark DRAFT.gguf`, same pattern as `--mtp`)?
+  2. **Non-causal attention**: The existing fused attention kernels (`ds4_cuda_attn.cu`)
+     assume causal masking. How much surgery to add a non-causal SWA mode for the 3 draft
+     layers? vLLM reused SparseMLA backends; ds4 has different attention kernel architecture.
+  3. **Confidence threshold**: Tunable runtime flag or hardcoded default (paper uses 0.5)?
+  4. **Target layer selection**: DSpark Flash uses layers 40-42. Configurable, or bake it?
 
 ### P2 — FP8 (the decode/quality track)  [MEDIUM]
 FP8 is the *decode* play: everything read every token (KV, attn proj, always-on shared
@@ -183,6 +290,38 @@ Dependency reality: **the math is NVIDIA; vLLM is optional and only for MoE fusi
   TODO: either finish wiring `ds4_cutlass_expert_ffn` into `routed_moe_launch`, or extend
   `use_sorted_pairs`-style batching to the MXFP4 path before shipping it as the default
   expert format.
+- **WIRED (2026-07-02): the CUTLASS path is now live and functionally correct, prefill wins,
+  decode regresses.** New tensor type `DS4_TENSOR_CUTLASS_MXFP4 = 40` (expert-major
+  ColumnMajor E2M1 data + swizzled E8M0 SF per expert, `cutlass_mxfp4_expert_layout()` in
+  `gguf.c`); accepted through `weights.c` validation as a third routed-expert combo; a new
+  `routed_moe_launch_cutlass()` in `ds4_cuda_moe.cu` sorts tokens by expert (reusing the
+  existing count/prefix/scatter kernels), gathers each active expert's rows, calls a
+  rewritten `ds4_cutlass_expert_ffn_scratch()` (caller-provided scratch via `cuda_tmp_alloc`,
+  no more per-call cudaMalloc/cudaFree/cudaDeviceSynchronize — that was 10 allocations per
+  call in the original standalone-test code), and scatters results back for the existing
+  `moe_sum_kernel` to reduce. Standalone CUTLASS kernel test still passes bit-exact
+  (`max_rel=0.00000`) after the scratch-buffer refactor. Loaded and served
+  `oracle-cutlass-mxfp4-99gb.gguf` end-to-end; `--logprob-vectors`, `--tensor-equivalence`,
+  `--short-prefill-ratio4`, `--local-golden-vectors` all pass, zero top-1 mismatches.
+  **Measured on this GB10** (`ds4-bench`, `speed-bench/promessi_sposi.txt`, ctx 2048-8192):
+  prefill **404-445 t/s** (matches/slightly beats the 431 t/s FP8-only baseline — expected,
+  since only 6/43 layers are CUTLASS) but decode is **~13 t/s, roughly HALF the ~25.5 t/s
+  baseline** — a real regression, not the "decode-neutral" this section predicted.
+  **ROOT CAUSE (diagnosed, not yet fixed):** CUTLASS's dense `GemmUniversal` interface needs
+  each expert's token count as a host-side int at GEMM-launch time (unlike the qwarp32 path,
+  which processes (token,expert) pairs independently on-device). `routed_moe_launch_cutlass`
+  reads the sorted-pairs `offsets[]` back with a blocking `cudaMemcpy` once per CUTLASS layer
+  per forward pass. For decode (n_tokens=1, 6 rich layers) that's 6 host syncs added to every
+  decode step; the measured throughput is nearly flat across context depth (12.98→13.08→
+  13.06→12.98 t/s @ 2k/4k/6k/8k) instead of declining the way the depth-dependent KV-read
+  baseline does (25.5→24.5→21.6 @ d0/4k/8k) — consistent with a fixed per-token sync cost
+  dominating over the real, small, depth-dependent component. TODO before shipping this as
+  the default expert path: eliminate the decode-time sync, most likely by special-casing
+  n_tokens==1 (a single token's routing to ≤n_expert distinct experts needs no sorting at
+  all) and sourcing the routing decision from wherever it's already host-visible in the
+  decode path rather than a fresh readback, or by having CUTLASS accept a device-side/fixed
+  worst-case M and avoid the host round-trip entirely. Until fixed, do not point production
+  decode traffic at a CUTLASS-typed GGUF.
 
 **NVFP4** (E2M1 + E4M3 per-16 microscale + FP32 global, ~4.5 bpw) stays in our pocket for
 quantizing *from high precision* (bf16) — e.g. if we ever push attn/dense below FP8 — where
@@ -224,43 +363,119 @@ streaming expert cache is the natural home (it already gates experts in/out of R
 activity). CAVEAT: pruning trades general capability for fit -- safe at 5-20%, aggressive
 only for a narrow/fixed workload profile.
 
-## Quick wins (2026-07-02 audit, near-zero risk)
-- **Prefill QK-norm+RoPE fusion gap — DONE (2026-07-02).** Prefill (`gpu_prefill.c`) now calls
-  `ds4_gpu_head_rms_norm_rope_tail_tensor` (same fused kernel decode already used, generic
-  over `n_tok`), mirroring decode's debug-dump guard so `DS4_CUDA_GRAPH_DUMP_*` tracing still
-  sees the intermediate "Qnorm" state when requested. Verified against oracle-zeroq8-99gb.gguf:
-  `--logprob-vectors`, `--local-golden-vectors`, `--short-prefill-ratio4` (n=1,2,3, directly
-  exercises the changed path), `--tensor-equivalence` all pass, zero top-1 mismatches,
-  short-prompt cases bit-identical to reference. Not yet re-benchmarked for t/s delta.
+## Tasks
+
+| ID | Task | Phase | Status | Blocked By | Est. Effort |
+|----|------|-------|--------|------------|-------------|
+| P0 | HF→ds4 GGUF converter (repacker + quantizer) | P0 | **done** | — | ~1-2 weeks |
+| P1.1 | DSpark: GGUF conversion | P1 | planned | — | 200-300 lines |
+| P1.2 | DSpark: weight binding | P1 | planned | P1.1 | 100 lines |
+| P1.3 | DSpark: GPU graph allocation | P1 | planned | P1.1 | 200 lines |
+| P1.4 | Non-causal SWA attention mode (= A4) | P1 | planned | — | 200 lines |
+| P1.5 | DSpark: target hidden capture | P1 | planned | P1.2 | 100 lines |
+| P1.6 | DSpark: Markov + confidence heads | P1 | planned | P1.2 | 150 lines |
+| P1.7 | DSpark: block spec decode cycle | P1 | planned | P1.3, P1.4, P1.5, P1.6, A3 | 600-1000 lines |
+| P1.8 | DSpark: CUDA graph capture | P1 | planned | P1.7 | 100 lines |
+| P1.9 | DSpark: server integration (`--dspark`) | P1 | planned | P1.7 | 50 lines |
+| P1.10 | DSpark: load-aware scheduler | P1 | deferred | P1.7 | 200-300 lines |
+| P2a | Real packed FP8 KV cache (replace fake-quant) | P2 | planned | — | ~1 week |
+| P2b | Profiling GATE (decode split analysis) | P2 | planned | — | ~1 day |
+| P2d.lm | lm_head MXFP8 + KL/perplexity gate | P2 | planned | P2b | ~3 days |
+| P2e | MXFP8 for F16 weight groups (compressor, indexer, HC) | P2 | planned | — | ~1 week |
+| P3 | Wire MXFP4 CUTLASS TC path (or extend prefill batching) | P3 | planned | P0 | ~2 weeks |
+| P4 | Oracle-driven multi-format allocation | P4 | deferred | P2/P3 formats settled | ~1 week |
+| P5 | Expert pruning (REAP/RIY) | P5 | deferred | — | ~1 week |
+| A1 | Fused prefill attention kernel (Flash-style tiling) | — | planned | — | ~2 weeks |
+| A3 | Multi-sequence KV paging (vLLM-style) | — | planned | — | ~1 week |
+
+**Legenda:**
+- Status: **NEXT** = immediate next item; **planned** = spec'd but not started; **in_progress** = active; **done** = complete; **deferred** = lower priority, not blocking.
+- A1 and A3 are attention-infrastructure items tracked here but owned by the appendix.
+- P2c and P2d.attn_output (attn_output_a/b MXFP8) are **done** — not listed here.
+- MTP (P1a) skipped — straight to DSpark.
+
+**Dependency graph (simplified):**
+```
+P0 ──┬──→ P3 (MXFP4 TC path)
+     └──→ P2d.lm (lm_head format)
+P1.1 → P1.2 → P1.3 ─┐
+P1.4 ────────────────┤
+P1.5 ────────────────┤──→ P1.7 → P1.8 → P1.9
+P1.6 ────────────────┤         └──→ P1.10
+A3 ──────────────────┘
+P2b ──→ P2d.lm (profile before lm_head FP8)
+```
+
+## Appendix: Attention architecture (2026-07-02 audit)
+
+ds4 attention is **Multi-Query Attention (MQA)** — 64/128 query heads, **1 KV head**, head dim
+512 — entirely custom CUDA, no FlashAttention or FlashInfer dependency. The computation is
+standard scaled dot-product (`score = dot(Q,K) / sqrt(512)`), online softmax (running max/sum),
+V accumulation, all **FP32**. Three-tier KV cache per layer: raw ring buffer (128 SWA window),
+attention-compressed (ratio 4 or 128 via learned MLP), and indexer-compressed (ratio 4 only,
+128-dim via top-K selection).
+
+**Identified improvement opportunities, highest ROI first:**
+
+1. **Fused prefill attention kernel (replace cuBLAS SGEMM path).** Today prefill does
+   `QK^T → HBM → softmax → HBM → PV → HBM` — three HBM round trips via cuBLAS strided-batched
+   SGEMM. A single fused kernel with FlashAttention-style tiling (partial accumulators in SRAM,
+   one write) would cut prefill attention HBM traffic ~3×. This is the single biggest latency
+   lever for long-prompt prefill (e.g. 32K tokens). *Reference: the decode path already does
+   fused online softmax; extend the pattern to batched prefill.*
+
+2. **Real packed FP8 KV cache (vs current fake-quant).** The raw cache stores `float[512]` per
+   entry — 2 KB/token/layer. The existing `fp8_kv_quantize_kernel` rounds to E4M3 grid but
+   writes back as f32 (zero bandwidth win). Repacking to ~1-byte FP8 halves KV bandwidth and
+   memory — the biggest decode win at context depth. Already flagged in P2a as deferred work;
+   prioritize the compressed-cache repack over the raw window (the 128-token window is only
+   ~11 MiB across 43 layers). *Also: remove the hard-coded `DS4_CUDA_SCORE_BUF_CAP = 8192`
+   compressed-row limit that truncates sessions above 8K compressed KV.*
+
+3. **Multi-sequence KV paging for speculative decode.** The ring buffer is a single contiguous
+   slab. Both MTP (existing) and DSpark (planned) need independent KV state for multiple
+   candidate sequences during verification. A page-table-based KV cache (vLLM-style) would
+   let draft and target models share memory efficiently, and enable the `kv_from_hidden` seed
+   required by DSpark's draft KV initialization. *Prerequisite for P1b item 7 (block spec
+   decode cycle).*
+
+4. **Non-causal SWA mode (for DSpark draft backbone).** All current kernels assume causal
+   masking. DSpark's 3-layer draft backbone needs all 5 draft positions to attend to each
+   other in a single forward pass. Add a 4th attention mode alongside causal, SWA, and
+   batched — the new mode uses the same kernel pipeline but with a non-causal mask (every
+   position visible to every other, bounded by the SWA window). *P1b item 4, ~200 lines.*
+
+5. **Blackwell TMA + WGMMA for decode attention.** The CUTLASS submodule ships Blackwell FMHA
+   examples (`examples/77_blackwell_fmha/`) using TMA for async tensor loads and WGMMA for
+   warp-group matmul. All ds4 attention kernels are hand-written warp-level — porting the hot
+   decode kernel to TMA+WGMMA would overlap KV loads with compute and improve shared memory
+   utilization. Lower ROI than items 1-4 due to current memory-bandwidth-bound decode (TMA
+   helps compute-bound workloads more). *Defer until after P1b.*
+
+**Why ds4 doesn't need FlashAttention or FlashInfer:**
+- **MQA simplification:** With 1 KV head and SWA=128, the KV set is always bounded (256 raw
+  max + 8192 compressed). Full-scan fits in registers with no HBM intermediate writes —
+  FlashAttention's tiling overhead isn't justified.
+- **Specialized beats general:** ds4's kernels are hard-coded for exactly one shape set
+  (Flash/Pro), one cache topology, one dispatch pattern. No JIT, no template dispatch, no
+  branching — every kernel call is a straight-line CUDA graph node for the GB10 Tensor Cores.
+- **Trade-off:** This specialization blocks FlashInfer's features (paged KV, tree attention,
+  ALiBi, MLA) and makes non-causal or multi-sequence attention harder to add. The P1b DSpark
+  build pays this tax.
 
 ## Curated format menu (every format must earn its kernel)
-| bpw  | format   | hw path        | role |
-|------|----------|----------------|------|
-| 0    | PRUNE    | n/a (skip)     | dead experts for the workload (REAP/RIY) |
-| 2.06 | IQ2_XXS  | int (native)   | bulk experts (memory-bound decode) |
-| 2.6  | Q2_K     | int (native)   | bulk experts |
-| 3.4  | Q3_K     | int (native)   | mid experts (granularity) |
-| 4.5  | Q4_K     | int / mmq      | rich experts (memory-bound; lossy vs E2M1 source) |
-| 4.25 | **MXFP4**| **FP4 cores**  | rich experts — LOSSLESS vs the E2M1+E8M0/32 source, replaces Q4_K |
-| 4.5  | NVFP4    | FP4 cores      | only for quantizing from bf16 (block-16 E4M3 + global); not for experts |
-| ~8.25| **FP8**  | **FP8 cores**  | attention/dense (source-matched) |
-| 8.5  | Q8_0     | int            | precision-critical attn/output |
-Rule: ~5-7 non-redundant, hardware-aligned tiers. The oracle picks; don't stack
-redundant same-bpw formats (e.g. NVFP4 vs Q4_K is a *path* choice, not two slots).
-
-## Idea verdicts (2026-06-28)
-1. **FP8 + MXFP4 — YES, staged, both NVIDIA-first (vLLM optional).** FP8 (MXFP8) = cuBLASLt
-   dense GEMM, no vLLM/CUTLASS (KV already in antirez). MXFP4 = the experts' *native* source
-   format (E2M1+E8M0/32) → lossless, replaces lossy Q4_K, rides the same VEC32_UE8M0 swizzle.
-   The matmul is NVIDIA (cuBLASLt/CUTLASS); vLLM only a shortcut for grouped-MoE fusion (the
-   prefill/concurrency play, decode-neutral). Encoders are ours. NVFP4 = from-bf16 only.
-2. **INT4 / AutoRound — NO for this model.** AutoRound optimizes rounding *from high precision*;
-   our experts are FP4 at source, so the gain collapses to RTN. INT4 ≈ Q4_K we already have.
-   Revisit only for a bf16-source model.
-3. **Many formats — YES, curated.** Dispatch is free; kernels are the cost. ~5-7 hw-aligned tiers.
-4. **Expert pruning (REAP/RIY) — YES, high value.** Workload-profiled dead-expert removal
-   = the 0-bit tier; reclaims memory to keep live experts at FP4 instead of IQ2. The
-   activation profile becomes the master sensitivity signal for prune+quant+stream.
+| bpw  | format     | hw path                    | role |
+|------|------------|----------------------------|------|
+| 0    | PRUNE      | n/a (skip)                 | dead experts (P5, not yet built) |
+| 2.06 | IQ2_XXS    | int (native)               | bulk experts: gate/up in IQ2 combo |
+| 2.6  | Q2_K       | int (native)               | bulk experts: down in IQ2 combo |
+| 4.25 | MXFP4      | warp Q8_K dot (no TC yet)  | rich experts (type-39 active; CUTLASS type-40 TC path is dead code) |
+| ~8.25| FP8_E4M3   | FP8 TC / cuBLASLt MX       | attention/dense/shared experts (primary workhorse) |
+| 16   | BF16       | cuBLASLt / custom          | lm_head only (precision tier; FP8 pending KL gate) |
+Adopted: FP8+MXFP4 in P2/P3, expert pruning in P5. Rejected: INT4/AutoRound. Removed from table
+(rejected at load): Q3_K (never implemented), Q4_K (lossy vs MXFP4 source, removed),
+Q8_0 (replaced by MXFP8 for weights; Q8_K retained only as activation quant inside MoE kernels).
+NVFP4 dropped — no source weights are BF16, so the format has no application here.
 
 ## Rejected / parked
 - **PR#266 rows/block 8→16 occupancy opt** — REJECTED (2026-06-30). The upstream PR is *buggy* (verbatim it leaves half the rows unwritten + mixes the rest — proven in a standalone micro-test: 1024/2048 wrong). A *correct* reimplementation (16 threads/row + 16-wide segmented reduction; MoE rr<8/*256/keep-rr*32) is coherent but **perf-neutral on GB10**: decode 26.6 vs 26.2, prefill 437 vs 434 (within noise). Decode is bandwidth-bound (~74% MBU), not occupancy-bound, so the knob can't help. Don't revisit; the single-stream lever is spec decode (P1).
@@ -274,9 +489,15 @@ redundant same-bpw formats (e.g. NVFP4 vs Q4_K is a *path* choice, not two slots
 - DONE: oracle quant (oracle-99gb, Q8 non-experts) validated at parity with hand baseline.
 - DONE: P2 FP8 workhorse (MXFP8 attn/dense/shared via cuBLASLt MX prefill + mmvq decode) —
   validated coherent, measured 25.5 t/s decode / 431 t/s prefill @depth0.
-- NEXT: P1a — re-quant including `blk.43` MTP head → native `--mtp` baseline → then P1b DSpark serving.
-- DONE (2026-07-02): performance audit of the full active-path table against source. Found
-  the P3 CUTLASS MXFP4 path is dead code (never called) and disables prefill batching for
-  MXFP4 experts; KV "FP8" (2a) is fake-quant only with zero bandwidth win banked; confirmed
-  the attn_output_a MX-GEMM shape gate is reachable for the real model shape. See the P2/P3
-  status updates, the new 2e item, and Quick wins above.
+- DONE: Prefill QK-norm+RoPE fusion (2026-07-02). `gpu_prefill.c` now uses the same fused
+  `ds4_gpu_head_rms_norm_rope_tail_tensor` kernel decode already used. Verified bit-identical
+  against reference via `--logprob-vectors`, `--local-golden-vectors`, `--tensor-equivalence`.
+- DONE (2026-07-02): performance audit of full active-path table against source. Found P3
+  CUTLASS MXFP4 path is dead code (never called) and disables prefill batching for MXFP4
+  experts; KV "FP8" (2a) is fake-quant only with zero bandwidth win banked; confirmed the
+  `attn_output_a` MX-GEMM shape gate is reachable for real model shapes. See P2/P3 status
+  updates, new 2e item, and the Attention appendix for deeper analysis.
+- DONE (2026-07-02): P0 quantizer upgraded — added MXFP4 quantize/dequant output, MTP tensor
+  name mapping + expert handling in `deepseek4-quantize.c`, stripped unused types.
+  Can produce IQ2_XXS/Q2_K/FP8_E4M3/MXFP4 GGUFs from HF safetensors.
+- NEXT: P1 — DSpark runtime (GGUF conversion → weight binding → GPU graph → block cycle).

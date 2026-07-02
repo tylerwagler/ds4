@@ -417,6 +417,13 @@ enum {
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_FP8_E4M3 = 38,
     DS4_TENSOR_FP4_E2M1 = 39,
+    /* CUTLASS block-scaled MXFP4: expert-major ColumnMajor E2M1 data blob
+     * followed by a swizzled E8M0 SF blob, per expert. Byte size is NOT a
+     * uniform per-element rate (see cutlass_mxfp4_expert_bytes()) -- the
+     * gguf_types[] table entry for this type exists only so tensor_type()
+     * recognizes it; real per-expert offsets come from that helper, not
+     * from the table's block_elems/block_bytes. */
+    DS4_TENSOR_CUTLASS_MXFP4 = 40,
 };
 
 typedef struct {
@@ -1312,6 +1319,9 @@ bool cursor_string(ds4_cursor *c, ds4_str *s);
 uint64_t align_up(uint64_t value, uint64_t alignment);
 const gguf_type_info *tensor_type(uint32_t type);
 const char *tensor_type_name(uint32_t type);
+void cutlass_mxfp4_expert_layout(uint64_t k, uint64_t n,
+                                  uint64_t *data_bytes, uint64_t *sf_bytes,
+                                  uint64_t *stride);
 ds4_cursor cursor_at(const ds4_model *m, uint64_t pos);
 bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out);
 bool model_get_u64_compat(const ds4_model *m, const char *key, uint64_t *out);
@@ -1345,6 +1355,13 @@ void ds4_vec_dot_iq2_xxs_pair_q8_K(
         const block_q8_K *y);
 uint32_t required_u32(const ds4_model *m, const char *key);
 DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t);
+bool routed_expert_gate_down_layout(
+        const ds4_tensor *gate,
+        const ds4_tensor *down,
+        uint64_t         *gate_expert_bytes,
+        uint64_t         *gate_row_bytes,
+        uint64_t         *down_expert_bytes,
+        uint64_t         *down_row_bytes);
 bool ds4_streaming_routed_expert_bytes(
         const ds4_weights *weights,
         uint64_t          *per_expert_bytes_out);

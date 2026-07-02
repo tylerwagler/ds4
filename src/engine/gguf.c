@@ -34,6 +34,12 @@ static const gguf_type_info gguf_types[] = {
     [30] = {"bf16",     1,   2},
     [38] = {"fp8_e4m3", 32,  33},   /* MXFP8: E4M3 + per-32 E8M0 (8.25 bpw) */
     [39] = {"mxfp4",    32,  17},   /* MXFP4: E2M1 (2/byte) + per-32 E8M0 (4.25 bpw) */
+    /* CUTLASS block-scaled MXFP4 (see cutlass_mxfp4_expert_layout() below):
+     * NOT a uniform per-element byte rate, so block_elems=0 here on purpose
+     * -- this entry exists only so tensor_type_name() has something to
+     * print; it makes tensor_nbytes() refuse (rather than silently
+     * miscompute) if this type is ever routed through the generic path. */
+    [40] = {"cutlass_mxfp4", 0, 0},
 };
 
 
@@ -126,6 +132,26 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     if (blocks > UINT64_MAX / info->block_bytes) return false;
     *bytes = blocks * info->block_bytes;
     return true;
+}
+
+
+
+/* CUTLASS Sm120 block-scaled MXFP4 (type 40) is expert-major: one
+ * ColumnMajor E2M1 data blob (N*K/2 bytes) followed by one swizzled E8M0
+ * scale-factor blob per expert. The CUTLASS Sm1xxBlkScaledConfig tile atom
+ * pads both N and K up to a multiple of 128 for the SF blob, so this is
+ * NOT a uniform per-element byte rate and cannot live in gguf_types[].
+ * (For DS4's actual rich-expert shapes both dims are already multiples of
+ * 128, so sf_bytes == n*k/32 exactly with no padding -- but callers must
+ * not assume that holds for arbitrary shapes.) */
+void cutlass_mxfp4_expert_layout(uint64_t k, uint64_t n,
+                                  uint64_t *data_bytes, uint64_t *sf_bytes,
+                                  uint64_t *stride) {
+    uint64_t k_pad = (k + 127) / 128 * 128;
+    uint64_t n_pad = (n + 127) / 128 * 128;
+    *data_bytes = n * k / 2;
+    *sf_bytes = (n_pad / 32) * k_pad;
+    *stride = *data_bytes + *sf_bytes;
 }
 
 
@@ -348,7 +374,15 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
         if (!cursor_u32(c, &t->type)) ds4_die(c->error);
         if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
 
-        if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
+        if (t->type == DS4_TENSOR_CUTLASS_MXFP4) {
+            if (t->ndim != 3) ds4_die("CUTLASS MXFP4 tensor must be 3D [K,N,n_expert]");
+            uint64_t data_bytes, sf_bytes, stride;
+            cutlass_mxfp4_expert_layout(t->dim[0], t->dim[1], &data_bytes, &sf_bytes, &stride);
+            if (t->dim[2] != 0 && stride > UINT64_MAX / t->dim[2]) {
+                ds4_die("tensor element count overflow");
+            }
+            t->bytes = stride * t->dim[2];
+        } else if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
             ds4_log(stderr,
                 DS4_LOG_WARNING,
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",

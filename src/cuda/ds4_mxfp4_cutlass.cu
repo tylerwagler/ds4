@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include "ds4_gpu.h"
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -80,8 +81,7 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
   pack_act_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
 }
 
-// One MXFP4 GEMM: D[M,N] = A[M,K](act,packed) . B[N,K](weight,packed). A_sf/B_sf = swizzled SF buffers.
-static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
+static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
                     const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K){
   auto strideA = cutlass::make_cute_packed_stride(typename GemmKernel::StrideA{}, {M,K,1});
   auto strideB = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N,K,1});
@@ -89,24 +89,129 @@ static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
   auto strideD = cutlass::make_cute_packed_stride(typename GemmKernel::StrideD{}, {M,N,1});
   auto lSFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M,N,K,1));
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M,N,K,1));
-  typename Gemm::Arguments args{
+  return typename Gemm::Arguments{
     cutlass::gemm::GemmUniversalMode::kGemm, {M,N,K,1},
     { reinterpret_cast<const ElementA::DataType*>(A_data), strideA,
       reinterpret_cast<const ElementB::DataType*>(B_data), strideB,
       A_sf, lSFA, B_sf, lSFB },
     { {1.0f, 0.0f}, D, strideC, D, strideD } };   // C=D ptr (beta=0, unused) to keep epilogue happy
+}
+
+// Workspace bytes CUTLASS needs for a GEMM of this shape (queried once per distinct
+// (M,N,K) at scratch-sizing time; NOT malloc'd here -- caller folds this into one
+// scratch allocation so the hot path never touches the CUDA allocator).
+static size_t gemm_workspace_bytes(int M, int N, int K){
+  auto args = make_gemm_args(nullptr,nullptr,nullptr,nullptr,nullptr,M,N,K);
+  return Gemm::get_workspace_size(args);
+}
+
+// One MXFP4 GEMM: D[M,N] = A[M,K](act,packed) . B[N,K](weight,packed). A_sf/B_sf = swizzled SF
+// buffers. workspace must be at least gemm_workspace_bytes(M,N,K) bytes, caller-owned.
+static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
+                    const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K,
+                    void *workspace){
+  auto args = make_gemm_args(D,A_data,A_sf,B_data,B_sf,M,N,K);
   Gemm gemm;
-  size_t ws = Gemm::get_workspace_size(args);
-  void *wsp=nullptr; if(ws) cudaMalloc(&wsp,ws);
-  if (gemm.can_implement(args)!=cutlass::Status::kSuccess){ if(wsp)cudaFree(wsp); return 1; }
-  if (gemm.initialize(args, wsp)!=cutlass::Status::kSuccess){ if(wsp)cudaFree(wsp); return 2; }
+  if (gemm.can_implement(args)!=cutlass::Status::kSuccess) return 1;
+  if (gemm.initialize(args, workspace)!=cutlass::Status::kSuccess) return 2;
   auto st = gemm.run();
-  if(wsp) cudaFree(wsp);
   return st==cutlass::Status::kSuccess ? 0 : 3;
 }
 
-// ---- extern-C expert FFN: out[T,out_dim] = down( swiglu( x.Wg^T, x.Wu^T ) ) . Wd^T ----
-// Weights pre-packed (data+sf) in B layout; x is f32 [T,in_dim]. Scratch allocated internally (engine version: caller-provided).
+// ---- Scratch layout shared by the sizing and execution paths (must stay in lock-step). ----
+// Everything the FFN needs beyond the weight/activation pointers it's called with: packed
+// activation buffers, their SF tables, the three GEMMs' float outputs, and the three GEMMs'
+// (usually zero-size, but not guaranteed) CUTLASS workspaces.
+struct ds4_cutlass_ffn_scratch_layout {
+  size_t xA_off, xSF_off, midA_off, midSF_off, gate_off, up_off, mid_off;
+  size_t ws_gate_off, ws_up_off, ws_down_off;
+  size_t xSF_n, midSF_n;
+  size_t ws_gate_bytes, ws_up_bytes, ws_down_bytes;
+  size_t total_bytes;
+};
+
+static size_t align_up_bytes(size_t n, size_t a){ return (n + a - 1) / a * a; }
+
+static ds4_cutlass_ffn_scratch_layout cutlass_ffn_scratch_layout(int T, int in_dim, int mid_dim, int out_dim){
+  ds4_cutlass_ffn_scratch_layout L{};
+  const size_t align = 256;
+  size_t off = 0;
+  L.xA_off = off; off = align_up_bytes(off + (size_t)T*in_dim/2, align);
+  L.xSF_n = (size_t)((T+127)/128*128)*((in_dim/32+3)/4*4);
+  L.xSF_off = off; off = align_up_bytes(off + L.xSF_n*sizeof(ElementSF), align);
+  L.midA_off = off; off = align_up_bytes(off + (size_t)T*mid_dim/2, align);
+  L.midSF_n = (size_t)((T+127)/128*128)*((mid_dim/32+3)/4*4);
+  L.midSF_off = off; off = align_up_bytes(off + L.midSF_n*sizeof(ElementSF), align);
+  L.gate_off = off; off = align_up_bytes(off + (size_t)T*mid_dim*sizeof(float), align);
+  L.up_off   = off; off = align_up_bytes(off + (size_t)T*mid_dim*sizeof(float), align);
+  L.mid_off  = off; off = align_up_bytes(off + (size_t)T*mid_dim*sizeof(float), align);
+  L.ws_gate_bytes = gemm_workspace_bytes(T, mid_dim, in_dim);
+  L.ws_up_bytes   = L.ws_gate_bytes;   // identical (M,N,K) shape to gate
+  L.ws_down_bytes = gemm_workspace_bytes(T, out_dim, mid_dim);
+  L.ws_gate_off = off; off = align_up_bytes(off + L.ws_gate_bytes, align);
+  L.ws_up_off   = off; off = align_up_bytes(off + L.ws_up_bytes, align);
+  L.ws_down_off = off; off = align_up_bytes(off + L.ws_down_bytes, align);
+  L.total_bytes = off;
+  return L;
+}
+
+// Scratch bytes ds4_cutlass_expert_ffn_scratch() needs for the worst case of T tokens routed
+// to a single expert. Callers size one buffer for their layer's (in_dim,mid_dim,out_dim) shape
+// at T=max_tokens_per_expert once (e.g. via cuda_tmp_alloc) and reuse it across every expert
+// and every layer that shares that shape -- this is deliberately NOT malloc'd per call.
+extern "C" size_t ds4_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim){
+  return cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim).total_bytes;
+}
+
+// Core FFN, no allocation and no synchronization: out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T.
+// Weights pre-packed (data+sf) in B layout; x is f32 [T,in_dim]. `scratch` must be at least
+// ds4_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes, 256-byte aligned.
+// Launches into the caller's current stream (legacy default stream); the caller is responsible
+// for ordering/synchronizing against its own subsequent work, same as every other kernel in
+// this engine's decode/prefill graphs.
+// SF weight pointers are typed as raw bytes at this extern "C" boundary (not ElementSF*) so
+// callers outside this TU -- e.g. ds4_cuda_moe.cu, which has no CUTLASS header visibility --
+// can call this without depending on CUTLASS types. ElementSF (cutlass::float_ue8m0_t) is a
+// 1-byte POD; the reinterpret below is exact.
+extern "C" int ds4_cutlass_expert_ffn_scratch(
+    float *out, const float *x,
+    const uint8_t *Wg_d, const uint8_t *Wg_sf,
+    const uint8_t *Wu_d, const uint8_t *Wu_sf,
+    const uint8_t *Wd_d, const uint8_t *Wd_sf,
+    const float *weights, float clamp,
+    int T, int in_dim, int mid_dim, int out_dim,
+    uint8_t *scratch, size_t scratch_bytes){
+  ds4_cutlass_ffn_scratch_layout L = cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim);
+  if (!scratch || scratch_bytes < L.total_bytes) return -1;
+  const ElementSF *Wg_sf_e = reinterpret_cast<const ElementSF*>(Wg_sf);
+  const ElementSF *Wu_sf_e = reinterpret_cast<const ElementSF*>(Wu_sf);
+  const ElementSF *Wd_sf_e = reinterpret_cast<const ElementSF*>(Wd_sf);
+  uint8_t *xA = scratch + L.xA_off;
+  ElementSF *xSF = reinterpret_cast<ElementSF*>(scratch + L.xSF_off);
+  uint8_t *midA = scratch + L.midA_off;
+  ElementSF *midSF = reinterpret_cast<ElementSF*>(scratch + L.midSF_off);
+  float *gate = reinterpret_cast<float*>(scratch + L.gate_off);
+  float *up   = reinterpret_cast<float*>(scratch + L.up_off);
+  float *mid  = reinterpret_cast<float*>(scratch + L.mid_off);
+  void *ws_gate = L.ws_gate_bytes ? scratch + L.ws_gate_off : nullptr;
+  void *ws_up   = L.ws_up_bytes   ? scratch + L.ws_up_off   : nullptr;
+  void *ws_down = L.ws_down_bytes ? scratch + L.ws_down_off : nullptr;
+  if (L.xSF_n) cudaMemset(xSF,0,L.xSF_n*sizeof(ElementSF));
+  if (L.midSF_n) cudaMemset(midSF,0,L.midSF_n*sizeof(ElementSF));
+  int rc=0;
+  pack_activation(xA,xSF,x,T,in_dim);
+  rc|=run_gemm(gate,xA,xSF,Wg_d,Wg_sf_e,T,mid_dim,in_dim,ws_gate);
+  rc|=run_gemm(up,  xA,xSF,Wu_d,Wu_sf_e,T,mid_dim,in_dim,ws_up);
+  { long n=(long)T*mid_dim; int t=256,b=(int)((n+t-1)/t); swiglu_kernel<<<b,t>>>(mid,gate,up,weights,clamp,mid_dim,n); }
+  pack_activation(midA,midSF,mid,T,mid_dim);
+  rc|=run_gemm(out, midA,midSF,Wd_d,Wd_sf_e,T,out_dim,mid_dim,ws_down);
+  return rc;
+}
+
+// ---- extern-C expert FFN (standalone/test convenience): allocates+frees its own scratch and
+// synchronizes before returning. The engine never calls this -- it calls the scratch variant
+// above with a pre-sized, reused buffer, since a per-call cudaMalloc/cudaFree/cudaDeviceSynchronize
+// here is exactly the hot-path cost the engine path exists to avoid. ----
 extern "C" int ds4_cutlass_expert_ffn(
     float *out, const float *x,
     const uint8_t *Wg_d, const ElementSF *Wg_sf,
@@ -114,26 +219,16 @@ extern "C" int ds4_cutlass_expert_ffn(
     const uint8_t *Wd_d, const ElementSF *Wd_sf,
     const float *weights, float clamp,
     int T, int in_dim, int mid_dim, int out_dim){
-  uint8_t *xA=nullptr, *midA=nullptr; ElementSF *xSF=nullptr, *midSF=nullptr;
-  float *gate=nullptr, *up=nullptr, *mid=nullptr;
-  size_t xA_bytes=(size_t)T*in_dim/2, midA_bytes=(size_t)T*mid_dim/2;
-  // SF buffers sized generously: one E8M0 per 32, rounded up to the atom tiling.
-  size_t xSF_n=(size_t)((T+127)/128*128)*((in_dim/32+3)/4*4);
-  size_t midSF_n=(size_t)((T+127)/128*128)*((mid_dim/32+3)/4*4);
-  cudaMalloc(&xA,xA_bytes); cudaMalloc(&xSF,xSF_n*sizeof(ElementSF));
-  cudaMalloc(&midA,midA_bytes); cudaMalloc(&midSF,midSF_n*sizeof(ElementSF));
-  cudaMalloc(&gate,(size_t)T*mid_dim*sizeof(float)); cudaMalloc(&up,(size_t)T*mid_dim*sizeof(float));
-  cudaMalloc(&mid,(size_t)T*mid_dim*sizeof(float));
-  cudaMemset(xSF,0,xSF_n*sizeof(ElementSF)); cudaMemset(midSF,0,midSF_n*sizeof(ElementSF));
-  int rc=0;
-  pack_activation(xA,xSF,x,T,in_dim);
-  rc|=run_gemm(gate,xA,xSF,Wg_d,Wg_sf,T,mid_dim,in_dim);
-  rc|=run_gemm(up,  xA,xSF,Wu_d,Wu_sf,T,mid_dim,in_dim);
-  { long n=(long)T*mid_dim; int t=256,b=(int)((n+t-1)/t); swiglu_kernel<<<b,t>>>(mid,gate,up,weights,clamp,mid_dim,n); }
-  pack_activation(midA,midSF,mid,T,mid_dim);
-  rc|=run_gemm(out, midA,midSF,Wd_d,Wd_sf,T,out_dim,mid_dim);
+  size_t scratch_bytes = ds4_cutlass_expert_ffn_scratch_bytes(T, in_dim, mid_dim, out_dim);
+  uint8_t *scratch=nullptr;
+  cudaMalloc(&scratch, scratch_bytes);
+  int rc = ds4_cutlass_expert_ffn_scratch(out,x,Wg_d,reinterpret_cast<const uint8_t*>(Wg_sf),
+                                          Wu_d,reinterpret_cast<const uint8_t*>(Wu_sf),
+                                          Wd_d,reinterpret_cast<const uint8_t*>(Wd_sf),
+                                          weights,clamp,
+                                          T,in_dim,mid_dim,out_dim,scratch,scratch_bytes);
   cudaDeviceSynchronize();
-  cudaFree(xA);cudaFree(xSF);cudaFree(midA);cudaFree(midSF);cudaFree(gate);cudaFree(up);cudaFree(mid);
+  cudaFree(scratch);
   return rc;
 }
 

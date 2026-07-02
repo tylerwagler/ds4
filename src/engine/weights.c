@@ -131,7 +131,8 @@ static void tensor_expect_plain_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_FP4_E2M1;
+           type == DS4_TENSOR_FP4_E2M1 ||
+           type == DS4_TENSOR_CUTLASS_MXFP4;
 }
 
 
@@ -153,6 +154,55 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
 DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
     return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
+}
+
+
+
+/* Computes (gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes)
+ * for any of the three supported routed-expert quant combos, centralizing the
+ * dispatch-site pattern `row_bytes = routed_expert_row_bytes(t); expert_bytes =
+ * t->dim[1] * row_bytes` that's repeated across gpu_prefill.c/gpu_decode.c.
+ *
+ * For CUTLASS_MXFP4 (type 40) "row_bytes" has no ordinary per-row meaning --
+ * the tensor is expert-major ColumnMajor+swizzle with no per-row byte stride
+ * at all. It instead carries the data/SF split point within each expert's
+ * block: the SF blob starts *row_bytes bytes into that expert's slice, and
+ * *expert_bytes is the full [data + SF] stride to the next expert. Callers
+ * that dispatch on gate->type == DS4_TENSOR_CUTLASS_MXFP4 must read it that
+ * way; only the CUTLASS MoE path does. */
+bool routed_expert_gate_down_layout(
+        const ds4_tensor *gate,
+        const ds4_tensor *down,
+        uint64_t         *gate_expert_bytes,
+        uint64_t         *gate_row_bytes,
+        uint64_t         *down_expert_bytes,
+        uint64_t         *down_row_bytes) {
+    /* NOTE: gate and down are NOT always the same type -- the IQ2_XXS/Q2_K combo pairs a
+     * gate/up type with a *different* down type by design (see
+     * tensor_expect_routed_expert_combo). Only MXFP4 and CUTLASS_MXFP4 share gate==down. */
+    if (!gate || !down) return false;
+
+    if (gate->type == DS4_TENSOR_CUTLASS_MXFP4) {
+        uint64_t gate_sf, gate_stride, down_sf, down_stride;
+        cutlass_mxfp4_expert_layout(gate->dim[0], gate->dim[1],
+                                     gate_row_bytes, &gate_sf, &gate_stride);
+        cutlass_mxfp4_expert_layout(down->dim[0], down->dim[1],
+                                     down_row_bytes, &down_sf, &down_stride);
+        *gate_expert_bytes = gate_stride;
+        *down_expert_bytes = down_stride;
+        return true;
+    }
+
+    *gate_row_bytes = routed_expert_row_bytes(gate);
+    *down_row_bytes = routed_expert_row_bytes(down);
+    if (*gate_row_bytes == 0 || *down_row_bytes == 0 ||
+        gate->dim[1] > UINT64_MAX / *gate_row_bytes ||
+        down->dim[1] > UINT64_MAX / *down_row_bytes) {
+        return false;
+    }
+    *gate_expert_bytes = gate->dim[1] * *gate_row_bytes;
+    *down_expert_bytes = down->dim[1] * *down_row_bytes;
+    return true;
 }
 
 
@@ -332,10 +382,12 @@ uint64_t ds4_streaming_manual_cache_safe_bytes(void) {
 
 
 
-/* The CUDA routed-MoE dispatcher executes exactly two expert quant combos:
- * gate/up IQ2_XXS with Q2_K down, or gate/up/down all MXFP4 (FP4_E2M1).
- * Reject anything else at load with one clear error instead of a silent
- * kernel-dispatch failure at the first MoE layer. */
+/* The CUDA routed-MoE dispatcher executes exactly three expert quant combos:
+ * gate/up IQ2_XXS with Q2_K down; gate/up/down all MXFP4 (FP4_E2M1, dp4a
+ * dequant-dot path); or gate/up/down all CUTLASS_MXFP4 (tensor-core grouped
+ * GEMM path, expert-major data+SF layout). Reject anything else at load with
+ * one clear error instead of a silent kernel-dispatch failure at the first
+ * MoE layer. */
 static void tensor_expect_routed_expert_combo(
         const ds4_tensor *gate,
         const ds4_tensor *up,
@@ -346,11 +398,15 @@ static void tensor_expect_routed_expert_combo(
     const bool mxfp4_combo = gate->type == DS4_TENSOR_FP4_E2M1 &&
                              up->type   == DS4_TENSOR_FP4_E2M1 &&
                              down->type == DS4_TENSOR_FP4_E2M1;
-    if (iq2_combo || mxfp4_combo) return;
+    const bool cutlass_mxfp4_combo = gate->type == DS4_TENSOR_CUTLASS_MXFP4 &&
+                                     up->type   == DS4_TENSOR_CUTLASS_MXFP4 &&
+                                     down->type == DS4_TENSOR_CUTLASS_MXFP4;
+    if (iq2_combo || mxfp4_combo || cutlass_mxfp4_combo) return;
     fprintf(stderr,
             "ds4: unsupported routed expert quant combo at tensor %.*s: "
             "gate=%s up=%s down=%s; supported combos are "
-            "gate/up=iq2_xxs with down=q2_k, or gate/up/down=mxfp4\n",
+            "gate/up=iq2_xxs with down=q2_k, gate/up/down=mxfp4, or "
+            "gate/up/down=cutlass_mxfp4\n",
             (int)gate->name.len,
             gate->name.ptr,
             tensor_type_name(gate->type),
@@ -999,6 +1055,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case DS4_TENSOR_BF16:
     case DS4_TENSOR_FP8_E4M3:
     case DS4_TENSOR_FP4_E2M1:
+    case DS4_TENSOR_CUTLASS_MXFP4:
         return true;
     default:
         return false;
