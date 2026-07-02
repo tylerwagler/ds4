@@ -91,6 +91,15 @@ source attn/dense is already E4M3).
   `ds4_gpu_dsv4_fp8_kv_quantize_tensor`, kvstore quant-aware checkpoints all exist. MLA
   already compresses KV to a latent; FP8-ing that latent ~halves KV bandwidth/memory →
   decode win at depth + more context room. Lowest effort, do right after the oracle quant.
+  **CORRECTION (2026-07-02 audit):** `fp8_kv_quantize_kernel` (`ds4_cuda_norm_kv.cu:358-380`)
+  only fake-quants — it rounds nope-dim KV values to the E4M3 grid, then writes the result
+  back as a 32-bit float. Raw-window storage is `DS4_N_HEAD_DIM * sizeof(float)` = 2048
+  bytes/token/layer, identical to a plain f32 store. We are paying the E4M3 rounding cost
+  with ZERO bandwidth win banked today. TODO: actually repack to real ~1-byte FP8 storage
+  (both raw-window and compressed-cache writes) to realize the memory win this item claims.
+  Biggest payoff is at depth (compressed-KV reads scale with context); the fixed 128-token
+  raw window itself is small (~11 MiB/decode-step across 43 layers) — prioritize the
+  compressed-cache repack over the raw window.
 - **2b Profiling GATE** — profile the oracle quant's decode (attn vs shared vs MoE vs KV
   split) BEFORE building 2c. Earlier nsys put attention ~6.6ms and the real stall was the
   now-fixed graph bug → decode is likely MoE-memory-bound. If attn/shared is a thin slice,
@@ -112,6 +121,31 @@ source attn/dense is already E4M3).
   Payoff is **prefill tensor-core unification only** (8.5→8.25 bpw ≈ 0.45 GB; decode is
   memory-bound so no decode gain). SEQUENCING (user, 2026-06-29): **do P3 MXFP4-experts FIRST**
   (97% of the model = the real lever); 2d is the cleanup pass to reach a fully Q8-free model.
+  **STATUS UPDATE (2026-07-02):** `attn_output_a`/`attn_output_b` are now on MXFP8 — fused
+  MXFP8×MXFP8 kernels for both decode and prefill (`cuda_attention_output_a_mx_gemm`,
+  `ds4_cuda_matmul.cu:655`), currently the uncommitted rework being validated. Confirmed the
+  `rank%128==0, group_dim%32==0` shape gate on `attn_output_a`'s MX-GEMM path is satisfied by
+  the real Flash/Pro shapes (`rank=1024, group_dim=4096`) — the fast path is reachable, not a
+  silent fallback. Remaining Q8/BF16 item is lm_head only. TODO: **the KL/perplexity gate
+  mentioned above does not exist in code** — no `kl_div`/`perplexity`-gated runtime logic
+  found anywhere; format selection today is a raw `w->output->type == DS4_TENSOR_BF16` check
+  (`weights.c:538-543`) on whatever the GGUF ships. Building that gate is a prerequisite, not
+  a formality, before flipping lm_head to FP8.
+- **2e Extend MXFP8 to the remaining F16 GEMM weight groups (2026-07-02 audit, NEW).**
+  The KV compressor (`attn_compressor_{ape,kv,gate}`, 41/43 layers), the DSA indexer
+  (`indexer_attn_q_b`/`indexer_proj`/`indexer_compressor_*`, 21/43 ratio-4 layers), and
+  hyper-connections (`hc_attn_fn`/`hc_ffn_fn`/`output_hc_fn`, all 43 layers + final) are still
+  `DS4_TENSOR_F16`. Shape-derived (not measured) per-token decode bytes at F16 vs MXFP8:
+  | group | F16 | MXFP8 | saved |
+  |---|---:|---:|---:|
+  | KV compressor | ~499 MiB | ~260 MiB | ~240 MiB |
+  | DSA indexer | ~431 MiB | ~222 MiB | ~209 MiB |
+  | Hyper-connections | ~65 MiB | ~33 MiB | ~31 MiB |
+  Combined ~480 MiB/token saved, roughly 5-6% of the ~8 GB/token active-weight estimate
+  implied by the 32 t/s bandwidth ceiling above. Same mechanical migration as 2c, no new
+  kernel infra needed. CAVEAT: the indexer feeds DSA top-k selection — a quantization
+  regression there means wrong tokens attended, not just numeric drift. Validate by comparing
+  top-k selection sets, not just logit RMS, separately from the compressor/HC quality bar.
 
 ### P3 — MXFP4 experts on FP4 tensor cores  [the serving play]
 KEY FACT: the source routed experts are **already MXFP4** — `dequant_fp4_weight` decodes
@@ -134,6 +168,21 @@ Dependency reality: **the math is NVIDIA; vLLM is optional and only for MoE fusi
   grouped FP4 collectives; (c) lift vLLM's fused FP4-MoE kernel (a CUTLASS wrapper, Apache-2.0)
   via a C bridge. Do NOT hand-write tcgen05 FP4 MMA.
 - Risk: CUTLASS/cuBLASLt grouped FP4 on sm_121 is bleeding edge (toolchain friction).
+- **STATUS (2026-07-02 audit): option (b) is partially built and NOT wired in.**
+  `ds4_cutlass_expert_ffn` (`ds4_mxfp4_cutlass.cu`) implements a CUTLASS `mx_float4_t` grouped
+  GEMM, compiles and links into every binary — but has zero call sites outside its own
+  `DS4_MXFP4_STANDALONE` test `main()`. It never runs. The real dispatch,
+  `routed_moe_launch` (`ds4_cuda_moe.cu:2284`), routes MXFP4 weights to per-token `qwarp32`
+  kernels (`moe_gate_up_mid_mxfp4_qwarp32_kernel`, `moe_down_mxfp4_sum6_qwarp32_kernel`) — no
+  tensor cores, decode-shaped and prefill-shaped alike.
+- **REGRESSION RISK:** `use_sorted_pairs = n_tokens > 1 && !mxfp4_path` (`ds4_cuda_moe.cu:2391`)
+  explicitly disables the batched/tiled prefill optimization whenever expert weights are
+  MXFP4. IQ2_XXS/Q2_K experts get that batching; MXFP4 experts don't. **MXFP4 prefill may
+  currently be SLOWER than IQ2_XXS/Q2_K prefill** — measure before assuming MXFP4 is a strict
+  upgrade at prefill/concurrency until the CUTLASS path (or equivalent batching) is wired in.
+  TODO: either finish wiring `ds4_cutlass_expert_ffn` into `routed_moe_launch`, or extend
+  `use_sorted_pairs`-style batching to the MXFP4 path before shipping it as the default
+  expert format.
 
 **NVFP4** (E2M1 + E4M3 per-16 microscale + FP32 global, ~4.5 bpw) stays in our pocket for
 quantizing *from high precision* (bf16) — e.g. if we ever push attn/dense below FP8 — where
@@ -174,6 +223,16 @@ histogram per expert) + a skip/zero mask on ds4's routed-MoE dispatch. antirez's
 streaming expert cache is the natural home (it already gates experts in/out of RAM by
 activity). CAVEAT: pruning trades general capability for fit -- safe at 5-20%, aggressive
 only for a narrow/fixed workload profile.
+
+## Quick wins (2026-07-02 audit, near-zero risk)
+- **Prefill QK-norm+RoPE fusion gap.** `decode_q_norm_rope_fused` (`gpu_decode.c:1474-1491`)
+  already calls a single fused RMS-norm+RoPE kernel (`ds4_gpu_head_rms_norm_rope_tail_tensor`,
+  `ds4_cuda_norm_kv.cu:119`) for decode. Prefill (`gpu_prefill.c:609-632`) unconditionally
+  calls the two-kernel unfused version instead — no comment/TODO explains why, and the fused
+  kernel's signature is already generic over `n_tok`. Costs one extra kernel launch plus one
+  extra full HBM round-trip of the Q tensor per layer, every prefill (×43 layers Flash / ×61
+  Pro). TODO: call the fused kernel from prefill too — decode already proves it numerically
+  correct, so this is wiring, not new kernel work.
 
 ## Curated format menu (every format must earn its kernel)
 | bpw  | format   | hw path        | role |
@@ -217,3 +276,8 @@ redundant same-bpw formats (e.g. NVFP4 vs Q4_K is a *path* choice, not two slots
 - DONE: P2 FP8 workhorse (MXFP8 attn/dense/shared via cuBLASLt MX prefill + mmvq decode) —
   validated coherent, measured 25.5 t/s decode / 431 t/s prefill @depth0.
 - NEXT: P1a — re-quant including `blk.43` MTP head → native `--mtp` baseline → then P1b DSpark serving.
+- DONE (2026-07-02): performance audit of the full active-path table against source. Found
+  the P3 CUTLASS MXFP4 path is dead code (never called) and disables prefill batching for
+  MXFP4 experts; KV "FP8" (2a) is fake-quant only with zero bandwidth win banked; confirmed
+  the attn_output_a MX-GEMM shape gate is reachable for the real model shape. See the P2/P3
+  status updates, the new 2e item, and Quick wins above.
