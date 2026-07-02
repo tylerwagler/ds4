@@ -47,6 +47,7 @@ static void usage(const char *argv0) {
     printf("  --output TYPE          output.* tensor type\n");
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
+    printf("  --format-map FILE      JSON manifest of per-tensor formats (prisma_alloc.py output)\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q2_k, iq2_xxs, fp8_e4m3, mxfp4\n");
@@ -130,6 +131,8 @@ static params parse_args(int argc, char **argv) {
             *eq = '\0';
             p.policy.overrides = xrealloc(p.policy.overrides, (size_t)(p.policy.n_overrides + 1) * sizeof(p.policy.overrides[0]));
             p.policy.overrides[p.policy.n_overrides++] = (type_override){ xstrdup(spec), parse_type(eq + 1) };
+        } else if (strcmp(arg, "--format-map") == 0) {
+            policy_load_format_map(&p.policy, need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--n-experts") == 0) {
             p.n_experts = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--threads") == 0) {

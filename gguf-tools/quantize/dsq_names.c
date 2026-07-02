@@ -238,3 +238,35 @@ bool is_quantizable_target(ds4q_type type) {
     return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 || ds4q_can_quantize(type);
 }
 
+/* --format-map: load a prisma_alloc.py manifest ({"tensor.name": "FMT", ...})
+ * as exact-name overrides appended to the policy's override list, so the
+ * allocator's chosen per-tensor formats drive the output GGUF directly. CLI
+ * --tensor-type overrides are appended before this and therefore win. */
+void policy_load_format_map(quant_policy *p, const char *path) {
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    json_doc d = json_parse_text(text, len);
+    if (d.len < 1 || d.v[0].type != JT_OBJECT) die("--format-map is not a JSON object");
+    int loaded = 0;
+    for (int i = 1; i < d.len && d.v[i].parent == 0;) {
+        const int k = i;
+        const int v = i + 1;
+        if (v >= d.len || d.v[v].parent != 0 || d.v[v].type != JT_STRING) {
+            die("--format-map entries must be \"tensor\": \"TYPE\" strings");
+        }
+        char *name = json_strdup_tok(&d, k);
+        char *fmt = json_strdup_tok(&d, v);
+        p->overrides = xrealloc(p->overrides,
+                                (size_t)(p->n_overrides + 1) * sizeof(p->overrides[0]));
+        p->overrides[p->n_overrides].prefix = name;
+        p->overrides[p->n_overrides].type = parse_type(fmt);
+        p->n_overrides++;
+        loaded++;
+        free(fmt);
+        i = json_skip(&d, v);
+    }
+    json_free(&d);
+    free(text);
+    fprintf(stderr, "format-map: %d tensor overrides loaded from %s\n", loaded, path);
+}
+
