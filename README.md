@@ -11,8 +11,12 @@ API and integrated coding agent, all ready to work with coding agents or with
 the provided CLI interface. There are also tools for GGUF and imatrix generation,
 and for quality and speed testing.
 
-This fork is CUDA-only:
-* **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark (GB10).
+This tree is the **CUDA-only fork** of
+[antirez/ds4](https://github.com/antirez/ds4) targeting **NVIDIA CUDA on
+Linux**, with special care for the **DGX Spark (GB10)** and its ~128 GB of
+unified memory. The upstream Metal (macOS) and ROCm backends were removed in
+this fork; see [AGENT.md](AGENT.md) for the source layout, supported weight
+formats, and validation notes.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -39,11 +43,11 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM the the model size is still preferred, SSD streaming allows to turn the available amount of RAM from a hard cutoff (can I run this model or not?) to continuous spectrum of speed levels.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since recently we introduced large new features: distributed inference, SSD streaming, and other minor improvements.
-* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized graph path targets **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics: it is selected at runtime with `--cpu`, there is no separate CPU-only build target in this fork, and it is slated for eventual removal.
 
 ## Acknowledgements to llama.cpp and GGML
 
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
+DwarfStar does not link against GGML, but it **exists thanks to the path opened by the
 llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
 engineering knowledge developed there**.
 We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
@@ -90,17 +94,29 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 Flash and PRO GGUFs published for
-this project. It is not a general GGUF loader, and arbitrary DeepSeek/GGUF files
-will not have the tensor layout, quantization mix, metadata, or optional MTP
-state expected by the engine. The 2 bit quantizations provided here are not
-a joke: they behave well, work under coding agents, call tools in a reliable way.
-The 2 bit quants use a very asymmetrical quantization: only the routed MoE
-experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
-majority of all the model space: the other components (shared experts,
-projections, routing) are left untouched to guarantee quality.
+This implementation is not a general GGUF loader: the engine binds one known
+DeepSeek V4 tensor layout and rejects everything else. **This fork's weight
+binder is stricter than upstream's.** It accepts exactly:
 
-Download one main model. **Prefer the imatrix versions.**
+| Tensor group | Accepted formats |
+| --- | --- |
+| Attention projections, shared experts, MTP | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales) |
+| Routed experts gate/up/down | `IQ2_XXS`/`IQ2_XXS`/`Q2_K`, or all three `MXFP4` |
+| Output head | `BF16` or MXFP8 |
+| Norms, embeddings, indexer, HC | `F32`/`F16` |
+
+Legacy `Q4_K` and `Q8_0` weight tensors are **rejected at load** with a clear
+error. This means the GGUFs published for upstream ds4 do not load in this
+fork: they use `Q8_0` attention/shared-expert/output tensors (and `Q4_K` in
+the q4 and PRO variants). GGUFs for this fork are produced offline with the
+tools in [gguf-tools/](gguf-tools/README.md), starting from the original FP8
+safetensors. The asymmetric-quantization idea is unchanged from upstream:
+only the routed MoE experts — the large majority of the model bytes — are
+pushed to 2 or 4 bits, while everything else stays high precision.
+
+`download_model.sh` still fetches the **upstream** GGUF artifacts, kept for
+reference and as requantization inputs; remember they will not load directly
+here. **Prefer the imatrix versions.**
 
 ```sh
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
@@ -132,18 +148,19 @@ production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
-but must be enabled explicitly with `--mtp`. The current MTP/speculative
-decoding path is still experimental: it is correctness-gated and currently
-provides at most a slight speedup, not a meaningful generation-speed win.
+GGUF for Flash (upstream `Q4_K`/`Q8_0` artifact — this fork requires MTP
+tensors in MXFP8, so it too must be requantized before use). MTP must be
+enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
+still experimental: it is correctness-gated and currently provides at most a
+slight speedup, not a meaningful generation-speed win.
 
-Then build:
+Then build (the `cutlass/` submodule is required):
 
 ```sh
-make                  # macOS Metal
-make cuda-spark       # Linux CUDA, DGX Spark / GB10
-make cuda-generic     # Linux CUDA, other local CUDA GPUs
-make cpu              # CPU-only diagnostics build
+git submodule update --init cutlass
+make cuda-spark            # Linux CUDA, DGX Spark / GB10
+make cuda-generic          # Linux CUDA, other local CUDA GPUs
+make cuda CUDA_ARCH=sm_N   # explicit nvcc -arch value
 ```
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
@@ -152,10 +169,18 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 
 ## Speed
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
-decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+On this fork's target hardware — a DGX Spark GB10 running the 97 GB
+MXFP8/IQ2 Flash build — current single-run numbers are about **162 t/s**
+long-prompt prefill and **12.35 t/s** greedy decode
+(`--ctx 32768`, `--nothink`, `-n 256`).
+
+The table below keeps the **upstream, pre-fork** single-run CLI numbers for
+reference. They were measured on Apple hardware (Metal backend) and on the
+upstream GGUFs, neither of which this fork supports; only the last row is a
+CUDA run. Same settings: `--ctx 32768`, `--nothink`, greedy decoding,
+`-n 256`. The short prompt is a normal small Italian story prompt. The long
+prompts exercise chunked prefill plus long-context decode. Q4 requires the
+larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
@@ -177,9 +202,9 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 ## Running models larger than RAM
 
-The normal Metal path tries to make the model resident in GPU-addressable
+The normal CUDA path tries to make the model resident in GPU-addressable
 memory. This is the fastest path and should remain your default when the model
-fits. When it does not fit, DwarfStar also has a Metal-only **SSD streaming**
+fits. When it does not fit, DwarfStar also has an **SSD streaming**
 capacity mode. In this mode the non-routed model weights stay resident, while
 routed MoE experts are kept in an in-memory cache and loaded from the GGUF file
 on cache misses.
@@ -187,7 +212,7 @@ on cache misses.
 Streaming is not as fast as fitting the full model in RAM. It still needs memory
 for non-routed weights, KV cache, graph scratch, activations, and the routed
 expert cache. It is useful because routed experts dominate model size and modern
-Mac SSDs are fast enough to make cache misses tolerable. Long prefills can still
+NVMe SSDs are fast enough to make cache misses tolerable. Long prefills can still
 be fast; generation is more sensitive to cache misses because every new token
 routes through experts again.
 
@@ -208,14 +233,19 @@ The `32GB` value is a memory budget for complete routed experts, not a generic
 byte cache. DwarfStar converts it to the number of full experts that fit for the
 current GGUF. Non-routed weights, KV cache, graph scratch, and activations need
 additional memory. Only the automatic cache budget does the subtraction for you:
-it takes 80% of the Metal recommended working set, subtracts non-routed weights,
+it takes 80% of the backend's recommended working set, subtracts non-routed weights,
 then uses the rest for routed experts. Leave the hot expert preload enabled for
 normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
 only for measurements.
 
 ### Practical SSD streaming examples
 
-On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
+These examples are inherited from upstream (Apple hardware, upstream GGUFs)
+and are retained to illustrate the knobs. The mechanism is wired into the
+CUDA build, but the referenced GGUF files do not load in this fork without
+requantization.
+
+On 64GB machines, start with the 2-bit Flash GGUF and a moderate expert cache:
 
 ```sh
 ./download_model.sh q2-imatrix
@@ -228,7 +258,7 @@ On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
   --nothink
 ```
 
-On 128GB MacBooks, PRO q2 streaming is experimental but usable for inspection
+On 128GB machines, PRO q2 streaming is experimental but usable for inspection
 and occasional work when you accept slow generation. Start with `--nothink`:
 
 ```sh
@@ -245,7 +275,7 @@ On an M5 Max with 128GB of RAM, a short PRO q2 streaming decode benchmark found
 the automatic budget best: it selected about `59GB` of routed expert cache.
 Manual `64GB` to `75GB` caches were close on that machine. Larger explicit
 `NGB` requests are capped before inference so the expert buffers remain
-lockable instead of falling into macOS paging. If the system is under extra
+lockable instead of falling into OS paging. If the system is under extra
 memory pressure and `mlock` still fails, ds4 refuses to install pageable
 expert-cache entries and releases a locked-cache margin before continuing with
 the measured lockable cache size. Prefer the automatic budget; if setting the
@@ -272,6 +302,12 @@ splitting transformer layers across multiple machines. The main example is the
 full 4-bit Flash quant across two 128 GB MacBooks: each process maps only its
 own layer slice, activations are sent over TCP, and the coordinator keeps normal
 CLI/API behavior.
+
+**Fork note:** the distributed path is retained and builds, but the examples
+and measurements in this section are upstream's, taken on Apple hardware with
+Q4/PRO GGUFs that this fork's loader rejects. Treat this section as upstream
+reference material until it is re-validated on CUDA hosts with fork-format
+GGUFs.
 
 Distributed inference also allows to **speed up prefill** by
 using multiple GPUs at the same time to process different micro-batches at
@@ -340,9 +376,9 @@ gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf
 This is a capacity use case: each process maps only its own half of the model,
 while the worker owns the output head and returns logits.
 
-The current PRO Q4 Metal path uses queue-resident exact expert tables for the
+The upstream PRO Q4 path used queue-resident exact expert tables for the
 large routed experts. This avoids the broad multi-GiB routed-tensor bindings
-that made early distributed PRO Q4 attempts either run very slowly or hit Metal
+that made early distributed PRO Q4 attempts either run very slowly or hit GPU
 memory accounting limits. In a short greedy smoke test over the direct
 `192.168.0.182` / `192.168.0.183` link, the model generated coherent text and
 measured 11.47 t/s generation after startup. Per-token telemetry was balanced:
@@ -485,7 +521,7 @@ trusted networks.
 ## Reducing heat, power usage and fan noise
 
 Long local inference runs can keep the GPU busy for extended periods. If you
-care more about heat, fan noise, battery life on MacBooks, or reducing thermal
+care more about heat, fan noise, power draw, or reducing thermal
 stress on the hardware than about maximum throughput, use `--power N`.
 
 `--power 100` is the default and means full speed. Lower values ask DwarfStar to target
@@ -529,7 +565,8 @@ conversation text and title but removes the heavy KV payload; switching to a
 stripped session rebuilds the KV cache by prefilling the saved text.
 
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
-so relative runtime files such as `metal/*.metal` resolve from the project tree.
+so relative runtime paths such as the default `./ds4flash.gguf` model and
+`dir-steering/` data resolve from the project tree.
 
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach
@@ -570,7 +607,7 @@ to match the strict official-vector checkpoint path, or
 `DS4_CUDA_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
 allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
 as an explicit run configuration.
-Chunked Metal prefill reuses the same range-capable layer-major graph for each
+Chunked GPU prefill reuses the same range-capable layer-major graph for each
 chunk, preserving absolute compressor/indexer boundaries while avoiding the old
 per-layer chunk dispatch path.
 
@@ -701,7 +738,8 @@ Start a local OpenAI/Anthropic-compatible server:
 ```
 
 Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
-so relative runtime files such as `metal/*.metal` resolve from the project tree.
+so relative runtime paths such as the default `./ds4flash.gguf` model and
+`dir-steering/` data resolve from the project tree.
 
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
@@ -725,6 +763,8 @@ Supported endpoints:
 The Flash and PRO model endpoints are compatibility aliases. They both report
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does
 not select a different model.
+
+There is no `/health` endpoint; use `GET /v1/models` as the health probe.
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
@@ -823,11 +863,8 @@ higher than the `--ctx` value you started the server with:
 You can use larger context and larger cache if you wish. Full context of
 1M tokens is going to use more or less 26GB of memory (compressed indexer
 alone will be like 22GB), so configure a context which makes sense in
-your system. With 128GB of RAM you would run the 2-bit quants, which are
-already 81GB, 26GB are going to be likely too much, so a context window
-of 100~300k tokens is wiser. However users reported being able to run 2bit
-quants with 250k ctx window in a Macs with just 96GB of system memory: make sure
-to kill processes that use too much memory, if you plan doing so ;)
+your system. On the GB10 with ~128GB of unified memory, the 97GB Flash build
+leaves limited headroom, so a context window of 100~300k tokens is wiser.
 
 The `384000` output limit below avoids token caps since the model is able
 to generate very long replies otherwise (up to 384k tokens). The server
@@ -841,7 +878,7 @@ For **opencode**, add a provider and agent entry to
   "$schema": "https://opencode.ai/config.json",
   "provider": {
     "ds4": {
-      "name": "ds4.c (local)",
+      "name": "ds4 (local)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
@@ -849,7 +886,7 @@ For **opencode**, add a provider and agent entry to
       },
       "models": {
         "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash (ds4.c local)",
+          "name": "DeepSeek V4 Flash (ds4 local)",
           "limit": {
             "context": 100000,
             "output": 384000
@@ -874,7 +911,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
 {
   "providers": {
     "ds4": {
-      "name": "ds4.c local",
+      "name": "ds4 local",
       "baseUrl": "http://127.0.0.1:8000/v1",
       "api": "openai-completions",
       "apiKey": "dsv4-local",
@@ -891,7 +928,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
       "models": [
         {
           "id": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (ds4.c local)",
+          "name": "DeepSeek V4 Flash (ds4 local)",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": null,
@@ -955,7 +992,7 @@ export ANTHROPIC_MODEL="deepseek-v4-flash"
 
 export ANTHROPIC_CUSTOM_MODEL_OPTION="deepseek-v4-flash"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="DeepSeek V4 Flash local ds4"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="ds4.c local GGUF"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="ds4 local GGUF"
 
 export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4-flash"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4-flash"
@@ -1131,7 +1168,7 @@ route and pushes the relevant layer tensors back to the workers. The saved file
 does not retain the distributed topology.
 
 The tensor payload is DS4-specific KV/session state, not a generic inference
-graph dump. It is expected to be portable only across compatible `ds4.c`
+graph dump. It is expected to be portable only across compatible DwarfStar
 builds for this model layout.
 
 The cache stores checkpoints at four moments:
@@ -1171,14 +1208,15 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA in CUDA builds:
+CUDA is the default graph backend; the backends are `cuda` and `cpu`:
 
 ```sh
-./ds4 -p "Hello" --metal
 ./ds4 -p "Hello" --cuda
+./ds4 -p "Hello" --cpu
+./ds4 -p "Hello" --backend cuda
 ```
 
-On Linux, plain `make` prints the available build targets instead of selecting a
+Plain `make` prints the available build targets instead of selecting a
 CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
 explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
 `make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
@@ -1189,19 +1227,11 @@ make cuda CUDA_ARCH=sm_120
 make cuda CUDA_ARCH=native
 ```
 
-There is also a CPU reference/debug path:
-
-```sh
-./ds4 -p "Hello" --cpu
-make cpu
-./ds4
-./ds4 -p "Hello"
-```
-
 Do not treat the CPU path as the production target. The CLI and `ds4-server`
 support the CPU backend for reference/debug use and share the same KV session
-and snapshot format as Metal and CUDA, but normal inference should use Metal or
-CUDA.
+and snapshot format as CUDA, but normal inference should use CUDA. There is no
+CPU-only build target: the CPU path is compiled into the CUDA binaries,
+selected at runtime with `--cpu`, and slated for eventual removal.
 
 ## Steering
 
@@ -1225,14 +1255,18 @@ attention regressions show up before they become long generation failures. The
 C runner pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
 comparison.
 
-All project tests are driven by the C runner, with a small `ds4-eval`
+All project tests are driven by the C runners, with a small `ds4-eval`
 extractor self-test run first:
 
 ```sh
-make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
+make test                  # ds4-eval --self-test-extractors, ds4_agent_test, ds4_test
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+`ds4_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`);
+`ds4_agent_test` and the eval self-test run without one. `make
+cuda-regression` runs a GPU kernel smoke test that needs no model.
 
 ## Debugging Notes
 
@@ -1242,7 +1276,7 @@ first answer:
 ```sh
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./ds4 --dump-logits /tmp/logits.json --metal --nothink --prompt-file prompt.txt
+./ds4 --dump-logits /tmp/logits.json --cuda --nothink --prompt-file prompt.txt
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 
