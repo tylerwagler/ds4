@@ -525,17 +525,6 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    /* The fused Q8 pair kernel is not FP8-aware; if these weights are MXFP8 fall
-     * back to the separate routed matmuls (which dispatch to the FP8 path). */
-    if (getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") == NULL &&
-        !g_fp8_offsets.count(gate_offset) && !g_fp8_offsets.count(up_offset)) {
-        return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
-                                                 model_map, model_size,
-                                                 gate_offset, up_offset,
-                                                 in_dim, out_dim, out_dim,
-                                                 x, 1) &&
-               ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
-    }
     return ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
                                         gate_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_matmul_q8_0_tensor(up, model_map, model_size,
@@ -977,21 +966,6 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    /* Fused Q8 hc-expand kernel is not FP8-aware; fall back to the separate
-     * routed matmul (+ explicit hc-expand) when the down weight is MXFP8. */
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL &&
-        !g_fp8_offsets.count(weight_offset)) {
-        return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
-                                                        model_map, model_size,
-                                                        weight_offset,
-                                                        in_dim, out_dim,
-                                                        shared_mid,
-                                                        routed_out,
-                                                        residual_hc,
-                                                        split,
-                                                        n_embd, n_hc,
-                                                        "shared_down_hc_expand");
-    }
     return ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim,
                                         shared_mid, 1) &&

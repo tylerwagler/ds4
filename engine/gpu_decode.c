@@ -396,23 +396,9 @@ bool gpu_graph_matmul_plain_tensor(
 
 
 
-static bool gpu_graph_use_pro_q4_cpu_router(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_PRO_Q4_CPU_ROUTER", &cache);
-}
-
-
-
 static bool gpu_graph_use_streaming_iq2_cpu_router(void) {
     return getenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER") == NULL;
-}
-
-
-
-static bool gpu_graph_use_q4_selected_shared_overlap(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_Q4_SELECTED_OVERLAP_SHARED", &cache);
 }
 
 
@@ -421,23 +407,6 @@ static bool gpu_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
            getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL;
-}
-
-
-
-static bool gpu_graph_q4_non_streaming_opt_in_enabled(void) {
-    return getenv("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
-           getenv("DS4_METAL_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
-           getenv("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL ||
-           getenv("DS4_METAL_ENABLE_Q4_EXPERT_ADDRESS_TABLE") != NULL ||
-           getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
-           getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_ADDRESS_AUTO") != NULL;
-}
-
-
-
-static bool gpu_graph_q4_selected_paths_allowed(const ds4_gpu_graph *g) {
-    return g && (g->ssd_streaming || gpu_graph_q4_non_streaming_opt_in_enabled());
 }
 
 
@@ -468,29 +437,9 @@ static bool gpu_graph_use_iq2_selected_async_early_commit(
 
 
 
-static bool gpu_graph_use_pro_q4_expert_table_auto(const ds4_gpu_graph *g) {
-    if (getenv("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
-        getenv("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") != NULL) {
-        return false;
-    }
-    if (!g || (!g->ssd_streaming &&
-               getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL)) {
-        return false;
-    }
-    return ds4_gpu_pro_q4_expert_table_auto_available() != 0;
-}
-
-
-
 static bool gpu_graph_decode_cpu_router_applicable(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
-    const bool pro_q4 =
-        DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
-        gpu_graph_use_pro_q4_cpu_router() &&
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
     const bool streaming_iq2 =
         g &&
         g->ssd_streaming &&
@@ -505,61 +454,7 @@ static bool gpu_graph_decode_cpu_router_applicable(
         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
         getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
-    return pro_q4 || streaming_iq2;
-}
-
-
-
-static bool gpu_graph_decode_pro_q4_expert_table_expected(
-        const ds4_gpu_graph     *g,
-        const ds4_layer_weights *layer,
-        uint64_t                 gate_tensor_bytes,
-        uint64_t                 down_tensor_bytes) {
-    const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-    return !g->quality &&
-           DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
-           gpu_graph_q4_selected_paths_allowed(g) &&
-           layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-           layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-           layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-           DS4_N_EXPERT == 384 &&
-           DS4_N_EXPERT_USED == 6 &&
-           gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
-           down_tensor_bytes >= q4_selected_min_tensor_bytes &&
-           getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
-           getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
-           (gpu_graph_use_pro_q4_expert_table_auto(g) ||
-            getenv("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL) &&
-           getenv("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL &&
-           getenv("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") == NULL;
-}
-
-
-
-static bool gpu_graph_decode_q4_selected_slots_expected(
-        const ds4_gpu_graph     *g,
-        const ds4_layer_weights *layer,
-        uint64_t                 gate_tensor_bytes,
-        uint64_t                 down_tensor_bytes) {
-    if (gpu_graph_decode_pro_q4_expert_table_expected(g, layer,
-                                                        gate_tensor_bytes,
-                                                        down_tensor_bytes)) {
-        return false;
-    }
-    const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-    return !g->quality &&
-           gpu_graph_q4_selected_paths_allowed(g) &&
-           layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-           layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-           layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-           DS4_N_EXPERT_USED == 6 &&
-           DS4_N_EXPERT >= 128 &&
-           (g->ssd_streaming ||
-            (gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
-             down_tensor_bytes >= q4_selected_min_tensor_bytes)) &&
-           getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
-           getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
-           getenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") == NULL;
+    return streaming_iq2;
 }
 
 
@@ -598,17 +493,12 @@ static bool gpu_graph_decode_cuda_selected_slots_expected(
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
         return false;
     }
-    const bool q4 =
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-        getenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") == NULL;
     const bool iq2 =
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
         getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
-    return q4 || iq2;
+    return iq2;
 }
 
 
@@ -848,14 +738,11 @@ static bool gpu_graph_decode_set_hash_selected_override(
         const ds4_gpu_graph     *g) {
     if (!layer->ffn_gate_tid2eid) return true;
 
-    const bool q4_selected =
-        gpu_graph_decode_q4_selected_slots_expected(g,
-                                                      layer,
-                                                      gate_tensor_bytes,
-                                                      down_tensor_bytes);
+    (void)gate_tensor_bytes;
+    (void)down_tensor_bytes;
     const bool iq2_selected =
         gpu_graph_decode_iq2_selected_slots_expected(g, layer);
-    if (!q4_selected && !iq2_selected) {
+    if (!iq2_selected) {
         return true;
     }
 
@@ -898,7 +785,6 @@ static bool gpu_graph_decode_cpu_router(
         uint32_t                il,
         uint32_t                token) {
     const bool profile =
-        getenv("DS4_METAL_PRO_Q4_CPU_ROUTER_PROFILE") != NULL ||
         getenv("DS4_METAL_STREAMING_IQ2_CPU_ROUTER_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     if (ds4_gpu_end_commands() == 0) return false;
@@ -1824,10 +1710,10 @@ bool gpu_graph_encode_decode_layer(
                 g->layer_n_index_comp[il] > DS4_N_INDEXER_TOP_K) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
-                    !tensor_type_is_f16_or_q8_0(layer->indexer_attn_q_b->type) ||
+                    layer->indexer_attn_q_b->type != DS4_TENSOR_F16 ||
                     layer->indexer_attn_q_b->dim[0] != q_rank ||
                     layer->indexer_attn_q_b->dim[1] != indexer_q_dim) {
-                    fprintf(stderr, "ds4: Metal graph indexer q projection expects F16 or Q8_0 weights\n");
+                    fprintf(stderr, "ds4: Metal graph indexer q projection expects F16 weights\n");
                     ok = false;
                 }
                 if (ok && (!layer->indexer_proj ||
@@ -2174,12 +2060,6 @@ bool gpu_graph_encode_decode_layer(
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !gpu_graph_use_reference_shared_down_hc();
-    const bool q4_selected_shared_overlap =
-        gpu_graph_use_q4_selected_shared_overlap() &&
-        gpu_graph_decode_q4_selected_slots_expected(g,
-                                                      layer,
-                                                      layer->ffn_gate_exps->bytes,
-                                                      layer->ffn_down_exps->bytes);
     const bool iq2_selected_shared_overlap =
         gpu_graph_use_iq2_selected_shared_overlap(g) &&
         gpu_graph_decode_iq2_selected_slots_expected(g, layer);
@@ -2192,8 +2072,7 @@ bool gpu_graph_encode_decode_layer(
         !gpu_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
-        (q4_selected_shared_overlap ||
-         iq2_selected_shared_overlap ||
+        (iq2_selected_shared_overlap ||
          cuda_selected_shared_overlap);
     const bool async_selected_load =
         overlap_selected_shared &&
@@ -2817,10 +2696,6 @@ bool gpu_graph_matmul_plain_tensor(
     if (w->type == DS4_TENSOR_F32) {
         return ds4_gpu_matmul_f32_tensor(out, model->map, model->size,
                                            w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
-    }
-    if (w->type == DS4_TENSOR_Q8_0) {
-        return ds4_gpu_matmul_q8_0_tensor(out, model->map, model->size,
-                                            w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }
     fprintf(stderr, "ds4: Metal plain matmul does not support %s\n", tensor_type_name(w->type));
     return false;

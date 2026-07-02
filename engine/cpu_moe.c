@@ -551,36 +551,6 @@ static void layer_routed_moe_batch(
         }
 
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
-    } else if (gate_type == DS4_TENSOR_Q4_K) {
-        matvec_q4_k_batch_mid_ctx mid_ctx = {
-            .mid = mid,
-            .xq = xq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .pair_weight = pair_weight,
-            .clamp = clamp,
-            .in_dim = expert_in_dim,
-            .out_dim = expert_out_dim,
-            .xq_blocks = xq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t gate_in_dim, gate_out_dim;
-            uint64_t up_in_dim, up_out_dim;
-            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
-                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
-            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
-                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
-            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
-                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
     } else {
         ds4_die("unsupported gate/up expert tensor type for batch");
     }
@@ -625,32 +595,6 @@ static void layer_routed_moe_batch(
         }
 
         ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
-    } else if (down_type == DS4_TENSOR_Q4_K) {
-        matvec_q4_k_batch_accum_rows_ctx down_ctx = {
-            .moe = moe,
-            .midq = midq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .n_active = n_active,
-            .n_tok = n_tok,
-            .in_dim = down_in_dim,
-            .out_dim = down_out_dim,
-            .midq_blocks = midq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t in_dim, out_dim;
-            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
-            if (in_dim != down_in_dim || out_dim != down_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
     } else {
         ds4_die("unsupported down expert tensor type for batch");
     }

@@ -61,11 +61,7 @@ static void tensor_expect_layout(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    /* Accept MXFP8 wherever Q8_0 is expected: the workhorse weights (attn_kv/q,
-     * shared experts) may be FP8 (routed to the FP8 matmul via the load-time
-     * flag); attn_output stays Q8 in the file so nothing regresses. */
-    if (t->type != type &&
-        !(type == DS4_TENSOR_Q8_0 && t->type == DS4_TENSOR_FP8_E4M3)) {
+    if (t->type != type) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected %s\n",
                 (int)t->name.len,
@@ -132,36 +128,9 @@ static void tensor_expect_plain_layout(
 
 
 
-bool tensor_type_is_f16_or_q8_0(uint32_t type) {
-    return type == DS4_TENSOR_F16 || type == DS4_TENSOR_Q8_0;
-}
-
-
-
-static void tensor_expect_f16_or_q8_0_layout(
-        const ds4_tensor *t,
-        uint32_t          ndim,
-        uint64_t          d0,
-        uint64_t          d1,
-        uint64_t          d2) {
-    if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (!tensor_type_is_f16_or_q8_0(t->type)) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected f16 or q8_0\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
-    }
-    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
-}
-
-
-
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_FP4_E2M1;
 }
 
@@ -171,7 +140,6 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
-    case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     /* MXFP4: 17 bytes / 32 vals = [1 E8M0 scale][16 bytes = 32x E2M1]. Per-QK_K
      * (256 vals) = 8 sub-blocks * 17 = 136 bytes, matching the other per-QK_K sizes. */
     case DS4_TENSOR_FP4_E2M1: return (QK_K / 32) * 17;
@@ -285,7 +253,7 @@ bool ds4_streaming_routed_expert_bytes(
 
 /*
  * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
- * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
+ * bigger quant (e.g. MXFP4 among IQ2 layers). The streaming expert cache is a
  * single-size-class slab allocator sized from the FIRST routed layer, so those
  * layers can never be served from it: they must read expert weights through the
  * mapped-model views instead. A layer is "uniform" iff its per-expert bytes
@@ -538,12 +506,12 @@ static void weights_validate_layout(
         tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
         tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        /* Output head may be Q8_0 (quantized from the tied BF16 embed) or BF16
-         * (kept lossless; the engine has a dedicated BF16 matmul). */
+        /* Output head is BF16 (kept lossless; the engine has a dedicated BF16
+         * matmul) or MXFP8 (routed to the FP8 matmul). */
         if (w->output->type == DS4_TENSOR_BF16)
             tensor_expect_layout(w->output,      DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
         else
-            tensor_expect_layout(w->output,      DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+            tensor_expect_layout(w->output,      DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -558,14 +526,14 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_layout(l->attn_kv,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-        tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_FP8_E4M3, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_FP8_E4M3, 2, out_low_dim, DS4_N_EMBD, 0);
 
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -578,7 +546,7 @@ static void weights_validate_layout(
         if (ratio == 4) {
             const uint64_t index_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
             const uint64_t index_width = 2u * DS4_N_INDEXER_HEAD_DIM;
-            tensor_expect_f16_or_q8_0_layout(l->indexer_attn_q_b, 2, DS4_N_LORA_Q, index_q_dim, 0);
+            tensor_expect_layout(l->indexer_attn_q_b, DS4_TENSOR_F16, 2, DS4_N_LORA_Q, index_q_dim, 0);
             tensor_expect_layout(l->indexer_proj,              DS4_TENSOR_F16, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD, 0);
             tensor_expect_layout(l->indexer_compressor_ape,    DS4_TENSOR_F16, 2, index_width, ratio, 0);
             tensor_expect_layout(l->indexer_compressor_kv,     DS4_TENSOR_F16, 2, DS4_N_EMBD, index_width, 0);
@@ -599,9 +567,9 @@ static void weights_validate_layout(
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (il < DS4_N_HASH_LAYER) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
@@ -620,8 +588,8 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
     tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
     tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_layout(w->e_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->h_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->e_proj,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->h_proj,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
     tensor_expect_layout(w->enorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
     tensor_expect_layout(w->hnorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
     tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
@@ -630,14 +598,14 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
     tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
     tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
     tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
-    tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
+    tensor_expect_layout(l->attn_kv,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
     tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
     tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-    tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-    tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
+    tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_FP8_E4M3, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+    tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_FP8_E4M3, 2, out_low_dim, DS4_N_EMBD, 0);
 
     tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
     tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
@@ -651,9 +619,9 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
         ds4_die("MTP routed gate/up experts use different quant types");
     }
-    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
 }
 
 
@@ -990,6 +958,53 @@ void config_validate_model(const ds4_model *m) {
 
 
 
+/* Weight formats the engine still decodes.  Legacy Q4_K and Q8_0 weight
+ * support has been removed; reject such GGUFs up front with one clear error
+ * instead of failing on the first per-tensor layout check. */
+static bool weights_tensor_type_supported(uint32_t type) {
+    switch (type) {
+    case DS4_TENSOR_F32:
+    case DS4_TENSOR_F16:
+    case DS4_TENSOR_Q2_K:
+    case DS4_TENSOR_IQ2_XXS:
+    case DS4_TENSOR_I32:
+    case DS4_TENSOR_BF16:
+    case DS4_TENSOR_FP8_E4M3:
+    case DS4_TENSOR_FP4_E2M1:
+        return true;
+    default:
+        return false;
+    }
+}
+
+
+
+static void weights_reject_unsupported_types(const ds4_model *m) {
+    bool seen[256] = { false };
+    bool any = false;
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const uint32_t type = m->tensors[i].type;
+        if (weights_tensor_type_supported(type)) continue;
+        if (type < 256 && seen[type]) continue;
+        if (type < 256) seen[type] = true;
+        fprintf(stderr,
+                "ds4: unsupported weight tensor type %s (first tensor: %.*s)\n",
+                tensor_type_name(type),
+                (int)m->tensors[i].name.len,
+                m->tensors[i].name.ptr);
+        any = true;
+    }
+    if (any) {
+        fprintf(stderr,
+                "ds4: supported weight tensor types: f32, f16, bf16, i32, q2_k, "
+                "iq2_xxs, fp8_e4m3 (MXFP8), mxfp4\n");
+        exit(1);
+    }
+}
+
+
+
 static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required, bool optional) {
     if (required) {
         w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
@@ -1073,6 +1088,7 @@ void weights_bind(
         bool             require_output,
         bool             optional_output) {
     memset(w, 0, sizeof(*w));
+    weights_reject_unsupported_types(m);
 
     uint32_t start = 0;
     uint32_t end = DS4_N_LAYER - 1u;
@@ -1130,52 +1146,11 @@ static void model_map_span_vec_append(ds4_model_map_span_vec *spans, uint64_t lo
 
 
 
-static uint32_t model_map_q4_pro_group_views(void) {
-    uint32_t views = 1;
-    const char *env = getenv("DS4_METAL_Q4_PRO_MAP_GROUPS");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0 && v <= 384 && (384u % (uint32_t)v) == 0) {
-            views = (uint32_t)v;
-        }
-    }
-    return views;
-}
-
-
-
 static void model_map_span_vec_include_one(ds4_model_map_span_vec *spans, const ds4_tensor *t) {
     if (!t || t->bytes == 0) return;
-    const uint64_t q4_isolated_min_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-    const uint32_t q4_pro_group_views = model_map_q4_pro_group_views();
-    if (t->type == DS4_TENSOR_Q4_K &&
-        t->ndim == 3 &&
-        t->dim[2] == 384 &&
-        t->bytes >= q4_isolated_min_bytes &&
-        (t->bytes % q4_pro_group_views) == 0)
-    {
-        /*
-         * PRO Q4 routed expert tensors are too large to hide inside broad
-         * layer spans. Isolate them so the default selected-expert path does
-         * not stack large aliases on top of layer-sized model views. Optional
-         * group splits are enabled by DS4_METAL_Q4_PRO_MAP_GROUPS for Metal
-         * experiments that bind stable grouped views.
-         */
-        const uint64_t group_bytes = t->bytes / q4_pro_group_views;
-        if (group_bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = group_bytes;
-        for (uint32_t i = 0; i < q4_pro_group_views; i++) {
-            const uint64_t lo = t->abs_offset + (uint64_t)i * group_bytes;
-            model_map_span_vec_append(spans, lo, lo + group_bytes, true);
-        }
-        return;
-    }
-
     uint64_t lo = UINT64_MAX, hi = 0;
     model_map_span_include_tensor(t, &lo, &hi, &spans->max_tensor_bytes);
-    const bool isolate = t->type == DS4_TENSOR_Q4_K &&
-                         t->bytes >= q4_isolated_min_bytes;
-    model_map_span_vec_append(spans, lo, hi, isolate);
+    model_map_span_vec_append(spans, lo, hi, false);
 }
 
 
@@ -1457,6 +1432,7 @@ DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
 
 void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
+    weights_reject_unsupported_types(m);
 
     w->hc_head_base  = required_tensor(m, "mtp.0.hc_head_base.weight");
     w->hc_head_fn    = required_tensor(m, "mtp.0.hc_head_fn.weight");

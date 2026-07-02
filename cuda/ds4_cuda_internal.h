@@ -66,13 +66,6 @@ typedef struct {
 } cuda_block_q2_K;
 
 typedef struct {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t scales[12];
-    uint8_t qs[CUDA_QK_K / 2];
-} cuda_block_q4_K;
-
-typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
     int16_t bsums[CUDA_QK_K / 16];
@@ -101,24 +94,6 @@ struct cuda_model_arena {
     char *device_ptr;
     uint64_t bytes;
     uint64_t used;
-};
-
-struct cuda_q8_f16_range {
-    const void *host_base;
-    uint64_t offset;
-    uint64_t weight_bytes;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    __half *device_ptr;
-};
-
-struct cuda_q8_f32_range {
-    const void *host_base;
-    uint64_t offset;
-    uint64_t weight_bytes;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    float *device_ptr;
 };
 
 struct cuda_stream_selected_cache {
@@ -193,22 +168,7 @@ extern std::unordered_set<uint64_t> g_fp8_offsets;
 void *cuda_tmp_alloc(uint64_t bytes, const char *what);
 int cuda_attention_score_buffer_fits(uint32_t n_comp);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
-void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes);
 int cuda_q8_use_dp4a(void);
-const __half *cuda_q8_f16_ptr(
-        const void *model_map,
-        uint64_t offset,
-        uint64_t weight_bytes,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        const char *label);
-float *cuda_q8_f32_ptr(
-        const void *model_map,
-        uint64_t offset,
-        uint64_t weight_bytes,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        const char *label);
 int cuda_ok(cudaError_t err, const char *what);
 int cublas_ok(cublasStatus_t st, const char *what);
 int cuda_matmul_q8_0_hc_expand_tensor_labeled(

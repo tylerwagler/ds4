@@ -138,14 +138,10 @@ ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
+test: ds4_test ds4_agent_test ds4-eval
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
 
-q4k-dot-test: tests/test_q4k_dot.c
-	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
-	./tests/test_q4k_dot
-
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test tests/test_q4k_dot *.o engine/*.o agent/*.o server/*.o cuda/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test *.o engine/*.o agent/*.o server/*.o cuda/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

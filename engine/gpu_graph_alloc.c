@@ -368,15 +368,11 @@ bool gpu_graph_cuda_stream_prefill_batch_selected_addr_enabled(
             !layer->ffn_down_exps) {
             continue;
         }
-        const bool q4 =
-            layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-            layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-            layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
         const bool iq2 =
             layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
             layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
             layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
-        if (q4 || iq2) return true;
+        if (iq2) return true;
     }
     return false;
 }

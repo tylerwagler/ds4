@@ -2548,12 +2548,9 @@ bool gpu_graph_eval_token_raw_swa(
 
 static bool gpu_graph_streaming_decode_prefill_wide_default(
         const ds4_weights *weights) {
-    return DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
-           weights &&
-           DS4_N_LAYER > 0 &&
-           weights->layer[0].ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-           weights->layer[0].ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-           weights->layer[0].ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    /* Only the (removed) Q4_K Flash layout defaulted to wide decode-prefill. */
+    (void)weights;
+    return false;
 }
 
 

@@ -130,7 +130,6 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * These layouts and IQ2 tables match the GGUF quantized tensor format,
  * reduced to only the formats ds4.c currently reads:
  *   - Q2_K routed down experts
- *   - Q4_K routed experts in the high-memory variant
  *   - IQ2_XXS routed gate/up experts
  *   - Q8_K temporary activation blocks for dot products
  */
@@ -276,13 +275,6 @@ typedef struct {
 } block_q2_K;
 
 typedef struct {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t  scales[12];
-    uint8_t  qs[QK_K / 2];
-} block_q4_K;
-
-typedef struct {
     float   d;
     int8_t  qs[QK_K];
     int16_t bsums[QK_K / 16];
@@ -420,7 +412,6 @@ enum {
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
-    DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
@@ -734,69 +725,6 @@ typedef struct {
     uint64_t row_bytes[DS4_MAX_EXPERT];
     uint64_t midq_blocks;
 } matvec_q2_k_batch_accum_rows_ctx;
-
-/* =========================================================================
- * Q4_K routed expert matrix-vector products.
- * ========================================================================= */
-
-typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT_USED];
-    const uint8_t *up_base[DS4_MAX_EXPERT_USED];
-    const block_q8_K *xq;
-    float expert_weight[DS4_MAX_EXPERT_USED];
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT_USED];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT_USED];
-    int n_expert;
-} matvec_q4_k_mid_ctx;
-
-typedef struct {
-    float *out;
-    const uint8_t *base[DS4_MAX_EXPERT_USED];
-    const block_q8_K *xq[DS4_MAX_EXPERT_USED];
-    uint64_t in_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT_USED];
-    int n_expert;
-} matvec_q4_k_accum_ctx;
-
-/* Q4_K batch mid worker: same structure as IQ2_XXS batch but uses Q4_K dot. */
-typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT];
-    const uint8_t *up_base[DS4_MAX_EXPERT];
-    const block_q8_K *xq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT];
-    uint64_t xq_blocks;
-} matvec_q4_k_batch_mid_ctx;
-
-/* Q4_K batch down accum worker: same structure as Q2_K batch but uses Q4_K dot. */
-typedef struct {
-    float *moe;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint32_t n_active;
-    uint32_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_q4_k_batch_accum_rows_ctx;
 
 typedef struct {
     float *moe;
@@ -1411,7 +1339,6 @@ void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim);
 void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim);
 void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k);
 void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y);
-void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_q8_K *y);
 void ds4_vec_dot_iq2_xxs_pair_q8_K(
         int n,
         float *s0,
@@ -1420,7 +1347,6 @@ void ds4_vec_dot_iq2_xxs_pair_q8_K(
         const block_iq2_xxs *x1,
         const block_q8_K *y);
 uint32_t required_u32(const ds4_model *m, const char *key);
-bool tensor_type_is_f16_or_q8_0(uint32_t type);
 DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t);
 bool ds4_streaming_routed_expert_bytes(
         const ds4_weights *weights,
@@ -1604,8 +1530,6 @@ void matvec_q2_k_experts_accum_prequant(
 void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1);
 void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1);
 void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1);
-void matvec_q4_k_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1);
-void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1);
 void matvec_experts_mid_prequant(
         float            *mid,
         const ds4_model  *m,
@@ -2622,7 +2546,7 @@ static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t
  *
  * These functions are the CPU reference math used by the C backend and by
  * Metal diagnostics.  They implement only the tensor formats present in the
- * DeepSeek V4 Flash GGUF: F16, F32, Q8_0, Q2_K, IQ2_XXS, and Q8_K activation
+ * DeepSeek V4 Flash GGUF: F16, F32, Q2_K, IQ2_XXS, and Q8_K activation
  * blocks used for expert dot products.
  */
 

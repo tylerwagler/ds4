@@ -694,32 +694,6 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
 
 
 
-static bool accelerator_cache_q8_tensors(const ds4_model *m,
-                                         const uint64_t *span_offsets,
-                                         const uint64_t *span_sizes,
-                                         uint32_t span_count) {
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        const ds4_tensor *t = &m->tensors[i];
-        if (t->bytes == 0) continue;
-        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
-        if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
-                                              span_offsets, span_sizes, span_count)) {
-            continue;
-        }
-        char label[128];
-        snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
-        if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
-            ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
-            fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
-                    (int)t->name.len, t->name.ptr);
-            return false;
-        }
-    }
-    return true;
-}
-
-
-
 bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
@@ -751,7 +725,6 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
         return false;
     }
-    if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
     const double t1 = now_sec();
     const char *accelerator_name = "CUDA";
     fprintf(stderr,
