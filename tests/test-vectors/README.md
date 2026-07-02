@@ -46,7 +46,7 @@ DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-
 ```
 
 The runner opens the normal non-quality path with accelerator-specific fast
-routes disabled and pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict
+routes disabled and pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict
 official-vector check.
 
 `official.vec` is intentionally trivial to parse from C: each case points to a

@@ -513,7 +513,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
 }
 
 
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+extern "C" int ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -525,9 +525,9 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    return ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
+    return ds4_gpu_matmul_mxfp8_tensor(gate, model_map, model_size,
                                         gate_offset, in_dim, out_dim, x, 1) &&
-           ds4_gpu_matmul_q8_0_tensor(up, model_map, model_size,
+           ds4_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
                                         up_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
@@ -904,20 +904,6 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
 
 
 
-extern "C" int ds4_gpu_hc_expand_split_half_tensor(
-        ds4_gpu_tensor *out_hc,
-        const ds4_gpu_tensor *block_out_h,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t n_embd,
-        uint32_t n_hc) {
-    (void)out_hc; (void)block_out_h; (void)residual_hc; (void)split;
-    (void)n_embd; (void)n_hc;
-    return 0;
-}
-
-
-
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
@@ -937,22 +923,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
 
 
 
-extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
-        ds4_gpu_tensor *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add_h,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t n_embd,
-        uint32_t n_hc) {
-    (void)out_hc; (void)block_out; (void)block_add_h; (void)residual_hc;
-    (void)split; (void)n_embd; (void)n_hc;
-    return 0;
-}
-
-
-
-extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+extern "C" int ds4_gpu_shared_down_hc_expand_mxfp8_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,
@@ -966,7 +937,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    return ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
+    return ds4_gpu_matmul_mxfp8_tensor(shared_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim,
                                         shared_mid, 1) &&
            ds4_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
@@ -988,7 +959,7 @@ extern "C" int ds4_gpu_matmul_fp8_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (getenv("DS4_CUDA_DISABLE_FP8_HC_EXPAND_FUSED") == NULL) {
         return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -1000,7 +971,7 @@ extern "C" int ds4_gpu_matmul_fp8_hc_expand_tensor(
                                                         n_embd, n_hc,
                                                         "fp8_hc_expand");
     }
-    return ds4_gpu_matmul_q8_0_tensor(block_out, model_map, model_size,
+    return ds4_gpu_matmul_mxfp8_tensor(block_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);

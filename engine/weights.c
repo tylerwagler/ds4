@@ -332,6 +332,35 @@ uint64_t ds4_streaming_manual_cache_safe_bytes(void) {
 
 
 
+/* The CUDA routed-MoE dispatcher executes exactly two expert quant combos:
+ * gate/up IQ2_XXS with Q2_K down, or gate/up/down all MXFP4 (FP4_E2M1).
+ * Reject anything else at load with one clear error instead of a silent
+ * kernel-dispatch failure at the first MoE layer. */
+static void tensor_expect_routed_expert_combo(
+        const ds4_tensor *gate,
+        const ds4_tensor *up,
+        const ds4_tensor *down) {
+    const bool iq2_combo = gate->type == DS4_TENSOR_IQ2_XXS &&
+                           up->type   == DS4_TENSOR_IQ2_XXS &&
+                           down->type == DS4_TENSOR_Q2_K;
+    const bool mxfp4_combo = gate->type == DS4_TENSOR_FP4_E2M1 &&
+                             up->type   == DS4_TENSOR_FP4_E2M1 &&
+                             down->type == DS4_TENSOR_FP4_E2M1;
+    if (iq2_combo || mxfp4_combo) return;
+    fprintf(stderr,
+            "ds4: unsupported routed expert quant combo at tensor %.*s: "
+            "gate=%s up=%s down=%s; supported combos are "
+            "gate/up=iq2_xxs with down=q2_k, or gate/up/down=mxfp4\n",
+            (int)gate->name.len,
+            gate->name.ptr,
+            tensor_type_name(gate->type),
+            tensor_type_name(up->type),
+            tensor_type_name(down->type));
+    exit(1);
+}
+
+
+
 static void tensor_expect_routed_expert(
         const ds4_tensor *t,
         uint32_t          ndim,
@@ -563,10 +592,9 @@ static void weights_validate_layout(
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
-        if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
-            fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
-            exit(1);
-        }
+        tensor_expect_routed_expert_combo(l->ffn_gate_exps,
+                                          l->ffn_up_exps,
+                                          l->ffn_down_exps);
         tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
@@ -616,9 +644,9 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
     tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
     tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
-    if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
-        ds4_die("MTP routed gate/up experts use different quant types");
-    }
+    tensor_expect_routed_expert_combo(l->ffn_gate_exps,
+                                      l->ffn_up_exps,
+                                      l->ffn_down_exps);
     tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);

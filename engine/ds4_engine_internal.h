@@ -1003,7 +1003,6 @@ typedef struct {
     ds4_gpu_tensor *batch_qr;
     ds4_gpu_tensor *batch_qr_norm;
     ds4_gpu_tensor *batch_q;
-    ds4_gpu_tensor *batch_q_half;
     ds4_gpu_tensor *batch_kv_raw;
     ds4_gpu_tensor *batch_kv;
     ds4_gpu_tensor *batch_comp_kv;
@@ -2158,7 +2157,7 @@ bool gpu_graph_matmul_plain_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-bool gpu_graph_matmul_q8_0_named_tensor(
+bool gpu_graph_matmul_mxfp8_named_tensor(
         const char             *module,
         uint32_t                il,
         uint32_t                pos0,

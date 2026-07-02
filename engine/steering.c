@@ -110,22 +110,22 @@ ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
  * =========================================================================
  *
  * The release path calls these after important stages, but they are no-ops
- * unless DS4_METAL_GRAPH_DUMP_PREFIX is set.  Dumping synchronizes and restarts
+ * unless DS4_CUDA_GRAPH_DUMP_PREFIX is set.  Dumping synchronizes and restarts
  * the command batch, so it is intentionally isolated here.
  */
 
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
     if (!prefix || !prefix[0]) return false;
 
-    const char *name_env = getenv("DS4_METAL_GRAPH_DUMP_NAME");
+    const char *name_env = getenv("DS4_CUDA_GRAPH_DUMP_NAME");
     if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
 
-    const char *layer_env = getenv("DS4_METAL_GRAPH_DUMP_LAYER");
+    const char *layer_env = getenv("DS4_CUDA_GRAPH_DUMP_LAYER");
     if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
         (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
 
-    const char *pos_env = getenv("DS4_METAL_GRAPH_DUMP_POS");
+    const char *pos_env = getenv("DS4_CUDA_GRAPH_DUMP_POS");
     if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
 
     return true;

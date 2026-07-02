@@ -43,27 +43,27 @@ static bool gpu_graph_install_model_spans(
 
 
 static bool gpu_graph_stream_readahead_enabled(void) {
-    return getenv("DS4_METAL_ENABLE_STREAMING_READAHEAD") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_READAHEAD") == NULL;
+    return getenv("DS4_CUDA_ENABLE_STREAMING_READAHEAD") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_READAHEAD") == NULL;
 }
 
 
 
 static bool gpu_graph_stream_madvise_willneed_enabled(void) {
-    return getenv("DS4_METAL_ENABLE_STREAMING_MADVISE_WILLNEED") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_MADVISE_WILLNEED") == NULL;
+    return getenv("DS4_CUDA_ENABLE_STREAMING_MADVISE_WILLNEED") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_MADVISE_WILLNEED") == NULL;
 }
 
 
 
 bool gpu_graph_stream_decode_static_map_enabled(void) {
-    return getenv("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP") == NULL;
+    return getenv("DS4_CUDA_DISABLE_STREAMING_STATIC_DECODE_MAP") == NULL;
 }
 
 
 
 bool gpu_graph_stream_decode_static_map_state_cache_enabled(void) {
-    return getenv("DS4_METAL_DISABLE_STREAMING_STATIC_MAP_STATE_CACHE") == NULL;
+    return getenv("DS4_CUDA_DISABLE_STREAMING_STATIC_MAP_STATE_CACHE") == NULL;
 }
 
 
@@ -72,11 +72,11 @@ bool gpu_graph_stream_decode_layer_batch_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH") == NULL &&
-           (getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL ||
-            getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL) &&
-           getenv("DS4_METAL_DECODE_STAGE_PROFILE") == NULL &&
-           getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+           getenv("DS4_CUDA_DISABLE_STREAMING_LAYER_BATCH") == NULL &&
+           (getenv("DS4_CUDA_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL ||
+            getenv("DS4_CUDA_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL) &&
+           getenv("DS4_CUDA_DECODE_STAGE_PROFILE") == NULL &&
+           getenv("DS4_CUDA_GRAPH_DUMP_PREFIX") == NULL;
 }
 
 
@@ -211,8 +211,8 @@ bool gpu_graph_stream_prefill_selected_pagein_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_PAGEIN") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_PAGEIN") == NULL;
+           getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_SELECTED_PAGEIN") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_SELECTED_PAGEIN") == NULL;
 }
 
 
@@ -221,8 +221,8 @@ bool gpu_graph_stream_prefill_selected_madvise_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_MADVISE") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_MADVISE") == NULL;
+           getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_SELECTED_MADVISE") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_SELECTED_MADVISE") == NULL;
 }
 
 
@@ -231,8 +231,8 @@ bool gpu_graph_stream_prefill_layer_pagein_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PAGEIN") == NULL;
+           getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_PAGEIN") == NULL;
 }
 
 
@@ -241,9 +241,9 @@ bool gpu_graph_stream_prefill_layer_readahead_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_LAYER_READAHEAD") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_READAHEAD") == NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL;
+           getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_LAYER_READAHEAD") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_READAHEAD") == NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL;
 }
 
 
@@ -252,8 +252,8 @@ bool gpu_graph_stream_prefill_layer_pread_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREAD") == NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL;
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_PREAD") == NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL;
 }
 
 
@@ -262,14 +262,14 @@ bool gpu_graph_stream_prefill_layer_madvise_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_MADVISE") == NULL;
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") == NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_MADVISE") == NULL;
 }
 
 
 
 static uint32_t gpu_graph_stream_prefill_batch_selected_addr_auto_max(void) {
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX");
     if (env && env[0]) {
         char *end = NULL;
         const long v = strtol(env, &end, 10);
@@ -287,7 +287,7 @@ static uint32_t gpu_graph_stream_prefill_batch_selected_addr_auto_max(void) {
 
 
 static uint32_t gpu_graph_stream_prefill_batch_selected_addr_auto_min(void) {
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN");
     if (env && env[0]) {
         char *end = NULL;
         const long v = strtol(env, &end, 10);
@@ -313,10 +313,10 @@ bool gpu_graph_stream_prefill_batch_selected_addr_enabled(
         g->quality ||
         !weights ||
         n_tokens <= 1 ||
-        getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
-        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
-        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
-        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
+        getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
+        getenv("DS4_CUDA_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+        getenv("DS4_CUDA_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
         DS4_N_LAYER == 0 ||
         DS4_N_EXPERT_USED != 6 ||
         weights->layer[0].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
@@ -329,7 +329,7 @@ bool gpu_graph_stream_prefill_batch_selected_addr_enabled(
         return false;
     }
 
-    if (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL) {
+    if (getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL) {
         return true;
     }
 
@@ -351,11 +351,10 @@ bool gpu_graph_cuda_stream_prefill_batch_selected_addr_enabled(
         g->quality ||
         !weights ||
         n_tokens <= 1 ||
-        getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
         getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
-        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
-        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
-        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
+        getenv("DS4_CUDA_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+        getenv("DS4_CUDA_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
         DS4_N_LAYER == 0 ||
         DS4_N_EXPERT < 128 ||
         DS4_N_EXPERT_USED != 6) {
@@ -384,8 +383,8 @@ static bool gpu_graph_stream_prefill_selected_profile_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_PROFILE") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_PROFILE") == NULL;
+           getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_PROFILE") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_SELECTED_PROFILE") == NULL;
 }
 
 
@@ -742,9 +741,9 @@ static void *gpu_graph_stream_pagein_worker_main(void *arg) {
 
 
 static uint32_t gpu_graph_stream_prefill_layer_pagein_threads(void) {
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_THREADS");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_PREPARE_THREADS");
     if (!env || !env[0]) {
-        env = getenv("DS4_METAL_STREAMING_PREFILL_LAYER_PAGEIN_THREADS");
+        env = getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_PAGEIN_THREADS");
     }
     if (!env || !env[0]) return 8;
     char *end = NULL;
@@ -758,9 +757,9 @@ static uint32_t gpu_graph_stream_prefill_layer_pagein_threads(void) {
 static uint32_t gpu_graph_stream_prefill_selected_prepare_threads(
         bool madvise_only) {
     if (!madvise_only) return 1;
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_PREPARE_THREADS");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_PREPARE_THREADS");
     if (!env || !env[0]) {
-        env = getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_MADVISE_THREADS");
+        env = getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_MADVISE_THREADS");
     }
     if (!env || !env[0]) return gpu_graph_stream_prefill_layer_pagein_threads();
     char *end = NULL;
@@ -772,7 +771,7 @@ static uint32_t gpu_graph_stream_prefill_selected_prepare_threads(
 
 
 static uint32_t gpu_graph_stream_prefill_selected_prepare_gap(void) {
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_PREPARE_GAP");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_PREPARE_GAP");
     if (!env || !env[0]) return 0;
     char *end = NULL;
     unsigned long v = strtoul(env, &end, 10);
@@ -783,16 +782,16 @@ static uint32_t gpu_graph_stream_prefill_selected_prepare_gap(void) {
 
 
 bool gpu_graph_stream_prefill_layer_pagein_overlap_enabled(void) {
-    return getenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_NO_OVERLAP") == NULL &&
-           getenv("DS4_METAL_STREAMING_PREFILL_LAYER_PAGEIN_NO_OVERLAP") == NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE_OVERLAP") == NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PAGEIN_OVERLAP") == NULL;
+    return getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_PREPARE_NO_OVERLAP") == NULL &&
+           getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_PAGEIN_NO_OVERLAP") == NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_PREPARE_OVERLAP") == NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_PAGEIN_OVERLAP") == NULL;
 }
 
 
 
 uint32_t gpu_graph_stream_prefill_layer_prepare_ahead(void) {
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREPARE_AHEAD");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_PREPARE_AHEAD");
     if (!env || !env[0]) return 1;
     char *end = NULL;
     unsigned long v = strtoul(env, &end, 10);
@@ -818,8 +817,8 @@ bool gpu_graph_stream_prefill_selected_pagein_start(
     memset(job, 0, sizeof(*job));
     job->ok = true;
     job->profile =
-        getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_PAGEIN_PROFILE") != NULL ||
-        getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_MADVISE_PROFILE") != NULL;
+        getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_PAGEIN_PROFILE") != NULL ||
+        getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_MADVISE_PROFILE") != NULL;
     job->layer = il;
     job->n_tokens = n_tokens;
 
@@ -1072,10 +1071,10 @@ static bool gpu_graph_stream_prefill_layer_pagein_start(
     job->pread_only = pread_only;
     job->readahead_only = readahead_only;
     job->profile =
-        getenv("DS4_METAL_STREAMING_PREFILL_LAYER_PAGEIN_PROFILE") != NULL ||
-        getenv("DS4_METAL_STREAMING_PREFILL_LAYER_PREAD_PROFILE") != NULL ||
-        getenv("DS4_METAL_STREAMING_PREFILL_LAYER_MADVISE_PROFILE") != NULL ||
-        getenv("DS4_METAL_STREAMING_PREFILL_LAYER_READAHEAD_PROFILE") != NULL;
+        getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_PAGEIN_PROFILE") != NULL ||
+        getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_PREAD_PROFILE") != NULL ||
+        getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_MADVISE_PROFILE") != NULL ||
+        getenv("DS4_CUDA_STREAMING_PREFILL_LAYER_READAHEAD_PROFILE") != NULL;
     job->layer = il;
     job->n_tokens = n_tokens;
 
@@ -1402,9 +1401,9 @@ bool gpu_graph_stream_prefill_selected_readahead_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD") != NULL ||
-            getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") != NULL) &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD") == NULL;
+           (getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD") != NULL ||
+            getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") != NULL) &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD") == NULL;
 }
 
 
@@ -1413,15 +1412,15 @@ bool gpu_graph_stream_prefill_selected_readahead_shared_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") == NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD") == NULL;
+           getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED") == NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_SELECTED_READAHEAD") == NULL;
 }
 
 
 
 static uint32_t gpu_graph_stream_prefill_selected_readahead_gap(void) {
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_READAHEAD_GAP");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_READAHEAD_GAP");
     if (!env || !env[0]) return 0;
     char *end = NULL;
     unsigned long v = strtoul(env, &end, 10);
@@ -1509,7 +1508,7 @@ bool gpu_graph_stream_readahead_selected_experts_from_gpu(
     int32_t *selected = xmalloc((size_t)n_ids * sizeof(selected[0]));
 
     const bool profile =
-        getenv("DS4_METAL_STREAMING_PREFILL_SELECTED_READAHEAD_PROFILE") != NULL;
+        getenv("DS4_CUDA_STREAMING_PREFILL_SELECTED_READAHEAD_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     bool ok = ds4_gpu_tensor_read(g->batch_router_selected,
                                   0,
@@ -1742,7 +1741,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
     static uint32_t cached = 0;
     if (parsed < 0) {
         parsed = 0;
-        const char *env = getenv("DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD");
+        const char *env = getenv("DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD");
         if (env && env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(env, &end, 10);
@@ -1754,7 +1753,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
                 parsed = 1;
             } else {
                 fprintf(stderr,
-                        "ds4: invalid DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
+                        "ds4: invalid DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
                         "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
                         env);
             }
@@ -1779,7 +1778,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
  *
  * The normal generation path uses the fused helpers below.  The older unfused
  * kernels remain available as diagnostic reference paths selected only by the
- * DS4_METAL_DISABLE_*_FUSION environment switches.
+ * DS4_CUDA_DISABLE_*_FUSION environment switches.
  */
 
 bool gpu_graph_env_flag(const char *name, int *cache) {

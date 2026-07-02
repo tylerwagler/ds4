@@ -8,35 +8,35 @@
 
 bool gpu_graph_use_reference_hc_decode(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_DISABLE_HC_FUSION", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_HC_FUSION", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_kv_decode(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_DISABLE_KV_FUSION", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_KV_FUSION", &cache);
 }
 
 
 
 bool gpu_graph_use_reference_qkv_norm(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_DISABLE_QKV_NORM_FUSION", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_QKV_NORM_FUSION", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_compressor_pair_proj(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_hc_norm_decode(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_HC_NORM_FUSION", &cache);
 }
 
 
@@ -44,21 +44,21 @@ static bool gpu_graph_use_reference_hc_norm_decode(void) {
 bool gpu_graph_enable_batch_hc_norm_fusion(void) {
     static int cache = -1;
     return !gpu_graph_use_reference_hc_norm_decode() &&
-           gpu_graph_env_flag("DS4_METAL_ENABLE_BATCH_HC_NORM_FUSION", &cache);
+           gpu_graph_env_flag("DS4_CUDA_ENABLE_BATCH_HC_NORM_FUSION", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_shared_down_hc(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_attn_out_hc(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_DISABLE_ATTN_OUT_HC_FUSION", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_ATTN_OUT_HC_FUSION", &cache);
 }
 
 
@@ -106,7 +106,7 @@ static bool gpu_graph_decode_hc_pre(
 
 static bool gpu_graph_hc_norm_fusion_check_enabled(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_METAL_HC_NORM_FUSION_CHECK", &cache);
+    return gpu_graph_env_flag("DS4_CUDA_HC_NORM_FUSION_CHECK", &cache);
 }
 
 
@@ -116,7 +116,7 @@ static float gpu_graph_hc_norm_fusion_check_tolerance(void) {
     static float tolerance;
     if (initialized) return tolerance;
     tolerance = 2.0e-4f;
-    const char *env = getenv("DS4_METAL_HC_NORM_FUSION_CHECK_TOL");
+    const char *env = getenv("DS4_CUDA_HC_NORM_FUSION_CHECK_TOL");
     if (env && env[0]) {
         char *end = NULL;
         const float v = strtof(env, &end);
@@ -397,8 +397,8 @@ bool gpu_graph_matmul_plain_tensor(
 
 
 static bool gpu_graph_use_streaming_iq2_cpu_router(void) {
-    return getenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER") == NULL;
+    return getenv("DS4_CUDA_ENABLE_STREAMING_IQ2_CPU_ROUTER") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_IQ2_CPU_ROUTER") == NULL;
 }
 
 
@@ -414,8 +414,8 @@ static bool gpu_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
 static bool gpu_graph_use_iq2_selected_shared_overlap(const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL &&
-           getenv("DS4_METAL_DISABLE_IQ2_SELECTED_SHARED_OVERLAP") == NULL;
+           getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL &&
+           getenv("DS4_CUDA_DISABLE_IQ2_SELECTED_SHARED_OVERLAP") == NULL;
 }
 
 
@@ -423,7 +423,7 @@ static bool gpu_graph_use_iq2_selected_shared_overlap(const ds4_gpu_graph *g) {
 static bool gpu_graph_use_iq2_selected_async_load(const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_LOAD") == NULL;
+           getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_ASYNC_LOAD") == NULL;
 }
 
 
@@ -432,7 +432,7 @@ static bool gpu_graph_use_iq2_selected_async_early_commit(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
+           getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
 }
 
 
@@ -451,9 +451,9 @@ static bool gpu_graph_decode_cpu_router_applicable(
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
         DS4_N_EXPERT_USED == 6 &&
         DS4_N_EXPERT >= 128 &&
-        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
-        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
-        getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+        getenv("DS4_CUDA_MOE_WRITE_CLAMPED_ACT") == NULL &&
+        getenv("DS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+        getenv("DS4_CUDA_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
     return streaming_iq2;
 }
 
@@ -470,9 +470,9 @@ bool gpu_graph_decode_iq2_selected_slots_expected(
            layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
            DS4_N_EXPERT_USED == 6 &&
            DS4_N_EXPERT >= 128 &&
-           getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
-           getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
-           getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+           getenv("DS4_CUDA_MOE_WRITE_CLAMPED_ACT") == NULL &&
+           getenv("DS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+           getenv("DS4_CUDA_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
 }
 
 
@@ -489,15 +489,15 @@ static bool gpu_graph_decode_cuda_selected_slots_expected(
         !layer->ffn_down_exps ||
         DS4_N_EXPERT_USED != 6 ||
         DS4_N_EXPERT < 128 ||
-        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
-        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
+        getenv("DS4_CUDA_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
         return false;
     }
     const bool iq2 =
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-        getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+        getenv("DS4_CUDA_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
     return iq2;
 }
 
@@ -506,12 +506,12 @@ static bool gpu_graph_decode_cuda_selected_slots_expected(
 uint32_t gpu_graph_streaming_prefill_cache_seed_k(const ds4_gpu_graph *g) {
     if (!g ||
         !g->ssd_streaming ||
-        getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_CACHE_SEED") == NULL) {
+        getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_CACHE_SEED") == NULL) {
         return 0;
     }
 
     uint32_t k = 1;
-    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_CACHE_SEED_K");
+    const char *env = getenv("DS4_CUDA_STREAMING_PREFILL_CACHE_SEED_K");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
@@ -536,7 +536,7 @@ bool gpu_graph_streaming_expert_hotlist_enabled(const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
            !g->ssd_streaming_cold &&
-           getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST") == NULL;
+           getenv("DS4_CUDA_DISABLE_STREAMING_EXPERT_HOTLIST") == NULL;
 }
 
 
@@ -709,7 +709,7 @@ uint32_t gpu_graph_streaming_expert_preload_count(
          * thousands of preads into shared Metal buffers and trip the system
          * watchdog before decode begins. Explicit CLI preload counts bypass
          * this cap. */
-        const char *env = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
+        const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
         uint32_t cap = 4096;
         if (env && env[0]) {
             char *end = NULL;
@@ -785,7 +785,7 @@ static bool gpu_graph_decode_cpu_router(
         uint32_t                il,
         uint32_t                token) {
     const bool profile =
-        getenv("DS4_METAL_STREAMING_IQ2_CPU_ROUTER_PROFILE") != NULL;
+        getenv("DS4_CUDA_STREAMING_IQ2_CPU_ROUTER_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
@@ -861,8 +861,8 @@ static bool gpu_graph_use_iq2_selected_readahead_shared_delay(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") == NULL;
+           getenv("DS4_CUDA_ENABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") != NULL &&
+           getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") == NULL;
 }
 
 
@@ -881,7 +881,7 @@ static bool gpu_graph_decode_selected_readahead_override(
     }
 
     const bool profile =
-        getenv("DS4_METAL_STREAMING_SELECTED_READAHEAD_PROFILE") != NULL;
+        getenv("DS4_CUDA_STREAMING_SELECTED_READAHEAD_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
@@ -1338,7 +1338,7 @@ bool gpu_graph_encode_decode_layer(
     bool ok = true;
     const bool decode_stage_profile = gpu_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
-#define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
+#define DS4_CUDA_PROFILE_DECODE_STAGE(name) do { \
         if (ok && decode_stage_profile) { \
             ok = gpu_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
@@ -1388,7 +1388,7 @@ bool gpu_graph_encode_decode_layer(
                                        layer->hc_attn_scale->abs_offset,
                                        layer->hc_attn_base->abs_offset);
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_pre");
+    DS4_CUDA_PROFILE_DECODE_STAGE("attn_hc_pre");
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_attn_pre_mixes", g->hc_mix, mix_hc, il, pos);
         gpu_graph_debug_dump_tensor("hc_attn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
@@ -1402,13 +1402,13 @@ bool gpu_graph_encode_decode_layer(
                                                                    model->map, model->size,
                                                                    layer->attn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_norm");
+    DS4_CUDA_PROFILE_DECODE_STAGE("attn_norm");
     if (ok) {
         gpu_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
     bool qkv_pair_projected = false;
     if (ok && qkv_rms_fused) {
-        qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(g->qr,
+        qkv_pair_projected = ds4_gpu_matmul_mxfp8_pair_tensor(g->qr,
                                                              g->kv_raw,
                                                              model->map,
                                                              model->size,
@@ -1420,7 +1420,7 @@ bool gpu_graph_encode_decode_layer(
                                                              g->attn_norm,
                                                              1) != 0;
     }
-    if (ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(g->qr,
+    if (ok && !qkv_pair_projected) ok = ds4_gpu_matmul_mxfp8_tensor(g->qr,
                                                                     model->map,
                                                                     model->size,
                                                                     layer->attn_q_a->abs_offset,
@@ -1432,7 +1432,7 @@ bool gpu_graph_encode_decode_layer(
         gpu_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
     if (qkv_rms_fused) {
-        if (ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
+        if (ok && !qkv_pair_projected) ok = ds4_gpu_matmul_mxfp8_tensor(g->kv_raw, model->map, model->size,
                                                   layer->attn_kv->abs_offset,
                                                   DS4_N_EMBD, DS4_N_HEAD_DIM,
                                                   g->attn_norm, 1) != 0;
@@ -1463,7 +1463,7 @@ bool gpu_graph_encode_decode_layer(
     if (qkv_rms_fused && ok) {
         gpu_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
+    if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
                                               q_rank, q_dim,
                                               g->qr_norm, 1) != 0;
@@ -1501,12 +1501,12 @@ bool gpu_graph_encode_decode_layer(
                                                 false, freq_base, freq_scale, ext_factor, attn_factor,
                                                 DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("q_path");
+    DS4_CUDA_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         gpu_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
     }
     if (!qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
+        if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->kv_raw, model->map, model->size,
                                                   layer->attn_kv->abs_offset,
                                                   DS4_N_EMBD, DS4_N_HEAD_DIM,
                                                   g->attn_norm, 1) != 0;
@@ -1533,7 +1533,7 @@ bool gpu_graph_encode_decode_layer(
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
     if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
-    DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
+    DS4_CUDA_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
@@ -1543,7 +1543,7 @@ bool gpu_graph_encode_decode_layer(
     ds4_gpu_tensor *comp_selected = NULL;
     uint32_t n_selected = 0;
     double decode_index_stage_t0 = 0.0;
-    const bool decode_index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
+    const bool decode_index_stage_profile = getenv("DS4_CUDA_INDEXER_STAGE_PROFILE") != NULL;
     if (ok && compressed) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -1833,7 +1833,7 @@ bool gpu_graph_encode_decode_layer(
         n_comp = g->layer_n_comp[il];
         comp_cache = g->layer_attn_comp_cache[il];
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
+    DS4_CUDA_PROFILE_DECODE_STAGE("compressor_indexer");
 
     if (ok) {
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
@@ -1882,7 +1882,7 @@ bool gpu_graph_encode_decode_layer(
                                                          DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
         }
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("attention");
+    DS4_CUDA_PROFILE_DECODE_STAGE("attention");
     if (ok) {
         gpu_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
@@ -1937,7 +1937,7 @@ bool gpu_graph_encode_decode_layer(
                                                      n_groups, DS4_N_EMBD,
                                                      g->heads, 1) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
+    DS4_CUDA_PROFILE_DECODE_STAGE("attn_output");
     if (ok) {
         gpu_graph_debug_dump_tensor("attn_low", g->attn_low, (uint64_t)n_groups * rank, il, pos);
     }
@@ -1951,7 +1951,7 @@ bool gpu_graph_encode_decode_layer(
         ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
                                         g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
+    DS4_CUDA_PROFILE_DECODE_STAGE("attn_hc_post");
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
@@ -1996,7 +1996,7 @@ bool gpu_graph_encode_decode_layer(
                                        layer->hc_ffn_scale->abs_offset,
                                        layer->hc_ffn_base->abs_offset);
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
+    DS4_CUDA_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
         gpu_graph_debug_dump_tensor("hc_ffn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
@@ -2010,7 +2010,7 @@ bool gpu_graph_encode_decode_layer(
                                                                    model->map, model->size,
                                                                    layer->ffn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
-    DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
+    DS4_CUDA_PROFILE_DECODE_STAGE("ffn_norm");
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
@@ -2045,7 +2045,7 @@ bool gpu_graph_encode_decode_layer(
                                                                    layer->ffn_down_exps->bytes,
                                                                    g);
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("router");
+    DS4_CUDA_PROFILE_DECODE_STAGE("router");
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
         gpu_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
@@ -2055,7 +2055,7 @@ bool gpu_graph_encode_decode_layer(
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_gate_up =
         !g->quality &&
-        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+        getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !gpu_graph_use_reference_shared_down_hc();
     const bool iq2_selected_shared_overlap =
@@ -2112,7 +2112,7 @@ bool gpu_graph_encode_decode_layer(
                                                                 down_expert_bytes);
         }
         if (ok && fuse_shared_gate_up) {
-            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+            ok = ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(g->shared_gate,
                                                              g->shared_up,
                                                              g->shared_mid,
                                                              model->map,
@@ -2124,18 +2124,18 @@ bool gpu_graph_encode_decode_layer(
                                                              g->ffn_norm,
                                                              DS4_SWIGLU_CLAMP_EXP) != 0;
         } else if (ok) {
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
+            if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_gate, model->map, model->size,
                                                       layer->ffn_gate_shexp->abs_offset,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
+            if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_up, model->map, model->size,
                                                       layer->ffn_up_shexp->abs_offset,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
             if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                                                shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
-        DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+        DS4_CUDA_PROFILE_DECODE_STAGE("shared_gate_up");
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                      g->routed_gate,
                                                      g->routed_up,
@@ -2156,7 +2156,7 @@ bool gpu_graph_encode_decode_layer(
                                                      DS4_N_EXPERT,
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
-        DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        DS4_CUDA_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             gpu_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                           (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -2169,7 +2169,7 @@ bool gpu_graph_encode_decode_layer(
             gpu_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
         }
         if (ok && fuse_shared_down_hc) {
-            ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
+            ok = ds4_gpu_shared_down_hc_expand_mxfp8_tensor(g->after_ffn_hc,
                                                              g->shared_out,
                                                              model->map,
                                                              model->size,
@@ -2183,12 +2183,12 @@ bool gpu_graph_encode_decode_layer(
                                                              DS4_N_EMBD,
                                                              DS4_N_HC) != 0;
         } else if (ok) {
-            ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
+            ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_out, model->map, model->size,
                                               layer->ffn_down_shexp->abs_offset,
                                               shared_dim, DS4_N_EMBD,
                                               g->shared_mid, 1) != 0;
         }
-        DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+        DS4_CUDA_PROFILE_DECODE_STAGE("shared_down");
         if (ok) {
             gpu_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
         }
@@ -2219,7 +2219,7 @@ bool gpu_graph_encode_decode_layer(
                                                       DS4_N_EMBD,
                                                       DS4_N_HC) != 0;
         }
-        DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
+        DS4_CUDA_PROFILE_DECODE_STAGE("ffn_hc_post");
         if (ok) {
             gpu_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
         }
@@ -2248,7 +2248,7 @@ bool gpu_graph_encode_decode_layer(
             ok = ds4_gpu_flush_commands() != 0;
         }
         if (ok && fuse_shared_gate_up) {
-            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+            ok = ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(g->shared_gate,
                                                              g->shared_up,
                                                              g->shared_mid,
                                                              model->map,
@@ -2260,25 +2260,25 @@ bool gpu_graph_encode_decode_layer(
                                                              g->ffn_norm,
                                                              DS4_SWIGLU_CLAMP_EXP) != 0;
         } else if (ok) {
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
+            if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_gate, model->map, model->size,
                                                       layer->ffn_gate_shexp->abs_offset,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
-            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
+            if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_up, model->map, model->size,
                                                       layer->ffn_up_shexp->abs_offset,
                                                       DS4_N_EMBD, shared_dim,
                                                       g->ffn_norm, 1) != 0;
             if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                                                shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
-        DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+        DS4_CUDA_PROFILE_DECODE_STAGE("shared_gate_up");
         if (ok && !fuse_shared_down_hc) {
-            ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
+            ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_out, model->map, model->size,
                                               layer->ffn_down_shexp->abs_offset,
                                               shared_dim, DS4_N_EMBD,
                                               g->shared_mid, 1) != 0;
         }
-        DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+        DS4_CUDA_PROFILE_DECODE_STAGE("shared_down");
         if (async_load_started) {
             const bool flush_ok = ds4_gpu_flush_commands() != 0;
             const bool finish_ok =
@@ -2329,7 +2329,7 @@ bool gpu_graph_encode_decode_layer(
                                                      DS4_N_EXPERT,
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
-        DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        DS4_CUDA_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             gpu_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                           (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -2342,7 +2342,7 @@ bool gpu_graph_encode_decode_layer(
             gpu_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
         }
         if (ok && fuse_shared_down_hc) {
-            ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
+            ok = ds4_gpu_shared_down_hc_expand_mxfp8_tensor(g->after_ffn_hc,
                                                              g->shared_out,
                                                              model->map,
                                                              model->size,
@@ -2356,7 +2356,7 @@ bool gpu_graph_encode_decode_layer(
                                                              DS4_N_EMBD,
                                                              DS4_N_HC) != 0;
         }
-        DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+        DS4_CUDA_PROFILE_DECODE_STAGE("shared_down");
         if (ok) {
             gpu_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
         }
@@ -2387,7 +2387,7 @@ bool gpu_graph_encode_decode_layer(
                                                       DS4_N_EMBD,
                                                       DS4_N_HC) != 0;
         }
-        DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
+        DS4_CUDA_PROFILE_DECODE_STAGE("ffn_hc_post");
         if (ok) {
             gpu_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
         }
@@ -2413,7 +2413,7 @@ bool gpu_graph_encode_decode_layer(
                                                  DS4_N_EXPERT,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                  il) != 0;
-    DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+    DS4_CUDA_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -2432,7 +2432,7 @@ bool gpu_graph_encode_decode_layer(
         gpu_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
     if (ok && fuse_shared_gate_up) {
-        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+        ok = ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
                                                          model->map,
@@ -2444,20 +2444,20 @@ bool gpu_graph_encode_decode_layer(
                                                          g->ffn_norm,
                                                          DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
+        if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_gate, model->map, model->size,
                                                   layer->ffn_gate_shexp->abs_offset,
                                                   DS4_N_EMBD, shared_dim,
                                                   g->ffn_norm, 1) != 0;
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
+        if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_up, model->map, model->size,
                                                   layer->ffn_up_shexp->abs_offset,
                                                   DS4_N_EMBD, shared_dim,
                                                   g->ffn_norm, 1) != 0;
         if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+    DS4_CUDA_PROFILE_DECODE_STAGE("shared_gate_up");
     if (ok && fuse_shared_down_hc) {
-        ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
+        ok = ds4_gpu_shared_down_hc_expand_mxfp8_tensor(g->after_ffn_hc,
                                                          g->shared_out,
                                                          model->map,
                                                          model->size,
@@ -2471,12 +2471,12 @@ bool gpu_graph_encode_decode_layer(
                                                          DS4_N_EMBD,
                                                          DS4_N_HC) != 0;
     } else if (ok) {
-        ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
+        ok = ds4_gpu_matmul_mxfp8_tensor(g->shared_out, model->map, model->size,
                                           layer->ffn_down_shexp->abs_offset,
                                           shared_dim, DS4_N_EMBD,
                                           g->shared_mid, 1) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+    DS4_CUDA_PROFILE_DECODE_STAGE("shared_down");
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
     }
@@ -2507,8 +2507,8 @@ bool gpu_graph_encode_decode_layer(
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
-#undef DS4_METAL_PROFILE_DECODE_STAGE
+    DS4_CUDA_PROFILE_DECODE_STAGE("ffn_hc_post");
+#undef DS4_CUDA_PROFILE_DECODE_STAGE
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
@@ -2571,7 +2571,7 @@ bool gpu_graph_encode_output_head(
                                             weights->output->abs_offset, DS4_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
         else
-            ok = ds4_gpu_matmul_q8_0_tensor(g->logits, model->map, model->size,
+            ok = ds4_gpu_matmul_mxfp8_tensor(g->logits, model->map, model->size,
                                             weights->output->abs_offset, DS4_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
     }
@@ -2587,7 +2587,7 @@ bool gpu_graph_encode_output_head(
  *
  * A target verifier only needs top-1 ids for intermediate draft rows and full
  * logits for the last accepted row.  Running the normal one-row output head in
- * a loop serializes the HC collapse, output norm, and Q8 vocab projection.  For
+ * a loop serializes the HC collapse, output norm, and MXFP8 vocab projection.  For
  * tiny MTP suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
@@ -2664,7 +2664,7 @@ bool gpu_graph_encode_output_head_batch(
                                             weights->output->abs_offset, DS4_N_EMBD,
                                             vocab_dim, output_norm, n_tokens) != 0;
         else
-            ok = ds4_gpu_matmul_q8_0_tensor(logits, model->map, model->size,
+            ok = ds4_gpu_matmul_mxfp8_tensor(logits, model->map, model->size,
                                             weights->output->abs_offset, DS4_N_EMBD,
                                             vocab_dim, output_norm, n_tokens) != 0;
     }
@@ -2701,7 +2701,7 @@ bool gpu_graph_matmul_plain_tensor(
 
 
 
-bool gpu_graph_matmul_q8_0_named_tensor(
+bool gpu_graph_matmul_mxfp8_named_tensor(
         const char             *module,
         uint32_t                il,
         uint32_t                pos0,
@@ -2715,7 +2715,7 @@ bool gpu_graph_matmul_q8_0_named_tensor(
     (void)module;
     (void)il;
     (void)pos0;
-    const bool ok = ds4_gpu_matmul_q8_0_tensor(out,
+    const bool ok = ds4_gpu_matmul_mxfp8_tensor(out,
                                                  model->map,
                                                  model->size,
                                                  w->abs_offset,
@@ -2765,7 +2765,7 @@ bool gpu_graph_encode_output_head_mtp(
                                             base_weights->output->abs_offset, DS4_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
         else
-            ok = ds4_gpu_matmul_q8_0_tensor(g->logits, base_model->map, base_model->size,
+            ok = ds4_gpu_matmul_mxfp8_tensor(g->logits, base_model->map, base_model->size,
                                             base_weights->output->abs_offset, DS4_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
     }
@@ -3268,11 +3268,11 @@ int gpu_graph_first_token_full_test(
     ds4_gpu_graph g;
     bool ok = gpu_graph_alloc(&g, weights, &weights->layer[0]);
     g.quality = quality;
-    const bool trace_layers = getenv("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
+    const bool trace_layers = getenv("DS4_CUDA_GRAPH_TRACE_LAYERS") != NULL;
     if (trace_layers && ok) {
         g.materialize_ffn_out = true;
-        const bool teacher_force = getenv("DS4_METAL_GRAPH_TEACHER_FORCE") != NULL;
-        const char *stage_layer_env = getenv("DS4_METAL_GRAPH_TRACE_STAGE_LAYER");
+        const bool teacher_force = getenv("DS4_CUDA_GRAPH_TEACHER_FORCE") != NULL;
+        const char *stage_layer_env = getenv("DS4_CUDA_GRAPH_TRACE_STAGE_LAYER");
         const long stage_layer = stage_layer_env ? strtol(stage_layer_env, NULL, 10) : -1;
         float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
         float *cpu_cur = xmalloc((size_t)hc_dim * sizeof(float));
@@ -3398,7 +3398,7 @@ int gpu_graph_first_token_full_test(
 
 uint32_t gpu_graph_token_split_after_layers(void) {
     uint32_t split_after_layers = 4;
-    const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
+    const char *split_env = getenv("DS4_CUDA_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(split_env, &end, 10);

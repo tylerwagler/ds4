@@ -263,7 +263,7 @@ bool gpu_graph_prefill_layer_major(
 
     if (!gpu_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
-    const bool split_profile = getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
+    const bool split_profile = getenv("DS4_CUDA_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
      * A full long-prompt prefill can keep the GPU busy for a long time. Split
      * non-tiny prefills when a frontend asked for display progress: completed
@@ -276,7 +276,7 @@ bool gpu_graph_prefill_layer_major(
     const bool split_commands = g->ssd_streaming ||
                                 split_profile || throttle || callback_split ||
                                 n_tokens > 2048 || imatrix != NULL;
-    const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
+    const bool profile = getenv("DS4_CUDA_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -312,7 +312,7 @@ bool gpu_graph_prefill_layer_major(
 
         const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
         uint32_t output_row = (uint32_t)n_tokens - 1u;
-        const char *output_row_env = getenv("DS4_METAL_GRAPH_OUTPUT_ROW");
+        const char *output_row_env = getenv("DS4_CUDA_GRAPH_OUTPUT_ROW");
         if (output_row_env && output_row_env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(output_row_env, &end, 10);
@@ -666,7 +666,7 @@ bool gpu_graph_prefill_layer_major(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
-    const char *output_row_env = getenv("DS4_METAL_GRAPH_OUTPUT_ROW");
+    const char *output_row_env = getenv("DS4_CUDA_GRAPH_OUTPUT_ROW");
     if (output_row_env && output_row_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(output_row_env, &end, 10);
@@ -848,7 +848,7 @@ bool gpu_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
-    const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
+    const bool profile = getenv("DS4_CUDA_GRAPH_PREFILL_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     const uint32_t end = start + n_tokens;
 
@@ -1257,7 +1257,7 @@ uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
-    const char *env = getenv("DS4_METAL_GRAPH_RAW_CAP");
+    const char *env = getenv("DS4_CUDA_GRAPH_RAW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -1288,7 +1288,7 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
  * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
  * as a conservative crossover.  The env knob remains useful for retuning. */
 uint32_t gpu_graph_resume_prefill_min_tokens(void) {
-    const char *env = getenv("DS4_METAL_RESUME_PREFILL_MIN");
+    const char *env = getenv("DS4_CUDA_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -1392,7 +1392,7 @@ int gpu_graph_prompt_logits_test(
         const token_vec   *prompt,
         int                ctx_size) {
     int n_test = prompt->len;
-    const char *n_test_env = getenv("DS4_METAL_GRAPH_PROMPT_TOKENS");
+    const char *n_test_env = getenv("DS4_CUDA_GRAPH_PROMPT_TOKENS");
     if (n_test_env && n_test_env[0]) {
         char *endp = NULL;
         const long v = strtol(n_test_env, &endp, 10);
@@ -1414,7 +1414,7 @@ int gpu_graph_prompt_logits_test(
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report = getenv("DS4_CUDA_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     ds4_kv_cache cpu_cache;
@@ -1447,7 +1447,7 @@ int gpu_graph_prompt_logits_test(
     if (memory_report) ds4_gpu_print_memory_report("after prompt graph");
 
     if (ok) {
-        const char *dump_gpu = getenv("DS4_METAL_GRAPH_DUMP_LOGITS");
+        const char *dump_gpu = getenv("DS4_CUDA_GRAPH_DUMP_LOGITS");
         if (dump_gpu && dump_gpu[0]) {
             if (write_f32_binary_file(dump_gpu, gpu_logits, DS4_N_VOCAB)) {
                 fprintf(stderr, "ds4: wrote Metal graph logits to %s\n", dump_gpu);
@@ -1459,8 +1459,8 @@ int gpu_graph_prompt_logits_test(
                 fprintf(stderr, "ds4: wrote CPU logits to %s\n", dump_cpu);
             }
         }
-        if (getenv("DS4_METAL_GRAPH_TRACE_CACHE") != NULL ||
-            getenv("DS4_METAL_GRAPH_TRACE_COMP") != NULL) {
+        if (getenv("DS4_CUDA_GRAPH_TRACE_CACHE") != NULL ||
+            getenv("DS4_CUDA_GRAPH_TRACE_COMP") != NULL) {
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 const uint32_t n_raw = cpu_cache.layer[il].n_raw;
                 if (n_raw != 0) {

@@ -191,7 +191,7 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  * attention output projections, and DS4's tail-only RoPE.
  */
 
-int ds4_gpu_matmul_q8_0_tensor(
+int ds4_gpu_matmul_mxfp8_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -201,8 +201,8 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Route the q8 workhorse matmul (attn_kv/q + shared) to MXFP8 when the model's
- * those weights are FP8 (set once at load). */
+/* Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
+ * output head) by offset so the matmul above executes it; done once at load. */
 void ds4_gpu_register_fp8_weight(uint64_t weight_offset);
 
 /* Optional fused GPU operations.
@@ -210,10 +210,8 @@ void ds4_gpu_register_fp8_weight(uint64_t weight_offset);
  * These are acceleration hooks, not required backend primitives.  A backend
  * that does not provide the fused kernel must still define the symbol and
  * return 0.  Callers then use the portable sequence of required primitives.
- * Backends that return nonzero from a fused half-output operation must also
- * implement the matching half-input HC expansion helpers below.
  */
-int ds4_gpu_matmul_q8_0_pair_tensor(
+int ds4_gpu_matmul_mxfp8_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
         const void             *model_map,
@@ -226,17 +224,7 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ds4_gpu_matmul_q8_0_f16_out_tensor(
-        ds4_gpu_tensor       *out_h,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok);
-
-int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+int ds4_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -366,30 +354,6 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow,
         float             eps);
-
-int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *q_half,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t              n_tok,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              n_rot,
-        uint32_t              pos0,
-        uint32_t              n_ctx_orig,
-        bool                  inverse,
-        float                 freq_base,
-        float                 freq_scale,
-        float                 ext_factor,
-        float                 attn_factor,
-        float                 beta_fast,
-        float                 beta_slow,
-        float                 eps);
 
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_tensor *x,
@@ -930,14 +894,6 @@ int ds4_gpu_hc_expand_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_hc_expand_split_half_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out_h,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
-
 int ds4_gpu_hc_expand_add_split_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
@@ -947,16 +903,7 @@ int ds4_gpu_hc_expand_add_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_hc_expand_add_split_half_add_tensor(
-        ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add_h,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
-
-int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+int ds4_gpu_shared_down_hc_expand_mxfp8_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,

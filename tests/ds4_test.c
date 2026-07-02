@@ -79,22 +79,22 @@ typedef struct {
 static test_streaming_prefill_env test_force_canonical_streaming_prefill(void) {
     test_streaming_prefill_env saved = {
         .cold_decode =
-            test_save_env("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL"),
+            test_save_env("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL"),
         .batch_selected_addr =
-            test_save_env("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR"),
+            test_save_env("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR"),
     };
     if (test_env_bool("DS4_TEST_SSD_STREAMING")) {
-        setenv("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL", "1", 1);
-        setenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
+        setenv("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL", "1", 1);
+        setenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
     }
     return saved;
 }
 
 static void test_restore_canonical_streaming_prefill(
         test_streaming_prefill_env saved) {
-    test_restore_env("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL",
+    test_restore_env("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL",
                      saved.cold_decode);
-    test_restore_env("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
+    test_restore_env("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
                      saved.batch_selected_addr);
 }
 
@@ -808,21 +808,14 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
+    char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
-    setenv("DS4_METAL_PREFILL_CHUNK", "2048", 1);
-    if (getenv("DS4_TEST_LOGPROB_AUTO_METAL") == NULL) {
-        setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
-    } else {
-        unsetenv("DS4_METAL_DISABLE_METAL4");
-    }
+    setenv("DS4_CUDA_PREFILL_CHUNK", "2048", 1);
     ds4_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -846,8 +839,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
     ds4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+    test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -874,28 +866,28 @@ static void test_metal_ssd_streaming_cache_pressure(void) {
     char *saved_cache_experts =
         test_save_env("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS");
     char *saved_disable_layer_batch =
-        test_save_env("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH");
+        test_save_env("DS4_CUDA_DISABLE_STREAMING_LAYER_BATCH");
     char *saved_disable_static_decode =
-        test_save_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
+        test_save_env("DS4_CUDA_DISABLE_STREAMING_STATIC_DECODE_MAP");
     char *saved_one_stage =
-        test_save_env("DS4_METAL_MOE_ONE_STAGE_PROFILE");
+        test_save_env("DS4_CUDA_MOE_ONE_STAGE_PROFILE");
 
     setenv("DS4_TEST_SSD_STREAMING", "1", 1);
     setenv("DS4_TEST_SSD_STREAMING_CACHE_GB", "16", 1);
     unsetenv("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS");
-    unsetenv("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH");
-    unsetenv("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP");
-    unsetenv("DS4_METAL_MOE_ONE_STAGE_PROFILE");
+    unsetenv("DS4_CUDA_DISABLE_STREAMING_LAYER_BATCH");
+    unsetenv("DS4_CUDA_DISABLE_STREAMING_STATIC_DECODE_MAP");
+    unsetenv("DS4_CUDA_MOE_ONE_STAGE_PROFILE");
 
     fprintf(stderr,
             "ds4-test: Metal SSD streaming cache-pressure repro "
             "(16GiB cache, layer-batched decode, short_code_completion)\n");
     test_official_logprob_vectors_run("short_code_completion");
 
-    test_restore_env("DS4_METAL_MOE_ONE_STAGE_PROFILE", saved_one_stage);
-    test_restore_env("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP",
+    test_restore_env("DS4_CUDA_MOE_ONE_STAGE_PROFILE", saved_one_stage);
+    test_restore_env("DS4_CUDA_DISABLE_STREAMING_STATIC_DECODE_MAP",
                      saved_disable_static_decode);
-    test_restore_env("DS4_METAL_DISABLE_STREAMING_LAYER_BATCH",
+    test_restore_env("DS4_CUDA_DISABLE_STREAMING_LAYER_BATCH",
                      saved_disable_layer_batch);
     test_restore_env("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS",
                      saved_cache_experts);
@@ -1085,21 +1077,18 @@ static void test_local_golden_vectors(void) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
-    char *saved_moe_tile_max = test_save_env("DS4_METAL_MOE_TILE_MAX");
+    char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
+    char *saved_moe_tile_max = test_save_env("DS4_CUDA_MOE_TILE_MAX");
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
-    setenv("DS4_METAL_PREFILL_CHUNK", "4096", 1);
-    setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
-    unsetenv("DS4_METAL_MOE_TILE_MAX");
+    setenv("DS4_CUDA_PREFILL_CHUNK", "4096", 1);
+    unsetenv("DS4_CUDA_MOE_TILE_MAX");
 
     ds4_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-        test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
-        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+        test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
+        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -1112,9 +1101,8 @@ static void test_local_golden_vectors(void) {
 
     ds4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-    test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
-    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+    test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
+    test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -1515,11 +1503,8 @@ static void test_metal_mpp_equivalence(void) {
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
     memset(cases, 0, sizeof(cases));
 
-    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
-    setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
     ds4_engine *ref_engine = test_open_engine(false);
     if (!ref_engine) {
-        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
         return;
     }
 
@@ -1536,7 +1521,6 @@ static void test_metal_mpp_equivalence(void) {
                                      &tc->ref_gen_len));
     }
     ds4_engine_close(ref_engine);
-    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
 
     test_run_mpp_candidate("auto", cases, ncase);
 
@@ -1578,8 +1562,8 @@ static void test_streaming_decode_prefill_correctness(void) {
     }
     ds4_engine_close(ref_engine);
 
-    unsetenv("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL");
-    unsetenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    unsetenv("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL");
+    unsetenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
 
     ds4_engine *cand_engine = test_open_engine(false);
     if (cand_engine) {
@@ -2162,7 +2146,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
-    puts("  DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
+    puts("  DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");

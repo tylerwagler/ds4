@@ -79,7 +79,6 @@ void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_comp_kv);
     ds4_gpu_tensor_free(g->batch_kv);
     ds4_gpu_tensor_free(g->batch_kv_raw);
-    ds4_gpu_tensor_free(g->batch_q_half);
     ds4_gpu_tensor_free(g->batch_q);
     ds4_gpu_tensor_free(g->batch_qr_norm);
     ds4_gpu_tensor_free(g->batch_qr);

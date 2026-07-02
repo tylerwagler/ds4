@@ -701,10 +701,10 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
                                             uint32_t span_count) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
-    /* Register each MXFP8 weight's offset so the q8 matmul routes ONLY those to
-     * the FP8 path (per-tensor, not a global flag — attn_output stays Q8 even
-     * though it flows through the same matmul). Runs before the DIRECT_MODEL
-     * early-out so it applies in the mmap path too. */
+    /* Register each MXFP8 weight's offset so the workhorse matmul executes
+     * ONLY registered tensors (per-tensor routing; unregistered offsets are
+     * rejected at dispatch). Runs before the DIRECT_MODEL early-out so it
+     * applies in the mmap path too. */
     uint64_t n_fp8 = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];

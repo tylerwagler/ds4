@@ -48,7 +48,7 @@ void gpu_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
@@ -79,7 +79,7 @@ void gpu_graph_debug_dump_f16_tensor(
         uint64_t          n_f16,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
     if (!t || n_f16 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
@@ -113,7 +113,7 @@ void gpu_graph_debug_dump_i32_tensor(
         uint64_t          n_i32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
     if (!t || n_i32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
@@ -400,7 +400,6 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_qr = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
-    g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
     g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_kv = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
@@ -486,7 +485,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
                     g->batch_attn_cur && g->batch_attn_norm &&
-                    g->batch_qr && g->batch_qr_norm && g->batch_q && g->batch_q_half &&
+                    g->batch_qr && g->batch_qr_norm && g->batch_q &&
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
                     g->batch_indexer_q && g->batch_indexer_weights &&

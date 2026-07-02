@@ -11,10 +11,8 @@ API and integrated coding agent, all ready to work with coding agents or with
 the provided CLI interface. There are also tools for GGUF and imatrix generation,
 and for quality and speed testing.
 
-We support the following backends:
-* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM (or less, using SSD streaming).
-* **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark.
-* **Strix Halo (ROCm)**, systems like the Framework Desktop and other systems based on the same GPU and unified RAM design.
+This fork is CUDA-only:
+* **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark (GB10).
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -567,9 +565,9 @@ interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
 
 Sessions prefill long prompts in 4096-token chunks by default. Set
-`DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
+`DS4_CUDA_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
 to match the strict official-vector checkpoint path, or
-`DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
+`DS4_CUDA_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
 allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
 as an explicit run configuration.
 Chunked Metal prefill reuses the same range-capable layer-major graph for each
@@ -1224,7 +1222,7 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `top_logprobs` slice exposed by the API. Local vectors are generated with
 `./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
-C runner pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict API-vector
+C runner pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
 comparison.
 
 All project tests are driven by the C runner, with a small `ds4-eval`
