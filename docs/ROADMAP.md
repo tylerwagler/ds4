@@ -225,14 +225,13 @@ activity). CAVEAT: pruning trades general capability for fit -- safe at 5-20%, a
 only for a narrow/fixed workload profile.
 
 ## Quick wins (2026-07-02 audit, near-zero risk)
-- **Prefill QK-norm+RoPE fusion gap.** `decode_q_norm_rope_fused` (`gpu_decode.c:1474-1491`)
-  already calls a single fused RMS-norm+RoPE kernel (`ds4_gpu_head_rms_norm_rope_tail_tensor`,
-  `ds4_cuda_norm_kv.cu:119`) for decode. Prefill (`gpu_prefill.c:609-632`) unconditionally
-  calls the two-kernel unfused version instead — no comment/TODO explains why, and the fused
-  kernel's signature is already generic over `n_tok`. Costs one extra kernel launch plus one
-  extra full HBM round-trip of the Q tensor per layer, every prefill (×43 layers Flash / ×61
-  Pro). TODO: call the fused kernel from prefill too — decode already proves it numerically
-  correct, so this is wiring, not new kernel work.
+- **Prefill QK-norm+RoPE fusion gap — DONE (2026-07-02).** Prefill (`gpu_prefill.c`) now calls
+  `ds4_gpu_head_rms_norm_rope_tail_tensor` (same fused kernel decode already used, generic
+  over `n_tok`), mirroring decode's debug-dump guard so `DS4_CUDA_GRAPH_DUMP_*` tracing still
+  sees the intermediate "Qnorm" state when requested. Verified against oracle-zeroq8-99gb.gguf:
+  `--logprob-vectors`, `--local-golden-vectors`, `--short-prefill-ratio4` (n=1,2,3, directly
+  exercises the changed path), `--tensor-equivalence` all pass, zero top-1 mismatches,
+  short-prompt cases bit-identical to reference. Not yet re-benchmarked for t/s delta.
 
 ## Curated format menu (every format must earn its kernel)
 | bpw  | format   | hw path        | role |
