@@ -1013,8 +1013,6 @@ typedef struct {
     ds4_gpu_tensor *batch_heads;
     ds4_gpu_tensor *batch_attn_low;
     ds4_gpu_tensor *batch_attn_out;
-    ds4_gpu_tensor *batch_group_tmp;
-    ds4_gpu_tensor *batch_low_tmp;
     ds4_gpu_tensor *batch_after_attn_hc;
     ds4_gpu_tensor *batch_ffn_cur;
     ds4_gpu_tensor *batch_ffn_norm;

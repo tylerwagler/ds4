@@ -684,11 +684,9 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-int ds4_gpu_attention_output_q8_batch_tensor(
+int ds4_gpu_attention_output_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
-        ds4_gpu_tensor       *group_tmp,
-        ds4_gpu_tensor       *low_tmp,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
@@ -700,21 +698,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 
-int ds4_gpu_attention_output_q8_batch_f16_tensor(
-        ds4_gpu_tensor       *out_h,
-        ds4_gpu_tensor       *low,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
-        uint64_t                group_dim,
-        uint64_t                rank,
-        uint32_t                n_groups,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens);
-
-int ds4_gpu_attention_output_low_q8_tensor(
+int ds4_gpu_attention_output_low_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -987,7 +971,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+int ds4_gpu_matmul_fp8_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,

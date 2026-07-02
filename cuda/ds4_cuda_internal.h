@@ -168,10 +168,9 @@ extern std::unordered_set<uint64_t> g_fp8_offsets;
 void *cuda_tmp_alloc(uint64_t bytes, const char *what);
 int cuda_attention_score_buffer_fits(uint32_t n_comp);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
-int cuda_q8_use_dp4a(void);
 int cuda_ok(cudaError_t err, const char *what);
 int cublas_ok(cublasStatus_t st, const char *what);
-int cuda_matmul_q8_0_hc_expand_tensor_labeled(
+int cuda_matmul_fp8_hc_expand_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,

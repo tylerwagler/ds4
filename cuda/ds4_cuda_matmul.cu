@@ -254,137 +254,98 @@ __global__ static void matmul_bf16_kernel(
 
 
 
-__device__ __forceinline__ static int32_t load_i8x4_i32_aligned(const int8_t *p) {
-    return *(const int32_t *)p;
-}
-
-
-
-__device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *p) {
-    const uint8_t *u = (const uint8_t *)p;
-    return (int32_t)((uint32_t)u[0] |
-                     ((uint32_t)u[1] << 8) |
-                     ((uint32_t)u[2] << 16) |
-                     ((uint32_t)u[3] << 24));
-}
-
-
-
-__device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
-    int32_t dot = 0;
-#pragma unroll
-    for (uint32_t i = 0; i < 32u; i += 4u) {
-        dot = __dp4a(load_i8x4_i32_unaligned(a + i), load_i8x4_i32_aligned(b + i), dot);
-    }
-    return dot;
-}
-
-
-
-__device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const int8_t *b, uint64_t n, int use_dp4a) {
-    if (use_dp4a && n == 32u) return dot_i8x32_dp4a(a, b);
-    int32_t dot = 0;
-    for (uint64_t i = 0; i < n; i++) dot += (int32_t)a[i] * (int32_t)b[i];
-    return dot;
-}
-
-
-
-__global__ static void quantize_q8_0_f32_kernel(
-        int8_t *xq,
-        float *xscale,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t blocks) {
-    uint64_t b = blockIdx.x;
-    uint64_t tok = blockIdx.y;
-    if (b >= blocks) return;
-    uint64_t i0 = b * 32;
-    uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-    const float *xr = x + tok * in_dim + i0;
-
-    float a = 0.0f;
-    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
-    __shared__ float vals[32];
-    vals[threadIdx.x] = a;
-    __syncthreads();
-    for (uint32_t stride = 16; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    const float d = vals[0] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
-    int8_t *dst = xq + (tok * blocks + b) * 32;
-    if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
-        v = v > 127 ? 127 : (v < -128 ? -128 : v);
-        dst[threadIdx.x] = (int8_t)v;
-    } else {
-        dst[threadIdx.x] = 0;
-    }
-}
-
-
-
-/* MXFP8 weight block (33B: [E8M0][32 e4m3]) . pre-quantized Q8 activation block.
- * The attn-output fused kernels are not FP8-aware; this lets them consume MXFP8
- * weights. Mixes e4m3 weight (float) with int8 activation -> float MAC (no dp4a).
- * Returns wscale*sum(e4m3*act); caller multiplies by the activation's xscale. */
-__device__ __forceinline__ static float dev_dot_fp8mx_q8_block(
-        const unsigned char *wblk, const int8_t *xq, uint64_t bn) {
+/* MXFP8 weight block (33B: [E8M0][32 e4m3]) . raw f32 activation block.
+ * Decode-side attn-output dot: the e4m3 weight is expanded to float and MAC'd
+ * against the unquantized activation, so the only quantization error left on
+ * this path is the weight's own (e4m3-packing the activations pushed the
+ * perplexity gate; int8 requant is what this change removes). The contiguous
+ * 32-element inner loop is what nvcc vectorizes — a lane-per-element
+ * (mmvq-style) mapping profiled 2.2x slower. Returns wscale*sum(e4m3*x). */
+__device__ __forceinline__ static float dev_dot_fp8mx_f32_block(
+        const unsigned char *wblk, const float *x, uint64_t bn) {
     const float wscale = __int_as_float((uint32_t)wblk[0] << 23);   /* E8M0 */
     float s = 0.0f;
     for (uint64_t i = 0; i < bn; i++) {
         const __half wh = (__half)(*(const __nv_fp8_e4m3 *)&wblk[1 + i]);
-        s += __half2float(wh) * (float)xq[i];
+        s += __half2float(wh) * x[i];
     }
     return wscale * s;
 }
 
 
 
-__global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
+/* Same dot against an activation block already staged in registers (full
+ * 32-element block only). */
+__device__ __forceinline__ static float dev_dot_fp8mx_xreg_block(
+        const unsigned char *wblk, const float *xb) {
+    const float wscale = __int_as_float((uint32_t)wblk[0] << 23);   /* E8M0 */
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; i++) {
+        const __half wh = (__half)(*(const __nv_fp8_e4m3 *)&wblk[1 + i]);
+        s += __half2float(wh) * xb[i];
+    }
+    return wscale * s;
+}
+
+
+
+/* Fused attn-output kernels: MXFP8 weight rows dotted against RAW f32
+ * activations. Each warp covers DS4_FP8MX_ROWS consecutive output rows and
+ * loads every 32-float activation block into registers ONCE for all of them,
+ * so per-row activation traffic drops to int8-path parity (per-row f32 reads
+ * straight from global measured ~13% slower end-to-end at decode; a shared-
+ * memory staging variant measured worse still). */
+enum { DS4_FP8MX_ROWS = 4 };
+
+
+
+__global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
         float *out_hc,
         float *block_out,
         const float *block_add,
         const float *residual_hc,
         const float *split,
         const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
+        const float *x,
         uint64_t in_dim,
         uint64_t out_dim,
         uint32_t n_embd,
         uint32_t n_hc,
         uint64_t blocks,
-        int has_add,
-        int use_dp4a,
-        int is_fp8) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+        int has_add) {
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * DS4_FP8MX_ROWS;
     const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    const uint32_t wstride = is_fp8 ? 33u : 34u;
-    const unsigned char *wr = w + row * blocks * wstride;
-    float acc = 0.0f;
+    if (row0 >= out_dim) return;
+    const uint32_t nr = out_dim - row0 < DS4_FP8MX_ROWS ? (uint32_t)(out_dim - row0)
+                                                        : (uint32_t)DS4_FP8MX_ROWS;
+    const unsigned char *wr = w + row0 * blocks * 33u;
+    float acc[DS4_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        const int8_t *xqb = xq + b * 32;
-        if (is_fp8) {
-            acc += dev_dot_fp8mx_q8_block(wr + b * 33, xqb, bn) * xscale[b];
+        if (bn == 32u) {
+            float xb[32];
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+                *(float4 *)&xb[k * 4] = *(const float4 *)&x[i0 + (uint32_t)k * 4u];
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+                if (r < nr) acc[r] += dev_dot_fp8mx_xreg_block(wr + (r * blocks + b) * 33u, xb);
+            }
         } else {
-            const __half *scale_h = (const __half *)(wr + b * 34);
-            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
-            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+            for (uint32_t r = 0; r < nr; r++) {
+                acc[r] += dev_dot_fp8mx_f32_block(wr + (r * blocks + b) * 33u, x + i0, bn);
+            }
         }
     }
-    acc = warp_sum_f32(acc);
-    if (lane == 0) {
-        const uint32_t d = (uint32_t)row;
-        block_out[d] = acc;
-        float block_v = acc;
+    for (uint32_t r = 0; r < nr; r++) {
+        const float red = warp_sum_f32(acc[r]);
+        if (lane != 0) continue;
+        const uint32_t d = (uint32_t)(row0 + r);
+        block_out[d] = red;
+        float block_v = red;
         if (has_add) block_v += block_add[d];
         const float *post = split + n_hc;
         const float *comb = split + 2u * n_hc;
@@ -402,48 +363,63 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
 
 
 
-__global__ static void grouped_q8_0_a_preq_warp8_kernel(
+__global__ static void grouped_fp8mx_a_warp8_kernel(
         float *low,
         const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
+        const float *x,
         uint64_t group_dim,
         uint64_t rank,
         uint32_t n_groups,
         uint32_t n_tokens,
-        uint64_t blocks,
-        int use_dp4a,
-        int is_fp8) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+        uint64_t blocks) {
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * DS4_FP8MX_ROWS;
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
-    if (row >= low_dim || tok >= n_tokens) return;
+    if (row0 >= low_dim || tok >= n_tokens) return;
+    const uint32_t nr = low_dim - row0 < DS4_FP8MX_ROWS ? (uint32_t)(low_dim - row0)
+                                                        : (uint32_t)DS4_FP8MX_ROWS;
+    const unsigned char *wr = w + row0 * blocks * 33u;
+    const uint64_t group = row0 / rank;
+    float acc[DS4_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    const uint64_t group = row / rank;
-    const uint64_t row_in_group = row - group * rank;
-    const uint32_t wstride = is_fp8 ? 33u : 34u;
-    const unsigned char *wr = w + (group * rank + row_in_group) * blocks * wstride;
-    const uint64_t xrow = tok * (uint64_t)n_groups + group;
-    const int8_t *xqr = xq + xrow * blocks * 32;
-    const float *xsr = xscale + xrow * blocks;
-    float acc = 0.0f;
-
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        const uint64_t i0 = b * 32;
-        const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
-        const int8_t *xqb = xqr + b * 32;
-        if (is_fp8) {
-            acc += dev_dot_fp8mx_q8_block(wr + b * 33, xqb, bn) * xsr[b];
-        } else {
-            const __half *scale_h = (const __half *)(wr + b * 34);
-            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
-            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+    if ((row0 + nr - 1) / rank == group) {
+        /* Common case (rank % DS4_FP8MX_ROWS == 0): all rows share the
+         * group's activation row, so its blocks are loaded once per warp. */
+        const float *xr = x + (tok * (uint64_t)n_groups + group) * group_dim;
+        for (uint64_t b = lane; b < blocks; b += 32u) {
+            const uint64_t i0 = b * 32;
+            const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+            if (bn == 32u) {
+                float xb[32];
+#pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    *(float4 *)&xb[k * 4] = *(const float4 *)&xr[i0 + (uint32_t)k * 4u];
+                }
+#pragma unroll
+                for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+                    if (r < nr) acc[r] += dev_dot_fp8mx_xreg_block(wr + (r * blocks + b) * 33u, xb);
+                }
+            } else {
+                for (uint32_t r = 0; r < nr; r++) {
+                    acc[r] += dev_dot_fp8mx_f32_block(wr + (r * blocks + b) * 33u, xr + i0, bn);
+                }
+            }
+        }
+    } else {
+        for (uint32_t r = 0; r < nr; r++) {
+            const float *xr = x + (tok * (uint64_t)n_groups + (row0 + r) / rank) * group_dim;
+            for (uint64_t b = lane; b < blocks; b += 32u) {
+                const uint64_t i0 = b * 32;
+                const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+                acc[r] += dev_dot_fp8mx_f32_block(wr + (r * blocks + b) * 33u, xr + i0, bn);
+            }
         }
     }
-    acc = warp_sum_f32(acc);
-    if (lane == 0) low[tok * low_dim + row] = acc;
+    for (uint32_t r = 0; r < nr; r++) {
+        const float red = warp_sum_f32(acc[r]);
+        if (lane == 0) low[tok * low_dim + row0 + r] = red;
+    }
 }
 
 
@@ -524,6 +500,26 @@ __global__ static void mxfp8_quant_act_kernel(const float *X, int rows, int K, i
     if (se < -127) se = -127; if (se > 127) se = 127;
     data[(size_t)(kb * 32 + lane) + (size_t)row * K] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
     if (lane == 0) scale[mx_sfoff(row, kb, KBp)] = (unsigned char)(se + 127);
+}
+
+
+/* Grouped variant for the attn-output "a" projection. The activation tensor is
+ * heads[tok][group][K] but each group is an independent GEMM, so the E4M3 data
+ * is regrouped as n_groups slabs of [K, n_tokens] col-major and the E8M0 scale
+ * as n_groups independent swizzles of scale_slab bytes (token = scale row). */
+__global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_tokens, int n_groups,
+                                                      int K, int KBp, __nv_fp8_e4m3 *data,
+                                                      unsigned char *scale, size_t scale_slab) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
+    int KB = K / 32; if (warp >= n_tokens * n_groups * KB) return;
+    int row = warp / KB, kb = warp % KB;        /* row = tok * n_groups + g */
+    int g = row % n_groups, tok = row / n_groups;
+    float v = X[(size_t)row * K + kb * 32 + lane], a = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    int se = -127; if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
+    if (se < -127) se = -127; if (se > 127) se = 127;
+    data[((size_t)g * n_tokens + tok) * K + kb * 32 + lane] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
+    if (lane == 0) scale[(size_t)g * scale_slab + mx_sfoff(tok, kb, KBp)] = (unsigned char)(se + 127);
 }
 
 
@@ -632,6 +628,96 @@ extern "C" int ds4_gpu_matmul_fp8_mx_tensor(ds4_gpu_tensor *out, const void *mod
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size, weight_offset,
                                              in_dim, out_dim, x, n_tok, "fp8_mx");
+}
+
+
+
+/* Prefill attn-output "a" projection as n_groups block-scaled MXFP8xMXFP8 GEMMs.
+ *
+ * The projection is block-diagonal: group g's [rank, group_dim] weight slice only
+ * sees activation rows (tok, g). cuBLASLt's VEC32_UE8M0 scale layout tiles rows in
+ * 128-row blocks, so a batched/strided formulation can't share one swizzled scale
+ * buffer across groups; instead the weight cache is sliced per group (exact when
+ * rank % 128 == 0: both data columns and scale tiles are contiguous per group)
+ * and the activations are quantized into per-group data + scale slabs. Each of
+ * the n_groups (8/16) GEMMs writes straight into low[tok][g*rank + r] via ldd,
+ * so no epilogue pass is needed. */
+static int cuda_attention_output_a_mx_gemm(
+        ds4_gpu_tensor *low,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t out_a_offset,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        const ds4_gpu_tensor *heads,
+        uint32_t n_tokens) {
+    if (group_dim % 32 != 0 || rank % 128 != 0 || !cublaslt_ensure()) return 0;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t KB = group_dim / 32;
+    const uint64_t weight_bytes = low_dim * KB * 33;
+    if (out_a_offset > model_size || weight_bytes > model_size - out_a_offset) return 0;
+    const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, out_a_offset, weight_bytes,
+                                                group_dim, low_dim, "attn_out_a");
+    if (!w) return 0;
+    const int KBp = mx_rup((int)KB, 4);
+    const size_t x_scale_slab = (size_t)mx_rup((int)n_tokens, 128) * KBp;
+    const size_t w_scale_slab = ((size_t)rank / 128) * (size_t)KBp * 128;
+    const size_t data_bytes = (size_t)n_tokens * n_groups * group_dim;
+    const size_t scale_bytes = (size_t)n_groups * x_scale_slab;
+    size_t wz = 32u << 20;
+    size_t off_sx = (data_bytes + 255) & ~(size_t)255;
+    size_t off_ws = (off_sx + scale_bytes + 255) & ~(size_t)255;
+    char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "attn_out_a mx scratch");
+    if (!scratch) return 0;
+    __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)scratch;
+    unsigned char *sx = (unsigned char *)(scratch + off_sx);
+    void *ws = scratch + off_ws;
+    cudaMemset(sx, 0, scale_bytes);
+    int warps = (int)n_tokens * (int)n_groups * (int)KB;
+    mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
+            (const float *)heads->ptr, (int)n_tokens, (int)n_groups,
+            (int)group_dim, KBp, xq, sx, x_scale_slab);
+    if (!cuda_ok(cudaGetLastError(), "attn_out_a act quant")) return 0;
+    cublasLtMatmulDesc_t op; if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
+    cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+    cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
+    cublasLtMatrixLayout_t la, lb, ld;
+    cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, group_dim, rank, group_dim);
+    cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
+    cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, rank, n_tokens, low_dim);
+    cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
+    cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+    cublasLtMatmulHeuristicResult_t h; int got = 0;
+    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, op, la, lb, ld, ld, pf, 1, &h, &got);
+    int ok = 0;
+    if (hs == CUBLAS_STATUS_SUCCESS && got && ws) {
+        ok = 1;
+        for (uint32_t g = 0; g < n_groups && ok; g++) {
+            const __nv_fp8_e4m3 *ag = w->data + (size_t)g * rank * group_dim;
+            const unsigned char *as = w->scale + (size_t)g * w_scale_slab;
+            const __nv_fp8_e4m3 *bg = xq + (size_t)g * n_tokens * group_dim;
+            const unsigned char *bs = sx + (size_t)g * x_scale_slab;
+            float *dg = (float *)low->ptr + (size_t)g * rank;
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &as, sizeof(as));
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &bs, sizeof(bs));
+            float al = 1.f, be = 0.f;
+            cublasStatus_t st = cublasLtMatmul(g_cublaslt, op, &al, ag, la, bg, lb, &be,
+                                               dg, ld, dg, ld, &h.algo, ws, wz, 0);
+            ok = (st == CUBLAS_STATUS_SUCCESS);
+            if (!ok) fprintf(stderr, "ds4: cuBLASLt attn_out_a MXFP8 matmul failed: status %d\n", (int)st);
+        }
+    }
+    cublasLtMatmulPreferenceDestroy(pf);
+    cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(ld);
+    cublasLtMatmulDescDestroy(op);
+    return ok;
 }
 
 
@@ -752,7 +838,7 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
 
 
 
-int cuda_matmul_q8_0_hc_expand_tensor_labeled(
+int cuda_matmul_fp8_hc_expand_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -772,8 +858,7 @@ int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         out_dim != (uint64_t)n_embd) {
         return 0;
     }
-    const int is_fp8 = g_fp8_offsets.count(weight_offset) ? 1 : 0;
-    if (!is_fp8) return 0;
+    if (!g_fp8_offsets.count(weight_offset)) return 0;
     const uint64_t wstride = 33u;
     const uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * wstride)) return 0;
@@ -789,37 +874,24 @@ int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         (block_add && block_add->bytes < out_dim * sizeof(float))) {
         return 0;
     }
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, label ? label : "q8_0_hc_expand");
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, label ? label : "fp8_hc_expand");
     if (!wptr) return 0;
 
-    const uint64_t xq_bytes = blocks * 32u;
-    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 hc expand prequant");
-    if (!tmp) return 0;
-    int8_t *xq = (int8_t *)tmp;
-    float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+    matmul_fp8mx_hc_expand_warp8_kernel<<<((unsigned)out_dim + 31u) / 32u, 256>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
             (const float *)residual_hc->ptr,
             (const float *)split->ptr,
             reinterpret_cast<const unsigned char *>(wptr),
-            xq,
-            xscale,
+            (const float *)x->ptr,
             in_dim,
             out_dim,
             n_embd,
             n_hc,
             blocks,
-            block_add ? 1 : 0,
-            use_dp4a,
-            is_fp8);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
+            block_add ? 1 : 0);
+    return cuda_ok(cudaGetLastError(), "matmul_fp8_hc_expand launch");
 }
 
 
@@ -1028,11 +1100,9 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
 }
 
 
-extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+extern "C" int ds4_gpu_attention_output_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
-        ds4_gpu_tensor       *group_tmp,
-        ds4_gpu_tensor       *low_tmp,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
@@ -1043,15 +1113,11 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens) {
-    (void)group_tmp;
-    (void)low_tmp;
     if (!out || !low || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
         return 0;
     }
-    const int is_fp8_a = g_fp8_offsets.count(out_a_offset) ? 1 : 0;
-    const int is_fp8_b = g_fp8_offsets.count(out_b_offset) ? 1 : 0;
-    if (!is_fp8_a || !is_fp8_b) return 0;
+    if (!g_fp8_offsets.count(out_a_offset) || !g_fp8_offsets.count(out_b_offset)) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
     const uint64_t blocks_b = (low_dim + 31) / 32;
@@ -1065,45 +1131,31 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
-            cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
-    const unsigned char *out_b = reinterpret_cast<const unsigned char *>(
-            cuda_model_range_ptr(model_map, out_b_offset, out_b_bytes, "attn_out_b"));
-    if (!out_a || !out_b) return 0;
 
-    {
-        const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
-        const uint64_t xq_bytes = x_rows * blocks_a * 32u;
-        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-        const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
-        void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a q8 prequant");
-        if (!tmp) return 0;
-        int8_t *xq = (int8_t *)tmp;
-        float *xscale = (float *)((char *)tmp + scale_offset);
-        const int use_dp4a = cuda_q8_use_dp4a();
-        dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
-                                                xscale,
-                                                (const float *)heads->ptr,
-                                                group_dim,
-                                                blocks_a);
-        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
-        dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
-        grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
-                                                          out_a,
-                                                          xq,
-                                                          xscale,
-                                                          group_dim,
-                                                          rank,
-                                                          n_groups,
-                                                          n_tokens,
-                                                          blocks_a,
-                                                          use_dp4a,
-                                                          is_fp8_a);
-        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
+    /* "a" projection: prefill takes the block-scaled MXFP8xMXFP8 tensor-core
+     * GEMMs; decode (and any shape/heuristic miss) falls back to the fused
+     * raw-f32-activation kernel. */
+    int a_done = 0;
+    if (n_tokens > 1 && getenv("DS4_FP8_NO_MXCORE") == NULL) {
+        a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
+                                                 group_dim, rank, n_groups, heads, n_tokens);
+    }
+    if (!a_done) {
+        const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
+                cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
+        if (!out_a) return 0;
+        dim3 grid_a(((unsigned)low_dim + 31u) / 32u, (unsigned)n_tokens, 1);
+        grouped_fp8mx_a_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+                                                      out_a,
+                                                      (const float *)heads->ptr,
+                                                      group_dim,
+                                                      rank,
+                                                      n_groups,
+                                                      n_tokens,
+                                                      blocks_a);
+        if (!cuda_ok(cudaGetLastError(), "attention_output_a launch")) return 0;
     }
 
-    (void)out_b;
     return cuda_matmul_q8_0_tensor_labeled(out,
                                            model_map,
                                            model_size,
@@ -1117,28 +1169,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
 
 
 
-extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
-        ds4_gpu_tensor *out_h,
-        ds4_gpu_tensor *low,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t out_a_offset,
-        uint64_t out_b_offset,
-        uint64_t group_dim,
-        uint64_t rank,
-        uint32_t n_groups,
-        uint64_t out_dim,
-        const ds4_gpu_tensor *heads,
-        uint32_t n_tokens) {
-    (void)out_h; (void)low; (void)model_map; (void)model_size;
-    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
-    (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
-    return 0;
-}
-
-
-
-extern "C" int ds4_gpu_attention_output_low_q8_tensor(
+extern "C" int ds4_gpu_attention_output_low_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -1150,8 +1181,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     if (!low || !heads || !model_map || group_dim == 0 || rank == 0 || n_groups == 0) {
         return 0;
     }
-    const int is_fp8 = g_fp8_offsets.count(out_a_offset) ? 1 : 0;
-    if (!is_fp8) return 0;
+    if (!g_fp8_offsets.count(out_a_offset)) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
     const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 33u;
@@ -1165,34 +1195,15 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
             cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
     if (!out_a) return 0;
 
-    const uint64_t x_rows = (uint64_t)n_groups;
-    const uint64_t xq_bytes = x_rows * blocks_a * 32u;
-    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output low q8 prequant");
-    if (!tmp) return 0;
-    int8_t *xq = (int8_t *)tmp;
-    float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
-    dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
-                                            xscale,
-                                            (const float *)heads->ptr,
-                                            group_dim,
-                                            blocks_a);
-    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
-    dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
-    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
-                                                      out_a,
-                                                      xq,
-                                                      xscale,
-                                                      group_dim,
-                                                      rank,
-                                                      n_groups,
-                                                      1,
-                                                      blocks_a,
-                                                      use_dp4a,
-                                                      is_fp8);
-    return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
+    dim3 grid_a(((unsigned)low_dim + 31u) / 32u, 1, 1);
+    grouped_fp8mx_a_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+                                                  out_a,
+                                                  (const float *)heads->ptr,
+                                                  group_dim,
+                                                  rank,
+                                                  n_groups,
+                                                  1,
+                                                  blocks_a);
+    return cuda_ok(cudaGetLastError(), "attention_output_low launch");
 }
 

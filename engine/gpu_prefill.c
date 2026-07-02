@@ -1775,66 +1775,35 @@ bool gpu_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
-    const bool attn_out_debug =
-        gpu_graph_debug_wants("attn_low", il, pos0) ||
-        gpu_graph_debug_wants("attn_out", il, pos0);
-    bool attn_out_f16 = false;
-    if (ok &&
-        !attn_out_debug &&
-        !gpu_graph_directional_steering_attn_enabled(g)) {
-        attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
-                                                                    g->batch_attn_low,
-                                                                    model->map,
-                                                                    model->size,
-                                                                    layer->attn_output_a->abs_offset,
-                                                                    layer->attn_output_b->abs_offset,
-                                                                    group_dim,
-                                                                    rank,
-                                                                    n_groups,
-                                                                    DS4_N_EMBD,
-                                                                    g->batch_heads,
-                                                                    n_tokens) != 0;
+    if (ok) {
+        ok = ds4_gpu_attention_output_batch_tensor(g->batch_attn_out,
+                                                   g->batch_attn_low,
+                                                   model->map,
+                                                   model->size,
+                                                   layer->attn_output_a->abs_offset,
+                                                   layer->attn_output_b->abs_offset,
+                                                   group_dim,
+                                                   rank,
+                                                   n_groups,
+                                                   DS4_N_EMBD,
+                                                   g->batch_heads,
+                                                   n_tokens) != 0;
     }
-    if (!attn_out_f16) {
-        if (ok) {
-            ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
-                                                          g->batch_attn_low,
-                                                          g->batch_group_tmp,
-                                                          g->batch_low_tmp,
-                                                          model->map,
-                                                          model->size,
-                                                          layer->attn_output_a->abs_offset,
-                                                          layer->attn_output_b->abs_offset,
-                                                          group_dim,
-                                                          rank,
-                                                          n_groups,
-                                                          DS4_N_EMBD,
-                                                          g->batch_heads,
-                                                          n_tokens) != 0;
-        }
-        if (ok) {
-            gpu_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
-                                          (uint64_t)n_tokens * n_groups * rank,
-                                          il,
-                                          pos0);
-        }
-        if (ok) {
-            gpu_graph_debug_dump_tensor("attn_out", g->batch_attn_out,
-                                          (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
-        }
+    if (ok) {
+        gpu_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
+                                      (uint64_t)n_tokens * n_groups * rank,
+                                      il,
+                                      pos0);
+    }
+    if (ok) {
+        gpu_graph_debug_dump_tensor("attn_out", g->batch_attn_out,
+                                      (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
-    if (ok && !attn_out_f16 && gpu_graph_directional_steering_attn_enabled(g)) {
+    if (ok && gpu_graph_directional_steering_attn_enabled(g)) {
         ok = gpu_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
-    if (ok && attn_out_f16) {
-        ok = ds4_gpu_hc_expand_split_half_tensor(after_attn_hc_view,
-                                                 g->batch_q_half,
-                                                 g->batch_cur_hc,
-                                                 hc_split_view,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_HC) != 0;
-    } else if (ok) {
+    if (ok) {
         ok = ds4_gpu_hc_expand_split_tensor(after_attn_hc_view,
                                             g->batch_attn_out,
                                             g->batch_cur_hc,

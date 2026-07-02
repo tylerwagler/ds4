@@ -975,7 +975,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
 
 
 
-extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+extern "C" int ds4_gpu_matmul_fp8_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -989,7 +989,7 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
-        return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, block_out,
+        return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,
                                                         weight_offset,
                                                         in_dim, out_dim,
@@ -998,7 +998,7 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                                         residual_hc,
                                                         split,
                                                         n_embd, n_hc,
-                                                        "q8_hc_expand");
+                                                        "fp8_hc_expand");
     }
     return ds4_gpu_matmul_q8_0_tensor(block_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim, x, 1) &&

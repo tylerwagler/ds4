@@ -1904,16 +1904,16 @@ bool gpu_graph_encode_decode_layer(
         !gpu_graph_directional_steering_attn_enabled(g) &&
         !gpu_graph_use_reference_attn_out_hc();
     if (ok && fuse_attn_out_hc) {
-        ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->attn_output_a->abs_offset,
-                                                      group_dim,
-                                                      rank,
-                                                      n_groups,
-                                                      g->heads) != 0;
+        ok = ds4_gpu_attention_output_low_tensor(g->attn_low,
+                                                   model->map,
+                                                   model->size,
+                                                   layer->attn_output_a->abs_offset,
+                                                   group_dim,
+                                                   rank,
+                                                   n_groups,
+                                                   g->heads) != 0;
         if (ok) {
-            ok = ds4_gpu_matmul_q8_0_hc_expand_tensor(g->after_attn_hc,
+            ok = ds4_gpu_matmul_fp8_hc_expand_tensor(g->after_attn_hc,
                                                         g->attn_out,
                                                         model->map,
                                                         model->size,
@@ -1927,17 +1927,15 @@ bool gpu_graph_encode_decode_layer(
                                                         DS4_N_HC) != 0;
         }
     } else if (ok) {
-        ok = ds4_gpu_attention_output_q8_batch_tensor(g->attn_out,
-                                                        g->attn_low,
-                                                        g->batch_group_tmp,
-                                                        g->batch_low_tmp,
-                                                        model->map,
-                                                        model->size,
-                                                        layer->attn_output_a->abs_offset,
-                                                        layer->attn_output_b->abs_offset,
-                                                        group_dim, rank,
-                                                        n_groups, DS4_N_EMBD,
-                                                        g->heads, 1) != 0;
+        ok = ds4_gpu_attention_output_batch_tensor(g->attn_out,
+                                                     g->attn_low,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->attn_output_a->abs_offset,
+                                                     layer->attn_output_b->abs_offset,
+                                                     group_dim, rank,
+                                                     n_groups, DS4_N_EMBD,
+                                                     g->heads, 1) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
     if (ok) {

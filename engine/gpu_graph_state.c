@@ -70,8 +70,6 @@ void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_ffn_norm);
     ds4_gpu_tensor_free(g->batch_ffn_cur);
     ds4_gpu_tensor_free(g->batch_after_attn_hc);
-    ds4_gpu_tensor_free(g->batch_low_tmp);
-    ds4_gpu_tensor_free(g->batch_group_tmp);
     ds4_gpu_tensor_free(g->batch_attn_out);
     ds4_gpu_tensor_free(g->batch_attn_low);
     ds4_gpu_tensor_free(g->batch_heads);
