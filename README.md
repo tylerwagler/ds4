@@ -15,7 +15,7 @@ This tree is the **CUDA-only fork** of
 [antirez/ds4](https://github.com/antirez/ds4) targeting **NVIDIA CUDA on
 Linux**, with special care for the **DGX Spark (GB10)** and its ~128 GB of
 unified memory. The upstream Metal (macOS) and ROCm backends were removed in
-this fork; see [AGENT.md](AGENT.md) for the source layout, supported weight
+this fork; see [AGENTS.md](AGENTS.md) for the source layout, supported weight
 formats, and validation notes.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
@@ -75,7 +75,7 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
-- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.

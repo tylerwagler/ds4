@@ -11,11 +11,12 @@ is when an important correctness bug is fixed and it requires some speed penalty
 
 ## Correctness Regression Tests
 
-Build the default backend first:
+Build the CUDA binaries first (`make cuda-spark` for DGX Spark / GB10,
+`make cuda-generic` for other local CUDA GPUs):
 
 ```sh
 make clean
-make
+make cuda-spark
 ```
 
 The C test runner is `ds4_test`. Running it without arguments is equivalent to
@@ -32,7 +33,6 @@ Useful narrower checks:
 ./ds4_test --logprob-vectors
 ./ds4_test --long-context
 ./ds4_test --tool-call-quality
-./ds4_test --metal-kernels
 ```
 
 What they cover:
@@ -49,7 +49,6 @@ What they cover:
   lines that the test parses.
 - `--tool-call-quality`: exercises actual model behavior for DSML tool-call
   emission in both fast and exact paths.
-- `--metal-kernels`: isolated Metal kernel numeric checks.
 
 The runner defaults to `ds4flash.gguf`. Override paths when needed:
 
@@ -59,22 +58,14 @@ DS4_TEST_VECTOR_FILE=/path/to/official.vec ./ds4_test --logprob-vectors
 DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ds4_test --long-context
 ```
 
-For CUDA-specific changes, test on a CUDA machine:
+For kernel or GPU-path changes, also run the CUDA smoke regression:
 
 ```sh
-make
 make cuda-regression
 ```
 
-For CPU portability, at least verify that the CPU target still builds:
-
-```sh
-make cpu
-```
-
-The CPU backend is a reference/debug path, not the production performance
-target. Remember that executing the CPU path on Metal can crash the system
-because of a kernel bug in macOS.
+The CPU backend is a reference/debug path (select it at runtime with
+`--cpu`), not a performance target.
 
 ## Quality Checks For Quantization Changes
 

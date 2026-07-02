@@ -2,7 +2,7 @@
 
 ## Lessons To Reuse
 
-From `misc/SIMPLIFIED_NO_CANONICALIZATION_MODEL.md`:
+From the no-canonicalization model (an uncommitted working note, summarized here):
 
 - The sampled KV state is the most faithful state DS4 has.
 - Client-visible protocol objects should select that sampled state; they should
@@ -13,7 +13,7 @@ From `misc/SIMPLIFIED_NO_CANONICALIZATION_MODEL.md`:
 tool_use_id -> exact sampled DSML/KV frontier
 ```
 
-From `misc/RESPONSE_API.md`:
+From [RESPONSE_API.md](RESPONSE_API.md):
 
 - Protocol IDs exist to avoid proving that an already-known prefix tokenizes the
   same way again.
