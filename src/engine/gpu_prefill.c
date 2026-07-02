@@ -606,30 +606,54 @@ bool gpu_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         DS4_CUDA_PROFILE_Q_STAGE("q_b");
-        if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
+        const bool prefill_q_norm_debug = gpu_graph_debug_wants("Qnorm", il, pos0);
+        bool prefill_q_norm_rope_fused = false;
+        if (ok && !prefill_q_norm_debug) {
+            prefill_q_norm_rope_fused =
+                ds4_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
+                                                       n_tokens,
+                                                       DS4_N_HEAD,
+                                                       DS4_N_HEAD_DIM,
+                                                       DS4_N_ROT,
+                                                       pos0,
+                                                       compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                       false,
+                                                       freq_base,
+                                                       freq_scale,
+                                                       ext_factor,
+                                                       attn_factor,
+                                                       DS4_ROPE_YARN_BETA_FAST,
+                                                       DS4_ROPE_YARN_BETA_SLOW,
+                                                       DS4_RMS_EPS) != 0;
+        }
+        if (!prefill_q_norm_rope_fused) {
+            if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
+                                                        n_tokens,
+                                                        DS4_N_HEAD,
+                                                        DS4_N_HEAD_DIM,
+                                                        DS4_RMS_EPS) != 0;
+            if (ok) {
+                gpu_graph_debug_dump_tensor("Qnorm", g->batch_q,
+                                              (uint64_t)n_tokens * q_dim, il, pos0);
+            }
+            DS4_CUDA_PROFILE_Q_STAGE("head_norm");
+            if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
                                                     n_tokens,
                                                     DS4_N_HEAD,
                                                     DS4_N_HEAD_DIM,
-                                                    DS4_RMS_EPS) != 0;
-        if (ok) {
-            gpu_graph_debug_dump_tensor("Qnorm", g->batch_q,
-                                          (uint64_t)n_tokens * q_dim, il, pos0);
+                                                    DS4_N_ROT,
+                                                    pos0,
+                                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                    false,
+                                                    freq_base,
+                                                    freq_scale,
+                                                    ext_factor,
+                                                    attn_factor,
+                                                    DS4_ROPE_YARN_BETA_FAST,
+                                                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+        } else {
+            DS4_CUDA_PROFILE_Q_STAGE("head_norm");
         }
-        DS4_CUDA_PROFILE_Q_STAGE("head_norm");
-        if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
-                                                n_tokens,
-                                                DS4_N_HEAD,
-                                                DS4_N_HEAD_DIM,
-                                                DS4_N_ROT,
-                                                pos0,
-                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                false,
-                                                freq_base,
-                                                freq_scale,
-                                                ext_factor,
-                                                attn_factor,
-                                                DS4_ROPE_YARN_BETA_FAST,
-                                                DS4_ROPE_YARN_BETA_SLOW) != 0;
         if (ok) {
             gpu_graph_debug_dump_tensor("Qcur", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
