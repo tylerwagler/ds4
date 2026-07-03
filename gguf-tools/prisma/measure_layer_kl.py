@@ -35,7 +35,19 @@ def parse_layers(spec):
     return out
 
 
+def uvm_reload():
+    """Reclaim unified memory the GB10 driver leaks on every ds4 exit."""
+    for cmd in (["sudo", "-n", "rmmod", "nvidia_uvm"],
+                ["sudo", "-n", "modprobe", "nvidia_uvm"]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"error: {' '.join(cmd)} failed: {r.stderr.strip()} "
+                     f"(--uvm-reload needs passwordless sudo)")
+
+
 def run_ds4(args, cmd, log_name):
+    if args.uvm_reload:
+        uvm_reload()
     log_path = os.path.join(args.log_dir, log_name)
     with open(log_path, "w") as log:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=log, text=True)
@@ -57,6 +69,9 @@ def main():
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--log-dir", default=None)
+    ap.add_argument("--uvm-reload", action="store_true",
+                    help="reload nvidia_uvm before each run (GB10 leaks ~4-5GB "
+                         "of unified memory per ds4 exit; needs passwordless sudo)")
     a = ap.parse_args()
 
     ref_dump = a.ref_dump or (a.out + ".ref.bin")

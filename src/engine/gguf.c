@@ -642,6 +642,10 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
+        /* --expert-overlay swapped tensors live in the donor file's mapping
+         * (donor-relative offsets that can exceed this model's size); they are
+         * prepared separately by accelerator_prepare_expert_overlay. */
+        if (t->ext_map) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
