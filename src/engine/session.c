@@ -4598,6 +4598,21 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return n_accept;
 }
 
+int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen) {
+    if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
+    if (!ds4_engine_has_dspark(s->engine) || s->distributed || ds4_session_is_cpu(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    accepted[0] = first_token;
+    return 1;
+}
+
 
 
 void ds4_session_invalidate(ds4_session *s) {

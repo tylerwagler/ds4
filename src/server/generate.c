@@ -1061,6 +1061,22 @@ decode_again:
         int toks[17];
         int ntok = 0;
         if (temperature <= 0.0f &&
+            ds4_engine_has_dspark(s->engine) &&
+            getenv("DS4_DSPARK_DISABLE") == NULL)
+        {
+            ntok = ds4_session_eval_speculative_block(s->session,
+                                                      token,
+                                                      max_tokens - completion,
+                                                      ds4_token_eos(s->engine),
+                                                      toks,
+                                                      (int)(sizeof(toks) / sizeof(toks[0])),
+                                                      err,
+                                                      sizeof(err));
+            if (ntok < 0) {
+                finish = "error";
+                break;
+            }
+        } else if (temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
