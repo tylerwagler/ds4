@@ -571,7 +571,8 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_start,
         uint32_t                window,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                non_causal);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -593,7 +594,8 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                non_causal);
 
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,

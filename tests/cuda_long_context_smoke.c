@@ -156,10 +156,116 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+static int check_dspark_non_causal_attention(void) {
+    const uint32_t n_head = 8;
+    const uint32_t head_dim = 512;
+    const uint32_t n_tokens = 5;
+    const uint32_t n_raw = 5;
+    const uint32_t raw_cap = 5;
+    const uint64_t q_count = (uint64_t)n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)n_raw * head_dim;
+    const uint64_t heads_count = (uint64_t)n_tokens * n_head * head_dim;
+
+    float *sinks = (float *)calloc(n_head, sizeof(float));
+    float *kvrow = (float *)calloc((size_t)head_dim, sizeof(float));
+    float *q_row = (float *)calloc((size_t)head_dim, sizeof(float));
+    float *raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
+    float *q_host = (float *)calloc((size_t)q_count * n_tokens, sizeof(float));
+    float *heads_causal = (float *)calloc((size_t)heads_count, sizeof(float));
+    float *heads_non_causal = (float *)calloc((size_t)heads_count, sizeof(float));
+    if (!sinks || !kvrow || !q_row || !raw_host || !q_host || !heads_causal || !heads_non_causal) return 1;
+
+    for (uint32_t d = 0; d < head_dim; d++) {
+        kvrow[d] = (float)(d % 16) * 0.1f;
+        q_row[d] = (float)(d % 8) * 0.2f;
+    }
+    for (uint32_t t = 0; t < n_raw; t++) {
+        memcpy(raw_host + (uint64_t)t * head_dim, kvrow, head_dim * sizeof(float));
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        memcpy(q_host + (uint64_t)(t * n_head) * head_dim, q_row, (uint64_t)n_head * head_dim * sizeof(float));
+    }
+
+    ds4_gpu_tensor *heads_c = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+    ds4_gpu_tensor *heads_nc = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc((uint64_t)n_tokens * q_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    int rc = 1;
+    if (heads_c && heads_nc && q && raw &&
+        ds4_gpu_tensor_write(q, 0, q_host, (uint64_t)n_tokens * q_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float))) {
+
+        int ok_c = ds4_gpu_attention_decode_raw_batch_heads_tensor(heads_c,
+                                                                    sinks,
+                                                                    n_head * sizeof(float),
+                                                                    0,
+                                                                    q,
+                                                                    raw,
+                                                                    n_tokens, 0,
+                                                                    n_raw, raw_cap, 0,
+                                                                    0, n_head, head_dim, 0);
+        int ok_nc = ds4_gpu_attention_decode_raw_batch_heads_tensor(heads_nc,
+                                                                     sinks,
+                                                                     n_head * sizeof(float),
+                                                                     0,
+                                                                     q,
+                                                                     raw,
+                                                                     n_tokens, 0,
+                                                                     n_raw, raw_cap, 0,
+                                                                     0, n_head, head_dim, 1);
+        if (ok_c && ok_nc && ds4_gpu_synchronize() &&
+            ds4_gpu_tensor_read(heads_c, 0, heads_causal, heads_count * sizeof(float)) &&
+            ds4_gpu_tensor_read(heads_nc, 0, heads_non_causal, heads_count * sizeof(float))) {
+
+            int causal_all_equal = 1;
+            for (uint32_t t = 1; t < n_tokens; t++) {
+                if (memcmp(heads_causal, heads_causal + (uint64_t)t * n_head * head_dim,
+                           n_head * head_dim * sizeof(float)) != 0) {
+                    causal_all_equal = 0;
+                    break;
+                }
+            }
+
+            int non_causal_all_equal = 1;
+            for (uint32_t t = 1; t < n_tokens; t++) {
+                if (memcmp(heads_non_causal, heads_non_causal + (uint64_t)t * n_head * head_dim,
+                           n_head * head_dim * sizeof(float)) != 0) {
+                    non_causal_all_equal = 0;
+                    break;
+                }
+            }
+
+            if (causal_all_equal) {
+                fprintf(stderr, "dspark_attn: causal outputs unexpectedly equal\n");
+                rc = 1;
+            } else if (!non_causal_all_equal) {
+                fprintf(stderr, "dspark_attn: non-causal outputs not all equal\n");
+                rc = 1;
+            } else {
+                rc = 0;
+            }
+        }
+    }
+
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads_nc);
+    ds4_gpu_tensor_free(heads_c);
+    free(heads_non_causal);
+    free(heads_causal);
+    free(q_host);
+    free(raw_host);
+    free(q_row);
+    free(kvrow);
+    free(sinks);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (check_dspark_non_causal_attention() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;

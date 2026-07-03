@@ -784,9 +784,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                    n_raw,
                                                                    g->raw_cap,
                                                                    raw_start,
-                                                                   g->raw_window,
-                                                                   DS4_N_HEAD,
-                                                                   DS4_N_HEAD_DIM) != 0;
+                                                                    g->raw_window,
+                                                                    DS4_N_HEAD,
+                                                                    DS4_N_HEAD_DIM,
+                                                                    0) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -1498,10 +1499,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                              g->raw_cap,
                                                                              raw_start,
                                                                              n_comp,
-                                                                             g->raw_window,
-                                                                             ratio,
-                                                                             DS4_N_HEAD,
-                                                                             DS4_N_HEAD_DIM) != 0;
+                                                                              g->raw_window,
+                                                                              ratio,
+                                                                              DS4_N_HEAD,
+                                                                              DS4_N_HEAD_DIM,
+                                                                              0) != 0;
                 }
             }
             if (ok) batch_attention_done = true;

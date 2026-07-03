@@ -292,6 +292,7 @@ __global__ static void attention_decode_mixed_kernel(
         const float *comp_kv,
         const float *comp_mask,
         uint32_t use_comp_mask,
+        uint32_t non_causal,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -332,7 +333,7 @@ __global__ static void attention_decode_mixed_kernel(
                     const uint32_t wlo = qpos + 1u - window;
                     if (wlo > lo) lo = wlo;
                 }
-                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                const uint32_t hi = non_causal ? raw_last_pos : (qpos < raw_last_pos ? qpos : raw_last_pos);
                 if (hi >= lo) {
                     raw_first_idx = lo - first_raw_pos;
                     raw_count = hi - lo + 1u;
@@ -1093,6 +1094,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t non_causal,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -1138,7 +1140,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                     const uint32_t wlo = qpos + 1u - window;
                     if (wlo > lo) lo = wlo;
                 }
-                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                const uint32_t hi = non_causal ? raw_last_pos : (qpos < raw_last_pos ? qpos : raw_last_pos);
                 if (hi >= lo) {
                     raw_first_idx = lo - first_raw_pos;
                     raw_count = hi - lo + 1u;
@@ -1329,6 +1331,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
                                                                               n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              0,
                                                                               1,
                                                                               0,
                                                                               n_raw,
@@ -1352,6 +1355,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
+                                                 0,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
@@ -1470,6 +1474,7 @@ static int attention_decode_batch_launch(
         uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
+        uint32_t                non_causal,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -1506,6 +1511,7 @@ static int attention_decode_batch_launch(
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
                                                                               n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              non_causal,
                                                                               n_tokens,
                                                                               pos0,
                                                                               n_raw,
@@ -1530,6 +1536,7 @@ static int attention_decode_batch_launch(
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
                                                                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   non_causal,
                                                                    n_tokens,
                                                                    pos0,
                                                                    n_raw,
@@ -1549,7 +1556,7 @@ static int attention_decode_batch_launch(
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                                 use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
+                                                 use_comp_mask, non_causal, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
@@ -1570,9 +1577,10 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_start,
         uint32_t                window,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        uint32_t                non_causal) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
+                                      q, raw_kv, NULL, 0, NULL, 0, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim);
 }
@@ -1599,10 +1607,11 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        uint32_t                non_causal) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
+                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim);
 }
