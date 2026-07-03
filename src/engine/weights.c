@@ -1571,7 +1571,7 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
 
-    tensor_expect_layout(w->main_proj, DS4_TENSOR_FP8_E4M3, 2, E, 3ull * E, 0);
+    tensor_expect_layout(w->main_proj, DS4_TENSOR_FP8_E4M3, 2, 3ull * E, E, 0);
     tensor_expect_layout(w->main_norm, DS4_TENSOR_F32, 1, E, 0, 0);
 
     for (int li = 0; li < 3; li++) {
@@ -1605,11 +1605,11 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
         tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, E, 0);
     }
 
-    tensor_expect_layout(w->markov_w1, DS4_TENSOR_F32, 2, V, 256, 0);
-    tensor_expect_layout(w->markov_w2, DS4_TENSOR_F32, 2, V, 256, 0);
+    tensor_expect_layout(w->markov_w1, DS4_TENSOR_F32, 2, 256, V, 0);
+    tensor_expect_layout(w->markov_w2, DS4_TENSOR_F32, 2, 256, V, 0);
     tensor_expect_layout(w->confidence_proj, DS4_TENSOR_F32, 1, E + 256, 0, 0);
     tensor_expect_layout(w->hc_head_base, DS4_TENSOR_F32, 1, DS4_N_HC, 0, 0);
-    tensor_expect_layout(w->hc_head_fn, DS4_TENSOR_F32, 2, DS4_N_HC, (uint64_t)DS4_N_HC * E, 0);
+    tensor_expect_layout(w->hc_head_fn, DS4_TENSOR_F32, 2, (uint64_t)DS4_N_HC * E, DS4_N_HC, 0);
     tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32, 1, 1, 0, 0);
     tensor_expect_layout(w->final_norm, DS4_TENSOR_F32, 1, E, 0, 0);
 }
@@ -1657,7 +1657,7 @@ void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
     w->hc_head_scale    = required_tensor(m, "dspark.2.hc_head_scale.weight");
     w->final_norm       = required_tensor(m, "dspark.2.norm.weight");
 
-    w->vocab_size = (uint32_t)w->markov_w1->ne[0];
+    w->vocab_size = (uint32_t)w->markov_w1->ne[1];
 
     {
         uint32_t target_ids[3];
