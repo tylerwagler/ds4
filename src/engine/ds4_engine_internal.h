@@ -1024,6 +1024,10 @@ typedef struct {
     ds4_gpu_tensor *dspark_raw_cache[3];
     uint32_t dspark_n_raw[3];
 
+    /* Override compression ratio for DSpark draft layers (set to 0 before
+     * calling gpu_graph_encode_decode_layer for draft model forwarding). */
+    int comp_ratio_override;
+
     uint32_t prefill_cap;
     uint32_t raw_window;
 
@@ -2226,6 +2230,15 @@ bool gpu_graph_dspark_project_main_x(
         ds4_gpu_graph          *g,
         const ds4_model         *dspark_model,
         const ds4_dspark_weights *w);
+bool gpu_graph_dspark_draft_forward(
+        ds4_gpu_graph          *g,
+        const ds4_model         *base_model,
+        const ds4_weights       *base_weights,
+        const ds4_model         *dspark_model,
+        const ds4_dspark_weights *w,
+        ds4_gpu_tensor         *base_logits_out,
+        const int32_t            draft_ids[DS4_DSPARK_DRAFT_WINDOW],
+        uint32_t                n_draft);
 bool gpu_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,

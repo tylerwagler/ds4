@@ -1324,7 +1324,9 @@ bool gpu_graph_encode_decode_layer(
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    const bool compressed = g->comp_ratio_override >= 0
+        ? g->comp_ratio_override != 0
+        : ds4_layer_compress_ratio(il) != 0;
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
     const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
@@ -2583,6 +2585,91 @@ bool gpu_graph_dspark_project_main_x(
 
     ds4_gpu_tensor_free(proj_out);
     ds4_gpu_tensor_free(target_concat);
+    return ok;
+}
+
+bool gpu_graph_dspark_draft_forward(
+        ds4_gpu_graph          *g,
+        const ds4_model         *base_model,
+        const ds4_weights       *base_weights,
+        const ds4_model         *dspark_model,
+        const ds4_dspark_weights *w,
+        ds4_gpu_tensor         *base_logits_out,
+        const int32_t            draft_ids[DS4_DSPARK_DRAFT_WINDOW],
+        uint32_t                n_draft) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+
+    if (!g || !base_model || !base_weights || !dspark_model || !w ||
+        !base_logits_out || n_draft == 0 || n_draft > 16)
+        return false;
+
+    if (!base_weights->token_embd || !base_weights->output)
+        return false;
+
+    ds4_gpu_tensor *tokens_t = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+    if (!tokens_t) return false;
+    if (!ds4_gpu_tensor_write(tokens_t, 0, draft_ids, (uint64_t)n_draft * sizeof(int32_t))) {
+        ds4_gpu_tensor_free(tokens_t);
+        return false;
+    }
+
+    if (!ds4_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,
+                                         tokens_t,
+                                         base_model->map,
+                                         base_model->size,
+                                         base_weights->token_embd->abs_offset,
+                                         DS4_N_VOCAB,
+                                         n_draft,
+                                         DS4_N_EMBD,
+                                         DS4_N_HC)) {
+        ds4_gpu_tensor_free(tokens_t);
+        return false;
+    }
+    ds4_gpu_tensor_free(tokens_t);
+
+    g->cur_hc = g->batch_cur_hc;
+    g->after_ffn_hc = g->batch_next_hc;
+
+    const int prev_override = g->comp_ratio_override;
+    g->comp_ratio_override = 0;
+
+    bool ok = true;
+    for (uint32_t li = 0; li < 3 && ok; li++) {
+        const ds4_layer_weights *layer = &w->layer[li];
+        const uint32_t raw_cap = DS4_DSPARK_DRAFT_WINDOW;
+        const uint32_t raw_row = g->dspark_n_raw[li] % raw_cap;
+
+        ok = gpu_graph_encode_decode_layer(g, dspark_model, layer,
+                                            li, 0,
+                                            g->dspark_raw_cache[li],
+                                            raw_cap, raw_row,
+                                            g->dspark_n_raw[li],
+                                            draft_ids[0]);
+
+        if (ok) {
+            ds4_gpu_tensor *tmp = g->cur_hc;
+            g->cur_hc = g->after_ffn_hc;
+            g->after_ffn_hc = tmp;
+        }
+    }
+
+    g->comp_ratio_override = prev_override;
+
+    if (ok) {
+        ok = gpu_graph_encode_output_head(g, base_model, base_weights, DS4_N_VOCAB) != 0;
+    }
+
+    if (ok && base_logits_out) {
+        const uint64_t logits_bytes = (uint64_t)n_draft * DS4_N_VOCAB * sizeof(float);
+        if (base_logits_out->bytes >= logits_bytes) {
+            /* gpu_graph_encode_output_head writes 1 token; we have N.
+             * For now just copy first-token logits for testability. */
+            ds4_gpu_tensor_copy(base_logits_out, 0,
+                                g->logits, 0,
+                                (uint64_t)DS4_N_VOCAB * sizeof(float));
+        }
+    }
+
     return ok;
 }
 
