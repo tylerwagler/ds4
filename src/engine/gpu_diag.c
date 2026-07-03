@@ -504,3 +504,11 @@ bool gpu_graph_alloc_raw_cap(
     return ok;
 }
 
+void gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]) {
+    for (int i = 0; i < 3; i++) {
+        g->dspark_target_layer_ids[i] = target_layer_ids[i];
+        g->dspark_target_h[i] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    }
+    g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+}
+

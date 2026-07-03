@@ -985,6 +985,12 @@ int ds4_gpu_dspark_confidence_score(
         uint32_t               hidden_dim,
         uint32_t               embed_dim);
 
+int ds4_gpu_dspark_hc_mean_reduce(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *after_ffn_hc,
+        uint32_t               n_embd,
+        uint32_t               n_hc);
+
 #ifdef __cplusplus
 }
 #endif

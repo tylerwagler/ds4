@@ -548,6 +548,7 @@ typedef struct {
     ds4_tensor *final_norm;
     uint32_t embed_dim;
     uint32_t vocab_size;
+    uint32_t target_layer_ids[3];
 } ds4_dspark_weights;
 
 typedef struct {
@@ -1012,6 +1013,12 @@ typedef struct {
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
+
+    /* DSpark target hidden capture buffers */
+    ds4_gpu_tensor *dspark_target_h[3];
+    ds4_gpu_tensor *dspark_main_x;
+    uint32_t dspark_target_layer_ids[3];
+
     uint32_t prefill_cap;
     uint32_t raw_window;
 
@@ -1997,6 +2004,7 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_mtp);
+void gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
 bool gpu_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
@@ -2197,6 +2205,7 @@ bool gpu_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token);
+void gpu_graph_capture_dspark_target_hc(ds4_gpu_graph *g, uint32_t il);
 bool gpu_graph_encode_output_head(
         ds4_gpu_graph *g,
         const ds4_model       *model,

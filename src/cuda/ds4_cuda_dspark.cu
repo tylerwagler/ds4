@@ -159,3 +159,38 @@ extern "C" int ds4_gpu_dspark_confidence_score(
 
     return cuda_ok(cudaGetLastError(), "dspark confidence score");
 }
+
+
+
+__global__ static void dspark_hc_mean_reduce_kernel(
+        float *out,
+        const float *after_ffn_hc,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
+         d += blockDim.x * gridDim.x) {
+        float sum = 0.0f;
+        for (uint32_t hc = 0; hc < n_hc; hc++)
+            sum += after_ffn_hc[(uint64_t)hc * n_embd + d];
+        out[d] = sum / (float)n_hc;
+    }
+}
+
+extern "C" int ds4_gpu_dspark_hc_mean_reduce(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *after_ffn_hc,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    if (!out || !after_ffn_hc || n_embd == 0 || n_hc == 0) return 0;
+    if (out->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
+    if (after_ffn_hc->bytes < (uint64_t)n_hc * n_embd * sizeof(float)) return 0;
+
+    const uint32_t block_dim = 256;
+    const uint32_t grid_dim = (n_embd + block_dim - 1) / block_dim;
+
+    dspark_hc_mean_reduce_kernel<<<grid_dim, block_dim>>>(
+        (float *)out->ptr,
+        (const float *)after_ffn_hc->ptr,
+        n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "dspark hc mean reduce");
+}

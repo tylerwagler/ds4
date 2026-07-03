@@ -2806,6 +2806,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
+    if (e->dspark_ready) {
+        gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids);
+    }
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
         char err[256];
         if (ds4_dist_session_create(&s->distributed,

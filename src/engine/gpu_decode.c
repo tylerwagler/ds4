@@ -2517,7 +2517,20 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
+    if (ok) gpu_graph_capture_dspark_target_hc(g, il);
     return ok;
+}
+
+void gpu_graph_capture_dspark_target_hc(ds4_gpu_graph *g, uint32_t il) {
+    int slot = -1;
+    for (int i = 0; i < 3; i++) {
+        if (il == g->dspark_target_layer_ids[i]) { slot = i; break; }
+    }
+    if (slot < 0 || !g->dspark_target_h[slot]) return;
+
+    ds4_gpu_dspark_hc_mean_reduce(g->dspark_target_h[slot],
+                                   g->after_ffn_hc,
+                                   DS4_N_EMBD, DS4_N_HC);
 }
 
 

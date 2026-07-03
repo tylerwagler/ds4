@@ -1659,6 +1659,26 @@ void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
 
     w->vocab_size = (uint32_t)w->markov_w1->ne[0];
 
+    {
+        uint32_t target_ids[3];
+        if (model_get_u32(m, "dspark.target_layer_ids.0", &target_ids[0]) &&
+            model_get_u32(m, "dspark.target_layer_ids.1", &target_ids[1]) &&
+            model_get_u32(m, "dspark.target_layer_ids.2", &target_ids[2])) {
+            memcpy(w->target_layer_ids, target_ids, sizeof(target_ids));
+        } else {
+            uint32_t n_layer;
+            if (model_get_u32(m, "deepseek_v4_dspark.block_count", &n_layer) && n_layer >= 3) {
+                w->target_layer_ids[0] = n_layer - 3;
+                w->target_layer_ids[1] = n_layer - 2;
+                w->target_layer_ids[2] = n_layer - 1;
+            } else {
+                w->target_layer_ids[0] = 40;
+                w->target_layer_ids[1] = 41;
+                w->target_layer_ids[2] = 42;
+            }
+        }
+    }
+
     dspark_weights_validate_layout(w);
 }
 
