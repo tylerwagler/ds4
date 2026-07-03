@@ -1028,6 +1028,10 @@ typedef struct {
      * calling gpu_graph_encode_decode_layer for draft model forwarding). */
     int comp_ratio_override;
 
+    /* Override causal attention mask for DSpark draft backbone.
+     * Set to 1 before calling gpu_graph_encode_decode_layer for draft layers. */
+    int non_causal_override;
+
     uint32_t prefill_cap;
     uint32_t raw_window;
 
