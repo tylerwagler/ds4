@@ -976,6 +976,18 @@ int ds4_gpu_dspark_markov_step(
         uint32_t               vocab_size,
         uint32_t               embed_dim);
 
+int ds4_gpu_dspark_markov_step_model(
+        ds4_gpu_tensor       *refined_logits,
+        int32_t               *refined_id_dst,
+        const ds4_gpu_tensor *base_logits,
+        const void             *dspark_model_map,
+        uint64_t                dspark_model_size,
+        uint64_t                markov_w1_offset,
+        uint64_t                markov_w2_offset,
+        int32_t                prev_token,
+        uint32_t               vocab_size,
+        uint32_t               embed_dim);
+
 int ds4_gpu_dspark_confidence_score(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *hidden,

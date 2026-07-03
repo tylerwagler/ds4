@@ -189,6 +189,7 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 #define DS4_DSPARK_DRAFT_WINDOW 128u
+#define DS4_DSPARK_NOISE_TOKEN_ID 128799
 
 /* ---- shared types ---- */
 

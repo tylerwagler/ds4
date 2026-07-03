@@ -99,6 +99,60 @@ extern "C" int ds4_gpu_dspark_markov_step(
     return 1;
 }
 
+extern "C" int ds4_gpu_dspark_markov_step_model(
+        ds4_gpu_tensor *refined_logits,
+        int32_t *refined_id_dst,
+        const ds4_gpu_tensor *base_logits,
+        const void *dspark_model_map,
+        uint64_t dspark_model_size,
+        uint64_t markov_w1_offset,
+        uint64_t markov_w2_offset,
+        int32_t prev_token,
+        uint32_t vocab_size,
+        uint32_t embed_dim) {
+    if (!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map)
+        return 0;
+    if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return 0;
+    if (refined_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
+    if (base_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
+    if ((uint64_t)prev_token >= vocab_size) return 0;
+
+    const uint64_t w_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);
+    if (markov_w1_offset > dspark_model_size ||
+        w_bytes > dspark_model_size - markov_w1_offset) return 0;
+    if (markov_w2_offset > dspark_model_size ||
+        w_bytes > dspark_model_size - markov_w2_offset) return 0;
+
+    const float *w1 = (const float *)cuda_model_range_ptr(
+        dspark_model_map, markov_w1_offset, w_bytes, "dspark_markov_w1");
+    const float *w2 = (const float *)cuda_model_range_ptr(
+        dspark_model_map, markov_w2_offset, w_bytes, "dspark_markov_w2");
+    if (!w1 || !w2) return 0;
+
+    ds4_gpu_tensor *id_dev = ds4_gpu_tensor_alloc(sizeof(int32_t));
+    if (!id_dev) return 0;
+
+    const uint32_t block_dim = 256;
+    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
+    if (grid_dim > 65535) { ds4_gpu_tensor_free(id_dev); return 0; }
+
+    dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
+        (float *)refined_logits->ptr,
+        (int32_t *)id_dev->ptr,
+        (const float *)base_logits->ptr,
+        w1, w2, prev_token, vocab_size, embed_dim);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) { ds4_gpu_tensor_free(id_dev); return 0; }
+
+    if (!ds4_gpu_tensor_read(id_dev, 0, refined_id_dst, sizeof(int32_t))) {
+        ds4_gpu_tensor_free(id_dev);
+        return 0;
+    }
+    ds4_gpu_tensor_free(id_dev);
+    return 1;
+}
+
 
 __global__ static void dspark_confidence_score_kernel(
         float *scores,

@@ -4608,9 +4608,71 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         accepted[0] = first_token;
         return 1;
     }
+
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    const uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
+    int n_accept = 0;
+
+    /* Step 1: run target decode for the first token */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-    accepted[0] = first_token;
-    return 1;
+
+    /* Step 2: project main_x from captured target hidden states */
+    if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
+        return -1;
+
+    /* Step 3: build draft input — position 0 = first_token, rest = noise */
+    int32_t draft_ids[16];
+    draft_ids[0] = (int32_t)first_token;
+    for (uint32_t i = 1; i < n_draft; i++)
+        draft_ids[i] = DS4_DSPARK_NOISE_TOKEN_ID;
+
+    /* Step 4: run draft forward → N-token base logits in g->spec_logits */
+    if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
+                                         &e->dspark_model, &e->dspark_weights,
+                                         g->spec_logits, draft_ids, n_draft))
+        return -1;
+
+    /* Step 5: Markov refine — sequential over N positions */
+    const ds4_dspark_weights *w = &e->dspark_weights;
+    const uint32_t embed_dim = 256;
+    const uint32_t vocab_size = w->vocab_size;
+    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
+    const void *dmap = e->dspark_model.map;
+    const uint64_t dsize = e->dspark_model.size;
+
+    ds4_gpu_tensor *dspark_logits = ds4_gpu_tensor_alloc(vocab_bytes);
+    if (!dspark_logits) return -1;
+
+    int32_t refined_ids[16];
+    refined_ids[0] = (int32_t)first_token;
+    for (uint32_t pos = 0; pos < n_draft; pos++) {
+        /* Create view of spec_logits row [pos] as base logits */
+        ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
+            g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
+        if (!base_row) { ds4_gpu_tensor_free(dspark_logits); return -1; }
+
+        int32_t prev = refined_ids[pos];
+        if (!ds4_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
+                                               base_row,
+                                               dmap, dsize,
+                                               w->markov_w1->abs_offset,
+                                               w->markov_w2->abs_offset,
+                                               (int32_t)prev, vocab_size, embed_dim)) {
+            ds4_gpu_tensor_free(dspark_logits);
+            return -1;
+        }
+    }
+    ds4_gpu_tensor_free(dspark_logits);
+
+    /* Step 6: return accepted tokens (refined tokens 1..n_draft) */
+    for (uint32_t i = 1; i <= n_draft && n_accept < accepted_cap; i++) {
+        if (refined_ids[i] == eos_token) break;
+        accepted[n_accept++] = refined_ids[i];
+    }
+
+    /* TODO(P1.7c): target verify + rejection sampling + KV seeding */
+    return n_accept;
 }
 
 
