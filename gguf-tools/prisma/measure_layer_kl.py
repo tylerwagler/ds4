@@ -35,18 +35,53 @@ def parse_layers(spec):
     return out
 
 
-def uvm_reload():
-    """Reclaim unified memory the GB10 driver leaks on every ds4 exit, and
-    drop page caches so a freshly-written GGUF's dirty pages don't stack on
-    top of the run's ~90GiB device weight cache (transient double-occupancy
-    OOM-killed a run on 2026-07-03)."""
-    for cmd in (["sudo", "-n", "rmmod", "nvidia_uvm"],
-                ["sudo", "-n", "modprobe", "nvidia_uvm"],
-                ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"]):
+MIN_AVAIL_GB = 100  # ~90GiB device weight cache + margin
+
+
+def mem_available_gb():
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable"):
+            return int(line.split()[1]) / 1048576.0
+    return 0.0
+
+
+def run_all(cmds, what):
+    for cmd in cmds:
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            sys.exit(f"error: {' '.join(cmd)} failed: {r.stderr.strip()} "
-                     f"(--uvm-reload needs passwordless sudo)")
+            sys.exit(f"error: {' '.join(cmd)} failed: {r.stderr.strip()} ({what})")
+
+
+def uvm_reload():
+    """Reclaim unified memory the GB10 driver leaks on every ds4 exit, drop
+    page caches (dirty-GGUF double-occupancy), and VERIFY enough memory is
+    actually available before launching — a SIGKILLed CUDA process can leak
+    into the nvidia CORE module where the uvm reload can't reach (observed
+    2026-07-03); in that case escalate to a full driver teardown. Launching
+    anyway would OOM, SIGKILL ds4 mid-CUDA, and leak even more."""
+    run_all((["sudo", "-n", "rmmod", "nvidia_uvm"],
+             ["sudo", "-n", "modprobe", "nvidia_uvm"],
+             ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"]),
+            "--uvm-reload needs passwordless sudo")
+    if mem_available_gb() >= MIN_AVAIL_GB:
+        return
+    print(f"[uvm-reload] only {mem_available_gb():.0f}GB available; "
+          f"escalating to full nvidia driver teardown", flush=True)
+    subprocess.run(["sudo", "-n", "systemctl", "stop", "nvidia-persistenced"],
+                   capture_output=True)
+    run_all((["sudo", "-n", "modprobe", "-r", "nvidia_uvm", "nvidia_drm",
+              "nvidia_modeset", "nvidia"],
+             ["sudo", "-n", "modprobe", "nvidia"],
+             ["sudo", "-n", "modprobe", "nvidia_uvm"],
+             ["sudo", "-n", "modprobe", "nvidia_modeset"],
+             ["sudo", "-n", "modprobe", "nvidia_drm"]),
+            "full driver teardown")
+    subprocess.run(["sudo", "-n", "systemctl", "start", "nvidia-persistenced"],
+                   capture_output=True)
+    if mem_available_gb() < MIN_AVAIL_GB:
+        sys.exit(f"error: {mem_available_gb():.0f}GB available even after full "
+                 f"driver teardown (< {MIN_AVAIL_GB}GB); refusing to launch a "
+                 f"doomed run — investigate what is holding memory")
 
 
 def run_ds4(args, cmd, log_name):
