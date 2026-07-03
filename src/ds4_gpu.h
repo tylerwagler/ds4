@@ -964,6 +964,27 @@ int ds4_gpu_matmul_fp8_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* DSpark Markov + confidence heads */
+
+int ds4_gpu_dspark_markov_step(
+        ds4_gpu_tensor       *refined_logits,
+        int32_t               *refined_id_dst,
+        const ds4_gpu_tensor *base_logits,
+        const ds4_gpu_tensor *markov_w1,
+        const ds4_gpu_tensor *markov_w2,
+        int32_t                prev_token,
+        uint32_t               vocab_size,
+        uint32_t               embed_dim);
+
+int ds4_gpu_dspark_confidence_score(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *markov_embed,
+        const ds4_gpu_tensor *proj_weight,
+        uint32_t               n_positions,
+        uint32_t               hidden_dim,
+        uint32_t               embed_dim);
+
 #ifdef __cplusplus
 }
 #endif

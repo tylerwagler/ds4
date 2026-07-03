@@ -261,11 +261,147 @@ static int check_dspark_non_causal_attention(void) {
     return rc;
 }
 
+static int check_dspark_markov_head(void) {
+    const uint32_t vocab_size = 4096;
+    const uint32_t embed_dim = 256;
+    const uint32_t n_draft = 5;
+    int32_t prev_tokens[5] = {42, 100, 500, 1200, 3000};
+
+    float *w1_host = (float *)calloc((size_t)vocab_size * embed_dim, sizeof(float));
+    float *w2_host = (float *)calloc((size_t)vocab_size * embed_dim, sizeof(float));
+    float *base_host = (float *)calloc((size_t)vocab_size, sizeof(float));
+    int32_t ref_ids[5];
+    float ref_logits_host[4096];
+    if (!w1_host || !w2_host || !base_host) return 1;
+
+    for (uint32_t v = 0; v < vocab_size; v++) {
+        for (uint32_t i = 0; i < embed_dim; i++) {
+            w1_host[(uint64_t)v * embed_dim + i] = (float)((v * 7 + i * 13) % 100) * 0.01f;
+            w2_host[(uint64_t)v * embed_dim + i] = (float)((v * 3 + i * 11) % 50) * 0.02f;
+        }
+        base_host[v] = (float)(v % 200) * 0.01f;
+    }
+
+    ds4_gpu_tensor *w1 = ds4_gpu_tensor_alloc((uint64_t)vocab_size * embed_dim * sizeof(float));
+    ds4_gpu_tensor *w2 = ds4_gpu_tensor_alloc((uint64_t)vocab_size * embed_dim * sizeof(float));
+    ds4_gpu_tensor *base = ds4_gpu_tensor_alloc((uint64_t)vocab_size * sizeof(float));
+    ds4_gpu_tensor *ref_logits = ds4_gpu_tensor_alloc((uint64_t)vocab_size * sizeof(float));
+    int rc = 1;
+    if (w1 && w2 && base && ref_logits &&
+        ds4_gpu_tensor_write(w1, 0, w1_host, w1->bytes) &&
+        ds4_gpu_tensor_write(w2, 0, w2_host, w2->bytes) &&
+        ds4_gpu_tensor_write(base, 0, base_host, base->bytes)) {
+
+        int32_t id = prev_tokens[0];
+        for (uint32_t step = 0; step < n_draft; step++) {
+            int32_t gpu_id = 0;
+            if (!ds4_gpu_dspark_markov_step(ref_logits, &gpu_id, base, w1, w2,
+                                            id, vocab_size, embed_dim)) {
+                rc = 1;
+                goto cleanup;
+            }
+
+            const float *embed = w1_host + (uint64_t)id * embed_dim;
+            float cpu_best = -1e30f;
+            int32_t cpu_id = 0;
+            for (uint32_t v = 0; v < vocab_size; v++) {
+                float dot = 0.0f;
+                const float *w2r = w2_host + (uint64_t)v * embed_dim;
+                for (uint32_t i = 0; i < embed_dim; i++)
+                    dot += w2r[i] * embed[i];
+                float val = base_host[v] + dot;
+                if (val > cpu_best) { cpu_best = val; cpu_id = (int32_t)v; }
+            }
+
+            if (gpu_id != cpu_id) {
+                fprintf(stderr, "markov step %u: GPU=%d CPU=%d\n", step, gpu_id, cpu_id);
+                rc = 1;
+                goto cleanup;
+            }
+            ref_ids[step] = gpu_id;
+            id = gpu_id;
+        }
+        rc = 0;
+    }
+
+cleanup:
+    ds4_gpu_tensor_free(ref_logits);
+    ds4_gpu_tensor_free(base);
+    ds4_gpu_tensor_free(w2);
+    ds4_gpu_tensor_free(w1);
+    free(base_host);
+    free(w2_host);
+    free(w1_host);
+    return rc;
+}
+
+static int check_dspark_confidence_head(void) {
+    const uint32_t n_positions = 3;
+    const uint32_t hidden_dim = 32;
+    const uint32_t embed_dim = 8;
+    const uint32_t total_dim = hidden_dim + embed_dim;
+
+    float *proj_host = (float *)calloc(total_dim, sizeof(float));
+    float *hidden_host = (float *)calloc((size_t)n_positions * hidden_dim, sizeof(float));
+    float *embed_host = (float *)calloc((size_t)n_positions * embed_dim, sizeof(float));
+    float scores_host[3];
+    if (!proj_host || !hidden_host || !embed_host) return 1;
+
+    for (uint32_t i = 0; i < total_dim; i++)
+        proj_host[i] = (float)((i % 7) + 1) * 0.1f;
+    for (uint32_t p = 0; p < n_positions; p++) {
+        for (uint32_t i = 0; i < hidden_dim; i++)
+            hidden_host[(uint64_t)p * hidden_dim + i] = (float)((p + i) % 5) * 0.5f;
+        for (uint32_t i = 0; i < embed_dim; i++)
+            embed_host[(uint64_t)p * embed_dim + i] = (float)((p + i) % 3) * 0.3f;
+    }
+
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc((uint64_t)n_positions * sizeof(float));
+    ds4_gpu_tensor *hidden = ds4_gpu_tensor_alloc((uint64_t)n_positions * hidden_dim * sizeof(float));
+    ds4_gpu_tensor *embed = ds4_gpu_tensor_alloc((uint64_t)n_positions * embed_dim * sizeof(float));
+    ds4_gpu_tensor *proj = ds4_gpu_tensor_alloc((uint64_t)total_dim * sizeof(float));
+    int rc = 1;
+    if (scores && hidden && embed && proj &&
+        ds4_gpu_tensor_write(hidden, 0, hidden_host, hidden->bytes) &&
+        ds4_gpu_tensor_write(embed, 0, embed_host, embed->bytes) &&
+        ds4_gpu_tensor_write(proj, 0, proj_host, proj->bytes) &&
+        ds4_gpu_dspark_confidence_score(scores, hidden, embed, proj,
+                                        n_positions, hidden_dim, embed_dim) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(scores, 0, scores_host, scores->bytes)) {
+        rc = 0;
+        for (uint32_t p = 0; p < n_positions; p++) {
+            float dot = 0.0f;
+            for (uint32_t i = 0; i < hidden_dim; i++)
+                dot += hidden_host[(uint64_t)p * hidden_dim + i] * proj_host[i];
+            for (uint32_t i = 0; i < embed_dim; i++)
+                dot += embed_host[(uint64_t)p * embed_dim + i] * proj_host[hidden_dim + i];
+            float expected = 1.0f / (1.0f + expf(-dot));
+            if (fabsf(scores_host[p] - expected) > 1e-5f) {
+                fprintf(stderr, "confidence pos %u: GPU=%.6f CPU=%.6f\n",
+                        p, (double)scores_host[p], (double)expected);
+                rc = 1;
+            }
+        }
+    }
+
+    ds4_gpu_tensor_free(proj);
+    ds4_gpu_tensor_free(embed);
+    ds4_gpu_tensor_free(hidden);
+    ds4_gpu_tensor_free(scores);
+    free(embed_host);
+    free(hidden_host);
+    free(proj_host);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;
+    if (check_dspark_markov_head() != 0) rc = 1;
+    if (check_dspark_confidence_head() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
