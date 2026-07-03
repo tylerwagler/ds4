@@ -36,9 +36,13 @@ def parse_layers(spec):
 
 
 def uvm_reload():
-    """Reclaim unified memory the GB10 driver leaks on every ds4 exit."""
+    """Reclaim unified memory the GB10 driver leaks on every ds4 exit, and
+    drop page caches so a freshly-written GGUF's dirty pages don't stack on
+    top of the run's ~90GiB device weight cache (transient double-occupancy
+    OOM-killed a run on 2026-07-03)."""
     for cmd in (["sudo", "-n", "rmmod", "nvidia_uvm"],
-                ["sudo", "-n", "modprobe", "nvidia_uvm"]):
+                ["sudo", "-n", "modprobe", "nvidia_uvm"],
+                ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"]):
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             sys.exit(f"error: {' '.join(cmd)} failed: {r.stderr.strip()} "
