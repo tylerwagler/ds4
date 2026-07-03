@@ -2535,6 +2535,57 @@ void gpu_graph_capture_dspark_target_hc(ds4_gpu_graph *g, uint32_t il) {
 
 
 
+bool gpu_graph_dspark_project_main_x(
+        ds4_gpu_graph          *g,
+        const ds4_model         *dspark_model,
+        const ds4_dspark_weights *w) {
+    const uint64_t E = DS4_N_EMBD;
+    const uint64_t concat_dim = 3ull * E;
+
+    for (int i = 0; i < 3; i++) {
+        if (!g->dspark_target_h[i]) return false;
+    }
+
+    ds4_gpu_tensor *target_concat = ds4_gpu_tensor_alloc(concat_dim * sizeof(float));
+    if (!target_concat) return false;
+
+    bool ok = true;
+    for (int i = 0; i < 3; i++) {
+        ok = ds4_gpu_tensor_copy(target_concat, (uint64_t)i * E * sizeof(float),
+                                 g->dspark_target_h[i], 0, E * sizeof(float)) != 0;
+        if (!ok) break;
+    }
+
+    ds4_gpu_tensor *proj_out = NULL;
+    if (ok) {
+        proj_out = ds4_gpu_tensor_alloc(E * sizeof(float));
+        ok = proj_out != NULL;
+    }
+
+    if (ok) {
+        ok = ds4_gpu_matmul_mxfp8_tensor(proj_out,
+                                          dspark_model->map,
+                                          dspark_model->size,
+                                          w->main_proj->abs_offset,
+                                          concat_dim, E,
+                                          target_concat, 1) != 0;
+    }
+
+    if (ok) {
+        ok = ds4_gpu_rms_norm_weight_tensor(g->dspark_main_x,
+                                            proj_out,
+                                            dspark_model->map,
+                                            dspark_model->size,
+                                            w->main_norm->abs_offset,
+                                            (uint32_t)E,
+                                            DS4_RMS_EPS) != 0;
+    }
+
+    ds4_gpu_tensor_free(proj_out);
+    ds4_gpu_tensor_free(target_concat);
+    return ok;
+}
+
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
 bool gpu_graph_encode_output_head(
         ds4_gpu_graph *g,
