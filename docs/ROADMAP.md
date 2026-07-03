@@ -33,15 +33,15 @@ P3 entry in `==COMPLETED==` for the head-to-head numbers that surfaced this.
 |----|------|-------|--------|------------|-------------|
 | P0 | HF→ds4 GGUF converter (repacker + quantizer) | P0 | **done** | — | ~1-2 weeks |
 | P1.1 | DSpark: GGUF conversion | P1 | **done** | — | 200-300 lines |
-| P1.2 | DSpark: weight binding | P1 | planned | P1.1 | 100 lines |
-| P1.3 | DSpark: GPU graph allocation | P1 | planned | P1.1 | 200 lines |
-| P1.4 | Non-causal SWA attention mode (= A4) | P1 | planned | — | 200 lines |
-| P1.5 | DSpark: target hidden capture | P1 | planned | P1.2 | 100 lines |
-| P1.6 | DSpark: Markov + confidence heads | P1 | planned | P1.2 | 150 lines |
-| P1.7 | DSpark: block spec decode cycle | P1 | planned | P1.3, P1.4, P1.5, P1.6, A3 | 600-1000 lines |
-| P1.8 | DSpark: CUDA graph capture | P1 | planned | P1.7 | 100 lines |
-| P1.9 | DSpark: server integration (`--dspark`) | P1 | planned | P1.7 | 50 lines |
-| P1.10 | DSpark: load-aware scheduler | P1 | deferred | P1.7 | 200-300 lines |
+| P1.2 | DSpark: weight binding | P1 | planned | P1.1 | ~120 lines |
+| P1.3 | DSpark: GPU graph allocation | P1 | planned | P1.1 | ~200 lines |
+| P1.4 | Non-causal SWA attention mode (= A4) | P1 | planned | — | ~150 lines |
+| P1.5 | DSpark: target hidden capture | P1 | planned | P1.2 | ~80 lines |
+| P1.6 | DSpark: Markov + confidence heads | P1 | planned | P1.2 | ~120 lines |
+| P1.7 | DSpark: block spec decode cycle | P1 | planned | P1.3, P1.4, P1.5, P1.6 | ~700 lines |
+| P1.8 | DSpark: CUDA graph capture | P1 | planned | P1.7 | ~80 lines |
+| P1.9 | DSpark: server integration (`--dspark`) | P1 | planned | P1.7 | ~60 lines |
+| P1.10 | DSpark: load-aware scheduler | P1 | deferred | P1.7 | ~200 lines |
 | P2a | Real packed FP8 KV cache (replace fake-quant) | P2 | planned | — | ~1 week |
 | P2b | Profiling GATE (decode split analysis) | P2 | planned | — | ~1 day |
 | P2c | FP8 weights via cuBLASLt (attn_q/kv + shared experts MXFP8) | P2 | **done** | — | — |
@@ -63,13 +63,16 @@ P3 entry in `==COMPLETED==` for the head-to-head numbers that surfaced this.
 
 **Dependency graph (simplified):**
 ```
-P1.1 → P1.2 → P1.3 ─┐
-P1.4 ────────────────┤
-P1.5 ────────────────┤──→ P1.7 → P1.8 → P1.9
-P1.6 ────────────────┤         └──→ P1.10
-A3 ──────────────────┘
+P1.1 → P1.2 → P1.3 ───────────────────┐
+P1.4 (no deps, parallel) ─────────────┤
+P1.5 (no deps, parallel) ─────────────┤──→ P1.7 → P1.8 → P1.9
+P1.6 (no deps, parallel) ─────────────┘         └──→ P1.10 (deferred)
 P2b ──→ P2d.lm (profile before lm_head FP8)
 ```
+Note: P1.4 and P1.6 are pure CUDA kernel work, no weight model needed — can be
+built in parallel with P1.2. P1.5 (target capture) needs P1.2 only for the
+main_proj/main_norm weight names, but the capture loop around layers 40-42 is
+independent — partial parallelization possible.
 
 ## Phases
 
@@ -116,12 +119,15 @@ DFlash + Eagle3), NOT DGX Spark (naming clash). MTP skipped — straight to DSpa
   and shared experts (FP8), same architecture as a main model layer but with **compression
   ratio = 0** (no compressor, no indexer) and **non-causal sliding-window attention**.
 
-  - **Flow**: target layers 40-42 HC states → concat → `main_proj` FP8 matmul → `main_norm` →
+   - **Flow**: target layers 40-42 (V4-Flash, 43 layers, last 3) HC states → concat → `main_proj` FP8 matmul → `main_norm` →
     [decoder layer mtp.0] → [decoder layer mtp.1] → [decoder layer mtp.2] →
     Markov refine (sequential over 5 positions) → confidence score → HC collapse → lm_head.
-  - **Block size**: 5 draft tokens per speculative step (configurable).
-  - **Draft KV**: 3-layer raw SWA cache (no compressor state, window=128), seeded from
-    target hidden states via `kv_from_hidden`.
+   - **Block size**: runtime configurable (`--dspark-draft N`, default 5, range 1-16).
+     The Markov head autoregressively refines each of the N positions; each step is
+     just an embedding lookup + bias add, so N up to 16 adds negligible compute.
+  - **Draft KV**: 3-layer raw SWA cache (no compressor state, window=128); each committed
+    position's row is `kv_norm(wkv(main_x))` — the draft layer's KV projection applied to the
+    projected target hidden (see RESOLVED item 2 below).
   - vLLM implements non-causal SWA by reusing SparseMLA backends with expanded topk
     (queries all include each other independent of causality) — avoids custom kernels.
 
@@ -153,59 +159,64 @@ DFlash + Eagle3), NOT DGX Spark (naming clash). MTP skipped — straight to DSpa
      The `deepseek4-quantize.c` MTP name mapping already handles `mtp.N.*`→`mtp.N.*`
      identity mapping; for GGUF we'll use `dspark.N.*` naming to avoid confusion with
      the legacy MTP `mtp.0.*` prefix.
-     *Effort: ~100 lines.*
+     *Effort: ~120 lines.*
 
   3. **GPU graph allocation** (`gpu_graph_alloc.c`) — extend `ds4_gpu_graph` with draft
      model tensor views: 3 decoder layers' working buffers, 3-layer draft KV raw cache
      (128 SWA window each), hidden state intermediates for projection/Markov/confidence.
      *Effort: ~200 lines.*
 
-  4. **Draft backbone forward** — `dspark_forward_backbone()`: runs 3 decoder layers via
-     the existing `gpu_graph_encode_decode_layer` pipeline, but with a **non-causal**
-     attention mask. The 5 draft positions form a sliding-window "sentence" where every
-     token attends to every other. This requires adding a 4th attention mode to the fused
-     kernel (alongside causal, SWA, batched). *Effort: ~200 lines kernel mod + orchestration.*
+   4. **Draft backbone forward** — `dspark_forward_backbone()`: runs 3 decoder layers via
+      the existing `gpu_graph_encode_decode_layer` pipeline, but with a **non-causal**
+      attention mask. The N draft positions (1-16, configurable via `--dspark-draft`)
+      form a sliding-window "sentence" where every token attends to every other. This
+      requires adding a 4th attention mode to the fused kernel (alongside causal, SWA,
+      batched). *Effort: ~150 lines kernel mod + orchestration.*
 
-  5. **Target hidden capture** — capture main model's HC state at layers 40, 41, 42 →
-     concat → `dspark.main_proj` FP8 matmul → `dspark.main_norm` RMS norm.
-     The target layers' HC tensors are live in the main graph after each decode step;
-     this reads them before they're overwritten. *Effort: ~100 lines.*
+   5. **Target hidden capture** — capture main model's hidden at layers 40, 41, 42
+      (V4-Flash, 43 layers total — last 3 layers before output). Per the reference
+      (`model.py` Transformer.forward): the captured value is `h.mean(dim=2)` — the MEAN
+      over the hc_mult HC copies of the layer output, NOT the raw HC buffer. Then concat
+      (3×4096=12288) → `dspark.main_proj` FP8 matmul → `dspark.main_norm` RMS norm = main_x.
+      The graph reuses per-layer HC buffers across the 43-layer loop, so the captures must
+      be copy/reduce nodes added INSIDE the forward right after layers 40/41/42 execute — a
+      post-forward read would see only layer 42's data. *Effort: ~80 lines.*
 
   6. **Markov + confidence heads** — two small CUDA kernels:
      - `dspark_markov_refine()`: for each of 5 positions, gather `markov_w1[prev_token]`,
        project via `markov_w2`, add to base logits, argmax. Sequential across positions,
        but each step is just an embedding lookup + bias add.
      - `dspark_confidence_score()`: concat hidden + markov embed, linear, sigmoid.
-     *Effort: ~150 lines.*
+     *Effort: ~120 lines.*
 
   7. **Block spec decode cycle** (`session.c`) — new `ds4_session_eval_speculative_block()`,
      parallel to the existing `ds4_session_eval_speculative_argmax`. Flow per step:
-     (1) capture target hidden states from layers 40-42,
+      (1) capture target hidden states from layers 40-42 (last 3 of 43 for V4-Flash),
      (2) `project_main_hidden()` → 3-layer backbone → block hidden,
      (3) shared norm + lm_head → base logits for all 5 positions,
      (4) Markov refine + confidence score,
      (5) submit draft block to target verify (`gpu_graph_verify_suffix_tops`),
      (6) rejection sampling: accept longest valid prefix,
-     (7) materialize accepted KV rows into draft cache via `kv_from_hidden`,
+     (7) write accepted positions' draft-KV ring rows as `kv_norm(wkv(main_x))` per layer,
      (8) frontier snapshot/restore for partial accept (reuse existing `spec_frontier_*` infra).
-     *Effort: ~600-1000 lines. Crib from vLLM's `speculator.py`/`dspark_worker_v2.py`
+     *Effort: ~700 lines. Crib from vLLM's `speculator.py`/`dspark_worker_v2.py`
      and SGLang's `dspark_worker_v2.py` — the logic is well-documented Python, transliterate
      to C/CUDA.*
 
   8. **CUDA graph capture** — capture the full draft cycle (capture + backbone + markov +
      verify) in one CUDA graph per decode step, matching vLLM's approach. Reuse the existing
-     CUDA graph infrastructure. *Effort: ~100 lines.*
+     CUDA graph infrastructure. *Effort: ~80 lines.*
 
   9. **Server integration** (`generate.c`, `cli_main.c`) — `--dspark` flag, gating rules:
      greedy-only (temperature <= 0.0), not with SSD-streaming, conflicts with `--mtp`.
      Wire to `ds4_session_eval_speculative_block()` in the server's generation loop.
-     *Effort: ~50 lines.*
+     *Effort: ~60 lines.*
 
   10. **Load-aware scheduler** (deferrable) — confidence-threshold based verification
       budget trim, per P1b measured numbers. The confidence head outputs per-position
       survival probability; the scheduler uses these + GPU utilization to decide how
       many of the 5 draft tokens to actually submit for verification. Useful for
-      concurrency; nearly irrelevant for single-stream. *Effort: ~200-300 lines.*
+      concurrency; nearly irrelevant for single-stream. *Effort: ~200 lines.*
 
   **GPU memory budget for DSpark draft:**
   | Component | Size |
@@ -215,14 +226,113 @@ DFlash + Eagle3), NOT DGX Spark (naming clash). MTP skipped — straight to DSpa
   | Hidden state buffers (backbone + projection intermediates) | ~10 MiB |
   | **Total** | **~9 GB** (vs 97 GB target → ~9% overhead) |
 
-  **Open questions to resolve before P1b build:**
-  1. **GGUF format**: Bundle draft weights in the main GGUF, or load as a separate file
-     (`--dspark DRAFT.gguf`, same pattern as `--mtp`)?
-  2. **Non-causal attention**: The existing fused attention kernels (`ds4_cuda_attn.cu`)
-     assume causal masking. How much surgery to add a non-causal SWA mode for the 3 draft
-     layers? vLLM reused SparseMLA backends; ds4 has different attention kernel architecture.
-  3. **Confidence threshold**: Tunable runtime flag or hardcoded default (paper uses 0.5)?
-  4. **Target layer selection**: DSpark Flash uses layers 40-42. Configurable, or bake it?
+  **RESOLVED from DeepSeek's reference implementation (2026-07-03) — the checkpoint ships
+  authoritative code at `<snapshot>/inference/model.py`; both former open questions are
+  settled by it, not by the vLLM port:**
+  1. **Draft-position inputs / noise token** (`model.py` `forward_embed`, ~line 851):
+     `draft_input_ids = full([B, block_size], noise_token_id); draft_input_ids[:, 0] =
+     input_ids` — position 0 gets the just-sampled token, positions 1..N-1 get the noise
+     token (`dspark_noise_token_id: 128799`), all embedded through the SHARED main-model
+     embedding table, then HC-expanded (`unsqueeze(2).repeat(1,1,hc_mult,1)`). The draft
+     also shares the main lm_head. P1.1 must carry `dspark.noise_token_id` in GGUF metadata;
+     P1.7 step (2) must build this input block.
+  2. **Draft KV seeding** (`DSparkAttention.forward`, ~lines 752-795): the persistent draft
+     KV row for each committed position is `kv_norm(wkv(main_x))` — the draft layer's own KV
+     projection applied to the PROJECTED TARGET hidden (`main_x` from P1.5), one ring row
+     written per step (`kv_cache[:, start_pos % win] = main_kv`). The N speculative
+     positions' KV is computed fresh each cycle and only transiently concatenated
+     (`cat([cache, kv])`) — never persisted. So: no row-copy of speculative KV (decision 6
+     as originally written is wrong), and no separate `kv_from_hidden` module — just one
+     small per-layer matvec per accepted token. During prefill (`start_pos == 0`) the draft
+     layers do KV-fill only from main_x (no FFN work), populating the last `win` positions.
+     Two engine notes from the same code: `attn_sink` IS used in the draft sparse attention,
+     and the attention output applies an INVERSE rotary on its rope tail
+     (`apply_rotary_emb(o[..., -rd:], freqs_cis, True)`) before the grouped wo_a/wo_b.
+
+  **Resolved design decisions (2026-07-03):**
+   1. **GGUF format**: separate file, loaded via `--dspark PATH`. Same pattern as `--mtp`
+      (already implemented in P1.1).
+   2. **Non-causal attention**: Add a `non_causal` flag to `attention_decode_mixed_kernel`.
+      For draft layers (compression-ratio 0, raw KV only): change the hi bound
+      from `hi = qpos < raw_last_pos ? qpos : raw_last_pos` to `hi = raw_last_pos` (all
+      window positions visible). The compressed paths are never hit. NOTE: draft layers DO
+      have `attn_sinks` (`dspark.N.attn_sinks.weight` is in the P1.2 binding list) — sink
+      handling must be preserved in the non-causal mode. Orchestration requirement: all N
+      draft positions' KV must be written to the raw cache BEFORE the attention pass so the
+      block can attend to itself (two-phase: KV write for all N, then attend).
+      *~150 lines, no new kernel needed.*
+   3. **Confidence threshold**: Tunable runtime flag `--dspark-confidence FLOAT` (default 0.5)
+      + `DS4_DSPARK_CONFIDENCE` env var override.
+   4. **Target layer indices**: V4-Flash = 43 layers → layers 40, 41, 42 (last 3). Stored
+      in GGUF metadata as `dspark.target_layer_ids` (int array of 3 values); at binding time,
+      fall back to `[n_layer - 3, n_layer - 2, n_layer - 1]` if missing.
+   5. **Draft block size**: Runtime configurable via `--dspark-draft N` (1-16, default 5)
+      + `DS4_DSPARK_DRAFT_TOKENS` env var. Flash was trained at block size 5
+      (`dspark_block_size: 5` in config.json) — store it in GGUF metadata
+      (`dspark.block_size`) rather than hardcoding, default to it, and warn when N exceeds
+      it (positions past the trained block are unvalidated; expect acceptance falloff).
+      Graph capture and buffers must be sized for the max (16), not the current N.
+   6. **Draft KV seeding** (REVISED per reference implementation, see RESOLVED item 2
+      above): per committed token, compute `kv_norm(wkv(main_x))` in each draft layer and
+      write one ring row at `pos % 128`. NOT a copy of speculative-run KV rows — those are
+      transient. Cost: one small matvec per draft layer per accepted token, consuming the
+      `main_x` P1.5 already produces.
+   7. **A3 (multi-sequence KV paging) not required** for DSpark. The draft uses a dedicated
+      3-layer raw KV cache (window=128), separate from the main model's KV. No paging needed
+      because the draft cache is small (~256 KB per layer: 128 rows x 2048 B) and flushed each spec cycle.
+
+  **P1 engine options** (additions to `ds4_engine_options` in `ds4.h`):
+  | Field | Type | CLI flag | Default |
+  |-------|------|----------|---------|
+  | `dspark_path` | `const char *` | `--dspark PATH` | NULL |
+  | `dspark_draft_tokens` | `int` | `--dspark-draft N` | 5 |
+  | `dspark_confidence` | `float` | `--dspark-confidence FLOAT` | 0.5 |
+
+  **Completion criteria per sub-item:**
+  
+  | ID | Completion Criteria | Verification |
+  |----|-------------------|--------------|
+  | P1.1 | 78 tensors, correct shapes/types; loadable via `--dspark` | `ds4 --dspark gguf/dspark.gguf` exits clean |
+  | P1.2 | All `ds4_dspark_weights` fields non-NULL; layout validation passes type+shape | Startup logs: "DSpark support model loaded (draft=5)" |
+  | P1.3 | 3 draft KV caches (window=128), projection/Markov/confidence buffers allocated; free symmetric | Engine logs allocation; valgrind/asan clean |
+  | P1.4 | 5 draft positions attend to all window positions equally; existing causal path unchanged; compressed path never hit (ratio=0) | Black-box: 5 identical KV rows → 5 equal outputs; `--logprob-vectors` passes |
+   | P1.5 | `after_ffn_hc` at layers 40/41/42 captured after decode; `main_proj`+`main_norm` produce finite output | GPU graph diagnostics report target HC norms |
+  | P1.6 | 5 tokens refined from base logits; 5 survival probabilities ∈ [0,1]; both deterministic | CPU reference comparison vs GPU output |
+  | P1.7 | End-to-end spec cycle: produce N drafts, accept prefix ≥1, commit. **Greedy parity**: 0 top-1 mismatches vs non-spec baseline over 1000 tokens. **Acceptance**: avg ≥ 1.5. **Ppl**: within 0.01 of baseline. KV save/restore works mid-generation. | `ds4-eval` greedy comparison; `--logprob-vectors`; checkpoint save/restore |
+  | P1.8 | Full DSpark cycle captured in one graph; graph output matches non-graph | `--gpu-graph-test`/`--gpu-graph-full-test` pass |
+  | P1.9 | `ds4 --dspark PATH` serves; gating rules enforced (no `--mtp`, no `--ssd-streaming`, greedy-only) | CLI error messages; end-to-end generation |
+  | P1.10 | Not gating P1 ship | — |
+
+  **Test plan:**
+
+  | Test | Item | Prereq | Method |
+  |------|------|--------|--------|
+  | `tests/cuda_long_context_smoke` — dspark_attn | P1.4 | GPU only | Feed 5 identical KV rows, verify all 5 outputs equal |
+  | `tests/cuda_long_context_smoke` — dspark_heads | P1.6 | GPU only | Fixed Markov/confidence input vs CPU reference output |
+  | `ds4_test --dspark-self-test` | P1.7 | model + dspark GGUF | Same prompt with/without `--dspark`; report match rate, acceptance length, speedup |
+  | `--logprob-vectors` (pinned env) | P1.7 | model + dspark GGUF | `DS4_CUDA_PREFILL_CHUNK=2048`; compare against official API vectors |
+  | KV checkpoint integrity | P1.7 | model + dspark GGUF | Spec N steps, save checkpoint, restore, continue — verify token continuity |
+  | CLI gating matrix | P1.9 | dspark GGUF | All flag combos: `--dspark+--mtp`, `--dspark+--ssd-streaming`, `--dspark+--temperature 0.1` — all rejected |
+  | Memory leak | P1.3 | dspark GGUF | `ds4 --dspark PATH` in + out; valgrind or `DS4_ALLOC_GUARD` clean |
+
+  **Build order (with tests integrated):**
+
+  ```text
+  Step 1: P1.4 (non-causal SWA) + P1.6 (Markov/confidence) — CUDA only, no model needed
+          → add CUDA smoke tests to tests/cuda_long_context_smoke
+  Step 2: P1.2 (weight binding) — enables loading dspark GGUF
+          → verify with ds4 --dspark PATH
+  Step 3: P1.5 (target capture) — needs P1.2 for weight names
+          → instrument target HC norms in gpu_decode.c
+  Step 4: P1.3 (graph allocation) — needs P1.2 for tensor sizes
+          → verify alloc/free symmetric
+  Step 5: P1.7 (block spec cycle) — needs P1.2-1.6
+          → add --dspark-self-test to ds4_test
+  Step 6: P1.8 (CUDA graph capture) — needs P1.7
+          → verify graph passes --gpu-graph-test
+  Step 7: P1.9 (server integration) — needs P1.7
+          → CLI gating test matrix
+  ```
 
 ### P2 — FP8 (the decode/quality track)  [MEDIUM]
 FP8 is the *decode* play: everything read every token (KV, attn proj, always-on shared
@@ -411,11 +521,12 @@ attention-compressed (ratio 4 or 128 via learned MLP), and indexer-compressed (r
    compressed-row limit that truncates sessions above 8K compressed KV.*
 
 3. **Multi-sequence KV paging for speculative decode.** The ring buffer is a single contiguous
-   slab. Both MTP (existing) and DSpark (planned) need independent KV state for multiple
-   candidate sequences during verification. A page-table-based KV cache (vLLM-style) would
-   let draft and target models share memory efficiently, and enable the `kv_from_hidden` seed
-   required by DSpark's draft KV initialization. *Prerequisite for P1b item 7 (block spec
-   decode cycle).*
+   slab. A page-table-based KV cache (vLLM-style) would let multiple candidate sequences
+   share memory efficiently during verification. **No longer a P1 prerequisite** (P1 resolved
+   decision 7, 2026-07-03): DSpark's draft uses its own small dedicated 3-layer SWA cache
+   (~256 KB/layer, flushed per spec cycle), and the target side reuses the existing
+   `spec_frontier_*` snapshot/restore, same as MTP today. Paging remains a concurrency-era
+   improvement, not a spec-decode blocker.
 
 4. **Non-causal SWA mode (for DSpark draft backbone).** All current kernels assume causal
    masking. DSpark's 3-layer draft backbone needs all 5 draft positions to attend to each
