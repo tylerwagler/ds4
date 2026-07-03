@@ -536,6 +536,21 @@ typedef struct {
 } ds4_mtp_weights;
 
 typedef struct {
+    ds4_tensor *main_proj;
+    ds4_tensor *main_norm;
+    ds4_layer_weights layer[3];
+    ds4_tensor *markov_w1;
+    ds4_tensor *markov_w2;
+    ds4_tensor *confidence_proj;
+    ds4_tensor *hc_head_base;
+    ds4_tensor *hc_head_fn;
+    ds4_tensor *hc_head_scale;
+    ds4_tensor *final_norm;
+    uint32_t embed_dim;
+    uint32_t vocab_size;
+} ds4_dspark_weights;
+
+typedef struct {
     uint64_t off;
     uint64_t end;
     bool isolate;
@@ -1201,12 +1216,16 @@ struct ds4_vocab {
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
+    ds4_model dspark_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
+    ds4_dspark_weights dspark_weights;
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
+    int dspark_draft_tokens;
+    float dspark_confidence;
     char *directional_steering_file;
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
@@ -1223,6 +1242,7 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool gpu_ready;
     bool mtp_ready;
+    bool dspark_ready;
     ds4_model overlay_model;
     bool overlay_ready;
 };
@@ -1444,6 +1464,7 @@ DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
         const ds4_weights *w,
         ds4_model_map_span_vec *spans);
 void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m);
+void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m);
 void weights_free(ds4_weights *w);
 void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out);
 void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps);

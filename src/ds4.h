@@ -93,6 +93,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *dspark_path;
     /* "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
      * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */
@@ -102,6 +103,8 @@ typedef struct {
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
+    int dspark_draft_tokens;
+    float dspark_confidence;
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
@@ -277,6 +280,8 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+bool ds4_engine_has_dspark(ds4_engine *e);
+int ds4_engine_dspark_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

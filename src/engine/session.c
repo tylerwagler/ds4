@@ -782,6 +782,16 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
 }
 
+bool ds4_engine_has_dspark(ds4_engine *e) {
+    return e && e->backend != DS4_BACKEND_CPU &&
+           e->distributed.role == DS4_DISTRIBUTED_NONE &&
+           e->dspark_ready;
+}
+
+int ds4_engine_dspark_draft_tokens(ds4_engine *e) {
+    return ds4_engine_has_dspark(e) ? e->dspark_draft_tokens : 0;
+}
+
 
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -2178,6 +2188,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+    e->dspark_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
@@ -2192,6 +2203,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 5;
+    if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
+    e->dspark_confidence = opt->dspark_confidence > 0.0f ? opt->dspark_confidence : 0.5f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -2347,6 +2361,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
                 opt->mtp_path,
                 e->mtp_draft_tokens);
+    }
+
+    if (opt->dspark_path && opt->dspark_path[0] &&
+        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        if (e->ssd_streaming) {
+            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --dspark\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->mtp_ready) {
+            fprintf(stderr, "ds4: --mtp and --dspark are mutually exclusive\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        model_open(&e->dspark_model, opt->dspark_path, graph_backend, true);
+        dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
+        e->dspark_ready = true;
+        fprintf(stderr, "ds4: DSpark support model loaded: %s (draft=%d, confidence=%.2f)\n",
+                opt->dspark_path,
+                e->dspark_draft_tokens,
+                (double)e->dspark_confidence);
     }
 
     if (graph_backend) {
@@ -2556,6 +2593,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (e->dspark_ready &&
+            !ds4_gpu_set_model_map_range(e->dspark_model.map,
+                                           e->dspark_model.size,
+                                           e->dspark_model.tensor_data_pos,
+                                           e->dspark_model.size - e->dspark_model.tensor_data_pos,
+                                           e->dspark_model.max_tensor_bytes))
+        {
+            fprintf(stderr,
+                    "ds4: %s failed to map DSpark model views; aborting startup. "
+                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                    ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
@@ -2577,6 +2631,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                  NULL, NULL, 0)) {
                 fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
+                        ds4_backend_name(e->backend));
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        }
+        if (e->dspark_ready) {
+            (void)ds4_gpu_set_model_fd_for_map(e->dspark_model.fd, e->dspark_model.map);
+            if (!accelerator_cache_model_tensors(e->backend, &e->dspark_model,
+                                                 NULL, NULL, 0)) {
+                fprintf(stderr, "ds4: %s failed to prepare optional DSpark model cache\n",
                         ds4_backend_name(e->backend));
                 ds4_engine_close(e);
                 *out = NULL;
@@ -2671,6 +2737,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
+    if (e->dspark_ready) model_close(&e->dspark_model);
     if (e->overlay_ready) model_close(&e->overlay_model);
     model_close(&e->model);
     ds4_gpu_cleanup();

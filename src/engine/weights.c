@@ -1563,6 +1563,105 @@ void weights_free(ds4_weights *w) {
     memset(w, 0, sizeof(*w));
 }
 
+static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
+    const uint32_t E = w->embed_dim;
+    const uint32_t V = w->vocab_size;
+    const uint64_t hc_dim = (uint64_t)E * DS4_N_HC;
+    const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+
+    tensor_expect_layout(w->main_proj, DS4_TENSOR_FP8_E4M3, 2, E, 3ull * E, 0);
+    tensor_expect_layout(w->main_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+
+    for (int li = 0; li < 3; li++) {
+        const ds4_layer_weights *l = &w->layer[li];
+        tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
+        tensor_expect_layout(l->hc_attn_scale, DS4_TENSOR_F32, 1, 3, 0, 0);
+        tensor_expect_layout(l->hc_attn_base, DS4_TENSOR_F32, 1, hc_mix_dim, 0, 0);
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_layout(l->attn_q_a, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_LORA_Q, 0);
+        tensor_expect_layout(l->attn_q_a_norm, DS4_TENSOR_F32, 1, DS4_N_LORA_Q, 0, 0);
+        tensor_expect_layout(l->attn_q_b, DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_layout(l->attn_kv, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_HEAD_DIM, 0);
+        tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_sinks, DS4_TENSOR_F32, 1, DS4_N_HEAD, 0, 0);
+        tensor_expect_layout(l->attn_output_a, DS4_TENSOR_FP8_E4M3, 2,
+                             DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_layout(l->attn_output_b, DS4_TENSOR_FP8_E4M3, 2, out_low_dim, E, 0);
+        tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
+        tensor_expect_layout(l->hc_ffn_scale, DS4_TENSOR_F32, 1, 3, 0, 0);
+        tensor_expect_layout(l->hc_ffn_base, DS4_TENSOR_F32, 1, hc_mix_dim, 0, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, DS4_N_EXPERT, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, E, DS4_N_EXPERT);
+        tensor_expect_routed_expert_combo(l->ffn_gate_exps,
+                                          l->ffn_up_exps,
+                                          l->ffn_down_exps);
+        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, E, 0);
+    }
+
+    tensor_expect_layout(w->markov_w1, DS4_TENSOR_F32, 2, V, 256, 0);
+    tensor_expect_layout(w->markov_w2, DS4_TENSOR_F32, 2, V, 256, 0);
+    tensor_expect_layout(w->confidence_proj, DS4_TENSOR_F32, 1, E + 256, 0, 0);
+    tensor_expect_layout(w->hc_head_base, DS4_TENSOR_F32, 1, DS4_N_HC, 0, 0);
+    tensor_expect_layout(w->hc_head_fn, DS4_TENSOR_F32, 2, DS4_N_HC, (uint64_t)DS4_N_HC * E, 0);
+    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32, 1, 1, 0, 0);
+    tensor_expect_layout(w->final_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+}
+
+void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
+    memset(w, 0, sizeof(*w));
+    weights_reject_unsupported_types(m);
+
+    w->embed_dim = required_u32(m, "deepseek_v4_dspark.embedding_length");
+    w->main_proj = required_tensor(m, "dspark.main_proj.weight");
+    w->main_norm = required_tensor(m, "dspark.main_norm.weight");
+
+    for (int li = 0; li < 3; li++) {
+        ds4_layer_weights *l = &w->layer[li];
+        l->hc_attn_fn      = required_tensorf(m, "dspark.%d.hc_attn_fn.weight", li);
+        l->hc_attn_scale   = required_tensorf(m, "dspark.%d.hc_attn_scale.weight", li);
+        l->hc_attn_base    = required_tensorf(m, "dspark.%d.hc_attn_base.weight", li);
+        l->attn_norm       = required_tensorf(m, "dspark.%d.attn_norm.weight", li);
+        l->attn_q_a        = required_tensorf(m, "dspark.%d.attn_q_a.weight", li);
+        l->attn_q_a_norm   = required_tensorf(m, "dspark.%d.attn_q_a_norm.weight", li);
+        l->attn_q_b        = required_tensorf(m, "dspark.%d.attn_q_b.weight", li);
+        l->attn_kv         = required_tensorf(m, "dspark.%d.attn_kv.weight", li);
+        l->attn_kv_a_norm  = required_tensorf(m, "dspark.%d.attn_kv_a_norm.weight", li);
+        l->attn_sinks      = required_tensorf(m, "dspark.%d.attn_sinks.weight", li);
+        l->attn_output_a   = required_tensorf(m, "dspark.%d.attn_output_a.weight", li);
+        l->attn_output_b   = required_tensorf(m, "dspark.%d.attn_output_b.weight", li);
+        l->hc_ffn_fn       = required_tensorf(m, "dspark.%d.hc_ffn_fn.weight", li);
+        l->hc_ffn_scale    = required_tensorf(m, "dspark.%d.hc_ffn_scale.weight", li);
+        l->hc_ffn_base     = required_tensorf(m, "dspark.%d.hc_ffn_base.weight", li);
+        l->ffn_norm        = required_tensorf(m, "dspark.%d.ffn_norm.weight", li);
+        l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li);
+        l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li);
+        l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li);
+        l->ffn_down_exps   = required_tensorf(m, "dspark.%d.ffn_down_exps.weight", li);
+        l->ffn_gate_shexp  = required_tensorf(m, "dspark.%d.ffn_gate_shexp.weight", li);
+        l->ffn_up_shexp    = required_tensorf(m, "dspark.%d.ffn_up_shexp.weight", li);
+        l->ffn_down_shexp  = required_tensorf(m, "dspark.%d.ffn_down_shexp.weight", li);
+    }
+
+    w->markov_w1        = required_tensor(m, "dspark.2.markov_head.markov_w1.weight");
+    w->markov_w2        = required_tensor(m, "dspark.2.markov_head.markov_w2.weight");
+    w->confidence_proj  = required_tensor(m, "dspark.2.confidence_head.proj.weight");
+    w->hc_head_base     = required_tensor(m, "dspark.2.hc_head_base.weight");
+    w->hc_head_fn       = required_tensor(m, "dspark.2.hc_head_fn.weight");
+    w->hc_head_scale    = required_tensor(m, "dspark.2.hc_head_scale.weight");
+    w->final_norm       = required_tensor(m, "dspark.2.norm.weight");
+
+    w->vocab_size = (uint32_t)w->markov_w1->ne[0];
+
+    dspark_weights_validate_layout(w);
+}
+
 
 
 /* Load one token embedding row and expand it to float activations. */
