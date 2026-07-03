@@ -508,6 +508,9 @@ void gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
     for (int i = 0; i < 3; i++) {
         g->dspark_target_layer_ids[i] = target_layer_ids[i];
         g->dspark_target_h[i] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->dspark_raw_cache[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
+        g->dspark_n_raw[i] = 0;
     }
     g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
 }

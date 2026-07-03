@@ -103,7 +103,10 @@ void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_embed);
     ds4_gpu_tensor_free(g->spec_logits);
     ds4_gpu_tensor_free(g->dspark_main_x);
-    for (int i = 0; i < 3; i++) ds4_gpu_tensor_free(g->dspark_target_h[i]);
+    for (int i = 0; i < 3; i++) {
+        ds4_gpu_tensor_free(g->dspark_target_h[i]);
+        ds4_gpu_tensor_free(g->dspark_raw_cache[i]);
+    }
     ds4_gpu_tensor_free(g->output_norm);
     ds4_gpu_tensor_free(g->output_embd);
     ds4_gpu_tensor_free(g->output_weights);

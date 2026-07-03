@@ -188,6 +188,7 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  */
 
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
+#define DS4_DSPARK_DRAFT_WINDOW 128u
 
 /* ---- shared types ---- */
 
@@ -1018,6 +1019,10 @@ typedef struct {
     ds4_gpu_tensor *dspark_target_h[3];
     ds4_gpu_tensor *dspark_main_x;
     uint32_t dspark_target_layer_ids[3];
+
+    /* DSpark draft KV raw caches (one per draft layer, window=128) */
+    ds4_gpu_tensor *dspark_raw_cache[3];
+    uint32_t dspark_n_raw[3];
 
     uint32_t prefill_cap;
     uint32_t raw_window;
