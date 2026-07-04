@@ -2740,10 +2740,10 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_flat_hc, g->batch_cur_hc,
             (uint32_t)hc_dim, n_draft, DS4_RMS_EPS) != 0;
         /* HC → mix projection */
-        if (ok) ok = ds4_gpu_matmul_f16_tensor(
-            hc_mix_view, dspark_model->map, dspark_model->size,
-            layer->hc_attn_fn->abs_offset,
-            hc_dim, mix_hc, g->batch_flat_hc, n_draft) != 0;
+        if (ok) ok = gpu_graph_matmul_plain_tensor(
+            hc_mix_view, dspark_model,
+            layer->hc_attn_fn,
+            hc_dim, mix_hc, g->batch_flat_hc, n_draft);
         /* HC split + weighted sum → attn_cur (E-dim) */
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(
             attn_cur_view, hc_split_view, hc_mix_view,
