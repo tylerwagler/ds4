@@ -399,10 +399,10 @@ static int check_dspark_confidence_head(void) {
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
-    if (check_decode_attention_overflow_path() != 0) rc = 1;
-    if (check_dspark_non_causal_attention() != 0) rc = 1;
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
+    if (check_dspark_non_causal_attention() != 0) rc = 1;
+    if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
