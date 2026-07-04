@@ -133,20 +133,18 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
             4ull * DS4_N_EMBD * sizeof(float));
     bool ok = tail_hc != NULL;
     if (ok) {
-        ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
-                                         model->map,
-                                         model->size,
-                                         kv_weight->abs_offset,
+        ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv,
+                                              model,
+                                              kv_weight,
                                          DS4_N_EMBD,
                                          width,
                                          tail_hc,
                                          4) != 0;
     }
     if (ok) {
-        ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
-                                         model->map,
-                                         model->size,
-                                         score_weight->abs_offset,
+        ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc,
+                                             model,
+                                             score_weight,
                                          DS4_N_EMBD,
                                          width,
                                          tail_hc,
@@ -269,10 +267,9 @@ bool gpu_graph_warmup_prefill_kernels(
 
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
-        ok = ds4_gpu_matmul_f16_tensor(g->batch_hc_mix,
-                                         model->map,
-                                         model->size,
-                                         weights->layer[0].hc_attn_fn->abs_offset,
+        ok = gpu_graph_matmul_plain_tensor(g->batch_hc_mix,
+                                             model,
+                                             weights->layer[0].hc_attn_fn,
                                          hc_dim,
                                          mix_hc,
                                          g->batch_flat_hc,
@@ -455,10 +452,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
-                                             model->map,
-                                             model->size,
-                                             layer->hc_attn_fn->abs_offset,
+    if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
+                                              model,
+                                              layer->hc_attn_fn,
                                              hc_dim,
                                              mix_hc,
                                              g->batch_flat_hc,
@@ -800,18 +796,16 @@ bool gpu_graph_encode_layer_attention_batch(
             ok = false;
         }
         if (ok) {
-            ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
-                                             model->map,
-                                             model->size,
-                                             layer->attn_compressor_kv->abs_offset,
+            ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv,
+                                              model,
+                                              layer->attn_compressor_kv,
                                              DS4_N_EMBD,
                                              comp_width,
                                              g->batch_attn_norm,
                                              n_tokens) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->attn_compressor_gate->abs_offset,
+            if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc,
+                                              model,
+                                              layer->attn_compressor_gate,
                                                      DS4_N_EMBD,
                                                      comp_width,
                                                      g->batch_attn_norm,
@@ -1108,18 +1102,16 @@ bool gpu_graph_encode_layer_attention_batch(
                 ok = false;
             }
             if (ok) {
-                ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
-                                                 model->map,
-                                                 model->size,
-                                                 layer->indexer_compressor_kv->abs_offset,
+                ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv,
+                                              model,
+                                              layer->indexer_compressor_kv,
                                                  DS4_N_EMBD,
                                                  index_width,
                                                  g->batch_attn_norm,
                                                  n_tokens) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->indexer_compressor_gate->abs_offset,
+                if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc,
+                                              model,
+                                              layer->indexer_compressor_gate,
                                                          DS4_N_EMBD,
                                                          index_width,
                                                          g->batch_attn_norm,
@@ -1159,10 +1151,9 @@ bool gpu_graph_encode_layer_attention_batch(
             if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
                                                           n_tokens * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->indexer_proj->abs_offset,
+            if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_weights,
+                                              model,
+                                              layer->indexer_proj,
                                                      DS4_N_EMBD,
                                                      DS4_N_INDEXER_HEAD,
                                                      g->batch_attn_norm,
@@ -1884,10 +1875,9 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
-                                             model->map,
-                                             model->size,
-                                             layer->hc_ffn_fn->abs_offset,
+    if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
+                                              model,
+                                              layer->hc_ffn_fn,
                                              hc_dim,
                                              mix_hc,
                                              g->batch_flat_hc,
@@ -1957,10 +1947,9 @@ bool gpu_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_CUDA_PROFILE_FFN_STAGE("norm");
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_router_logits,
-                                             model->map,
-                                             model->size,
-                                             layer->ffn_gate_inp->abs_offset,
+    if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_router_logits,
+                                              model,
+                                              layer->ffn_gate_inp,
                                              DS4_N_EMBD,
                                              DS4_N_EXPERT,
                                              g->batch_ffn_norm,
