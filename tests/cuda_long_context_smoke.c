@@ -567,10 +567,65 @@ static int check_mxkv_roundtrip(void) {
     return rc;
 }
 
+/* MXKV gather primitive: dequant selected rows (contiguous and transposed). */
+static int check_mxkv_gather(void) {
+    const uint32_t n_cap = 100, n_sel = 32, head_dim = 512, nblk = head_dim / MXKV_BLK;
+    const uint32_t rowbytes = head_dim + nblk;   /* MXFP8 */
+    float *src = (float *)malloc((size_t)n_cap * head_dim * sizeof(float));
+    int32_t *rows = (int32_t *)malloc(n_sel * sizeof(int32_t));
+    if (!src || !rows) return 1;
+    for (uint32_t r = 0; r < n_cap; r++)
+        for (uint32_t d = 0; d < head_dim; d++)
+            src[r * head_dim + d] = sinf((float)(r * 5 + d) * 0.02f) * (1.0f + 0.05f * (float)r);
+    for (uint32_t i = 0; i < n_sel; i++) rows[i] = (int32_t)((i * 37 + 11) % n_cap);   /* scattered picks */
+
+    ds4_gpu_tensor *xf = ds4_gpu_tensor_alloc((uint64_t)n_cap * head_dim * sizeof(float));
+    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc((uint64_t)n_cap * rowbytes);
+    ds4_gpu_tensor *idx = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *g0 = ds4_gpu_tensor_alloc((uint64_t)n_sel * head_dim * sizeof(float));
+    ds4_gpu_tensor *g1 = ds4_gpu_tensor_alloc((uint64_t)n_sel * head_dim * sizeof(float));
+    float *out0 = (float *)malloc((size_t)n_sel * head_dim * sizeof(float));
+    float *out1 = (float *)malloc((size_t)n_sel * head_dim * sizeof(float));
+    int rc = 1;
+    if (xf && cache && idx && g0 && g1 && out0 && out1 &&
+        ds4_gpu_tensor_write(xf, 0, src, (uint64_t)n_cap * head_dim * sizeof(float)) &&
+        ds4_gpu_tensor_write(idx, 0, rows, (uint64_t)n_sel * sizeof(int32_t)) &&
+        ds4_gpu_mxkv_pack_tensor(xf, cache, MXKV_FP8, n_cap, head_dim) &&
+        ds4_gpu_mxkv_gather_dequant_tensor(cache, g0, idx, n_sel, n_cap, head_dim, MXKV_FP8, 0) &&
+        ds4_gpu_mxkv_gather_dequant_tensor(cache, g1, idx, n_sel, n_cap, head_dim, MXKV_FP8, 1) &&
+        ds4_gpu_tensor_read(g0, 0, out0, (uint64_t)n_sel * head_dim * sizeof(float)) &&
+        ds4_gpu_tensor_read(g1, 0, out1, (uint64_t)n_sel * head_dim * sizeof(float))) {
+        rc = 0;
+        for (uint32_t i = 0; i < n_sel && rc == 0; i++) {
+            const float *sr = src + (size_t)rows[i] * head_dim;
+            for (uint32_t b = 0; b < nblk; b++) {
+                float amax = 0.0f;
+                for (uint32_t j = 0; j < MXKV_BLK; j++) amax = fmaxf(amax, fabsf(sr[b * MXKV_BLK + j]));
+                float scale = mxkv_ref_scale(amax, 448.0f);
+                for (uint32_t j = 0; j < MXKV_BLK; j++) {
+                    uint32_t d = b * MXKV_BLK + j;
+                    float ref = mxkv_e4m3_snap(sr[d] / scale) * scale;
+                    if (fabsf(out0[(size_t)i * head_dim + d] - ref) > 1e-3f ||    /* contiguous */
+                        fabsf(out1[(size_t)d * n_sel + i] - ref) > 1e-3f) {       /* transposed */
+                        fprintf(stderr, "mxkv gather mismatch row%u d%u\n", i, d);
+                        rc = 1; break;
+                    }
+                }
+            }
+        }
+        if (rc == 0) printf("  mxkv gather n_sel=%u (contiguous + transposed) -> OK\n", n_sel);
+    }
+    ds4_gpu_tensor_free(g1); ds4_gpu_tensor_free(g0); ds4_gpu_tensor_free(idx);
+    ds4_gpu_tensor_free(cache); ds4_gpu_tensor_free(xf);
+    free(src); free(rows); free(out0); free(out1);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_mxkv_roundtrip() != 0) rc = 1;
+    if (check_mxkv_gather() != 0) rc = 1;
     if (check_dspark_fp8_kv_pack() != 0) rc = 1;
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;

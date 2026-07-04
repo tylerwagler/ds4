@@ -931,6 +931,60 @@ extern "C" int ds4_gpu_mxkv_dequant_tensor(const ds4_gpu_tensor *in, ds4_gpu_ten
     return cuda_ok(cudaGetLastError(), "mxkv_dequant launch");
 }
 
+/*
+ * Gathered dequant: dequant n_sel rows selected by rows[i] from an MX KV cache
+ * (row stride cap_rows) into a contiguous f32 [n_sel][head_dim] buffer.  This is
+ * the attention gather primitive — it materializes the top-K compressed rows
+ * (and, with an identity index, a raw window) that a query attends to, ready to
+ * pack into a GEMM operand.  Optional out_stride lets V be written transposed
+ * ([head_dim][n_sel]) by the caller assembling the PV operand.
+ */
+__global__ static void mxkv_gather_dequant_kernel(const uint8_t *cache, float *out,
+                                                  const int32_t *rows, uint32_t n_sel,
+                                                  uint32_t head_dim, uint32_t fmt,
+                                                  uint32_t out_row_stride, uint32_t out_col_stride) {
+    uint32_t i = blockIdx.x;
+    if (i >= n_sel) return;
+    int32_t r = rows[i];
+    if (r < 0) return;
+    const uint32_t nblk = head_dim / DS4_MXKV_BLOCK;
+    const uint32_t data_bytes = (fmt == DS4_MXKV_FMT_FP4) ? (head_dim + 1u) / 2u : head_dim;
+    const uint32_t rowbytes = data_bytes + nblk;
+    const uint8_t *inr = cache + (uint64_t)r * rowbytes;
+    const uint8_t *scales = inr + data_bytes;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float scale = dsv4_e8m0_decode_scale_dev(scales[d / DS4_MXKV_BLOCK]);
+        float v;
+        if (fmt == DS4_MXKV_FMT_FP4) {
+            const uint8_t byte = inr[d >> 1];
+            const uint8_t nib = (d & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
+            v = dsv4_e2m1fn_decode_dev(nib, scale);
+        } else {
+            v = dsv4_e4m3fn_decode_dev(inr[d], scale);
+        }
+        out[(uint64_t)i * out_row_stride + (uint64_t)d * out_col_stride] = v;
+    }
+}
+
+/* out is [n_sel][head_dim] contiguous when transpose==0, or [head_dim][n_sel]
+ * (column i strided) when transpose!=0 — the latter builds a PV V^T operand. */
+extern "C" int ds4_gpu_mxkv_gather_dequant_tensor(const ds4_gpu_tensor *cache, ds4_gpu_tensor *out,
+                                                  const ds4_gpu_tensor *rows, uint32_t n_sel,
+                                                  uint32_t cap_rows, uint32_t head_dim, uint32_t fmt,
+                                                  uint32_t transpose) {
+    if (!cache || !out || !rows || n_sel == 0 || (head_dim % DS4_MXKV_BLOCK) != 0 ||
+        (fmt != DS4_MXKV_FMT_FP8 && fmt != DS4_MXKV_FMT_FP4) ||
+        cache->bytes < (uint64_t)cap_rows * DS4_MXKV_ROWBYTES(fmt, head_dim) ||
+        rows->bytes < (uint64_t)n_sel * sizeof(int32_t) ||
+        out->bytes < (uint64_t)n_sel * head_dim * sizeof(float)) return 0;
+    const uint32_t out_row_stride = transpose ? 1u : head_dim;      /* stride between rows i */
+    const uint32_t out_col_stride = transpose ? n_sel : 1u;         /* stride between dims d */
+    mxkv_gather_dequant_kernel<<<n_sel, 256>>>((const uint8_t *)cache->ptr, (float *)out->ptr,
+                                               (const int32_t *)rows->ptr, n_sel, head_dim, fmt,
+                                               out_row_stride, out_col_stride);
+    return cuda_ok(cudaGetLastError(), "mxkv_gather_dequant launch");
+}
+
 
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||

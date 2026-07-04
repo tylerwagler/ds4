@@ -387,6 +387,19 @@ int ds4_gpu_mxkv_dequant_tensor(
         uint32_t               n_tok,
         uint32_t               head_dim);
 
+/* Gathered dequant of n_sel rows selected by `rows` (indices into a cap_rows MX
+ * cache) into f32 `out`: [n_sel][head_dim] when transpose==0, or [head_dim][n_sel]
+ * when transpose!=0 (builds a PV V^T operand). The attention gather primitive. */
+int ds4_gpu_mxkv_gather_dequant_tensor(
+        const ds4_gpu_tensor *cache,
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *rows,
+        uint32_t               n_sel,
+        uint32_t               cap_rows,
+        uint32_t               head_dim,
+        uint32_t               fmt,
+        uint32_t               transpose);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
