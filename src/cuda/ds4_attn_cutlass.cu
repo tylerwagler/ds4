@@ -504,25 +504,28 @@ extern "C" int ds4_attn_mx_decode(
 }
 
 #ifndef DS4_ATTN_CUTLASS_STANDALONE
+extern "C" void ds4_gpu_attn_mx_scratch_free(void *p) { if (p) cudaFree(p); }
+
 // Engine-facing decode-attention wrapper: unpacks ds4_gpu_tensor pointers,
 // resolves sinks from the model map, computes the visible KV set (raw SWA window
 // + comp: topk when indexed, else visible_comp = (pos+1)/ratio), and runs the
-// MXFP8 decode attention over the current f32 caches. Self-allocating scratch for
-// this first correctness pass (a per-session reused buffer is the follow-up).
+// MXFP8 decode attention over the current f32 caches. Scratch is a caller-owned
+// (per-graph) buffer that grows on demand in coarse steps; no per-call malloc or
+// sync -- launches on the default stream, ordered with the rest of the decode
+// graph, exactly like every other kernel here.
 extern "C" int ds4_gpu_attn_mx_decode(
     ds4_gpu_tensor *heads, ds4_gpu_tensor *q,
     ds4_gpu_tensor *raw_cache, uint32_t raw_cap, uint32_t raw_start, uint32_t n_raw,
     ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *comp_selected, uint32_t n_comp, uint32_t n_selected,
     const void *model_map, uint64_t model_size, uint64_t sinks_offset,
-    uint32_t pos, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    uint32_t pos, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim,
+    uint8_t **scratch, uint64_t *scratch_bytes) {
   const float *sinks = (const float *)cuda_model_range_ptr(
       model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
-  if (!sinks || !heads || !q || !raw_cache) return -1;
-  // raw SWA window: keep the last min(n_raw, window) rows of the cached span
+  if (!sinks || !heads || !q || !raw_cache || !scratch || !scratch_bytes) return -1;
   const uint32_t eff_win = window ? window : n_raw;
   const uint32_t raw_vis = n_raw < eff_win ? n_raw : eff_win;
   const uint32_t raw_first = n_raw - raw_vis;
-  // compressed visibility
   const int32_t *comp_rows = nullptr;
   uint32_t comp_vis;
   if (comp_selected && n_selected) {
@@ -532,17 +535,22 @@ extern "C" int ds4_gpu_attn_mx_decode(
     const uint32_t vc = ratio ? (pos + 1u) / ratio : n_comp;
     comp_vis = vc < n_comp ? vc : n_comp;
   }
+  const uint32_t n_kv = raw_vis + comp_vis;
+  if (n_kv == 0) return -1;
+  // Grow the reused scratch in coarse (512-KV) steps to limit realloc churn as
+  // context grows one token at a time.
+  const uint32_t n_kv_grow = (n_kv + 511u) & ~511u;
+  const size_t need = ds4_attn_mx_decode_scratch_bytes(n_head, head_dim, n_kv_grow);
+  if (need > (size_t)*scratch_bytes) {
+    if (*scratch) cudaFree(*scratch);
+    if (cudaMalloc(scratch, need) != cudaSuccess) { *scratch = nullptr; *scratch_bytes = 0; return -3; }
+    *scratch_bytes = need;
+  }
   const float *comp_ptr = comp_cache ? (const float *)comp_cache->ptr : (const float *)raw_cache->ptr;
-  size_t nbytes = ds4_attn_mx_decode_scratch_bytes(n_head, head_dim, raw_vis + comp_vis);
-  uint8_t *scratch = nullptr;
-  if (cudaMalloc(&scratch, nbytes) != cudaSuccess) return -3;
-  int rc = ds4_attn_mx_decode_f32_scratch(
+  return ds4_attn_mx_decode_f32_scratch(
       (float *)heads->ptr, (const float *)q->ptr,
       (const float *)raw_cache->ptr, comp_ptr, comp_rows, sinks,
-      n_head, head_dim, raw_start, raw_cap, raw_first, raw_vis, comp_vis, scratch, nbytes);
-  cudaDeviceSynchronize();
-  cudaFree(scratch);
-  return rc;
+      n_head, head_dim, raw_start, raw_cap, raw_first, raw_vis, comp_vis, *scratch, *scratch_bytes);
 }
 #endif  // !DS4_ATTN_CUTLASS_STANDALONE
 

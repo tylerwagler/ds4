@@ -1897,7 +1897,8 @@ bool gpu_graph_encode_decode_layer(
                     (comp_selected != NULL) ? n_selected : 0,
                     model->map, model->size, layer->attn_sinks->abs_offset,
                     pos, g->raw_window, ds4_layer_compress_ratio(il),
-                    DS4_N_HEAD, DS4_N_HEAD_DIM) == 0;
+                    DS4_N_HEAD, DS4_N_HEAD_DIM,
+                    &g->attn_mx_scratch, &g->attn_mx_scratch_bytes) == 0;
         } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,

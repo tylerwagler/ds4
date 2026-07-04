@@ -1040,6 +1040,11 @@ typedef struct {
      * calling gpu_graph_encode_decode_layer for draft model forwarding). */
     int comp_ratio_override;
 
+    /* Reused scratch for the MXFP8 decode attention path (DS4_ATTN_MX); grown on
+     * demand by ds4_gpu_attn_mx_decode, freed in gpu_graph_free. */
+    unsigned char *attn_mx_scratch;
+    uint64_t       attn_mx_scratch_bytes;
+
     uint32_t prefill_cap;
     uint32_t raw_window;
 

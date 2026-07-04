@@ -605,7 +605,12 @@ int ds4_gpu_attn_mx_decode(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        unsigned char         **scratch,
+        uint64_t               *scratch_bytes);
+
+/* Free a scratch buffer grown by ds4_gpu_attn_mx_decode (raw cudaFree). */
+void ds4_gpu_attn_mx_scratch_free(void *p);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
