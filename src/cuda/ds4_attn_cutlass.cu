@@ -354,49 +354,86 @@ __global__ void attn_softmax_sink(float *P, const float *scores, const float *si
 // ---- Decode attention entry point (MXFP8 KV) ----
 // One decode step: n_head query rows attend over the SHARED KV = raw f32 window
 // (n_raw rows) ++ gathered MXFP8 compressed rows (comp_rows[0..n_comp)). Produces
-// heads[n_head][head_dim]. Self-allocates scratch and synchronizes -- the engine
-// path will switch to a caller-owned reused buffer (as the MoE FFN does) once
-// wired. comp_k/comp_v are MXFP8 caches (row stride head_dim + head_dim/32).
+// heads[n_head][head_dim]. comp_k/comp_v are MXFP8 caches (row stride hd + hd/32).
+//
+// Scratch layout, sized at a max (n_head, head_dim, n_kv_pad) once and reused: the
+// hot path never touches the CUDA allocator (mirrors the MoE FFN scratch pattern).
+static size_t au(size_t n, size_t a) { return (n + a - 1) / a * a; }
+struct attn_decode_scratch {
+  size_t Kf, Vb, scores, P, Qd, Qs, Kd, Ks, Pd, Ps, Vd, Vs, w1, w2, total;
+  size_t qa, kb, pa, vb, ws1, ws2;   // element/byte counts needed for memsets/zeroing
+};
+static attn_decode_scratch attn_decode_layout(int M, int D, int KV) {
+  attn_decode_scratch L{}; const size_t A = 256; size_t o = 0;
+  L.qa = mx_sfa_count(M, D); L.kb = mx_sfb_count<G88>(KV, D);
+  L.pa = mx_sfa_count(M, KV); L.vb = mx_sfb_count<G88>(D, KV);
+  L.ws1 = mx_ws_bytes<G88>(M, KV, D); L.ws2 = mx_ws_bytes<G88>(M, D, KV);
+  L.Kf = o; o = au(o + (size_t)KV * D * 4, A);
+  L.Vb = o; o = au(o + (size_t)D * KV * 4, A);
+  L.scores = o; o = au(o + (size_t)M * KV * 4, A);
+  L.P = o; o = au(o + (size_t)M * KV * 4, A);
+  L.Qd = o; o = au(o + (size_t)M * D, A);       L.Qs = o; o = au(o + L.qa * 2, A);
+  L.Kd = o; o = au(o + (size_t)KV * D, A);       L.Ks = o; o = au(o + L.kb * 2, A);
+  L.Pd = o; o = au(o + (size_t)M * KV, A);       L.Ps = o; o = au(o + L.pa * 2, A);
+  L.Vd = o; o = au(o + (size_t)D * KV, A);       L.Vs = o; o = au(o + L.vb * 2, A);
+  L.w1 = o; o = au(o + L.ws1, A);                L.w2 = o; o = au(o + L.ws2, A);
+  L.total = o; return L;
+}
+// Bytes of scratch for the worst case (max heads / head_dim / padded KV).
+extern "C" size_t ds4_attn_mx_decode_scratch_bytes(uint32_t n_head, uint32_t head_dim, uint32_t max_n_kv) {
+  uint32_t kvp = (max_n_kv + 31u) & ~31u; if (kvp == 0) kvp = 32u;
+  return attn_decode_layout((int)n_head, (int)head_dim, (int)kvp).total;
+}
+// No allocation, no synchronization: launches on the caller's stream. The caller
+// owns `scratch` (>= ds4_attn_mx_decode_scratch_bytes for its max shape) and orders.
+extern "C" int ds4_attn_mx_decode_scratch(
+    float *heads, const float *q,
+    const float *raw_k, const float *raw_v,
+    const uint8_t *comp_k, const uint8_t *comp_v, const int32_t *comp_rows,
+    const float *sinks,
+    uint32_t n_head, uint32_t head_dim, uint32_t n_raw, uint32_t n_comp,
+    uint8_t *scratch, size_t scratch_bytes) {
+  const uint32_t n_kv = n_raw + n_comp;
+  if (n_kv == 0 || (head_dim % 32) != 0 || !scratch) return -1;
+  const uint32_t n_kv_pad = (n_kv + 31u) & ~31u;
+  const float scale = 1.0f / sqrtf((float)head_dim);
+  const int M = (int)n_head, D = (int)head_dim, KV = (int)n_kv_pad;
+  attn_decode_scratch L = attn_decode_layout(M, D, KV);
+  if (scratch_bytes < L.total) return -2;
+  float   *Kf = (float *)(scratch + L.Kf), *Vb = (float *)(scratch + L.Vb);
+  float   *scores = (float *)(scratch + L.scores), *P = (float *)(scratch + L.P);
+  uint8_t *Qd = scratch + L.Qd, *Kd = scratch + L.Kd, *Pd = scratch + L.Pd, *Vd = scratch + L.Vd;
+  ElementSF *Qs = (ElementSF *)(scratch + L.Qs), *Ks = (ElementSF *)(scratch + L.Ks);
+  ElementSF *Ps = (ElementSF *)(scratch + L.Ps), *Vs = (ElementSF *)(scratch + L.Vs);
+  void *w1 = L.ws1 ? (void *)(scratch + L.w1) : nullptr, *w2 = L.ws2 ? (void *)(scratch + L.w2) : nullptr;
+  // swizzled SF tensors can have physical holes -> zero before packing (as the MoE path does)
+  cudaMemsetAsync(Qs, 0, L.qa * 2); cudaMemsetAsync(Ks, 0, L.kb * 2);
+  cudaMemsetAsync(Ps, 0, L.pa * 2); cudaMemsetAsync(Vs, 0, L.vb * 2);
+  assemble_kv_mxfp8<<<n_kv_pad, 256>>>(Kf, Vb, raw_k, raw_v, comp_k, comp_v, comp_rows,
+                                       n_raw, n_comp, n_kv, n_kv_pad, head_dim);
+  mx_pack_a8(Qd, Qs, q, M, D);
+  mx_pack_b8<G88>(Kd, Ks, Kf, KV, D);
+  mx_pack_b8<G88>(Vd, Vs, Vb, D, KV);
+  int rc = mx_run<G88>(scores, Qd, Qs, Kd, Ks, M, KV, D, w1);              // QK^T -> scores[M][KV]
+  attn_softmax_sink<<<M, 256>>>(P, scores, sinks, nullptr, scale, M, n_kv_pad, n_kv);  // full-width write; mask pad
+  mx_pack_a8(Pd, Ps, P, M, KV);
+  rc |= mx_run<G88>(heads, Pd, Ps, Vd, Vs, M, D, KV, w2);                  // P.V -> heads[M][D]
+  return rc;
+}
+// Self-allocating convenience wrapper (tests / non-hot-path). Allocs, runs, syncs.
 extern "C" int ds4_attn_mx_decode(
     float *heads, const float *q,
     const float *raw_k, const float *raw_v,
     const uint8_t *comp_k, const uint8_t *comp_v, const int32_t *comp_rows,
     const float *sinks,
     uint32_t n_head, uint32_t head_dim, uint32_t n_raw, uint32_t n_comp) {
-  const uint32_t n_kv = n_raw + n_comp;
-  if (n_kv == 0 || (head_dim % 32) != 0) return -1;
-  const uint32_t n_kv_pad = (n_kv + 31u) & ~31u;
-  const float scale = 1.0f / sqrtf((float)head_dim);
-  const int M = (int)n_head, D = (int)head_dim, KV = (int)n_kv_pad;
-
-  float *Kf, *Vb, *scores, *P;
-  cudaMalloc(&Kf, (size_t)KV * D * 4); cudaMalloc(&Vb, (size_t)D * KV * 4);
-  cudaMalloc(&scores, (size_t)M * KV * 4); cudaMalloc(&P, (size_t)M * KV * 4);
-  cudaMemset(P, 0, (size_t)M * KV * 4);
-  assemble_kv_mxfp8<<<n_kv_pad, 256>>>(Kf, Vb, raw_k, raw_v, comp_k, comp_v, comp_rows,
-                                       n_raw, n_comp, n_kv, n_kv_pad, head_dim);
-
-  size_t qa = mx_sfa_count(M, D), kb = mx_sfb_count<G88>(KV, D);
-  size_t pa = mx_sfa_count(M, KV), vb = mx_sfb_count<G88>(D, KV);
-  uint8_t *Qd, *Kd, *Pd, *Vd; ElementSF *Qs, *Ks, *Ps, *Vs;
-  cudaMalloc(&Qd, (size_t)M * D); cudaMalloc(&Qs, qa * 2); cudaMalloc(&Kd, (size_t)KV * D); cudaMalloc(&Ks, kb * 2);
-  cudaMalloc(&Pd, (size_t)M * KV); cudaMalloc(&Ps, pa * 2); cudaMalloc(&Vd, (size_t)D * KV); cudaMalloc(&Vs, vb * 2);
-  cudaMemset(Qs, 0, qa * 2); cudaMemset(Ks, 0, kb * 2); cudaMemset(Ps, 0, pa * 2); cudaMemset(Vs, 0, vb * 2);
-  mx_pack_a8(Qd, Qs, q, M, D);
-  mx_pack_b8<G88>(Kd, Ks, Kf, KV, D);
-  mx_pack_b8<G88>(Vd, Vs, Vb, D, KV);
-
-  size_t ws1 = mx_ws_bytes<G88>(M, KV, D), ws2 = mx_ws_bytes<G88>(M, D, KV);
-  void *w1 = nullptr, *w2 = nullptr; if (ws1) cudaMalloc(&w1, ws1); if (ws2) cudaMalloc(&w2, ws2);
-  int rc = mx_run<G88>(scores, Qd, Qs, Kd, Ks, M, KV, D, w1);              // QK^T -> scores[M][KV]
-  attn_softmax_sink<<<M, 256>>>(P, scores, sinks, nullptr, scale, M, n_kv_pad, n_kv);  // mask pad >= n_kv
-  mx_pack_a8(Pd, Ps, P, M, KV);
-  rc |= mx_run<G88>(heads, Pd, Ps, Vd, Vs, M, D, KV, w2);                  // P.V -> heads[M][D]
+  size_t nbytes = ds4_attn_mx_decode_scratch_bytes(n_head, head_dim, n_raw + n_comp);
+  uint8_t *scratch = nullptr;
+  if (cudaMalloc(&scratch, nbytes) != cudaSuccess) return -3;
+  int rc = ds4_attn_mx_decode_scratch(heads, q, raw_k, raw_v, comp_k, comp_v, comp_rows, sinks,
+                                      n_head, head_dim, n_raw, n_comp, scratch, nbytes);
   cudaDeviceSynchronize();
-
-  cudaFree(Kf); cudaFree(Vb); cudaFree(scores); cudaFree(P);
-  cudaFree(Qd); cudaFree(Qs); cudaFree(Kd); cudaFree(Ks); cudaFree(Pd); cudaFree(Ps); cudaFree(Vd); cudaFree(Vs);
-  if (w1) cudaFree(w1); if (w2) cudaFree(w2);
+  cudaFree(scratch);
   return rc;
 }
 
