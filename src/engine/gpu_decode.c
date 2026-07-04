@@ -2591,7 +2591,8 @@ bool gpu_graph_dspark_project_main_x(
 void gpu_graph_dspark_seed_draft_kv(
         ds4_gpu_graph          *g,
         const ds4_model         *dspark_model,
-        const ds4_dspark_weights *w) {
+        const ds4_dspark_weights *w,
+        uint32_t                 n_rows) {
     const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     for (int li = 0; li < 3; li++) {
         ds4_gpu_tensor *kv_out = ds4_gpu_tensor_alloc(kv_bytes);
@@ -2616,11 +2617,13 @@ void gpu_graph_dspark_seed_draft_kv(
             ds4_gpu_tensor_free(kv_out);
             continue;
         }
-        const uint32_t row = g->dspark_n_raw[li] % DS4_DSPARK_DRAFT_WINDOW;
-        ds4_gpu_tensor_copy(g->dspark_raw_cache[li],
-                            (uint64_t)row * kv_bytes,
-                            kv_norm, 0, kv_bytes);
-        g->dspark_n_raw[li]++;
+        for (uint32_t i = 0; i < n_rows; i++) {
+            const uint32_t row = g->dspark_n_raw[li] % DS4_DSPARK_DRAFT_WINDOW;
+            ds4_gpu_tensor_copy(g->dspark_raw_cache[li],
+                                (uint64_t)row * kv_bytes,
+                                kv_norm, 0, kv_bytes);
+            g->dspark_n_raw[li]++;
+        }
         ds4_gpu_tensor_free(kv_norm);
         ds4_gpu_tensor_free(kv_out);
     }
@@ -2757,23 +2760,27 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(
             g->batch_kv, n_draft, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
 
-        /* --- Store KV in draft ring buffer (write first, then attend) --- */
+        /* --- Store draft KV transiently in ring buffer for attention --- */
+        const uint32_t saved_n_raw = g->dspark_n_raw[li];
+        const uint32_t kv_store_pos = saved_n_raw % raw_cap;
         if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(
             g->dspark_raw_cache[li], g->batch_kv,
-            raw_cap, 0, n_draft, DS4_N_HEAD_DIM) != 0;
-        const uint32_t new_n_raw = g->dspark_n_raw[li] + n_draft;
-        const uint32_t vis_raw = new_n_raw < raw_cap ? new_n_raw : raw_cap;
-        const uint32_t first_raw_pos = new_n_raw > raw_cap
-            ? new_n_raw - raw_cap : 0;
+            raw_cap, kv_store_pos, n_draft, DS4_N_HEAD_DIM) != 0;
+        const uint32_t vis_raw = saved_n_raw + n_draft;
+        const uint32_t cap_raw = vis_raw < raw_cap ? vis_raw : raw_cap;
+        const uint32_t raw_start = vis_raw > raw_cap
+            ? (vis_raw - raw_cap) % raw_cap : 0;
 
-        /* --- Non-causal raw batch attention --- */
+        /* --- Non-causal raw batch attention ---
+         * Queries are at positions [saved_n_raw, saved_n_raw+n_draft).
+         * Visible raw entries span [0, vis_raw) — all cached + current draft rows. */
         if (ok) ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(
             g->batch_heads,
             dspark_model->map, dspark_model->size,
             layer->attn_sinks->abs_offset,
             g->batch_q, g->dspark_raw_cache[li],
-            n_draft, pos0,
-            vis_raw, raw_cap, first_raw_pos % raw_cap,
+            n_draft, saved_n_raw,
+            cap_raw, raw_cap, raw_start,
             0,
             DS4_N_HEAD, DS4_N_HEAD_DIM,
             1) != 0;
@@ -2803,7 +2810,8 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_cur_hc = g->batch_next_hc;
             g->batch_next_hc = tmp;
         }
-        g->dspark_n_raw[li] = new_n_raw;
+        /* Draft KV is transient; dspark_n_raw remains at the persistent count.
+         * Committed positions are seeded via gpu_graph_dspark_seed_draft_kv(). */
     }
 
     g->comp_ratio_override = prev_comp;

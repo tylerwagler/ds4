@@ -4732,7 +4732,8 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
 
     /* Step 7: seed draft KV cache for committed positions */
     if (commit_drafts > 0)
-        gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights);
+        gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights,
+                                        (uint32_t)commit_drafts);
 
     /* Step 8: return accepted tokens */
     for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {

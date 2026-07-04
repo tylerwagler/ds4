@@ -2238,7 +2238,8 @@ bool gpu_graph_dspark_project_main_x(
 void gpu_graph_dspark_seed_draft_kv(
         ds4_gpu_graph          *g,
         const ds4_model         *dspark_model,
-        const ds4_dspark_weights *w);
+        const ds4_dspark_weights *w,
+        uint32_t                 n_rows);
 bool gpu_graph_dspark_draft_forward(
         ds4_gpu_graph          *g,
         const ds4_model         *base_model,
