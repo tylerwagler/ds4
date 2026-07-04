@@ -410,6 +410,12 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
     }
+    if (gpu_graph_attn_mx_enabled()) {
+        /* The compressed-KV cache is MXFP8 under DS4_ATTN_MX; its on-disk
+         * serialization is not implemented yet. Deferred (see Stage 4). */
+        payload_set_err(err, errlen, "session save unsupported with DS4_ATTN_MX (MXFP8 KV)");
+        return 1;
+    }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before layer snapshot");
         return 1;
@@ -541,6 +547,10 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     }
     if (ds4_session_is_cpu(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
+        return 1;
+    }
+    if (gpu_graph_attn_mx_enabled()) {
+        payload_set_err(err, errlen, "session load unsupported with DS4_ATTN_MX (MXFP8 KV)");
         return 1;
     }
     uint64_t remaining = payload_bytes;
@@ -1031,6 +1041,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
+    if (!ds4_session_is_cpu(s) && gpu_graph_attn_mx_enabled()) {
+        /* GPU path serializes the MXFP8 comp cache raw; not implemented. Deferred. */
+        payload_set_err(err, errlen, "session save unsupported with DS4_ATTN_MX (MXFP8 KV)");
+        return 1;
+    }
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -1245,6 +1260,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
+    }
+    if (!ds4_session_is_cpu(s) && gpu_graph_attn_mx_enabled()) {
+        payload_set_err(err, errlen, "session load unsupported with DS4_ATTN_MX (MXFP8 KV)");
+        return 1;
     }
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];

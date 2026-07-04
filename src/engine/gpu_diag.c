@@ -226,7 +226,7 @@ bool gpu_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
@@ -306,6 +306,7 @@ bool gpu_graph_alloc_raw_cap(
             const uint64_t attn_rows = (uint64_t)coff * ratio;
             uint64_t comp_row_bytes = (uint64_t)DS4_N_HEAD_DIM * (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
             if (DS4_GPU_ATTN_COMP_CACHE_FP8) comp_row_bytes = DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM);
+            if (gpu_graph_attn_mx_enabled()) comp_row_bytes = DS4_ENGINE_MXKV_FP8_ROWBYTES;
             g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
                     (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
@@ -353,9 +354,17 @@ bool gpu_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) {
+        /* f32 staging: the compressor writes real f32 rows here, then the commit
+         * step packs them to the persistent MXFP8 (or F16) comp cache. */
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
+    }
+    if (gpu_graph_attn_mx_enabled()) {
+        /* f32 shadow the prefill attention consumers read after the persistent
+         * MXFP8 comp cache is dequantized (see gpu_graph_attn_comp_read_cache). */
+        g->attn_comp_dequant = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap *
+                                                    DS4_N_HEAD_DIM * sizeof(float));
     }
     g->indexer_q = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
     g->indexer_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));

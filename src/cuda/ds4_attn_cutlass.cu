@@ -609,8 +609,11 @@ extern "C" int ds4_gpu_attn_mx_decode(
     if (cudaMalloc(scratch, need) != cudaSuccess) { *scratch = nullptr; *scratch_bytes = 0; return -3; }
     *scratch_bytes = need;
   }
-  const float *comp_ptr = comp_cache ? (const float *)comp_cache->ptr : (const float *)raw_cache->ptr;
-  return ds4_attn_mx_decode_f32_scratch(
+  // Phase B: the persistent comp cache is MXFP8 (DS4_ATTN_MX storage), read
+  // directly by the MX entry; raw stays f32. When there is no comp cache the
+  // pointer is unused (comp_vis == 0).
+  const uint8_t *comp_ptr = comp_cache ? (const uint8_t *)comp_cache->ptr : (const uint8_t *)raw_cache->ptr;
+  return ds4_attn_mx_decode_mx_scratch(
       (float *)heads->ptr, (const float *)q->ptr,
       (const float *)raw_cache->ptr, comp_ptr, comp_rows, sinks,
       n_head, head_dim, raw_start, raw_cap, raw_first, raw_vis, comp_vis, *scratch, *scratch_bytes);

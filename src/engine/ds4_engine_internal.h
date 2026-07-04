@@ -170,6 +170,16 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
 #define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
 
+/* MXFP8 (OCP micro-scaling) compressed-KV storage, selected at *runtime* by the
+ * DS4_ATTN_MX env (see gpu_graph_attn_mx_enabled()) rather than a compile-time
+ * macro like the F16/FP8 paths above.  One row = HD e4m3 bytes followed by
+ * ceil(HD/32) e8m0 (uint8) block scales; must stay byte-identical to the CUDA
+ * mxkv_pack/dequant kernels and assemble_kv_mxcomp (src/cuda). For DS4_N_HEAD_DIM
+ * == 512 that is 512 + 16 = 528 B/row (vs 2048 for f32). */
+#define DS4_ENGINE_MXKV_FMT_FP8 1u
+#define DS4_ENGINE_MXKV_FP8_ROWBYTES \
+    ((uint64_t)DS4_N_HEAD_DIM + (((uint64_t)DS4_N_HEAD_DIM + 31u) / 32u))
+
 /* The compressed-KV cache has one storage representation at a time: the write,
  * allocation, and attention-read paths all branch on exactly one of these. */
 #if DS4_GPU_ATTN_COMP_CACHE_F16 && DS4_GPU_ATTN_COMP_CACHE_FP8
@@ -980,6 +990,11 @@ typedef struct {
     ds4_gpu_tensor *comp_kv_cur;
     ds4_gpu_tensor *comp_sc_cur;
     ds4_gpu_tensor *attn_comp_stage;
+    /* f32 shadow used only when DS4_ATTN_MX is on: the prefill attention
+     * consumers read plain-f32/f16/fp8 comp rows, so the persistent MXFP8 comp
+     * cache is dequantized here (up to max layer_comp_cap rows) before each
+     * prefill-attention read. Decode reads the MXFP8 cache directly (CUTLASS). */
+    ds4_gpu_tensor *attn_comp_dequant;
     ds4_gpu_tensor *indexer_q;
     ds4_gpu_tensor *indexer_weights;
     ds4_gpu_tensor *indexer_scores;
@@ -2170,6 +2185,22 @@ bool gpu_graph_use_reference_qkv_norm(void);
 bool gpu_graph_enable_batch_hc_norm_fusion(void);
 uint32_t gpu_graph_attn_comp_cache_is_f16(void);
 uint32_t gpu_graph_attn_comp_cache_is_fp8(void);
+/* True when DS4_ATTN_MX is set (cached). When on, the compressed-KV cache is
+ * stored MXFP8 (DS4_ENGINE_MXKV_FP8_ROWBYTES/row) and decode attention runs the
+ * CUTLASS Sm120 MX path; when off the build is byte-identical to before. */
+int gpu_graph_attn_mx_enabled(void);
+/* Comp-cache row stride in bytes for the active storage format (MX-aware). */
+uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
+/* Returns the comp-cache tensor to hand to the (f32/f16/fp8) prefill attention
+ * consumers for `n_rows` rows: the cache itself normally, or the f32 shadow
+ * (attn_comp_dequant) after dequantizing when MX storage is on. NULL on error.
+ * The matching format flags are gpu_graph_attn_comp_read_is_f16/_is_fp8(). */
+ds4_gpu_tensor *gpu_graph_attn_comp_read_cache(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       n_rows);
+uint32_t gpu_graph_attn_comp_read_is_f16(void);
+uint32_t gpu_graph_attn_comp_read_is_fp8(void);
 ds4_gpu_tensor *gpu_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il);

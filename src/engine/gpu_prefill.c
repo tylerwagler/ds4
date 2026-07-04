@@ -828,7 +828,8 @@ bool gpu_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && n_comp > g->attn_comp_stage_cap) {
+            if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) &&
+                n_comp > g->attn_comp_stage_cap) {
                 fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
             }
@@ -911,7 +912,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && comp_chunk > g->attn_comp_stage_cap) {
+                if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) &&
+                    comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
@@ -1051,7 +1053,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                             DS4_RMS_EPS) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
-                        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+                        if (gpu_graph_attn_mx_enabled()) {
+                            /* comp_row_view aliases the f32 stage; commit packs
+                             * it to MXFP8 below. */
+                            ok = comp_row_view != NULL;
+                        } else if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
                             ds4_gpu_tensor *packed_dst = ds4_gpu_tensor_view(
                                 g->layer_attn_comp_cache[il],
                                 (uint64_t)comp_row * DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM),
@@ -1467,8 +1473,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               g->batch_q,
                                                                               g->layer_raw_cache[il],
-                                                                              g->layer_attn_comp_cache[il],
-                                                                              gpu_graph_attn_comp_cache_is_f16(), gpu_graph_attn_comp_cache_is_fp8(),
+                                                                              gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                              gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
                                                                               g->comp_selected,
                                                                               n_tokens,
                                                                               pos0,
@@ -1496,8 +1502,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                              layer->attn_sinks->abs_offset,
                                                                              g->batch_q,
                                                                              g->layer_raw_cache[il],
-                                                                             g->layer_attn_comp_cache[il],
-                                                                             gpu_graph_attn_comp_cache_is_f16(), gpu_graph_attn_comp_cache_is_fp8(),
+                                                                             gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                             gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
                                                                              use_comp_mask ? g->comp_mask : NULL,
                                                                              use_comp_mask,
                                                                              n_tokens,
@@ -1582,8 +1588,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           layer->attn_sinks->abs_offset,
                                                                           g->batch_q,
                                                                           g->layer_raw_cache[il],
-                                                                          g->layer_attn_comp_cache[il],
-                                                                          gpu_graph_attn_comp_cache_is_f16(), gpu_graph_attn_comp_cache_is_fp8(),
+                                                                          gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                          gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
                                                                           g->comp_selected,
                                                                           n_tokens,
                                                                           pos0,
@@ -1614,8 +1620,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        layer->attn_sinks->abs_offset,
                                                                        g->batch_q,
                                                                        g->batch_kv,
-                                                                       g->layer_attn_comp_cache[il],
-                                                                       gpu_graph_attn_comp_cache_is_f16(), gpu_graph_attn_comp_cache_is_fp8(),
+                                                                       gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                       gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
@@ -1709,8 +1715,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
-                                                                              g->layer_attn_comp_cache[il],
-                                                                              gpu_graph_attn_comp_cache_is_f16(), gpu_graph_attn_comp_cache_is_fp8(),
+                                                                              gpu_graph_attn_comp_read_cache(g, il, cur_comp),
+                                                                              gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -1733,8 +1739,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  n_raw,
                                                                  g->raw_cap,
                                                                  raw_start,
-                                                                 cur_comp ? g->layer_attn_comp_cache[il] : NULL,
-                                                                 gpu_graph_attn_comp_cache_is_f16(), gpu_graph_attn_comp_cache_is_fp8(),
+                                                                 cur_comp ? gpu_graph_attn_comp_read_cache(g, il, cur_comp) : NULL,
+                                                                 gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,
