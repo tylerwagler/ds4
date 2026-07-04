@@ -362,10 +362,10 @@ source attn/dense is already E4M3).
   Biggest payoff is at depth (compressed-KV reads scale with context); the fixed 128-token
   raw window itself is small (~11 MiB/decode-step across 43 layers) — prioritize the
   compressed-cache repack over the raw window.
-- **2b Profiling GATE** — profile the oracle quant's decode (attn vs shared vs MoE vs KV
-  split) BEFORE building 2c. Earlier nsys put attention ~6.6ms and the real stall was the
-  now-fixed graph bug → decode is likely MoE-memory-bound. If attn/shared is a thin slice,
-  2c is a quality win more than a speed one; if fat, build it.
+- **2b Profiling GATE** — deferred (2026-07-04).  2c is already done; the profiling
+  is only needed to gate 2d.lm (lm_head FP8).  The lm_head is 0.56 GB of the ~8 GB/token
+  active-weight estimate (~7%), likely noise in the decode bandwidth budget.
+  Run `ds4-bench` or nsys when a working model is available to confirm.
 - **2c FP8 weights via cuBLASLt — done.** See `==COMPLETED==`.
 - **2d Eliminate ALL remaining Q8 (end-state goal: zero Q8 in the model).** After 2c, the
   only Q8 left is **3.63 GB**: `attn_output_a`+`attn_output_b` (3.07 GB) and `output.weight`/
