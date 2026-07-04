@@ -194,6 +194,87 @@ static size_t mx_sfb_count(int N, int K) {
   return cute::size(cute::filter_zeros(G::Cfg::tile_atom_to_shape_SFB(make_shape(1, N, K, 1))));
 }
 
+// ---- Batched (L = n_head) variants: A/B/D are L contiguous matrices; SF layouts carry L. ----
+template <class TSF>
+__global__ void pack_a8_bat(uint8_t *Ad, TSF tSFA, const float *x, int M, int K, int L) {
+  int nblk = K / 32; long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)L * M * nblk) return;
+  int l = (int)(idx / ((long)M * nblk)); long r = idx % ((long)M * nblk);
+  int m = (int)(r / nblk), kb = (int)(r % nblk);
+  const float *xr = x + ((size_t)l * M + m) * K + (size_t)kb * 32;
+  float mx = 0.f; for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(xr[i]));
+  uint8_t e8 = a_e8m0_enc(mx, 448.f); float sc = exp2f((float)((int)e8 - 127));
+  uint8_t *outb = Ad + ((size_t)l * M + m) * K + (size_t)kb * 32;
+  for (int i = 0; i < 32; i++) outb[i] = a_e4m3_enc(xr[i] / sc);
+  tSFA(m, kb * 32, l) = ElementSF::bitcast(e8);
+}
+template <class TB, class TSF>
+__global__ void pack_b8_bat(TB tB, TSF tSFB, const float *x, int N, int K, int L) {
+  int nblk = K / 32; long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)L * N * nblk) return;
+  int l = (int)(idx / ((long)N * nblk)); long r = idx % ((long)N * nblk);
+  int n = (int)(r / nblk), kb = (int)(r % nblk);
+  const float *xr = x + ((size_t)l * N + n) * K + (size_t)kb * 32;
+  float mx = 0.f; for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(xr[i]));
+  uint8_t e8 = a_e8m0_enc(mx, 448.f); float sc = exp2f((float)((int)e8 - 127));
+  for (int i = 0; i < 32; i++) tB(n, kb * 32 + i, l) = cutlass::float_e4m3_t::bitcast(a_e4m3_enc(xr[i] / sc));
+  tSFB(n, kb * 32, l) = ElementSF::bitcast(e8);
+}
+static void mx_pack_a8_bat(uint8_t *Ad, ElementSF *Asf, const float *x, int M, int K, int L) {
+  auto lSFA = G88::Cfg::tile_atom_to_shape_SFA(make_shape(M, 0, K, L));
+  auto tSFA = make_tensor(make_gmem_ptr(Asf), lSFA);
+  long nb = (long)L * M * (K / 32), t = 128, b = (nb + t - 1) / t;
+  pack_a8_bat<<<b, t>>>(Ad, tSFA, x, M, K, L);
+}
+template <class G>
+static void mx_pack_b8_bat(uint8_t *Bd, ElementSF *Bsf, const float *x, int N, int K, int L) {
+  auto lB = cutlass::make_cute_packed_stride(typename G::Kernel::StrideB{}, {N, K, L});
+  auto layB = make_layout(make_shape(N, K, L), lB);
+  auto lSFB = G::Cfg::tile_atom_to_shape_SFB(make_shape(1, N, K, L));
+  auto tB = make_tensor(recast_ptr<cutlass::float_e4m3_t>(Bd), layB);
+  auto tSFB = make_tensor(make_gmem_ptr(Bsf), lSFB);
+  long nb = (long)L * N * (K / 32), t = 128, b = (nb + t - 1) / t;
+  pack_b8_bat<<<b, t>>>(tB, tSFB, x, N, K, L);
+}
+template <class G>
+static int mx_run_bat(float *D, const uint8_t *Ad, const ElementSF *Asf,
+                      const uint8_t *Bd, const ElementSF *Bsf, int M, int N, int K, int L, void *ws) {
+  auto sA = cutlass::make_cute_packed_stride(typename G::Kernel::StrideA{}, {M,K,L});
+  auto sB = cutlass::make_cute_packed_stride(typename G::Kernel::StrideB{}, {N,K,L});
+  auto sC = cutlass::make_cute_packed_stride(typename G::Kernel::StrideC{}, {M,N,L});
+  auto sD = cutlass::make_cute_packed_stride(typename G::Kernel::StrideD{}, {M,N,L});
+  auto lSFA = G::Cfg::tile_atom_to_shape_SFA(make_shape(M,N,K,L));
+  auto lSFB = G::Cfg::tile_atom_to_shape_SFB(make_shape(M,N,K,L));
+  typename G::Gemm::Arguments args{ cutlass::gemm::GemmUniversalMode::kGemm, {M,N,K,L},
+    { reinterpret_cast<const typename G::ElementA::DataType*>(Ad), sA,
+      reinterpret_cast<const typename G::ElementB::DataType*>(Bd), sB, Asf, lSFA, Bsf, lSFB },
+    { {1.f,0.f}, D, sC, D, sD } };
+  typename G::Gemm g;
+  if (g.can_implement(args) != cutlass::Status::kSuccess) return 1;
+  if (g.initialize(args, ws) != cutlass::Status::kSuccess) return 2;
+  return g.run() == cutlass::Status::kSuccess ? 0 : 3;
+}
+template <class G>
+static size_t mx_ws_bytes_bat(int M, int N, int K, int L) {
+  auto sA=cutlass::make_cute_packed_stride(typename G::Kernel::StrideA{},{M,K,L});
+  auto sB=cutlass::make_cute_packed_stride(typename G::Kernel::StrideB{},{N,K,L});
+  auto sC=cutlass::make_cute_packed_stride(typename G::Kernel::StrideC{},{M,N,L});
+  auto sD=cutlass::make_cute_packed_stride(typename G::Kernel::StrideD{},{M,N,L});
+  auto lSFA=G::Cfg::tile_atom_to_shape_SFA(make_shape(M,N,K,L));
+  auto lSFB=G::Cfg::tile_atom_to_shape_SFB(make_shape(M,N,K,L));
+  typename G::Gemm::Arguments args{ cutlass::gemm::GemmUniversalMode::kGemm, {M,N,K,L},
+    {(const typename G::ElementA::DataType*)nullptr,sA,(const typename G::ElementB::DataType*)nullptr,sB,(const ElementSF*)nullptr,lSFA,(const ElementSF*)nullptr,lSFB},
+    {{1.f,0.f},(float*)nullptr,sC,(float*)nullptr,sD} };
+  return G::Gemm::get_workspace_size(args);
+}
+static size_t mx_sfa_count_bat(int M, int K, int L) {
+  return cute::size(cute::filter_zeros(G88::Cfg::tile_atom_to_shape_SFA(make_shape(M, 0, K, L))));
+}
+template <class G>
+static size_t mx_sfb_count_bat(int N, int K, int L) {
+  return cute::size(cute::filter_zeros(G::Cfg::tile_atom_to_shape_SFB(make_shape(1, N, K, L))));
+}
+
 // ---- Softmax with attention sink (one block per query row) ----
 // scores[n_q, n_kv] (raw dot products) -> P[n_q, n_kv] probabilities, applying
 // scale = 1/sqrt(head_dim) and folding the per-query sink into the denominator
@@ -335,6 +416,55 @@ static int run_attn_1head(int n_q, int n_kv, int head_dim, float sink) {
   return (rc==0&&bad==0)?0:1;
 }
 
+// Batched multi-head attention (MXFP8): L=n_head heads, each a full QK->softmax+sink->PV.
+// Q/K/Vb laid out head-major [head][*][d]; per-head sink; parity vs host reference.
+static int run_attn_mha(int n_head, int n_q, int n_kv, int head_dim) {
+  std::mt19937 rng(7 + n_head + n_q + n_kv); std::normal_distribution<float> nd(0.f,1.f);
+  std::vector<float> Q((size_t)n_head*n_q*head_dim), K((size_t)n_head*n_kv*head_dim), Vb((size_t)n_head*head_dim*n_kv), sinks(n_head);
+  for(auto&v:Q)v=nd(rng)*0.5f; for(auto&v:K)v=nd(rng)*0.5f; for(auto&v:Vb)v=nd(rng);
+  for(int h=0;h<n_head;h++) sinks[h]=(float)(h%3)*1.5f;
+  const float scale=1.0f/sqrtf((float)head_dim);
+  // host reference (per head, over dq values)
+  std::vector<float> dqQ,dqK,dqVb; h_dq(dqQ,Q,n_head*n_q,head_dim,448.f,0); h_dq(dqK,K,n_head*n_kv,head_dim,448.f,0); h_dq(dqVb,Vb,n_head*head_dim,n_kv,448.f,0);
+  std::vector<float> Pref((size_t)n_head*n_q*n_kv), outref((size_t)n_head*n_q*head_dim,0.f);
+  for(int h=0;h<n_head;h++) for(int q=0;q<n_q;q++){
+    const float*qq=dqQ.data()+((size_t)h*n_q+q)*head_dim; float m=sinks[h]; std::vector<float> s(n_kv);
+    for(int j=0;j<n_kv;j++){ const float*kk=dqK.data()+((size_t)h*n_kv+j)*head_dim; double a=0; for(int d=0;d<head_dim;d++)a+=(double)qq[d]*kk[d]; s[j]=(float)a*scale; m=fmaxf(m,s[j]); }
+    double den=expf(sinks[h]-m); for(int j=0;j<n_kv;j++)den+=expf(s[j]-m);
+    for(int j=0;j<n_kv;j++) Pref[((size_t)h*n_q+q)*n_kv+j]=(float)(expf(s[j]-m)/den);
+  }
+  std::vector<float> dqP; h_dq(dqP,Pref,n_head*n_q,n_kv,448.f,0);
+  for(int h=0;h<n_head;h++) for(int q=0;q<n_q;q++) for(int d=0;d<head_dim;d++){ const float*pp=dqP.data()+((size_t)h*n_q+q)*n_kv; const float*vv=dqVb.data()+((size_t)h*head_dim+d)*n_kv; double a=0; for(int j=0;j<n_kv;j++)a+=(double)pp[j]*vv[j]; outref[((size_t)h*n_q+q)*head_dim+d]=(float)a; }
+  // device
+  float *dQ,*dK,*dVb,*dScores,*dP,*dOut,*dSinkRow;
+  cudaMalloc(&dQ,Q.size()*4); cudaMalloc(&dK,K.size()*4); cudaMalloc(&dVb,Vb.size()*4);
+  cudaMalloc(&dScores,(size_t)n_head*n_q*n_kv*4); cudaMalloc(&dP,(size_t)n_head*n_q*n_kv*4); cudaMalloc(&dOut,(size_t)n_head*n_q*head_dim*4);
+  cudaMalloc(&dSinkRow,(size_t)n_head*n_q*4);
+  cudaMemcpy(dQ,Q.data(),Q.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dK,K.data(),K.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dVb,Vb.data(),Vb.size()*4,cudaMemcpyHostToDevice);
+  { std::vector<float> sr((size_t)n_head*n_q); for(int h=0;h<n_head;h++)for(int q=0;q<n_q;q++)sr[(size_t)h*n_q+q]=sinks[h]; cudaMemcpy(dSinkRow,sr.data(),sr.size()*4,cudaMemcpyHostToDevice); }
+  size_t qa=mx_sfa_count_bat(n_q,head_dim,n_head), kb=mx_sfb_count_bat<G88>(n_kv,head_dim,n_head);
+  uint8_t*Qd,*Kd; ElementSF*Qs,*Ks; cudaMalloc(&Qd,Q.size()); cudaMalloc(&Qs,qa*2); cudaMalloc(&Kd,K.size()); cudaMalloc(&Ks,kb*2);
+  cudaMemset(Qs,0,qa*2); cudaMemset(Ks,0,kb*2);
+  mx_pack_a8_bat(Qd,Qs,dQ,n_q,head_dim,n_head); mx_pack_b8_bat<G88>(Kd,Ks,dK,n_kv,head_dim,n_head);
+  size_t ws1=mx_ws_bytes_bat<G88>(n_q,n_kv,head_dim,n_head); void*w1=nullptr; if(ws1)cudaMalloc(&w1,ws1);
+  int rc=mx_run_bat<G88>(dScores,Qd,Qs,Kd,Ks,n_q,n_kv,head_dim,n_head,w1);
+  attn_softmax_sink<<<n_head*n_q,256>>>(dP,dScores,dSinkRow,nullptr,scale,n_head*n_q,n_kv);
+  size_t pa=mx_sfa_count_bat(n_q,n_kv,n_head), vb=mx_sfb_count_bat<G88>(head_dim,n_kv,n_head);
+  uint8_t*Pd,*Vd; ElementSF*Ps,*Vs; cudaMalloc(&Pd,(size_t)n_head*n_q*n_kv); cudaMalloc(&Ps,pa*2); cudaMalloc(&Vd,(size_t)n_head*head_dim*n_kv); cudaMalloc(&Vs,vb*2);
+  cudaMemset(Ps,0,pa*2); cudaMemset(Vs,0,vb*2);
+  mx_pack_a8_bat(Pd,Ps,dP,n_q,n_kv,n_head); mx_pack_b8_bat<G88>(Vd,Vs,dVb,head_dim,n_kv,n_head);
+  size_t ws2=mx_ws_bytes_bat<G88>(n_q,head_dim,n_kv,n_head); void*w2=nullptr; if(ws2)cudaMalloc(&w2,ws2);
+  rc|=mx_run_bat<G88>(dOut,Pd,Ps,Vd,Vs,n_q,head_dim,n_kv,n_head,w2);
+  std::vector<float> got((size_t)n_head*n_q*head_dim); cudaMemcpy(got.data(),dOut,got.size()*4,cudaMemcpyDeviceToHost); cudaDeviceSynchronize();
+  double maxrel=0; int bad=0;
+  for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-outref[i]); double r=a/(fabs(outref[i])+1e-2); maxrel=fmax(maxrel,r); if(r>0.03&&a>0.02)bad++; }
+  printf("attn MHA n_head=%d n_q=%d n_kv=%d rc=%d max_rel=%.4f bad=%d/%zu -> %s\n",
+         n_head,n_q,n_kv,rc,maxrel,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
+  cudaFree(dQ);cudaFree(dK);cudaFree(dVb);cudaFree(dScores);cudaFree(dP);cudaFree(dOut);cudaFree(dSinkRow);
+  cudaFree(Qd);cudaFree(Qs);cudaFree(Kd);cudaFree(Ks);cudaFree(Pd);cudaFree(Ps);cudaFree(Vd);cudaFree(Vs); if(w1)cudaFree(w1); if(w2)cudaFree(w2);
+  return (rc==0&&bad==0)?0:1;
+}
+
 int main(){
   int rc=0;
   // QK^T: M=n_q, N=n_kv, K=head_dim=512
@@ -347,6 +477,9 @@ int main(){
   rc|=run_attn_1head(128,256,512,0.0f);
   rc|=run_attn_1head(64,512,512,2.5f);
   rc|=run_attn_1head(1,128,512,1.0f);   // decode-shaped (single query)
+  // Stage 3 batched multi-head
+  rc|=run_attn_mha(16,64,256,512);
+  rc|=run_attn_mha(32,1,128,512);       // decode: 32 heads, single query each
   printf("attn cutlass gemm: %s\n", rc==0?"OK":"FAIL");
   return rc;
 }
