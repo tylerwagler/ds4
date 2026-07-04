@@ -3036,7 +3036,11 @@ bool gpu_graph_matmul_plain_tensor(
         return ds4_gpu_matmul_f32_tensor(out, model->map, model->size,
                                            w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }
-    fprintf(stderr, "ds4: Metal plain matmul does not support %s\n", tensor_type_name(w->type));
+    if (w->type == DS4_TENSOR_FP8_E4M3) {
+        return ds4_gpu_matmul_mxfp8_tensor(out, model->map, model->size,
+                                            w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
+    }
+    fprintf(stderr, "ds4: plain matmul does not support %s\n", tensor_type_name(w->type));
     return false;
 }
 
