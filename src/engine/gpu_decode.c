@@ -266,6 +266,10 @@ uint32_t gpu_graph_attn_comp_cache_is_f16(void) {
 uint32_t gpu_graph_attn_comp_cache_is_fp8(void) {
     return DS4_GPU_ATTN_COMP_CACHE_FP8 ? 1u : 0u;
 }
+static bool gpu_graph_weight_is_plain_or_mxfp8(const ds4_tensor *w) {
+    return w->type == DS4_TENSOR_F16 || w->type == DS4_TENSOR_FP8_E4M3;
+}
+
 
 
 
@@ -1557,8 +1561,8 @@ bool gpu_graph_encode_decode_layer(
         const bool emit = ((pos + 1u) % ratio) == 0u;
         if (!layer->attn_compressor_kv || !layer->attn_compressor_gate ||
             !layer->attn_compressor_ape || !layer->attn_compressor_norm ||
-            layer->attn_compressor_kv->type != DS4_TENSOR_F16 ||
-            layer->attn_compressor_gate->type != DS4_TENSOR_F16 ||
+            !gpu_graph_weight_is_plain_or_mxfp8(layer->attn_compressor_kv) ||
+            !gpu_graph_weight_is_plain_or_mxfp8(layer->attn_compressor_gate) ||
             layer->attn_compressor_kv->dim[0] != DS4_N_EMBD ||
             layer->attn_compressor_gate->dim[0] != DS4_N_EMBD ||
             layer->attn_compressor_kv->dim[1] != comp_width ||
@@ -1571,25 +1575,36 @@ bool gpu_graph_encode_decode_layer(
             ok = false;
         }
         if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
-            ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                  g->comp_sc_cur,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_compressor_kv->abs_offset,
-                                                  layer->attn_compressor_gate->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  comp_width,
-                                                  g->attn_norm,
-                                                  1) != 0;
+            if (layer->attn_compressor_kv->type == DS4_TENSOR_F16) {
+                ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
+                                                      g->comp_sc_cur,
+                                                      model->map,
+                                                      model->size,
+                                                      layer->attn_compressor_kv->abs_offset,
+                                                      layer->attn_compressor_gate->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      comp_width,
+                                                      g->attn_norm,
+                                                      1) != 0;
+            } else {
+                ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
+                                                    layer->attn_compressor_kv,
+                                                    DS4_N_EMBD, comp_width,
+                                                    g->attn_norm, 1) &&
+                     gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
+                                                    layer->attn_compressor_gate,
+                                                    DS4_N_EMBD, comp_width,
+                                                    g->attn_norm, 1);
+            }
         } else {
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
-                                                     layer->attn_compressor_kv->abs_offset,
-                                                     DS4_N_EMBD, comp_width,
-                                                     g->attn_norm, 1) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_cur, model->map, model->size,
-                                                     layer->attn_compressor_gate->abs_offset,
-                                                     DS4_N_EMBD, comp_width,
-                                                     g->attn_norm, 1) != 0;
+            if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
+                                                         layer->attn_compressor_kv,
+                                                         DS4_N_EMBD, comp_width,
+                                                         g->attn_norm, 1);
+            if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
+                                                         layer->attn_compressor_gate,
+                                                         DS4_N_EMBD, comp_width,
+                                                         g->attn_norm, 1);
         }
         const uint32_t comp_row = g->layer_n_comp[il];
         if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
@@ -1649,8 +1664,8 @@ bool gpu_graph_encode_decode_layer(
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
                 !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
-                layer->indexer_compressor_kv->type != DS4_TENSOR_F16 ||
-                layer->indexer_compressor_gate->type != DS4_TENSOR_F16 ||
+                !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_compressor_kv) ||
+                !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_compressor_gate) ||
                 layer->indexer_compressor_kv->dim[0] != DS4_N_EMBD ||
                 layer->indexer_compressor_gate->dim[0] != DS4_N_EMBD ||
                 layer->indexer_compressor_kv->dim[1] != index_width ||
@@ -1663,25 +1678,36 @@ bool gpu_graph_encode_decode_layer(
                 ok = false;
             }
             if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
-                ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                      g->comp_sc_cur,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->indexer_compressor_kv->abs_offset,
-                                                      layer->indexer_compressor_gate->abs_offset,
-                                                      DS4_N_EMBD,
-                                                      index_width,
-                                                      g->attn_norm,
-                                                      1) != 0;
+                if (layer->indexer_compressor_kv->type == DS4_TENSOR_F16) {
+                    ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
+                                                          g->comp_sc_cur,
+                                                          model->map,
+                                                          model->size,
+                                                          layer->indexer_compressor_kv->abs_offset,
+                                                          layer->indexer_compressor_gate->abs_offset,
+                                                          DS4_N_EMBD,
+                                                          index_width,
+                                                          g->attn_norm,
+                                                          1) != 0;
+                } else {
+                    ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
+                                                        layer->indexer_compressor_kv,
+                                                        DS4_N_EMBD, index_width,
+                                                        g->attn_norm, 1) &&
+                         gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
+                                                        layer->indexer_compressor_gate,
+                                                        DS4_N_EMBD, index_width,
+                                                        g->attn_norm, 1);
+                }
             } else {
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
-                                                         layer->indexer_compressor_kv->abs_offset,
-                                                         DS4_N_EMBD, index_width,
-                                                         g->attn_norm, 1) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_cur, model->map, model->size,
-                                                         layer->indexer_compressor_gate->abs_offset,
-                                                         DS4_N_EMBD, index_width,
-                                                         g->attn_norm, 1) != 0;
+                if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
+                                                             layer->indexer_compressor_kv,
+                                                             DS4_N_EMBD, index_width,
+                                                             g->attn_norm, 1);
+                if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
+                                                             layer->indexer_compressor_gate,
+                                                             DS4_N_EMBD, index_width,
+                                                              g->attn_norm, 1);
             }
             const uint32_t index_row = g->layer_n_index_comp[il];
             if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
@@ -1730,14 +1756,14 @@ bool gpu_graph_encode_decode_layer(
                 g->layer_n_index_comp[il] > DS4_N_INDEXER_TOP_K) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
-                    layer->indexer_attn_q_b->type != DS4_TENSOR_F16 ||
+                    !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_attn_q_b) ||
                     layer->indexer_attn_q_b->dim[0] != q_rank ||
                     layer->indexer_attn_q_b->dim[1] != indexer_q_dim) {
                     fprintf(stderr, "ds4: Metal graph indexer q projection expects F16 weights\n");
                     ok = false;
                 }
                 if (ok && (!layer->indexer_proj ||
-                           layer->indexer_proj->type != DS4_TENSOR_F16 ||
+                           !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_proj) ||
                            layer->indexer_proj->dim[0] != DS4_N_EMBD ||
                            layer->indexer_proj->dim[1] != DS4_N_INDEXER_HEAD)) {
                     fprintf(stderr, "ds4: Metal graph indexer weight projection expects F16 weights\n");
@@ -1766,10 +1792,10 @@ bool gpu_graph_encode_decode_layer(
                 if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->indexer_q,
                                                               DS4_N_INDEXER_HEAD,
                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->indexer_weights, model->map, model->size,
-                                                         layer->indexer_proj->abs_offset,
-                                                         DS4_N_EMBD, DS4_N_INDEXER_HEAD,
-                                                         g->attn_norm, 1) != 0;
+                if (ok) ok = gpu_graph_matmul_plain_tensor(g->indexer_weights, model,
+                                                             layer->indexer_proj,
+                                                             DS4_N_EMBD, DS4_N_INDEXER_HEAD,
+                                                             g->attn_norm, 1);
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (ok && decode_index_stage_profile) {
                     ok = gpu_graph_indexer_stage_profile_boundary(NULL,
@@ -2866,13 +2892,12 @@ bool gpu_graph_encode_output_head(
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
-                                             model->map,
-                                             model->size,
-                                             weights->output_hc_fn->abs_offset,
-                                             hc_dim,
-                                             DS4_N_HC,
-                                             g->flat_hc,
+    if (ok) ok = gpu_graph_matmul_plain_tensor(g->output_pre,
+                                                 (const ds4_model *)model,
+                                                 weights->output_hc_fn,
+                                                 hc_dim,
+                                                 DS4_N_HC,
+                                                 g->flat_hc,
                                              1) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("result_hc_pre", g->output_pre, DS4_N_HC, DS4_N_LAYER, 0);
@@ -2970,10 +2995,9 @@ bool gpu_graph_encode_output_head_batch(
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(output_pre,
-                                             model->map,
-                                             model->size,
-                                             weights->output_hc_fn->abs_offset,
+    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre,
+                                                 (const ds4_model *)model,
+                                                 weights->output_hc_fn,
                                              hc_dim,
                                              DS4_N_HC,
                                              g->batch_flat_hc,
