@@ -397,9 +397,70 @@ static int check_dspark_confidence_head(void) {
     return rc;
 }
 
+static int check_dspark_fp8_kv_pack(void) {
+    const uint32_t head_dim = 512;
+    const uint32_t nblk = (head_dim + 63) / 64;
+    float *src = (float *)calloc(head_dim, sizeof(float));
+    if (!src) return 1;
+    for (uint32_t i = 0; i < head_dim; i++) src[i] = ((float)i - 256.0f) * 0.5f;
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(head_dim * sizeof(float));
+    ds4_gpu_tensor *packed = ds4_gpu_tensor_alloc(head_dim);
+    ds4_gpu_tensor *scales = ds4_gpu_tensor_alloc(nblk * sizeof(float));
+    if (!x || !packed || !scales) { free(src); return 1; }
+    if (!ds4_gpu_tensor_write(x, 0, src, head_dim * sizeof(float))) { free(src); return 1; }
+
+    int rc = 0;
+    if (!ds4_gpu_dsv4_fp8_kv_pack_tensor(x, packed, scales, 1, head_dim)) {
+        fprintf(stderr, "ds4: fp8 kv pack failed\n");
+        rc = 1;
+    }
+    if (rc == 0) {
+        uint8_t *packed_host = (uint8_t *)malloc(head_dim);
+        float *scales_host = (float *)malloc(nblk * sizeof(float));
+        if (!packed_host || !scales_host) rc = 1;
+        else {
+            if (!ds4_gpu_tensor_read(packed, 0, packed_host, head_dim))
+                rc = 1;
+            if (!ds4_gpu_tensor_read(scales, 0, scales_host, nblk * sizeof(float)))
+                rc = 1;
+            if (rc == 0) {
+                for (uint32_t i = 0; i < head_dim; i++) {
+                    float scale = scales_host[i >> 6];
+                    int idx = packed_host[i] & 0x7f;
+                    float val = 0.0f;
+                    int exp = (idx >> 3) & 15;
+                    int mant = idx & 7;
+                    if (exp == 0) val = (float)mant * 0.001953125f;
+                    else val = (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
+                    if (packed_host[i] & 0x80) val = -val;
+                    float recon = val * scale;
+                    float diff = fabsf(recon - src[i]);
+                    float tol = fmaxf(fabsf(src[i]) * 0.3f + 1e-5f, 1e-4f);
+                    if (diff > tol) {
+                        fprintf(stderr, "ds4: fp8 packing error at %u: src=%.6f recon=%.6f\n",
+                                i, (double)src[i], (double)recon);
+                        rc = 1;
+                        break;
+                    }
+                }
+            }
+            free(packed_host);
+            free(scales_host);
+        }
+    }
+
+    ds4_gpu_tensor_free(scales);
+    ds4_gpu_tensor_free(packed);
+    ds4_gpu_tensor_free(x);
+    free(src);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
+    if (check_dspark_fp8_kv_pack() != 0) rc = 1;
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;
