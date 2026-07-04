@@ -33,14 +33,14 @@ P3 entry in `==COMPLETED==` for the head-to-head numbers that surfaced this.
 |----|------|-------|--------|------------|-------------|
 | P0 | HF→ds4 GGUF converter (repacker + quantizer) | P0 | **done** | — | ~1-2 weeks |
 | P1.1 | DSpark: GGUF conversion | P1 | **done** | — | 200-300 lines |
-| P1.2 | DSpark: weight binding | P1 | planned | P1.1 | ~120 lines |
-| P1.3 | DSpark: GPU graph allocation | P1 | planned | P1.1 | ~200 lines |
-| P1.4 | Non-causal SWA attention mode (= A4) | P1 | planned | — | ~150 lines |
-| P1.5 | DSpark: target hidden capture | P1 | planned | P1.2 | ~80 lines |
-| P1.6 | DSpark: Markov + confidence heads | P1 | planned | P1.2 | ~120 lines |
-| P1.7 | DSpark: block spec decode cycle | P1 | planned | P1.3, P1.4, P1.5, P1.6 | ~700 lines |
-| P1.8 | DSpark: CUDA graph capture | P1 | planned | P1.7 | ~80 lines |
-| P1.9 | DSpark: server integration (`--dspark`) | P1 | planned | P1.7 | ~60 lines |
+| P1.2 | DSpark: weight binding | P1 | **done** | P1.1 | ~120 lines |
+| P1.3 | DSpark: GPU graph allocation | P1 | **done** | P1.1 | ~200 lines |
+| P1.4 | Non-causal SWA attention mode (= A4) | P1 | **done** | — | ~150 lines |
+| P1.5 | DSpark: target hidden capture | P1 | **done** | P1.2 | ~80 lines |
+| P1.6 | DSpark: Markov + confidence heads | P1 | **done** | P1.2 | ~120 lines |
+| P1.7 | DSpark: block spec decode cycle | P1 | **done** | P1.3, P1.4, P1.5, P1.6 | ~700 lines |
+| P1.8 | DSpark: CUDA graph capture | P1 | deferred (see note) | P1.7 | ~80 lines |
+| P1.9 | DSpark: server integration (`--dspark`) | P1 | **done** | P1.7 | ~60 lines |
 | P1.10 | DSpark: load-aware scheduler | P1 | deferred | P1.7 | ~200 lines |
 | P2a | Real packed FP8 KV cache (replace fake-quant) | P2 | planned | — | ~1 week |
 | P2b | Profiling GATE (decode split analysis) | P2 | planned | — | ~1 day |
@@ -203,9 +203,17 @@ DFlash + Eagle3), NOT DGX Spark (naming clash). MTP skipped — straight to DSpa
      and SGLang's `dspark_worker_v2.py` — the logic is well-documented Python, transliterate
      to C/CUDA.*
 
-  8. **CUDA graph capture** — capture the full draft cycle (capture + backbone + markov +
-     verify) in one CUDA graph per decode step, matching vLLM's approach. Reuse the existing
-     CUDA graph infrastructure. *Effort: ~80 lines.*
+  8. **CUDA graph capture** — deferred.  The DSpark spec cycle depends on variable
+     inputs (main_x, token IDs) that change each step; CUDA graphs would need the
+     `cudaGraphExecUpdate` API or device-side indirection for parameter passing.
+     On the GB10, decode is memory-bandwidth-bound (~74% MBU); eager execution
+     already saturates the bus.  The CUDA graph infrastructure in ds4 is limited to
+     `begin_commands`/`end_commands` (no-ops on CUDA); building full graph capture
+     would require a separate stream, capture begin/end calls, instantiation, and
+     parameter update logic — well beyond the ~80-line estimate.  This is consistent
+     with the project's own assessment: "CUDA-graph decode capture — eager wins this
+     (GPU-bound) workload; antirez ships no graphs. Parked."
+     *Effort: deferred.*
 
   9. **Server integration** (`generate.c`, `cli_main.c`) — `--dspark` flag, gating rules:
      greedy-only (temperature <= 0.0), not with SSD-streaming, conflicts with `--mtp`.
