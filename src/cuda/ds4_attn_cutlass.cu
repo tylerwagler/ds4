@@ -194,6 +194,40 @@ static size_t mx_sfb_count(int N, int K) {
   return cute::size(cute::filter_zeros(G::Cfg::tile_atom_to_shape_SFB(make_shape(1, N, K, 1))));
 }
 
+// ---- Softmax with attention sink (one block per query row) ----
+// scores[n_q, n_kv] (raw dot products) -> P[n_q, n_kv] probabilities, applying
+// scale = 1/sqrt(head_dim) and folding the per-query sink into the denominator
+// only (exp(sink - m), no value contribution). `valid` bounds the visible keys
+// per query (causal/window); keys >= valid[q] are masked out. sink is per-row
+// here (single head); the batched path passes sinks[head].
+__global__ void attn_softmax_sink(float *P, const float *scores, const float *sink_per_row,
+                                  const int32_t *valid, float scale, uint32_t n_q, uint32_t n_kv) {
+  uint32_t q = blockIdx.x;
+  if (q >= n_q) return;
+  const float *sr = scores + (uint64_t)q * n_kv;
+  float *pr = P + (uint64_t)q * n_kv;
+  uint32_t lim = valid ? (uint32_t)valid[q] : n_kv;
+  if (lim > n_kv) lim = n_kv;
+  const float sink = sink_per_row ? sink_per_row[q] : -INFINITY;
+
+  __shared__ float red[256];
+  // pass 1: row max (seeded with sink)
+  float m = sink;
+  for (uint32_t j = threadIdx.x; j < lim; j += blockDim.x) m = fmaxf(m, sr[j] * scale);
+  red[threadIdx.x] = m; __syncthreads();
+  for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+  m = red[0]; __syncthreads();
+  // pass 2: denom = sum exp(score-m) + exp(sink-m)
+  float d = 0.0f;
+  for (uint32_t j = threadIdx.x; j < lim; j += blockDim.x) d += expf(sr[j] * scale - m);
+  red[threadIdx.x] = d; __syncthreads();
+  for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
+  d = red[0] + expf(sink - m);
+  const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+  // write probabilities (masked keys -> 0)
+  for (uint32_t j = threadIdx.x; j < n_kv; j += blockDim.x) pr[j] = (j < lim) ? expf(sr[j] * scale - m) * inv : 0.0f;
+}
+
 #ifdef DS4_ATTN_CUTLASS_STANDALONE
 #include <vector>
 #include <random>
@@ -249,6 +283,58 @@ static int run_case(const char* name, int M, int N, int K, int bfp4){
   return (rc==0&&bad==0)?0:1;
 }
 
+// Single-head attention pipeline (MXFP8): QK GEMM -> softmax+sink -> PV GEMM, vs
+// a host reference over the same MX-dequantized values. Proves the Stage-3 core
+// mechanic before batching/gather/mixing. n_kv multiple of 32 (PV contraction).
+static int run_attn_1head(int n_q, int n_kv, int head_dim, float sink) {
+  std::mt19937 rng(99 + n_q + n_kv); std::normal_distribution<float> nd(0.f,1.f);
+  std::vector<float> Q((size_t)n_q*head_dim), K((size_t)n_kv*head_dim), Vb((size_t)head_dim*n_kv);
+  for(auto&v:Q)v=nd(rng)*0.5f; for(auto&v:K)v=nd(rng)*0.5f; for(auto&v:Vb)v=nd(rng);
+  const float scale = 1.0f/sqrtf((float)head_dim);
+  // host reference over dq values
+  std::vector<float> dqQ,dqK,dqVb; h_dq(dqQ,Q,n_q,head_dim,448.f,0); h_dq(dqK,K,n_kv,head_dim,448.f,0); h_dq(dqVb,Vb,head_dim,n_kv,448.f,0);
+  std::vector<float> Pref((size_t)n_q*n_kv), outref((size_t)n_q*head_dim,0.f);
+  for(int q=0;q<n_q;q++){
+    float m=sink; std::vector<float> s(n_kv);
+    for(int j=0;j<n_kv;j++){ double a=0; for(int d=0;d<head_dim;d++) a+=(double)dqQ[(size_t)q*head_dim+d]*dqK[(size_t)j*head_dim+d]; s[j]=(float)a*scale; m=fmaxf(m,s[j]); }
+    double den=expf(sink-m); for(int j=0;j<n_kv;j++) den+=expf(s[j]-m);
+    for(int j=0;j<n_kv;j++) Pref[(size_t)q*n_kv+j]=(float)(expf(s[j]-m)/den);
+  }
+  std::vector<float> dqP; h_dq(dqP,Pref,n_q,n_kv,448.f,0);   // P is packed to mxfp8 for the PV GEMM
+  for(int q=0;q<n_q;q++) for(int d=0;d<head_dim;d++){ double a=0; for(int j=0;j<n_kv;j++) a+=(double)dqP[(size_t)q*n_kv+j]*dqVb[(size_t)d*n_kv+j]; outref[(size_t)q*head_dim+d]=(float)a; }
+  // device pipeline
+  float *dQ,*dK,*dVb,*dScores,*dP,*dOut,*dSink;
+  cudaMalloc(&dQ,Q.size()*4); cudaMalloc(&dK,K.size()*4); cudaMalloc(&dVb,Vb.size()*4);
+  cudaMalloc(&dScores,(size_t)n_q*n_kv*4); cudaMalloc(&dP,(size_t)n_q*n_kv*4); cudaMalloc(&dOut,(size_t)n_q*head_dim*4);
+  cudaMalloc(&dSink,(size_t)n_q*4);
+  cudaMemcpy(dQ,Q.data(),Q.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dK,K.data(),K.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dVb,Vb.data(),Vb.size()*4,cudaMemcpyHostToDevice);
+  { std::vector<float> sk(n_q,sink); cudaMemcpy(dSink,sk.data(),(size_t)n_q*4,cudaMemcpyHostToDevice); }
+  // pack + QK
+  size_t qa_n=mx_sfa_count(n_q,head_dim), kb_n=mx_sfb_count<G88>(n_kv,head_dim);
+  uint8_t *Qd,*Kd; ElementSF *Qs,*Ks; cudaMalloc(&Qd,(size_t)n_q*head_dim); cudaMalloc(&Qs,qa_n*2); cudaMalloc(&Kd,(size_t)n_kv*head_dim); cudaMalloc(&Ks,kb_n*2);
+  cudaMemset(Qs,0,qa_n*2); cudaMemset(Ks,0,kb_n*2);
+  mx_pack_a8(Qd,Qs,dQ,n_q,head_dim); mx_pack_b8<G88>(Kd,Ks,dK,n_kv,head_dim);
+  size_t ws1=mx_ws_bytes<G88>(n_q,n_kv,head_dim); void*w1=nullptr; if(ws1)cudaMalloc(&w1,ws1);
+  int rc=mx_run<G88>(dScores,Qd,Qs,Kd,Ks,n_q,n_kv,head_dim,w1);
+  // softmax + sink
+  attn_softmax_sink<<<n_q,256>>>(dP,dScores,dSink,nullptr,scale,n_q,n_kv);
+  // pack + PV  (A=P [n_q,n_kv], B=Vb [head_dim,n_kv])
+  size_t pa_n=mx_sfa_count(n_q,n_kv), vb_n=mx_sfb_count<G88>(head_dim,n_kv);
+  uint8_t *Pd,*Vd; ElementSF *Ps,*Vs; cudaMalloc(&Pd,(size_t)n_q*n_kv); cudaMalloc(&Ps,pa_n*2); cudaMalloc(&Vd,(size_t)head_dim*n_kv); cudaMalloc(&Vs,vb_n*2);
+  cudaMemset(Ps,0,pa_n*2); cudaMemset(Vs,0,vb_n*2);
+  mx_pack_a8(Pd,Ps,dP,n_q,n_kv); mx_pack_b8<G88>(Vd,Vs,dVb,head_dim,n_kv);
+  size_t ws2=mx_ws_bytes<G88>(n_q,head_dim,n_kv); void*w2=nullptr; if(ws2)cudaMalloc(&w2,ws2);
+  rc|=mx_run<G88>(dOut,Pd,Ps,Vd,Vs,n_q,head_dim,n_kv,w2);
+  std::vector<float> got((size_t)n_q*head_dim); cudaMemcpy(got.data(),dOut,got.size()*4,cudaMemcpyDeviceToHost); cudaDeviceSynchronize();
+  double maxrel=0; int bad=0;
+  for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-outref[i]); double r=a/(fabs(outref[i])+1e-2); maxrel=fmax(maxrel,r); if(r>0.03&&a>0.02)bad++; }
+  printf("attn 1-head n_q=%d n_kv=%d sink=%.1f rc=%d max_rel=%.4f bad=%d/%zu -> %s\n",
+         n_q,n_kv,(double)sink,rc,maxrel,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
+  cudaFree(dQ);cudaFree(dK);cudaFree(dVb);cudaFree(dScores);cudaFree(dP);cudaFree(dOut);cudaFree(dSink);
+  cudaFree(Qd);cudaFree(Qs);cudaFree(Kd);cudaFree(Ks);cudaFree(Pd);cudaFree(Ps);cudaFree(Vd);cudaFree(Vs); if(w1)cudaFree(w1); if(w2)cudaFree(w2);
+  return (rc==0&&bad==0)?0:1;
+}
+
 int main(){
   int rc=0;
   // QK^T: M=n_q, N=n_kv, K=head_dim=512
@@ -257,6 +343,10 @@ int main(){
   // PV: M=n_q, N=head_dim=512, K=kv_tile=128
   rc|=run_case<G88>("PV mxfp8xmxfp8",128,512,128,0);
   rc|=run_case<G84>("PV mxfp8xmxfp4",128,512,128,1);
+  // Stage 3 mechanic: full single-head attention (QK -> softmax+sink -> PV)
+  rc|=run_attn_1head(128,256,512,0.0f);
+  rc|=run_attn_1head(64,512,512,2.5f);
+  rc|=run_attn_1head(1,128,512,1.0f);   // decode-shaped (single query)
   printf("attn cutlass gemm: %s\n", rc==0?"OK":"FAIL");
   return rc;
 }
