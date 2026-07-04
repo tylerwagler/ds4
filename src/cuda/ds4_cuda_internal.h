@@ -57,6 +57,27 @@ enum {
 #define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
 #define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
 
+/*
+ * Microscaling (MX / OCP) compressed-KV storage.  One E8M0 (power-of-two)
+ * scale byte per BLOCK=32 elements, laid out per row as [data ...][scales ...]:
+ *   MXFP8 (E4M3 data): HD data bytes  + NBLK scale bytes  (HD=512 -> 528 B/row)
+ *   MXFP4 (E2M1 data): HD/2 nibble bytes + NBLK scale bytes (HD=512 -> 272 B/row)
+ * This is the CUTLASS-consumable layout (float_ue8m0_t scales, block 32); the
+ * GEMM path re-tiles the scales into CUTLASS's swizzled SF layout at use time.
+ */
+#define DS4_MXKV_BLOCK 32u
+#define DS4_MXKV_NBLK(HD) (((HD) + DS4_MXKV_BLOCK - 1u) / DS4_MXKV_BLOCK)
+#define DS4_MXKV_FP8_ROWBYTES(HD) ((HD) + DS4_MXKV_NBLK(HD))
+#define DS4_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + DS4_MXKV_NBLK(HD))
+/* KV cache storage format selector (compile/runtime). */
+#define DS4_MXKV_FMT_NONE 0u
+#define DS4_MXKV_FMT_FP8  1u
+#define DS4_MXKV_FMT_FP4  2u
+#define DS4_MXKV_ROWBYTES(FMT, HD) \
+    ((FMT) == DS4_MXKV_FMT_FP4 ? DS4_MXKV_FP4_ROWBYTES(HD) \
+   : (FMT) == DS4_MXKV_FMT_FP8 ? DS4_MXKV_FP8_ROWBYTES(HD) \
+   : (HD) * sizeof(float))
+
 struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;

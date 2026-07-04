@@ -309,6 +309,43 @@ __device__ static float dsv4_e2m1fn_dequant_dev(float x) {
     return sign * dsv4_e2m1fn_value_dev(best);
 }
 
+/* Encode to an OCP E2M1 (float_e2m1_t) 4-bit nibble: [sign:1][magnitude:3].
+ * The magnitude table matches dsv4_e2m1fn_value_dev, i.e. CUTLASS float_e2m1_t. */
+__device__ static uint8_t dsv4_e2m1fn_encode_dev(float x) {
+    float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
+    for (int i = 1; i < 8; i++) {
+        float diff = fabsf(ax - dsv4_e2m1fn_value_dev(i));
+        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return (uint8_t)((best & 7) | ((x < 0.0f) ? 0x8u : 0u));
+}
+
+__device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
+    float val = dsv4_e2m1fn_value_dev(nib & 7);
+    return (nib & 8u) ? (-val * scale) : (val * scale);
+}
+
+/* E8M0 microscale: a power-of-two scale stored as a single byte = exponent+127
+ * (byte 255 is reserved NaN).  Given a block amax and the format's max
+ * representable magnitude, choose the smallest 2^k that maps amax into range. */
+__device__ static uint8_t dsv4_e8m0_encode_scale_dev(float amax, float max_repr) {
+    float ratio = fmaxf(amax, 1.0e-20f) / max_repr;
+    int k = (int)ceilf(log2f(ratio));
+    int e = k + 127;
+    if (e < 0) e = 0;
+    if (e > 254) e = 254;
+    return (uint8_t)e;
+}
+
+__device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
+    return exp2f((float)((int)byte - 127));
+}
+
 
 
 __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
@@ -809,6 +846,89 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_pack_tensor(
         scales->bytes < (uint64_t)n_tok * nblk * sizeof(float)) return 0;
     pack_fp8_kv_kernel<<<n_tok, 64>>>((const float *)x->ptr, (uint8_t *)packed->ptr, (float *)scales->ptr, n_tok, head_dim);
     return cuda_ok(cudaGetLastError(), "fp8_kv_pack launch");
+}
+
+
+/*
+ * Microscaling (MX) compressed-KV pack: one warp per row, DS4_MXKV_BLOCK=32
+ * elements per E8M0 scale.  Row layout is [data ...][E8M0 scale bytes ...]:
+ * MXFP8 = E4M3 data (1 B/elem); MXFP4 = E2M1 data (2 elems/byte).  head_dim
+ * must be a multiple of 32.  See DS4_MXKV_* in ds4_cuda_internal.h.
+ */
+__global__ static void mxkv_pack_kernel(const float *x, uint8_t *out,
+                                        uint32_t n_tok, uint32_t head_dim, uint32_t fmt) {
+    uint32_t row = blockIdx.x;
+    uint32_t lane = threadIdx.x;                 /* 0..31, one warp */
+    if (row >= n_tok) return;
+    const float *xr = x + (uint64_t)row * head_dim;
+    const uint32_t nblk = head_dim / DS4_MXKV_BLOCK;
+    const uint32_t data_bytes = (fmt == DS4_MXKV_FMT_FP4) ? (head_dim + 1u) / 2u : head_dim;
+    const uint32_t rowbytes = data_bytes + nblk;
+    uint8_t *outr = out + (uint64_t)row * rowbytes;
+    uint8_t *scales = outr + data_bytes;
+    const float max_repr = (fmt == DS4_MXKV_FMT_FP4) ? 6.0f : 448.0f;
+
+    for (uint32_t b = 0; b < nblk; b++) {
+        const uint32_t idx = b * DS4_MXKV_BLOCK + lane;
+        const float v = (idx < head_dim) ? xr[idx] : 0.0f;
+        float a = fabsf(v);
+        for (uint32_t s = 16u; s > 0u; s >>= 1) a = fmaxf(a, __shfl_down_sync(0xffffffffu, a, s));
+        a = __shfl_sync(0xffffffffu, a, 0);      /* block amax on every lane */
+        const uint8_t e8 = dsv4_e8m0_encode_scale_dev(a, max_repr);
+        const float scale = dsv4_e8m0_decode_scale_dev(e8);
+        if (lane == 0) scales[b] = e8;
+        if (fmt == DS4_MXKV_FMT_FP4) {
+            const uint8_t nib = dsv4_e2m1fn_encode_dev(v / scale);
+            const uint32_t hi = __shfl_down_sync(0xffffffffu, (uint32_t)nib, 1);
+            if ((lane & 1u) == 0u && idx < head_dim)
+                outr[b * (DS4_MXKV_BLOCK / 2u) + (lane >> 1)] = (uint8_t)(nib | (hi << 4));
+        } else {
+            if (idx < head_dim)
+                outr[b * DS4_MXKV_BLOCK + lane] = dsv4_e4m3fn_encode_dev(v / scale);
+        }
+    }
+}
+
+__global__ static void mxkv_dequant_kernel(const uint8_t *in, float *out,
+                                           uint32_t n_tok, uint32_t head_dim, uint32_t fmt) {
+    uint32_t row = blockIdx.x;
+    if (row >= n_tok) return;
+    const uint32_t nblk = head_dim / DS4_MXKV_BLOCK;
+    const uint32_t data_bytes = (fmt == DS4_MXKV_FMT_FP4) ? (head_dim + 1u) / 2u : head_dim;
+    const uint32_t rowbytes = data_bytes + nblk;
+    const uint8_t *inr = in + (uint64_t)row * rowbytes;
+    const uint8_t *scales = inr + data_bytes;
+    float *outr = out + (uint64_t)row * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float scale = dsv4_e8m0_decode_scale_dev(scales[d / DS4_MXKV_BLOCK]);
+        if (fmt == DS4_MXKV_FMT_FP4) {
+            const uint8_t byte = inr[d >> 1];
+            const uint8_t nib = (d & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
+            outr[d] = dsv4_e2m1fn_decode_dev(nib, scale);
+        } else {
+            outr[d] = dsv4_e4m3fn_decode_dev(inr[d], scale);
+        }
+    }
+}
+
+extern "C" int ds4_gpu_mxkv_pack_tensor(const ds4_gpu_tensor *x, ds4_gpu_tensor *out,
+                                        uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
+    if (!x || !out || n_tok == 0 || (head_dim % DS4_MXKV_BLOCK) != 0 ||
+        (fmt != DS4_MXKV_FMT_FP8 && fmt != DS4_MXKV_FMT_FP4) ||
+        x->bytes < (uint64_t)n_tok * head_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tok * DS4_MXKV_ROWBYTES(fmt, head_dim)) return 0;
+    mxkv_pack_kernel<<<n_tok, 32>>>((const float *)x->ptr, (uint8_t *)out->ptr, n_tok, head_dim, fmt);
+    return cuda_ok(cudaGetLastError(), "mxkv_pack launch");
+}
+
+extern "C" int ds4_gpu_mxkv_dequant_tensor(const ds4_gpu_tensor *in, ds4_gpu_tensor *out,
+                                           uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
+    if (!in || !out || n_tok == 0 || (head_dim % DS4_MXKV_BLOCK) != 0 ||
+        (fmt != DS4_MXKV_FMT_FP8 && fmt != DS4_MXKV_FMT_FP4) ||
+        in->bytes < (uint64_t)n_tok * DS4_MXKV_ROWBYTES(fmt, head_dim) ||
+        out->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+    mxkv_dequant_kernel<<<n_tok, 256>>>((const uint8_t *)in->ptr, (float *)out->ptr, n_tok, head_dim, fmt);
+    return cuda_ok(cudaGetLastError(), "mxkv_dequant launch");
 }
 
 

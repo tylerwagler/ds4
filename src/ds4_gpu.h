@@ -370,6 +370,23 @@ int ds4_gpu_dsv4_fp8_kv_pack_tensor(
         uint32_t               n_tok,
         uint32_t               head_dim);
 
+/* Microscaling (MX) compressed-KV pack/dequant. fmt is DS4_MXKV_FMT_FP8/FP4.
+ * Row layout [data][E8M0 scales], block 32; head_dim must be a multiple of 32.
+ * `out` (pack) / `in` (dequant) is sized n_tok * DS4_MXKV_ROWBYTES(fmt,head_dim). */
+int ds4_gpu_mxkv_pack_tensor(
+        const ds4_gpu_tensor *x,
+        ds4_gpu_tensor       *out,
+        uint32_t               fmt,
+        uint32_t               n_tok,
+        uint32_t               head_dim);
+
+int ds4_gpu_mxkv_dequant_tensor(
+        const ds4_gpu_tensor *in,
+        ds4_gpu_tensor       *out,
+        uint32_t               fmt,
+        uint32_t               n_tok,
+        uint32_t               head_dim);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
