@@ -42,12 +42,12 @@ P3 entry in `==COMPLETED==` for the head-to-head numbers that surfaced this.
 | P1.8 | DSpark: CUDA graph capture | P1 | deferred (see note) | P1.7 | ~80 lines |
 | P1.9 | DSpark: server integration (`--dspark`) | P1 | **done** | P1.7 | ~60 lines |
 | P1.10 | DSpark: load-aware scheduler | P1 | deferred | P1.7 | ~200 lines |
-| P2a | Real packed FP8 KV cache (replace fake-quant) | P2 | planned | — | ~1 week |
-| P2b | Profiling GATE (decode split analysis) | P2 | planned | — | ~1 day |
+| P2a | Real packed FP8 KV cache (replace fake-quant) | P2 | **done** (gated) | — | ~1 week |
+| P2b | Profiling GATE (decode split analysis) | P2 | deferred | — | ~1 day |
 | P2c | FP8 weights via cuBLASLt (attn_q/kv + shared experts MXFP8) | P2 | **done** | — | — |
 | P2d.ao | attn_output_a/b MXFP8 | P2 | **done** | — | — |
-| P2d.lm | lm_head MXFP8 + KL/perplexity gate | P2 | planned | P2b | ~3 days |
-| P2e | MXFP8 for F16 weight groups (compressor, indexer, HC) | P2 | planned | — | ~1 week |
+| P2d.lm | lm_head MXFP8 + KL/perplexity gate | P2 | planned | P2b+P3 | ~3 days |
+| P2e | MXFP8 for F16 weight groups (compressor, indexer, HC) | P2 | **done** (pending quant) | — | ~1 week |
 | P3 | Wire MXFP4 CUTLASS TC path (or extend prefill batching) | P3 | **done** | — | ~2 weeks |
 | P4 | Oracle-driven multi-format allocation | P4 | deferred | P2/P3 formats settled | ~1 week |
 | P5 | Expert pruning (REAP/RIY) | P5 | deferred | — | ~1 week |
