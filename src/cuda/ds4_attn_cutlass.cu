@@ -449,6 +449,69 @@ __global__ void assemble_kv_f32comp(float *Kf, float *VbT,
   }
 }
 
+// Phase B assembly: raw is f32 (ring), comp is a PERSISTENT MXFP8 cache (row
+// stride head_dim + head_dim/32, block-32 E8M0), dequantized on the fly. K==V.
+__global__ void assemble_kv_mxcomp(float *Kf, float *VbT,
+                                   const float *kv_raw, const uint8_t *kv_comp_mx, const int32_t *comp_rows,
+                                   uint32_t raw_start, uint32_t raw_cap, uint32_t raw_first,
+                                   uint32_t n_raw, uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim) {
+  uint32_t row = blockIdx.x;
+  if (row >= n_kv_pad) return;
+  const uint32_t nblk = head_dim / 32, rowbytes = head_dim + nblk;
+  for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    float v = 0.f;
+    if (row < n_raw) {
+      uint32_t phys = (raw_start + raw_first + row) % raw_cap;
+      v = kv_raw[(uint64_t)phys * head_dim + d];
+    } else if (row < n_kv) {
+      uint32_t i = row - n_raw;
+      int32_t r = comp_rows ? comp_rows[i] : (int32_t)i;
+      if (r >= 0) {
+        const uint8_t *cr = kv_comp_mx + (uint64_t)r * rowbytes;
+        v = a_e4m3_dec(cr[d], a_e8m0_dec(cr[head_dim + d / 32]));
+      }
+    }
+    Kf[(uint64_t)row * head_dim + d] = v;
+    VbT[(uint64_t)d * n_kv_pad + row] = v;
+  }
+}
+
+// Phase B decode entry: raw f32 window + persistent MXFP8 comp cache. Identical
+// pipeline to the f32 variant, differing only in the comp-cache read (dequant).
+extern "C" int ds4_attn_mx_decode_mx_scratch(
+    float *heads, const float *q,
+    const float *kv_raw, const uint8_t *kv_comp_mx, const int32_t *comp_rows,
+    const float *sinks,
+    uint32_t n_head, uint32_t head_dim,
+    uint32_t raw_start, uint32_t raw_cap, uint32_t raw_first, uint32_t n_raw, uint32_t n_comp,
+    uint8_t *scratch, size_t scratch_bytes) {
+  const uint32_t n_kv = n_raw + n_comp;
+  if (n_kv == 0 || (head_dim % 32) != 0 || !scratch) return -1;
+  const uint32_t n_kv_pad = (n_kv + 31u) & ~31u;
+  const float scale = 1.0f / sqrtf((float)head_dim);
+  const int M = (int)n_head, D = (int)head_dim, KV = (int)n_kv_pad;
+  attn_decode_scratch L = attn_decode_layout(M, D, KV);
+  if (scratch_bytes < L.total) return -2;
+  float *Kf = (float *)(scratch + L.Kf), *Vb = (float *)(scratch + L.Vb);
+  float *scores = (float *)(scratch + L.scores), *P = (float *)(scratch + L.P);
+  uint8_t *Qd = scratch + L.Qd, *Kd = scratch + L.Kd, *Pd = scratch + L.Pd, *Vd = scratch + L.Vd;
+  ElementSF *Qs = (ElementSF *)(scratch + L.Qs), *Ks = (ElementSF *)(scratch + L.Ks);
+  ElementSF *Ps = (ElementSF *)(scratch + L.Ps), *Vs = (ElementSF *)(scratch + L.Vs);
+  void *w1 = L.ws1 ? (void *)(scratch + L.w1) : nullptr, *w2 = L.ws2 ? (void *)(scratch + L.w2) : nullptr;
+  cudaMemsetAsync(Qs, 0, L.qa * 2); cudaMemsetAsync(Ks, 0, L.kb * 2);
+  cudaMemsetAsync(Ps, 0, L.pa * 2); cudaMemsetAsync(Vs, 0, L.vb * 2);
+  assemble_kv_mxcomp<<<n_kv_pad, 256>>>(Kf, Vb, kv_raw, kv_comp_mx, comp_rows,
+                                        raw_start, raw_cap, raw_first, n_raw, n_kv, n_kv_pad, head_dim);
+  mx_pack_a8(Qd, Qs, q, M, D);
+  mx_pack_b8<G88>(Kd, Ks, Kf, KV, D);
+  mx_pack_b8<G88>(Vd, Vs, Vb, D, KV);
+  int rc = mx_run<G88>(scores, Qd, Qs, Kd, Ks, M, KV, D, w1);
+  attn_softmax_sink<<<M, 256>>>(P, scores, sinks, nullptr, scale, M, n_kv_pad, n_kv);
+  mx_pack_a8(Pd, Ps, P, M, KV);
+  rc |= mx_run<G88>(heads, Pd, Ps, Vd, Vs, M, D, KV, w2);
+  return rc;
+}
+
 // Decode attention over the current f32 KV caches (no persistent MX storage yet):
 // assemble the shared KV (ring raw window + selected f32 comp rows) -> pack to
 // MXFP8 -> QK^T -> sink softmax -> PV. Caller-owned scratch, no alloc/sync.
@@ -812,6 +875,48 @@ static int run_decode_f32_test(const char* tag, int n_head, int raw_cap, int raw
   return (rc==0&&bad==0)?0:1;
 }
 
+// Phase B: raw f32 ring + PERSISTENT MXFP8 comp cache -> MX attention, vs ref.
+static int run_decode_mx_test(const char* tag, int n_head, int raw_cap, int raw_start, int raw_first,
+                              int n_raw, int cap_comp, int n_comp, int use_index, int head_dim){
+  std::mt19937 rng(71+n_head+n_raw+n_comp+use_index); std::normal_distribution<float> nd(0.f,1.f);
+  int n_kv=n_raw+n_comp;
+  std::vector<float> Q((size_t)n_head*head_dim), kvRaw((size_t)raw_cap*head_dim), compSrc((size_t)cap_comp*head_dim), sinks(n_head);
+  std::vector<int32_t> idx(n_comp);
+  for(auto&v:Q)v=nd(rng)*0.5f; for(auto&v:kvRaw)v=nd(rng); for(auto&v:compSrc)v=nd(rng);
+  for(int h=0;h<n_head;h++) sinks[h]=(float)(h%3);
+  for(int i=0;i<n_comp;i++) idx[i]=(i*23+5)%cap_comp;
+  const float scale=1.0f/sqrtf((float)head_dim); const int n_kv_pad=(n_kv+31)&~31;
+  std::vector<float> dqComp; h_dq(dqComp,compSrc,cap_comp,head_dim,448.f,0);   // comp stored MXFP8 -> dequant values
+  std::vector<float> Kf((size_t)n_kv*head_dim), Vb((size_t)head_dim*n_kv_pad,0.f);
+  for(int row=0;row<n_kv;row++) for(int d=0;d<head_dim;d++){
+    float v; if(row<n_raw){ int phys=(raw_start+raw_first+row)%raw_cap; v=kvRaw[(size_t)phys*head_dim+d]; }
+    else { int r=use_index?idx[row-n_raw]:(row-n_raw); v=dqComp[(size_t)r*head_dim+d]; }
+    Kf[(size_t)row*head_dim+d]=v; Vb[(size_t)d*n_kv_pad+row]=v; }
+  std::vector<float> dqQ,dqKf,dqVb; h_dq(dqQ,Q,n_head,head_dim,448.f,0); h_dq(dqKf,Kf,n_kv,head_dim,448.f,0); h_dq(dqVb,Vb,head_dim,n_kv_pad,448.f,0);
+  std::vector<float> Pref((size_t)n_head*n_kv_pad,0.f), outref((size_t)n_head*head_dim,0.f);
+  for(int h=0;h<n_head;h++){ const float*qq=dqQ.data()+(size_t)h*head_dim; float m=sinks[h]; std::vector<float> s(n_kv);
+    for(int j=0;j<n_kv;j++){ const float*kk=dqKf.data()+(size_t)j*head_dim; double a=0; for(int d=0;d<head_dim;d++)a+=(double)qq[d]*kk[d]; s[j]=(float)a*scale; m=fmaxf(m,s[j]); }
+    double den=expf(sinks[h]-m); for(int j=0;j<n_kv;j++)den+=expf(s[j]-m);
+    for(int j=0;j<n_kv;j++)Pref[(size_t)h*n_kv_pad+j]=(float)(expf(s[j]-m)/den); }
+  std::vector<float> dqP; h_dq(dqP,Pref,n_head,n_kv_pad,448.f,0);
+  for(int h=0;h<n_head;h++) for(int d=0;d<head_dim;d++){ const float*pp=dqP.data()+(size_t)h*n_kv_pad; const float*vv=dqVb.data()+(size_t)d*n_kv_pad; double a=0; for(int j=0;j<n_kv_pad;j++)a+=(double)pp[j]*vv[j]; outref[(size_t)h*head_dim+d]=(float)a; }
+  std::vector<uint8_t> cache; host_pack_mxfp8(cache,compSrc,cap_comp,head_dim);
+  float *dQ,*dRaw,*dSink,*dHeads; uint8_t*dComp; int32_t*dIdx;
+  cudaMalloc(&dQ,Q.size()*4); cudaMalloc(&dRaw,kvRaw.size()*4); cudaMalloc(&dSink,(size_t)n_head*4); cudaMalloc(&dHeads,(size_t)n_head*head_dim*4); cudaMalloc(&dComp,cache.size()); cudaMalloc(&dIdx,(size_t)n_comp*4);
+  cudaMemcpy(dQ,Q.data(),Q.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dRaw,kvRaw.data(),kvRaw.size()*4,cudaMemcpyHostToDevice);
+  cudaMemcpy(dSink,sinks.data(),(size_t)n_head*4,cudaMemcpyHostToDevice); cudaMemcpy(dComp,cache.data(),cache.size(),cudaMemcpyHostToDevice); cudaMemcpy(dIdx,idx.data(),(size_t)n_comp*4,cudaMemcpyHostToDevice);
+  size_t nb=ds4_attn_mx_decode_scratch_bytes(n_head,head_dim,n_kv); uint8_t*sc=nullptr; cudaMalloc(&sc,nb);
+  int rc=ds4_attn_mx_decode_mx_scratch(dHeads,dQ,dRaw,dComp,use_index?dIdx:nullptr,dSink,n_head,head_dim,
+                                       (uint32_t)raw_start,(uint32_t)raw_cap,(uint32_t)raw_first,(uint32_t)n_raw,(uint32_t)n_comp,sc,nb);
+  cudaDeviceSynchronize();
+  std::vector<float> got((size_t)n_head*head_dim); cudaMemcpy(got.data(),dHeads,got.size()*4,cudaMemcpyDeviceToHost);
+  double maxrel=0; int bad=0; for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-outref[i]); double r=a/(fabs(outref[i])+1e-2); maxrel=fmax(maxrel,r); if(r>0.04&&a>0.03)bad++; }
+  printf("decode-MX  %-10s n_head=%d n_raw=%d n_comp=%d idx=%d (n_kv=%d) rc=%d max_rel=%.4f bad=%d/%zu -> %s\n",
+         tag,n_head,n_raw,n_comp,use_index,n_kv,rc,maxrel,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
+  cudaFree(dQ);cudaFree(dRaw);cudaFree(dSink);cudaFree(dHeads);cudaFree(dComp);cudaFree(dIdx);cudaFree(sc);
+  return (rc==0&&bad==0)?0:1;
+}
+
 int main(){
   int rc=0;
   // QK^T: M=n_q, N=n_kv, K=head_dim=512
@@ -835,6 +940,10 @@ int main(){
   rc|=run_decode_f32_test("static",   64, 512, 0,   0,  40, 4096, 200, 0, 512);  // identity comp, raw_first=0
   rc|=run_decode_f32_test("indexed",  64, 512, 0,   0,  40, 4096, 200, 1, 512);  // topk comp
   rc|=run_decode_f32_test("ring+win", 96, 300, 250, 8,  32, 2048, 100, 1, 512);  // raw_start wraps, raw_first>0
+  // Phase B: persistent MXFP8 comp cache
+  rc|=run_decode_mx_test("static",   64, 512, 0,   0,  40, 4096, 200, 0, 512);
+  rc|=run_decode_mx_test("indexed",  64, 512, 0,   0,  40, 4096, 200, 1, 512);
+  rc|=run_decode_mx_test("ring+win", 96, 300, 250, 8,  32, 2048, 100, 1, 512);
   printf("attn cutlass gemm: %s\n", rc==0?"OK":"FAIL");
   return rc;
 }
