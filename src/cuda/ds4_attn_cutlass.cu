@@ -275,19 +275,61 @@ static size_t mx_sfb_count_bat(int N, int K, int L) {
   return cute::size(cute::filter_zeros(G::Cfg::tile_atom_to_shape_SFB(make_shape(1, N, K, L))));
 }
 
+// ---- MXFP8 decoders + K/V assembly for the decode attention entry point ----
+__device__ __forceinline__ float a_e4m3_dec(uint8_t b, float scale) {
+  float v = a_e4m3_val(b & 0x7f);
+  return (b & 0x80) ? (-v * scale) : (v * scale);
+}
+__device__ __forceinline__ float a_e8m0_dec(uint8_t b) { return exp2f((float)((int)b - 127)); }
+
+// Build the shared attention operands for one decode step: Kf [n_kv][head_dim]
+// (raw f32 window rows then gathered MXFP8 compressed rows) and VbT [head_dim]
+// [n_kv_pad] (V transposed for the PV GEMM, contraction = n_kv, zero-padded).
+// comp caches are MXFP8 (block 32, E8M0), rowbytes = head_dim + head_dim/32.
+__global__ void assemble_kv_mxfp8(float *Kf, float *VbT,
+                                  const float *raw_k, const float *raw_v,
+                                  const uint8_t *comp_k, const uint8_t *comp_v,
+                                  const int32_t *comp_rows,
+                                  uint32_t n_raw, uint32_t n_comp,
+                                  uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim) {
+  uint32_t row = blockIdx.x;
+  if (row >= n_kv_pad) return;
+  const uint32_t nblk = head_dim / 32, rowbytes = head_dim + nblk;
+  for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    float kv = 0.f, vv = 0.f;
+    if (row < n_raw) {
+      kv = raw_k[(uint64_t)row * head_dim + d];
+      vv = raw_v[(uint64_t)row * head_dim + d];
+    } else if (row < n_kv) {
+      int32_t r = comp_rows[row - n_raw];
+      if (r >= 0) {
+        const uint8_t *ck = comp_k + (uint64_t)r * rowbytes;
+        const uint8_t *cv = comp_v + (uint64_t)r * rowbytes;
+        kv = a_e4m3_dec(ck[d], a_e8m0_dec(ck[head_dim + d / 32]));
+        vv = a_e4m3_dec(cv[d], a_e8m0_dec(cv[head_dim + d / 32]));
+      }
+    }
+    Kf[(uint64_t)row * head_dim + d] = kv;                  // Kf is [n_kv_pad][head_dim] (pad=0)
+    VbT[(uint64_t)d * n_kv_pad + row] = vv;                  // VbT is [head_dim][n_kv_pad] (pad=0)
+  }
+}
+
 // ---- Softmax with attention sink (one block per query row) ----
 // scores[n_q, n_kv] (raw dot products) -> P[n_q, n_kv] probabilities, applying
 // scale = 1/sqrt(head_dim) and folding the per-query sink into the denominator
 // only (exp(sink - m), no value contribution). `valid` bounds the visible keys
 // per query (causal/window); keys >= valid[q] are masked out. sink is per-row
 // here (single head); the batched path passes sinks[head].
+// n_valid (>0) masks keys >= n_valid uniformly (used when n_kv is padded up to a
+// multiple of 32 for the PV contraction); `valid` gives a per-row bound instead.
 __global__ void attn_softmax_sink(float *P, const float *scores, const float *sink_per_row,
-                                  const int32_t *valid, float scale, uint32_t n_q, uint32_t n_kv) {
+                                  const int32_t *valid, float scale, uint32_t n_q, uint32_t n_kv,
+                                  uint32_t n_valid) {
   uint32_t q = blockIdx.x;
   if (q >= n_q) return;
   const float *sr = scores + (uint64_t)q * n_kv;
   float *pr = P + (uint64_t)q * n_kv;
-  uint32_t lim = valid ? (uint32_t)valid[q] : n_kv;
+  uint32_t lim = valid ? (uint32_t)valid[q] : (n_valid ? n_valid : n_kv);
   if (lim > n_kv) lim = n_kv;
   const float sink = sink_per_row ? sink_per_row[q] : -INFINITY;
 
@@ -307,6 +349,55 @@ __global__ void attn_softmax_sink(float *P, const float *scores, const float *si
   const float inv = d > 0.0f ? 1.0f / d : 0.0f;
   // write probabilities (masked keys -> 0)
   for (uint32_t j = threadIdx.x; j < n_kv; j += blockDim.x) pr[j] = (j < lim) ? expf(sr[j] * scale - m) * inv : 0.0f;
+}
+
+// ---- Decode attention entry point (MXFP8 KV) ----
+// One decode step: n_head query rows attend over the SHARED KV = raw f32 window
+// (n_raw rows) ++ gathered MXFP8 compressed rows (comp_rows[0..n_comp)). Produces
+// heads[n_head][head_dim]. Self-allocates scratch and synchronizes -- the engine
+// path will switch to a caller-owned reused buffer (as the MoE FFN does) once
+// wired. comp_k/comp_v are MXFP8 caches (row stride head_dim + head_dim/32).
+extern "C" int ds4_attn_mx_decode(
+    float *heads, const float *q,
+    const float *raw_k, const float *raw_v,
+    const uint8_t *comp_k, const uint8_t *comp_v, const int32_t *comp_rows,
+    const float *sinks,
+    uint32_t n_head, uint32_t head_dim, uint32_t n_raw, uint32_t n_comp) {
+  const uint32_t n_kv = n_raw + n_comp;
+  if (n_kv == 0 || (head_dim % 32) != 0) return -1;
+  const uint32_t n_kv_pad = (n_kv + 31u) & ~31u;
+  const float scale = 1.0f / sqrtf((float)head_dim);
+  const int M = (int)n_head, D = (int)head_dim, KV = (int)n_kv_pad;
+
+  float *Kf, *Vb, *scores, *P;
+  cudaMalloc(&Kf, (size_t)KV * D * 4); cudaMalloc(&Vb, (size_t)D * KV * 4);
+  cudaMalloc(&scores, (size_t)M * KV * 4); cudaMalloc(&P, (size_t)M * KV * 4);
+  cudaMemset(P, 0, (size_t)M * KV * 4);
+  assemble_kv_mxfp8<<<n_kv_pad, 256>>>(Kf, Vb, raw_k, raw_v, comp_k, comp_v, comp_rows,
+                                       n_raw, n_comp, n_kv, n_kv_pad, head_dim);
+
+  size_t qa = mx_sfa_count(M, D), kb = mx_sfb_count<G88>(KV, D);
+  size_t pa = mx_sfa_count(M, KV), vb = mx_sfb_count<G88>(D, KV);
+  uint8_t *Qd, *Kd, *Pd, *Vd; ElementSF *Qs, *Ks, *Ps, *Vs;
+  cudaMalloc(&Qd, (size_t)M * D); cudaMalloc(&Qs, qa * 2); cudaMalloc(&Kd, (size_t)KV * D); cudaMalloc(&Ks, kb * 2);
+  cudaMalloc(&Pd, (size_t)M * KV); cudaMalloc(&Ps, pa * 2); cudaMalloc(&Vd, (size_t)D * KV); cudaMalloc(&Vs, vb * 2);
+  cudaMemset(Qs, 0, qa * 2); cudaMemset(Ks, 0, kb * 2); cudaMemset(Ps, 0, pa * 2); cudaMemset(Vs, 0, vb * 2);
+  mx_pack_a8(Qd, Qs, q, M, D);
+  mx_pack_b8<G88>(Kd, Ks, Kf, KV, D);
+  mx_pack_b8<G88>(Vd, Vs, Vb, D, KV);
+
+  size_t ws1 = mx_ws_bytes<G88>(M, KV, D), ws2 = mx_ws_bytes<G88>(M, D, KV);
+  void *w1 = nullptr, *w2 = nullptr; if (ws1) cudaMalloc(&w1, ws1); if (ws2) cudaMalloc(&w2, ws2);
+  int rc = mx_run<G88>(scores, Qd, Qs, Kd, Ks, M, KV, D, w1);              // QK^T -> scores[M][KV]
+  attn_softmax_sink<<<M, 256>>>(P, scores, sinks, nullptr, scale, M, n_kv_pad, n_kv);  // mask pad >= n_kv
+  mx_pack_a8(Pd, Ps, P, M, KV);
+  rc |= mx_run<G88>(heads, Pd, Ps, Vd, Vs, M, D, KV, w2);                  // P.V -> heads[M][D]
+  cudaDeviceSynchronize();
+
+  cudaFree(Kf); cudaFree(Vb); cudaFree(scores); cudaFree(P);
+  cudaFree(Qd); cudaFree(Qs); cudaFree(Kd); cudaFree(Ks); cudaFree(Pd); cudaFree(Ps); cudaFree(Vd); cudaFree(Vs);
+  if (w1) cudaFree(w1); if (w2) cudaFree(w2);
+  return rc;
 }
 
 #ifdef DS4_ATTN_CUTLASS_STANDALONE
@@ -398,7 +489,7 @@ static int run_attn_1head(int n_q, int n_kv, int head_dim, float sink) {
   size_t ws1=mx_ws_bytes<G88>(n_q,n_kv,head_dim); void*w1=nullptr; if(ws1)cudaMalloc(&w1,ws1);
   int rc=mx_run<G88>(dScores,Qd,Qs,Kd,Ks,n_q,n_kv,head_dim,w1);
   // softmax + sink
-  attn_softmax_sink<<<n_q,256>>>(dP,dScores,dSink,nullptr,scale,n_q,n_kv);
+  attn_softmax_sink<<<n_q,256>>>(dP,dScores,dSink,nullptr,scale,n_q,n_kv,0);
   // pack + PV  (A=P [n_q,n_kv], B=Vb [head_dim,n_kv])
   size_t pa_n=mx_sfa_count(n_q,n_kv), vb_n=mx_sfb_count<G88>(head_dim,n_kv);
   uint8_t *Pd,*Vd; ElementSF *Ps,*Vs; cudaMalloc(&Pd,(size_t)n_q*n_kv); cudaMalloc(&Ps,pa_n*2); cudaMalloc(&Vd,(size_t)head_dim*n_kv); cudaMalloc(&Vs,vb_n*2);
@@ -448,7 +539,7 @@ static int run_attn_mha(int n_head, int n_q, int n_kv, int head_dim) {
   mx_pack_a8_bat(Qd,Qs,dQ,n_q,head_dim,n_head); mx_pack_b8_bat<G88>(Kd,Ks,dK,n_kv,head_dim,n_head);
   size_t ws1=mx_ws_bytes_bat<G88>(n_q,n_kv,head_dim,n_head); void*w1=nullptr; if(ws1)cudaMalloc(&w1,ws1);
   int rc=mx_run_bat<G88>(dScores,Qd,Qs,Kd,Ks,n_q,n_kv,head_dim,n_head,w1);
-  attn_softmax_sink<<<n_head*n_q,256>>>(dP,dScores,dSinkRow,nullptr,scale,n_head*n_q,n_kv);
+  attn_softmax_sink<<<n_head*n_q,256>>>(dP,dScores,dSinkRow,nullptr,scale,n_head*n_q,n_kv,0);
   size_t pa=mx_sfa_count_bat(n_q,n_kv,n_head), vb=mx_sfb_count_bat<G88>(head_dim,n_kv,n_head);
   uint8_t*Pd,*Vd; ElementSF*Ps,*Vs; cudaMalloc(&Pd,(size_t)n_head*n_q*n_kv); cudaMalloc(&Ps,pa*2); cudaMalloc(&Vd,(size_t)n_head*head_dim*n_kv); cudaMalloc(&Vs,vb*2);
   cudaMemset(Ps,0,pa*2); cudaMemset(Vs,0,vb*2);
@@ -462,6 +553,63 @@ static int run_attn_mha(int n_head, int n_q, int n_kv, int head_dim) {
          n_head,n_q,n_kv,rc,maxrel,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
   cudaFree(dQ);cudaFree(dK);cudaFree(dVb);cudaFree(dScores);cudaFree(dP);cudaFree(dOut);cudaFree(dSinkRow);
   cudaFree(Qd);cudaFree(Qs);cudaFree(Kd);cudaFree(Ks);cudaFree(Pd);cudaFree(Ps);cudaFree(Vd);cudaFree(Vs); if(w1)cudaFree(w1); if(w2)cudaFree(w2);
+  return (rc==0&&bad==0)?0:1;
+}
+
+// Host MXFP8 pack (matches device format: E4M3 data + E8M0 scales, block 32).
+static uint8_t h_e4m3_byte(float x){ float ax=fminf(fabsf(x),448.f); int lo=0,hi=126; while(lo<hi){int mid=(lo+hi+1)>>1; if(h_e4m3_val(mid)<=ax)lo=mid; else hi=mid-1;} int b=lo; if(b<126){float bd=fabsf(ax-h_e4m3_val(b)),nd=fabsf(ax-h_e4m3_val(b+1)); if(nd<bd)b++;} return (uint8_t)(b|((x<0)?0x80:0)); }
+static uint8_t h_e8m0_byte(float amax){ float r=fmaxf(amax,1e-20f)/448.f; int e=(int)ceilf(log2f(r))+127; if(e<0)e=0; if(e>254)e=254; return (uint8_t)e; }
+static void host_pack_mxfp8(std::vector<uint8_t>& cache, const std::vector<float>& src, int cap, int hd){
+  int nblk=hd/32, rowbytes=hd+nblk; cache.assign((size_t)cap*rowbytes,0);
+  for(int r=0;r<cap;r++) for(int b=0;b<nblk;b++){ float amax=0; for(int j=0;j<32;j++)amax=fmaxf(amax,fabsf(src[(size_t)r*hd+b*32+j]));
+    uint8_t e8=h_e8m0_byte(amax); float sc=exp2f((float)((int)e8-127));
+    for(int j=0;j<32;j++) cache[(size_t)r*rowbytes+b*32+j]=h_e4m3_byte(src[(size_t)r*hd+b*32+j]/sc);
+    cache[(size_t)r*rowbytes+hd+b]=e8; }
+}
+// Full decode attention entry-point parity test.
+static int run_decode_test(int n_head, int n_raw, int n_comp, int cap, int head_dim){
+  std::mt19937 rng(31+n_head+n_raw+n_comp); std::normal_distribution<float> nd(0.f,1.f);
+  int n_kv=n_raw+n_comp;
+  std::vector<float> Q((size_t)n_head*head_dim), rawK((size_t)n_raw*head_dim), rawV((size_t)n_raw*head_dim),
+    srcCK((size_t)cap*head_dim), srcCV((size_t)cap*head_dim), sinks(n_head);
+  std::vector<int32_t> rows(n_comp);
+  for(auto&v:Q)v=nd(rng)*0.5f; for(auto&v:rawK)v=nd(rng)*0.5f; for(auto&v:rawV)v=nd(rng);
+  for(auto&v:srcCK)v=nd(rng)*0.5f; for(auto&v:srcCV)v=nd(rng);
+  for(int h=0;h<n_head;h++) sinks[h]=(float)(h%3);
+  for(int i=0;i<n_comp;i++) rows[i]=(i*29+7)%cap;
+  const float scale=1.0f/sqrtf((float)head_dim);
+  // reference: assemble Kf (raw f32 ++ dq(comp)), VbT; then quantize operands and do the attention math
+  const int n_kv_pad=(n_kv+31)&~31;   // V and P are quantized/contracted at padded width, like the device
+  std::vector<float> dqCK,dqCV; h_dq(dqCK,srcCK,cap,head_dim,448.f,0); h_dq(dqCV,srcCV,cap,head_dim,448.f,0);
+  std::vector<float> Kf((size_t)n_kv*head_dim), Vb((size_t)head_dim*n_kv_pad,0.f);   // Vb padded cols = 0
+  for(int row=0;row<n_kv;row++) for(int d=0;d<head_dim;d++){
+    float k,v; if(row<n_raw){k=rawK[(size_t)row*head_dim+d];v=rawV[(size_t)row*head_dim+d];}
+    else {int r=rows[row-n_raw]; k=dqCK[(size_t)r*head_dim+d]; v=dqCV[(size_t)r*head_dim+d];}
+    Kf[(size_t)row*head_dim+d]=k; Vb[(size_t)d*n_kv_pad+row]=v; }
+  std::vector<float> dqQ,dqKf,dqVb; h_dq(dqQ,Q,n_head,head_dim,448.f,0); h_dq(dqKf,Kf,n_kv,head_dim,448.f,0); h_dq(dqVb,Vb,head_dim,n_kv_pad,448.f,0);
+  std::vector<float> Pref((size_t)n_head*n_kv_pad,0.f), outref((size_t)n_head*head_dim,0.f);
+  for(int h=0;h<n_head;h++){ const float*qq=dqQ.data()+(size_t)h*head_dim; float m=sinks[h]; std::vector<float> s(n_kv);
+    for(int j=0;j<n_kv;j++){ const float*kk=dqKf.data()+(size_t)j*head_dim; double a=0; for(int d=0;d<head_dim;d++)a+=(double)qq[d]*kk[d]; s[j]=(float)a*scale; m=fmaxf(m,s[j]); }
+    double den=expf(sinks[h]-m); for(int j=0;j<n_kv;j++)den+=expf(s[j]-m);
+    for(int j=0;j<n_kv;j++)Pref[(size_t)h*n_kv_pad+j]=(float)(expf(s[j]-m)/den); }   // padded cols stay 0
+  std::vector<float> dqP; h_dq(dqP,Pref,n_head,n_kv_pad,448.f,0);
+  for(int h=0;h<n_head;h++) for(int d=0;d<head_dim;d++){ const float*pp=dqP.data()+(size_t)h*n_kv_pad; const float*vv=dqVb.data()+(size_t)d*n_kv_pad; double a=0; for(int j=0;j<n_kv_pad;j++)a+=(double)pp[j]*vv[j]; outref[(size_t)h*head_dim+d]=(float)a; }
+  // device
+  std::vector<uint8_t> cacheK,cacheV; host_pack_mxfp8(cacheK,srcCK,cap,head_dim); host_pack_mxfp8(cacheV,srcCV,cap,head_dim);
+  float *dQ,*dRK,*dRV,*dSink,*dHeads; uint8_t*dCK,*dCV; int32_t*dRows;
+  cudaMalloc(&dQ,Q.size()*4); cudaMalloc(&dRK,rawK.size()*4); cudaMalloc(&dRV,rawV.size()*4);
+  cudaMalloc(&dSink,(size_t)n_head*4); cudaMalloc(&dHeads,(size_t)n_head*head_dim*4);
+  cudaMalloc(&dCK,cacheK.size()); cudaMalloc(&dCV,cacheV.size()); cudaMalloc(&dRows,(size_t)n_comp*4);
+  cudaMemcpy(dQ,Q.data(),Q.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dRK,rawK.data(),rawK.size()*4,cudaMemcpyHostToDevice);
+  cudaMemcpy(dRV,rawV.data(),rawV.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dSink,sinks.data(),(size_t)n_head*4,cudaMemcpyHostToDevice);
+  cudaMemcpy(dCK,cacheK.data(),cacheK.size(),cudaMemcpyHostToDevice); cudaMemcpy(dCV,cacheV.data(),cacheV.size(),cudaMemcpyHostToDevice);
+  cudaMemcpy(dRows,rows.data(),(size_t)n_comp*4,cudaMemcpyHostToDevice);
+  int rc=ds4_attn_mx_decode(dHeads,dQ,dRK,dRV,dCK,dCV,dRows,dSink,n_head,head_dim,n_raw,n_comp);
+  std::vector<float> got((size_t)n_head*head_dim); cudaMemcpy(got.data(),dHeads,got.size()*4,cudaMemcpyDeviceToHost);
+  double maxrel=0; int bad=0; for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-outref[i]); double r=a/(fabs(outref[i])+1e-2); maxrel=fmax(maxrel,r); if(r>0.04&&a>0.03)bad++; }
+  printf("decode entry n_head=%d n_raw=%d n_comp=%d (n_kv=%d) rc=%d max_rel=%.4f bad=%d/%zu -> %s\n",
+         n_head,n_raw,n_comp,n_kv,rc,maxrel,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
+  cudaFree(dQ);cudaFree(dRK);cudaFree(dRV);cudaFree(dSink);cudaFree(dHeads);cudaFree(dCK);cudaFree(dCV);cudaFree(dRows);
   return (rc==0&&bad==0)?0:1;
 }
 
@@ -480,6 +628,10 @@ int main(){
   // Stage 3 batched multi-head
   rc|=run_attn_mha(16,64,256,512);
   rc|=run_attn_mha(32,1,128,512);       // decode: 32 heads, single query each
+  // Stage 4 decode entry point (gather raw+comp -> attention), n_kv not mult-32 -> exercises padding
+  rc|=run_decode_test(64,56,200,4096,512);   // n_kv=256 (mult-32, no padding)
+  rc|=run_decode_test(64,40,200,4096,512);   // n_kv=240 -> pad 256
+  rc|=run_decode_test(128,17,100,2048,512);  // n_kv=117 -> pad 128
   printf("attn cutlass gemm: %s\n", rc==0?"OK":"FAIL");
   return rc;
 }
