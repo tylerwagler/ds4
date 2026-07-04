@@ -170,6 +170,12 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
 #define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
 
+/* The compressed-KV cache has one storage representation at a time: the write,
+ * allocation, and attention-read paths all branch on exactly one of these. */
+#if DS4_GPU_ATTN_COMP_CACHE_F16 && DS4_GPU_ATTN_COMP_CACHE_FP8
+#error "DS4_GPU_ATTN_COMP_CACHE_F16 and DS4_GPU_ATTN_COMP_CACHE_FP8 are mutually exclusive"
+#endif
+
 
 /* =========================================================================
  * Session Snapshot Payloads.

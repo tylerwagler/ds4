@@ -44,8 +44,9 @@ enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
      * compressed scores in shared memory.  The host routes larger unmasked
      * decode calls to the online attention kernel so this fixed buffer never
-     * becomes an out-of-bounds write at long context. */
-    DS4_CUDA_ATTENTION_SCORE_CAP = 8192u,
+     * becomes an out-of-bounds write at long context.  11712 fits under the
+     * GB10 48 KB shared-memory limit. */
+    DS4_CUDA_ATTENTION_SCORE_CAP = 11712u,
     DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
     DS4_CUDA_TOPK_MERGE_GROUP = 8u,
     DS4_CUDA_STREAM_EXPERT_DEFAULT = 8u * 64u,

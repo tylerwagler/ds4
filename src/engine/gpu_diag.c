@@ -197,6 +197,27 @@ bool gpu_graph_alloc_raw_cap(
     g->raw_cap = raw_cap;
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
+
+    /*
+     * FP8 compressed-KV storage is only read back by the single-token decode
+     * path and the batched decode-mixed prefill path.  The indexed-attention
+     * and static-mixed prefill kernels still bail on comp_kv_fp8, so any model
+     * with compressed (ratio != 0) layers would fail those paths at runtime
+     * once the cache is FP8-packed.  Refuse the combination up front with a
+     * clear message rather than allocating a cache that prefill cannot read.
+     * (No allocations have happened yet, so returning here needs no cleanup.)
+     */
+    if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (ds4_layer_compress_ratio(il) != 0) {
+                fprintf(stderr,
+                        "ds4: FP8 compressed-KV cache is not yet supported for compressed "
+                        "layers (indexed/static-mixed prefill kernels lack an FP8 read path); "
+                        "disable DS4_GPU_ATTN_COMP_CACHE_FP8\n");
+                return false;
+            }
+        }
+    }
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);

@@ -1389,8 +1389,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_mask && head_dim == 512u &&
-            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+        if (!use_mask && head_dim == 512u) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
@@ -1572,8 +1571,7 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_comp_mask && head_dim == 512u &&
-            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+        if (!use_comp_mask && head_dim == 512u) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
