@@ -1566,6 +1566,22 @@ void weights_free(ds4_weights *w) {
 static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
     const uint32_t E = w->embed_dim;
     const uint32_t V = w->vocab_size;
+    /*
+     * The tensor-layout checks below are self-referential: they validate every
+     * DSpark tensor against E/V read from the support GGUF's own metadata.  But
+     * the runtime drives DSpark with the target model's compiled constants
+     * (DS4_N_EMBD embed buffers, DS4_N_VOCAB logits stride), so a support model
+     * built for a different base would pass this validation and then produce
+     * misaligned reads or garbage drafts.  Pin E/V to the target here.
+     */
+    if (E != DS4_N_EMBD || V != DS4_N_VOCAB) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "dspark: support model shape (embed=%u vocab=%u) does not match "
+                 "target (embed=%u vocab=%u)",
+                 E, V, (uint32_t)DS4_N_EMBD, (uint32_t)DS4_N_VOCAB);
+        ds4_die(msg);
+    }
     const uint64_t hc_dim = (uint64_t)E * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -1666,16 +1682,15 @@ void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
             model_get_u32(m, "dspark.target_layer_ids.2", &target_ids[2])) {
             memcpy(w->target_layer_ids, target_ids, sizeof(target_ids));
         } else {
-            uint32_t n_layer;
-            if (model_get_u32(m, "deepseek_v4_dspark.block_count", &n_layer) && n_layer >= 3) {
-                w->target_layer_ids[0] = n_layer - 3;
-                w->target_layer_ids[1] = n_layer - 2;
-                w->target_layer_ids[2] = n_layer - 1;
-            } else {
-                w->target_layer_ids[0] = 40;
-                w->target_layer_ids[1] = 41;
-                w->target_layer_ids[2] = 42;
-            }
+            /*
+             * Fall back to the target model's last three layers.  Derive from
+             * the compiled target shape (DS4_N_LAYER), NOT the support GGUF's
+             * block_count — that field describes the 3-layer draft backbone, so
+             * using it would capture target layers {0,1,2} instead of the tail.
+             */
+            w->target_layer_ids[0] = DS4_N_LAYER - 3;
+            w->target_layer_ids[1] = DS4_N_LAYER - 2;
+            w->target_layer_ids[2] = DS4_N_LAYER - 1;
         }
     }
 

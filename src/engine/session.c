@@ -2822,7 +2822,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->mtp_draft_token = -1;
     }
     if (e->dspark_ready) {
-        gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids);
+        if (!gpu_graph_init_dspark_target(&s->graph, e->dspark_weights.target_layer_ids)) {
+            fprintf(stderr, "ds4: failed to allocate DSpark graph buffers\n");
+            gpu_graph_free(&s->graph);
+            free(s->logits);
+            free(s->mtp_logits);
+            free(s);
+            return 1;
+        }
     }
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
         char err[256];
@@ -4659,7 +4666,9 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     ds4_gpu_tensor *dspark_logits = ds4_gpu_tensor_alloc(vocab_bytes);
     if (!dspark_logits) return -1;
 
-    int32_t refined_ids[16];
+    /* refined_ids[0] holds first_token; positions 1..n_draft hold the refined
+     * drafts, so the array needs n_draft + 1 slots (17 at the clamp of 16). */
+    int32_t refined_ids[17];
     refined_ids[0] = (int32_t)first_token;
     for (uint32_t pos = 0; pos < n_draft; pos++) {
         /* Create view of spec_logits row [pos] as base logits */
@@ -4668,19 +4677,28 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         if (!base_row) { ds4_gpu_tensor_free(dspark_logits); return -1; }
 
         int32_t prev = refined_ids[pos];
-        if (!ds4_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
+        bool step_ok = ds4_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
                                                base_row,
                                                dmap, dsize,
                                                w->markov_w1->abs_offset,
                                                w->markov_w2->abs_offset,
-                                               (int32_t)prev, vocab_size, embed_dim)) {
+                                               (int32_t)prev, vocab_size, embed_dim);
+        ds4_gpu_tensor_free(base_row);
+        if (!step_ok) {
             ds4_gpu_tensor_free(dspark_logits);
             return -1;
         }
     }
     ds4_gpu_tensor_free(dspark_logits);
 
-    /* Step 6: verify drafts against target, rejection sampling */
+    /* Step 6: verify drafts against target, rejection sampling.
+     *
+     * Step 1 already committed first_token and left s->logits = P(next |
+     * first_token), i.e. the target's prediction of the first draft.  The
+     * batch verify below runs the target over the draft_n draft positions and
+     * fills row_tops[i-1] with its argmax after committing refined_ids[1..i],
+     * so it validates drafts 2..draft_n; the first draft is validated for free
+     * against s->logits. */
     const int saved_len = s->checkpoint.len;
     const int draft_n = (int)n_draft;
 
@@ -4698,44 +4716,85 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                                     (uint32_t)draft_n,
                                                     false,
                                                     row_tops, NULL);
+    if (!verify_ok) {
+        s->checkpoint.len = saved_len;
+        if (have_frontier) (void)spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        free(row_tops);
+        snprintf(err, errlen, "DSpark verifier failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
 
+    /* Accept the longest prefix the target agrees with.  The first draft is
+     * gated by the free s->logits prediction; each subsequent draft by the
+     * verifier's row_tops.  commit_drafts may be 0 when even the first draft
+     * disagrees. */
     int commit_drafts = 0;
-    if (verify_ok) {
-        commit_drafts = 1;  /* first draft always accepted */
+    if (sample_argmax(s->logits, DS4_N_VOCAB) == refined_ids[1]) {
+        commit_drafts = 1;
         for (int i = 1; i < draft_n; i++) {
             if (row_tops[i - 1] != refined_ids[i + 1]) break;
             commit_drafts++;
         }
     }
 
-    if (commit_drafts < draft_n && have_frontier) {
-        s->checkpoint.len = saved_len;
-        (void)spec_frontier_restore(&frontier, s);
-        for (int i = 0; i < commit_drafts; i++) {
-            if (ds4_session_eval(s, refined_ids[i + 1], err, errlen) != 0) {
-                spec_frontier_free(&frontier);
-                free(row_tops);
-                return -1;
-            }
+    bool ok_state = true;
+    if (commit_drafts == draft_n) {
+        /*
+         * Full accept: every draft stays committed and the verifier already
+         * advanced the target KV over all of them, so no rollback is needed.
+         * s->logits is still P(next | first_token) though — refresh it to the
+         * target distribution after the last committed draft (spec_logits row
+         * draft_n-1), matching the MTP full-accept path.
+         */
+        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        ok_state = gpu_graph_read_spec_logits_row(g, (uint32_t)(draft_n - 1), row_logits);
+        if (ok_state)
+            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        free(row_logits);
+    } else {
+        /*
+         * Partial accept or full reject: the verifier ran the target over all
+         * draft_n positions, so its KV/compressor frontier is now ahead of the
+         * commit_drafts we are keeping.  Roll back to the pre-draft frontier and
+         * replay exactly the committed drafts, which also refreshes s->logits.
+         * This is only possible with a valid snapshot — treat its absence as a
+         * hard error rather than leaving rejected drafts committed.
+         */
+        if (!have_frontier) {
+            spec_frontier_free(&frontier);
+            free(row_tops);
+            snprintf(err, errlen, "DSpark frontier snapshot failed");
+            s->checkpoint_valid = false;
+            return -1;
         }
-    } else if (!verify_ok) {
         s->checkpoint.len = saved_len;
-        if (have_frontier) (void)spec_frontier_restore(&frontier, s);
-        spec_frontier_free(&frontier);
-        free(row_tops);
-        snprintf(err, errlen, "DSpark verifier failed");
-        return -1;
+        ok_state = spec_frontier_restore(&frontier, s);
+        for (int i = 0; ok_state && i < commit_drafts; i++) {
+            if (ds4_session_eval(s, refined_ids[i + 1], err, errlen) != 0)
+                ok_state = false;
+        }
     }
 
     spec_frontier_free(&frontier);
     free(row_tops);
+    if (!ok_state) {
+        snprintf(err, errlen, "DSpark state update failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
 
     /* Step 7: seed draft KV cache for committed positions */
     if (commit_drafts > 0)
         gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights,
                                         (uint32_t)commit_drafts);
 
-    /* Step 8: return accepted tokens */
+    /* Step 8: return first_token followed by the accepted drafts.  The caller
+     * emits only the tokens returned here, so first_token — committed to the
+     * target KV in Step 1 — must lead the list or it is dropped from the
+     * output while remaining in context. */
+    accepted[n_accept++] = first_token;
     for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
         if (refined_ids[i + 1] == eos_token) break;
         accepted[n_accept++] = refined_ids[i + 1];

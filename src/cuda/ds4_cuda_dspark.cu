@@ -1,9 +1,18 @@
 #include "ds4_cuda_internal.h"
 
 
+/*
+ * Each block reduces the argmax over its slice of the vocabulary and writes
+ * that partial winner to block_best_id[blockIdx.x] / block_best_val[blockIdx.x].
+ * The kernel does NOT reduce across blocks — the host caller reads the
+ * grid_dim partials back and picks the global argmax.  (An earlier version
+ * wrote only element 0 into a 4-byte buffer, which both overran the allocation
+ * and returned block 0's argmax over just the first blockDim entries.)
+ */
 __global__ static void dspark_markov_step_kernel(
         float *refined_logits,
-        int32_t *refined_id,
+        int32_t *block_best_id,
+        float *block_best_val,
         const float *base_logits,
         const float *markov_w1,
         const float *markov_w2,
@@ -42,9 +51,39 @@ __global__ static void dspark_markov_step_kernel(
     }
 
     if (tid == 0) {
-        refined_id[blockIdx.x] = best_ids[0];
-        if (blockIdx.x == 0) *refined_id = best_ids[0];
+        block_best_id[blockIdx.x] = best_ids[0];
+        block_best_val[blockIdx.x] = best_vals[0];
     }
+}
+
+/*
+ * Read the per-block argmax partials back to the host and pick the global
+ * winner.  Blocks map to ascending contiguous vocab ranges (grid_dim =
+ * ceil(vocab/blockDim), one range per block), and the per-block reduction
+ * breaks ties toward the lowest id, so a strict '>' here yields the
+ * lowest-id global argmax — matching a sequential argmax over the vocab.
+ */
+static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
+                                        const ds4_gpu_tensor *val_dev,
+                                        uint32_t grid_dim,
+                                        int32_t *refined_id_dst) {
+    int32_t *ids = (int32_t *)malloc((size_t)grid_dim * sizeof(int32_t));
+    float *vals = (float *)malloc((size_t)grid_dim * sizeof(float));
+    int rc = 0;
+    if (ids && vals &&
+        ds4_gpu_tensor_read(id_dev, 0, ids, (uint64_t)grid_dim * sizeof(int32_t)) &&
+        ds4_gpu_tensor_read(val_dev, 0, vals, (uint64_t)grid_dim * sizeof(float))) {
+        int32_t best_id = ids[0];
+        float best_val = vals[0];
+        for (uint32_t b = 1; b < grid_dim; b++) {
+            if (vals[b] > best_val) { best_val = vals[b]; best_id = ids[b]; }
+        }
+        *refined_id_dst = best_id;
+        rc = 1;
+    }
+    free(ids);
+    free(vals);
+    return rc;
 }
 
 
@@ -66,37 +105,34 @@ extern "C" int ds4_gpu_dspark_markov_step(
     if (markov_w2->bytes < (uint64_t)vocab_size * embed_dim * sizeof(float)) return 0;
     if ((uint64_t)prev_token >= vocab_size) return 0;
 
-    ds4_gpu_tensor *id_dev = ds4_gpu_tensor_alloc(sizeof(int32_t));
-    if (!id_dev) return 0;
-
     const uint32_t block_dim = 256;
     const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
-    if (grid_dim > 65535) {
+    if (grid_dim > 65535) return 0;
+
+    ds4_gpu_tensor *id_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+    ds4_gpu_tensor *val_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+    if (!id_dev || !val_dev) {
         ds4_gpu_tensor_free(id_dev);
+        ds4_gpu_tensor_free(val_dev);
         return 0;
     }
 
     dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
         (float *)refined_logits->ptr,
         (int32_t *)id_dev->ptr,
+        (float *)val_dev->ptr,
         (const float *)base_logits->ptr,
         (const float *)markov_w1->ptr,
         (const float *)markov_w2->ptr,
         prev_token, vocab_size, embed_dim);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        ds4_gpu_tensor_free(id_dev);
-        return 0;
-    }
-
-    if (!ds4_gpu_tensor_read(id_dev, 0, refined_id_dst, sizeof(int32_t))) {
-        ds4_gpu_tensor_free(id_dev);
-        return 0;
-    }
+    int rc = 0;
+    if (cudaGetLastError() == cudaSuccess)
+        rc = dspark_markov_reduce_blocks(id_dev, val_dev, grid_dim, refined_id_dst);
 
     ds4_gpu_tensor_free(id_dev);
-    return 1;
+    ds4_gpu_tensor_free(val_dev);
+    return rc;
 }
 
 extern "C" int ds4_gpu_dspark_markov_step_model(
@@ -129,28 +165,32 @@ extern "C" int ds4_gpu_dspark_markov_step_model(
         dspark_model_map, markov_w2_offset, w_bytes, "dspark_markov_w2");
     if (!w1 || !w2) return 0;
 
-    ds4_gpu_tensor *id_dev = ds4_gpu_tensor_alloc(sizeof(int32_t));
-    if (!id_dev) return 0;
-
     const uint32_t block_dim = 256;
     const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
-    if (grid_dim > 65535) { ds4_gpu_tensor_free(id_dev); return 0; }
+    if (grid_dim > 65535) return 0;
+
+    ds4_gpu_tensor *id_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+    ds4_gpu_tensor *val_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+    if (!id_dev || !val_dev) {
+        ds4_gpu_tensor_free(id_dev);
+        ds4_gpu_tensor_free(val_dev);
+        return 0;
+    }
 
     dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
         (float *)refined_logits->ptr,
         (int32_t *)id_dev->ptr,
+        (float *)val_dev->ptr,
         (const float *)base_logits->ptr,
         w1, w2, prev_token, vocab_size, embed_dim);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) { ds4_gpu_tensor_free(id_dev); return 0; }
+    int rc = 0;
+    if (cudaGetLastError() == cudaSuccess)
+        rc = dspark_markov_reduce_blocks(id_dev, val_dev, grid_dim, refined_id_dst);
 
-    if (!ds4_gpu_tensor_read(id_dev, 0, refined_id_dst, sizeof(int32_t))) {
-        ds4_gpu_tensor_free(id_dev);
-        return 0;
-    }
     ds4_gpu_tensor_free(id_dev);
-    return 1;
+    ds4_gpu_tensor_free(val_dev);
+    return rc;
 }
 
 

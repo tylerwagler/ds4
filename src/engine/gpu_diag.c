@@ -185,7 +185,6 @@ bool gpu_graph_alloc_raw_cap(
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
     g->comp_ratio_override = -1;
-    g->non_causal_override = -1;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -507,14 +506,30 @@ bool gpu_graph_alloc_raw_cap(
     return ok;
 }
 
-void gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]) {
+bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]) {
+    bool ok = true;
     for (int i = 0; i < 3; i++) {
         g->dspark_target_layer_ids[i] = target_layer_ids[i];
         g->dspark_target_h[i] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
         g->dspark_raw_cache[i] = ds4_gpu_tensor_alloc(
             (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
         g->dspark_n_raw[i] = 0;
+        ok = ok && g->dspark_target_h[i] && g->dspark_raw_cache[i];
     }
     g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ok = ok && g->dspark_main_x;
+    /*
+     * DSpark reuses the MTP speculative-logits buffer for its N-token draft
+     * base logits and for the target verify pass.  --mtp and --dspark are
+     * mutually exclusive, so the enable_mtp branch in gpu_graph_alloc_raw_cap
+     * never allocated it for a DSpark session; allocate it here when MTP did
+     * not.  Without this the draft forward receives a NULL base_logits_out and
+     * every speculative block fails.
+     */
+    if (!g->spec_logits) {
+        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+    }
+    ok = ok && g->spec_logits;
+    return ok;
 }
 

@@ -1034,10 +1034,6 @@ typedef struct {
      * calling gpu_graph_encode_decode_layer for draft model forwarding). */
     int comp_ratio_override;
 
-    /* Override causal attention mask for DSpark draft backbone.
-     * Set to 1 before calling gpu_graph_encode_decode_layer for draft layers. */
-    int non_causal_override;
-
     uint32_t prefill_cap;
     uint32_t raw_window;
 
@@ -2023,7 +2019,7 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_mtp);
-void gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
+bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
 bool gpu_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,

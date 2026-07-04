@@ -2692,9 +2692,7 @@ bool gpu_graph_dspark_draft_forward(
     const uint32_t rank = DS4_N_LORA_O;
 
     const int prev_comp = g->comp_ratio_override;
-    const int prev_nc = g->non_causal_override;
     g->comp_ratio_override = 0;
-    g->non_causal_override = 1;
 
     for (uint32_t li = 0; li < 3 && ok; li++) {
         const ds4_layer_weights *layer = &w->layer[li];
@@ -2831,10 +2829,15 @@ bool gpu_graph_dspark_draft_forward(
         }
         /* Draft KV is transient; dspark_n_raw remains at the persistent count.
          * Committed positions are seeded via gpu_graph_dspark_seed_draft_kv(). */
+
+        /* Views over the batch working set are per-iteration host structs;
+         * free them each layer or they leak on every speculative block. */
+        ds4_gpu_tensor_free(hc_mix_view);
+        ds4_gpu_tensor_free(hc_split_view);
+        ds4_gpu_tensor_free(attn_cur_view);
     }
 
     g->comp_ratio_override = prev_comp;
-    g->non_causal_override = prev_nc;
 
     /* Batch output head → N-token logits in g->spec_logits */
     if (ok) {
@@ -2842,7 +2845,10 @@ bool gpu_graph_dspark_draft_forward(
             g, base_model, base_weights, n_draft, DS4_N_VOCAB);
     }
 
-    if (ok && base_logits_out) {
+    /* The output head already wrote into g->spec_logits.  Callers that pass a
+     * distinct buffer get a copy; the session passes g->spec_logits itself, so
+     * skip the self-copy (a same-buffer cudaMemcpy is undefined). */
+    if (ok && base_logits_out && base_logits_out != g->spec_logits) {
         const uint64_t logits_bytes = (uint64_t)n_draft * DS4_N_VOCAB * sizeof(float);
         ok = ds4_gpu_tensor_copy(base_logits_out, 0,
                                   g->spec_logits, 0,
