@@ -263,6 +263,10 @@ uint32_t gpu_graph_attn_comp_cache_is_f16(void) {
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
 }
 
+uint32_t gpu_graph_attn_comp_cache_is_fp8(void) {
+    return DS4_GPU_ATTN_COMP_CACHE_FP8 ? 1u : 0u;
+}
+
 
 
 static bool gpu_graph_store_attn_comp_stage(
@@ -1847,7 +1851,7 @@ bool gpu_graph_encode_decode_layer(
                     g->q,
                     raw_cache,
                     g->layer_attn_comp_cache[il],
-                    gpu_graph_attn_comp_cache_is_f16(),
+                    gpu_graph_attn_comp_cache_is_f16(), 0,
                     comp_selected,
                     1,
                     pos,
@@ -1876,7 +1880,7 @@ bool gpu_graph_encode_decode_layer(
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
-                                                         gpu_graph_attn_comp_cache_is_f16(),
+                                                         gpu_graph_attn_comp_cache_is_f16(), 0,
                                                          n_comp,
                                                          NULL,
                                                          0,

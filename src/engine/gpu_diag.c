@@ -284,10 +284,11 @@ bool gpu_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
+            uint64_t comp_row_bytes = (uint64_t)DS4_N_HEAD_DIM * (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            if (DS4_GPU_ATTN_COMP_CACHE_FP8) comp_row_bytes = DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM);
             g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                    (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+                    (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {

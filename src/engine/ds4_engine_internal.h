@@ -165,6 +165,11 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  */
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0
 
+#define DS4_GPU_ATTN_COMP_CACHE_FP8 0
+#define DS4_FP8_KV_BLOCK 64u
+#define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
+#define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
+
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -2157,6 +2162,7 @@ bool gpu_graph_use_reference_hc_decode(void);
 bool gpu_graph_use_reference_qkv_norm(void);
 bool gpu_graph_enable_batch_hc_norm_fusion(void);
 uint32_t gpu_graph_attn_comp_cache_is_f16(void);
+uint32_t gpu_graph_attn_comp_cache_is_fp8(void);
 ds4_gpu_tensor *gpu_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il);

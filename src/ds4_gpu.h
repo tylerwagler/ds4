@@ -363,6 +363,13 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+int ds4_gpu_dsv4_fp8_kv_pack_tensor(
+        const ds4_gpu_tensor *x,
+        ds4_gpu_tensor       *packed,
+        ds4_gpu_tensor       *scales,
+        uint32_t               n_tok,
+        uint32_t               head_dim);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -539,6 +546,7 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -583,6 +591,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -606,6 +615,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -628,6 +638,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -644,6 +655,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,

@@ -355,6 +355,60 @@ __device__ static DS4_CUDA_UNUSED void rope_tail_one_dev(float *x, uint32_t head
 
 
 
+__device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
+    float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value_dev(mid) <= ax) lo = mid;
+        else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        float bd = fabsf(ax - dsv4_e4m3fn_value_dev(best));
+        float nd = fabsf(ax - dsv4_e4m3fn_value_dev(best + 1));
+        if (nd < bd || (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) best++;
+    }
+    return (uint8_t)(best | ((x < 0.0f) ? 0x80u : 0u));
+}
+
+__device__ static float dsv4_e4m3fn_decode_dev(uint8_t byte, float scale) {
+    int idx = byte & 0x7f;
+    float val = dsv4_e4m3fn_value_dev(idx);
+    return (byte & 0x80) ? (-val * scale) : (val * scale);
+}
+
+#define DS4_FP8_KV_BLOCK 64u
+#define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
+#define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
+
+__global__ static void pack_fp8_kv_kernel(const float *x, uint8_t *packed, float *scales, uint32_t n_tok, uint32_t head_dim) {
+    uint32_t row = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    if (row >= n_tok) return;
+    const float *xr = x + (uint64_t)row * head_dim;
+    uint8_t *pr = packed + (uint64_t)row * head_dim;
+    float *sr = scales + (uint64_t)row * DS4_FP8_KV_NBLK(head_dim);
+    __shared__ float scratch[64];
+    for (uint32_t off = 0; off < head_dim; off += DS4_FP8_KV_BLOCK) {
+        float v = 0.0f;
+        if (off + tid < head_dim) v = xr[off + tid];
+        scratch[tid] = off + tid < head_dim ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        uint32_t blk = off / DS4_FP8_KV_BLOCK;
+        if (tid == 0) sr[blk] = scale;
+        if (off + tid < head_dim) {
+            pr[off + tid] = dsv4_e4m3fn_encode_dev(fminf(448.0f, fmaxf(-448.0f, v / scale)));
+        }
+        __syncthreads();
+    }
+}
+
 __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
@@ -740,6 +794,21 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
+}
+
+extern "C" int ds4_gpu_dsv4_fp8_kv_pack_tensor(
+        const ds4_gpu_tensor *x,
+        ds4_gpu_tensor       *packed,
+        ds4_gpu_tensor       *scales,
+        uint32_t               n_tok,
+        uint32_t               head_dim) {
+    uint32_t nblk = DS4_FP8_KV_NBLK(head_dim);
+    if (!x || !packed || !scales || n_tok == 0 ||
+        x->bytes < (uint64_t)n_tok * head_dim * sizeof(float) ||
+        packed->bytes < (uint64_t)n_tok * head_dim ||
+        scales->bytes < (uint64_t)n_tok * nblk * sizeof(float)) return 0;
+    pack_fp8_kv_kernel<<<n_tok, 64>>>((const float *)x->ptr, (uint8_t *)packed->ptr, (float *)scales->ptr, n_tok, head_dim);
+    return cuda_ok(cudaGetLastError(), "fp8_kv_pack launch");
 }
 
 

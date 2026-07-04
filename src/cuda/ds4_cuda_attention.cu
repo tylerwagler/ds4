@@ -1,5 +1,18 @@
 #include "ds4_cuda_internal.h"
 
+__device__ static float ds4a_e4m3_value(int i) {
+    int exp = (i >> 3) & 15;
+    int mant = i & 7;
+    if (exp == 0) return (float)mant * 0.001953125f;
+    return (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
+}
+
+__device__ static float ds4a_fp8_kv_dequant(uint8_t byte, float scale) {
+    int idx = byte & 0x7f;
+    float val = ds4a_e4m3_value(idx);
+    return (byte & 0x80) ? (-val * scale) : (val * scale);
+}
+
 
 
 __global__ static void attention_prefill_raw_kernel(
@@ -293,6 +306,7 @@ __global__ static void attention_decode_mixed_kernel(
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t non_causal,
+        uint32_t comp_kv_fp8,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -312,6 +326,8 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const uint32_t comp_row_bytes = comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
+    if (comp_kv_fp8 && n_comp) { (void)comp_row_bytes; }
     __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
     __shared__ float partial[256];
@@ -361,9 +377,16 @@ __global__ static void attention_decode_mixed_kernel(
             float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
             float s = -INFINITY;
             if (add > -1.0e20f) {
-                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                if (comp_kv_fp8) {
+                    const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c * comp_row_bytes;
+                    const float *sc = (const float *)(kv_u8 + head_dim);
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
+                } else {
+                    const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                }
                 s = dot * scale + add;
             }
             scores[raw_count + c] = s;
@@ -376,18 +399,29 @@ __global__ static void attention_decode_mixed_kernel(
             uint32_t row = row0 + qgroup;
             if (row < n_score) {
                 float add = 0.0f;
-                const float *kvrow = NULL;
+                bool have_row = false;
+                uint32_t c_idx = 0;
                 if (row < raw_count) {
-                    kvrow = raw_kv + (uint64_t)raw_rows[row] * head_dim;
+                    have_row = true;
                 } else {
                     uint32_t c = row - raw_count;
                     add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
-                    if (add > -1.0e20f) kvrow = comp_kv + (uint64_t)c * head_dim;
+                    if (add > -1.0e20f) { have_row = true; c_idx = c; }
                 }
                 float s = -INFINITY;
-                if (kvrow) {
+                if (have_row) {
                     float dot = 0.0f;
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    if (row < raw_count) {
+                        const float *kvrow = raw_kv + (uint64_t)raw_rows[row] * head_dim;
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    } else if (comp_kv_fp8) {
+                        const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c_idx * comp_row_bytes;
+                        const float *sc = (const float *)(kv_u8 + head_dim);
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
+                    } else {
+                        const float *kvrow = comp_kv + (uint64_t)c_idx * head_dim;
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    }
                     const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -437,9 +471,16 @@ __global__ static void attention_decode_mixed_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            if (comp_kv_fp8) {
+                const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c * comp_row_bytes;
+                const float *sc = (const float *)(kv_u8 + head_dim);
+                acc0 += ds4a_fp8_kv_dequant(kv_u8[d0], sc[d0 >> 6]) * s;
+                acc1 += ds4a_fp8_kv_dequant(kv_u8[d1], sc[d1 >> 6]) * s;
+            } else {
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                acc0 += kv[d0] * s;
+                acc1 += kv[d1] * s;
+            }
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -447,7 +488,15 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                if (comp_kv_fp8) {
+                    const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c * comp_row_bytes;
+                    const float *sc = (const float *)(kv_u8 + head_dim);
+                    acc += ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]) * scores[raw_count + c];
+                } else {
+                    acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+                }
+            }
             oh[d] = acc / denom;
         }
     }
@@ -1095,6 +1144,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const float *raw_kv,
         const float *comp_kv,
         uint32_t non_causal,
+        uint32_t comp_kv_fp8,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -1161,6 +1211,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
 
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
+    const uint32_t comp_row_bytes = comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
     const float4 *q4 = valid_head
         ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
@@ -1184,10 +1235,23 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else if (comp_kv_fp8) {
+                const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)(sr - raw_count) * comp_row_bytes;
+                const float *sc = (const float *)(kv_u8 + head_dim);
+                uint32_t base = c4 << 2;
+                float4 v;
+                v.x = ds4a_fp8_kv_dequant(kv_u8[base + 0], sc[(base + 0) >> 6]);
+                v.y = ds4a_fp8_kv_dequant(kv_u8[base + 1], sc[(base + 1) >> 6]);
+                v.z = ds4a_fp8_kv_dequant(kv_u8[base + 2], sc[(base + 2) >> 6]);
+                v.w = ds4a_fp8_kv_dequant(kv_u8[base + 3], sc[(base + 3) >> 6]);
+                kv_shared[off] = v;
+            } else {
+                const float4 *src = (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
+                kv_shared[off] = src[c4];
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1302,6 +1366,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -1315,7 +1380,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp *
+         (comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float))) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
     }
@@ -1332,6 +1398,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               (const float *)raw_kv->ptr,
                                                                               n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                                               0,
+                                                                              comp_kv_fp8,
                                                                               1,
                                                                               0,
                                                                               n_raw,
@@ -1355,7 +1422,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
-                                                 0,
+                                                 0, comp_kv_fp8,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
@@ -1472,6 +1539,7 @@ static int attention_decode_batch_launch(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                non_causal,
@@ -1494,7 +1562,8 @@ static int attention_decode_batch_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp *
+         (comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float))) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
@@ -1512,6 +1581,7 @@ static int attention_decode_batch_launch(
                                                                               (const float *)raw_kv->ptr,
                                                                               n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                                               non_causal,
+                                                                              comp_kv_fp8,
                                                                               n_tokens,
                                                                               pos0,
                                                                               n_raw,
@@ -1537,6 +1607,7 @@ static int attention_decode_batch_launch(
                                                                    (const float *)raw_kv->ptr,
                                                                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                                    non_causal,
+                                                                   comp_kv_fp8,
                                                                    n_tokens,
                                                                    pos0,
                                                                    n_raw,
@@ -1556,7 +1627,7 @@ static int attention_decode_batch_launch(
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                                 use_comp_mask, non_causal, n_tokens, pos0, n_raw, raw_cap,
+                                                 use_comp_mask, non_causal, comp_kv_fp8, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
@@ -1580,7 +1651,7 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                head_dim,
         uint32_t                non_causal) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, NULL, 0, NULL, 0, non_causal, n_tokens, pos0,
+                                      q, raw_kv, NULL, 0, 0, NULL, 0, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim);
 }
@@ -1596,6 +1667,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -1611,7 +1683,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                non_causal) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask, non_causal,
+                                      q, raw_kv, comp_kv, comp_kv_f16, comp_kv_fp8, comp_mask, use_comp_mask, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim);
 }
@@ -1627,6 +1699,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -1639,7 +1712,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
+    if (comp_kv_f16 || comp_kv_fp8 ||
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
@@ -1887,13 +1960,14 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
+    if (comp_kv_f16 || comp_kv_fp8) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
@@ -1910,6 +1984,7 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_fp8,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,

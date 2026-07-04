@@ -52,6 +52,10 @@ enum {
     DS4_CUDA_STREAM_EXPERT_MAX = 61u * 384u
 };
 
+#define DS4_FP8_KV_BLOCK 64u
+#define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
+#define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
+
 struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
