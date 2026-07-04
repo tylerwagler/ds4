@@ -1657,7 +1657,7 @@ void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
     w->hc_head_scale    = required_tensor(m, "dspark.2.hc_head_scale.weight");
     w->final_norm       = required_tensor(m, "dspark.2.norm.weight");
 
-    w->vocab_size = (uint32_t)w->markov_w1->ne[1];
+    w->vocab_size = (uint32_t)w->markov_w1->dim[1];
 
     {
         uint32_t target_ids[3];

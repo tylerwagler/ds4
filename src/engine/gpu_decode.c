@@ -2633,7 +2633,7 @@ bool gpu_graph_dspark_draft_forward(
         const ds4_model         *dspark_model,
         const ds4_dspark_weights *w,
         ds4_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[DS4_DSPARK_DRAFT_WINDOW],
+        const int32_t            draft_ids[],
         uint32_t                n_draft) {
     if (!g || !base_model || !base_weights || !dspark_model || !w ||
         !base_logits_out || n_draft == 0 || n_draft > 16 ||
@@ -2758,10 +2758,9 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_kv, n_draft, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
 
         /* --- Store KV in draft ring buffer (write first, then attend) --- */
-        const uint32_t raw_row = g->dspark_n_raw[li] % raw_cap;
         if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(
             g->dspark_raw_cache[li], g->batch_kv,
-            DS4_N_HEAD_DIM, n_draft, 0, raw_cap, raw_row) != 0;
+            raw_cap, 0, n_draft, DS4_N_HEAD_DIM) != 0;
         const uint32_t new_n_raw = g->dspark_n_raw[li] + n_draft;
         const uint32_t vis_raw = new_n_raw < raw_cap ? new_n_raw : raw_cap;
         const uint32_t first_raw_pos = new_n_raw > raw_cap
@@ -2791,7 +2790,8 @@ bool gpu_graph_dspark_draft_forward(
         /* --- HC expand + split → batch_after_attn_hc --- */
         if (ok) ok = ds4_gpu_hc_expand_split_tensor(
             g->batch_after_attn_hc, g->batch_attn_out,
-            DS4_N_EMBD, DS4_N_HC, n_draft) != 0;
+            g->batch_cur_hc, g->batch_hc_split,
+            DS4_N_EMBD, DS4_N_HC) != 0;
 
         /* --- FFN batch (reuses existing function) --- */
         if (ok) ok = gpu_graph_encode_layer_ffn_batch(
@@ -2817,11 +2817,9 @@ bool gpu_graph_dspark_draft_forward(
 
     if (ok && base_logits_out) {
         const uint64_t logits_bytes = (uint64_t)n_draft * DS4_N_VOCAB * sizeof(float);
-        if (base_logits_out->bytes >= logits_bytes) {
-            ok = ds4_gpu_tensor_copy(base_logits_out, 0,
-                                      g->spec_logits, 0,
-                                      logits_bytes) != 0;
-        }
+        ok = ds4_gpu_tensor_copy(base_logits_out, 0,
+                                  g->spec_logits, 0,
+                                  logits_bytes) != 0;
     }
 
     return ok;

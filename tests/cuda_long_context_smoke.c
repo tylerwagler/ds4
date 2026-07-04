@@ -1,8 +1,10 @@
 #include "ds4_gpu.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static double monotonic_seconds(void) {
@@ -168,7 +170,7 @@ static int check_dspark_non_causal_attention(void) {
 
     float *sinks = (float *)calloc(n_head, sizeof(float));
     float *kvrow = (float *)calloc((size_t)head_dim, sizeof(float));
-    float *q_row = (float *)calloc((size_t)head_dim, sizeof(float));
+    float *q_row = (float *)calloc((size_t)n_head * head_dim, sizeof(float));
     float *raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
     float *q_host = (float *)calloc((size_t)q_count * n_tokens, sizeof(float));
     float *heads_causal = (float *)calloc((size_t)heads_count, sizeof(float));
@@ -177,6 +179,8 @@ static int check_dspark_non_causal_attention(void) {
 
     for (uint32_t d = 0; d < head_dim; d++) {
         kvrow[d] = (float)(d % 16) * 0.1f;
+    }
+    for (uint32_t d = 0; d < n_head * head_dim; d++) {
         q_row[d] = (float)(d % 8) * 0.2f;
     }
     for (uint32_t t = 0; t < n_raw; t++) {
@@ -270,8 +274,6 @@ static int check_dspark_markov_head(void) {
     float *w1_host = (float *)calloc((size_t)vocab_size * embed_dim, sizeof(float));
     float *w2_host = (float *)calloc((size_t)vocab_size * embed_dim, sizeof(float));
     float *base_host = (float *)calloc((size_t)vocab_size, sizeof(float));
-    int32_t ref_ids[5];
-    float ref_logits_host[4096];
     if (!w1_host || !w2_host || !base_host) return 1;
 
     for (uint32_t v = 0; v < vocab_size; v++) {
@@ -288,9 +290,9 @@ static int check_dspark_markov_head(void) {
     ds4_gpu_tensor *ref_logits = ds4_gpu_tensor_alloc((uint64_t)vocab_size * sizeof(float));
     int rc = 1;
     if (w1 && w2 && base && ref_logits &&
-        ds4_gpu_tensor_write(w1, 0, w1_host, w1->bytes) &&
-        ds4_gpu_tensor_write(w2, 0, w2_host, w2->bytes) &&
-        ds4_gpu_tensor_write(base, 0, base_host, base->bytes)) {
+        ds4_gpu_tensor_write(w1, 0, w1_host, (uint64_t)vocab_size * embed_dim * sizeof(float)) &&
+        ds4_gpu_tensor_write(w2, 0, w2_host, (uint64_t)vocab_size * embed_dim * sizeof(float)) &&
+        ds4_gpu_tensor_write(base, 0, base_host, (uint64_t)vocab_size * sizeof(float))) {
 
         int32_t id = prev_tokens[0];
         for (uint32_t step = 0; step < n_draft; step++) {
@@ -318,7 +320,6 @@ static int check_dspark_markov_head(void) {
                 rc = 1;
                 goto cleanup;
             }
-            ref_ids[step] = gpu_id;
             id = gpu_id;
         }
         rc = 0;
@@ -362,13 +363,13 @@ static int check_dspark_confidence_head(void) {
     ds4_gpu_tensor *proj = ds4_gpu_tensor_alloc((uint64_t)total_dim * sizeof(float));
     int rc = 1;
     if (scores && hidden && embed && proj &&
-        ds4_gpu_tensor_write(hidden, 0, hidden_host, hidden->bytes) &&
-        ds4_gpu_tensor_write(embed, 0, embed_host, embed->bytes) &&
-        ds4_gpu_tensor_write(proj, 0, proj_host, proj->bytes) &&
+        ds4_gpu_tensor_write(hidden, 0, hidden_host, (uint64_t)n_positions * hidden_dim * sizeof(float)) &&
+        ds4_gpu_tensor_write(embed, 0, embed_host, (uint64_t)n_positions * embed_dim * sizeof(float)) &&
+        ds4_gpu_tensor_write(proj, 0, proj_host, (uint64_t)total_dim * sizeof(float)) &&
         ds4_gpu_dspark_confidence_score(scores, hidden, embed, proj,
                                         n_positions, hidden_dim, embed_dim) &&
         ds4_gpu_synchronize() &&
-        ds4_gpu_tensor_read(scores, 0, scores_host, scores->bytes)) {
+        ds4_gpu_tensor_read(scores, 0, scores_host, (uint64_t)n_positions * sizeof(float))) {
         rc = 0;
         for (uint32_t p = 0; p < n_positions; p++) {
             float dot = 0.0f;

@@ -111,7 +111,7 @@ src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/
 src/cuda/ds4_mxfp4_cutlass.o: src/cuda/ds4_mxfp4_cutlass.cu src/ds4_gpu.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/ds4_mxfp4_cutlass.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS)
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) src/cuda/ds4_mxfp4_cutlass.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)

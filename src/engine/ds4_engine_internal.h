@@ -2246,7 +2246,7 @@ bool gpu_graph_dspark_draft_forward(
         const ds4_model         *dspark_model,
         const ds4_dspark_weights *w,
         ds4_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[DS4_DSPARK_DRAFT_WINDOW],
+        const int32_t            draft_ids[],
         uint32_t                n_draft);
 bool gpu_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
