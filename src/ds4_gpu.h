@@ -583,6 +583,30 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* MXFP8 decode attention over the current f32 KV caches (CUTLASS Sm120 MX GEMM
+ * path). Compute-path drop-in for the decode attention, gated behind DS4_ATTN_MX.
+ * Resolves sinks from the model map and the visible KV set (raw SWA window +
+ * comp: comp_selected topk when indexed, else visible_comp=(pos+1)/ratio). */
+int ds4_gpu_attn_mx_decode(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *raw_cache,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_raw,
+        ds4_gpu_tensor       *comp_cache,
+        ds4_gpu_tensor       *comp_selected,
+        uint32_t                n_comp,
+        uint32_t                n_selected,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        uint32_t                pos,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

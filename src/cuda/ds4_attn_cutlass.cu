@@ -24,6 +24,9 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
+#ifndef DS4_ATTN_CUTLASS_STANDALONE
+#include "ds4_cuda_internal.h"   // ds4_gpu_tensor (->ptr), cuda_model_range_ptr (engine build only)
+#endif
 using namespace cute;
 
 using ElementSF = cutlass::float_ue8m0_t;
@@ -499,6 +502,49 @@ extern "C" int ds4_attn_mx_decode(
   cudaFree(scratch);
   return rc;
 }
+
+#ifndef DS4_ATTN_CUTLASS_STANDALONE
+// Engine-facing decode-attention wrapper: unpacks ds4_gpu_tensor pointers,
+// resolves sinks from the model map, computes the visible KV set (raw SWA window
+// + comp: topk when indexed, else visible_comp = (pos+1)/ratio), and runs the
+// MXFP8 decode attention over the current f32 caches. Self-allocating scratch for
+// this first correctness pass (a per-session reused buffer is the follow-up).
+extern "C" int ds4_gpu_attn_mx_decode(
+    ds4_gpu_tensor *heads, ds4_gpu_tensor *q,
+    ds4_gpu_tensor *raw_cache, uint32_t raw_cap, uint32_t raw_start, uint32_t n_raw,
+    ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *comp_selected, uint32_t n_comp, uint32_t n_selected,
+    const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+    uint32_t pos, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+  const float *sinks = (const float *)cuda_model_range_ptr(
+      model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+  if (!sinks || !heads || !q || !raw_cache) return -1;
+  // raw SWA window: keep the last min(n_raw, window) rows of the cached span
+  const uint32_t eff_win = window ? window : n_raw;
+  const uint32_t raw_vis = n_raw < eff_win ? n_raw : eff_win;
+  const uint32_t raw_first = n_raw - raw_vis;
+  // compressed visibility
+  const int32_t *comp_rows = nullptr;
+  uint32_t comp_vis;
+  if (comp_selected && n_selected) {
+    comp_rows = (const int32_t *)comp_selected->ptr;
+    comp_vis = n_selected;
+  } else {
+    const uint32_t vc = ratio ? (pos + 1u) / ratio : n_comp;
+    comp_vis = vc < n_comp ? vc : n_comp;
+  }
+  const float *comp_ptr = comp_cache ? (const float *)comp_cache->ptr : (const float *)raw_cache->ptr;
+  size_t nbytes = ds4_attn_mx_decode_scratch_bytes(n_head, head_dim, raw_vis + comp_vis);
+  uint8_t *scratch = nullptr;
+  if (cudaMalloc(&scratch, nbytes) != cudaSuccess) return -3;
+  int rc = ds4_attn_mx_decode_f32_scratch(
+      (float *)heads->ptr, (const float *)q->ptr,
+      (const float *)raw_cache->ptr, comp_ptr, comp_rows, sinks,
+      n_head, head_dim, raw_start, raw_cap, raw_first, raw_vis, comp_vis, scratch, nbytes);
+  cudaDeviceSynchronize();
+  cudaFree(scratch);
+  return rc;
+}
+#endif  // !DS4_ATTN_CUTLASS_STANDALONE
 
 #ifdef DS4_ATTN_CUTLASS_STANDALONE
 #include <vector>

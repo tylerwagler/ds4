@@ -1883,7 +1883,22 @@ bool gpu_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
-        if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
+        static int mx_attn_env = -1;
+        if (mx_attn_env < 0) mx_attn_env = getenv("DS4_ATTN_MX") != NULL;
+        if (mx_attn_env) {
+            /* MXFP8 decode attention (CUTLASS Sm120 MX GEMM). Compute-path swap
+             * over the current f32 caches; requires a sm_120f build. */
+            ok = ds4_gpu_attn_mx_decode(
+                    g->heads, g->q,
+                    raw_cache, raw_cap, raw_start, n_raw,
+                    comp_cache,
+                    (comp_selected != NULL && n_selected != 0) ? comp_selected : NULL,
+                    n_comp,
+                    (comp_selected != NULL) ? n_selected : 0,
+                    model->map, model->size, layer->attn_sinks->abs_offset,
+                    pos, g->raw_window, ds4_layer_compress_ratio(il),
+                    DS4_N_HEAD, DS4_N_HEAD_DIM) == 0;
+        } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
