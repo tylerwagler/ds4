@@ -2284,16 +2284,31 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         overlay_path[path_len] = '\0';
         model_open(&e->overlay_model, overlay_path, graph_backend, false);
         e->overlay_ready = true;
-        const uint32_t swapped =
-            model_apply_expert_overlay(&e->model, &e->overlay_model, sep + 1);
-        if (swapped == 0) {
-            fprintf(stderr, "ds4: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
-                    sep + 1);
+        /* PREFIX is a comma-separated list so several layers can be swapped
+         * in one run (e.g. compose "anchor + candidate" from a cheap base
+         * without materializing the combined model as a file). */
+        char prefixes[2048];
+        const size_t plist_len = strlen(sep + 1);
+        if (plist_len >= sizeof(prefixes)) {
+            fprintf(stderr, "ds4: --expert-overlay prefix list is too long\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        fprintf(stderr, "ds4: expert overlay: %u tensors swapped in from %s (prefix %s)\n",
+        memcpy(prefixes, sep + 1, plist_len + 1);
+        uint32_t swapped = 0;
+        for (char *p = strtok(prefixes, ","); p; p = strtok(NULL, ",")) {
+            const uint32_t n = model_apply_expert_overlay(&e->model, &e->overlay_model, p);
+            if (n == 0) {
+                fprintf(stderr, "ds4: --expert-overlay prefix '%s' matched no routed-expert tensors\n",
+                        p);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            swapped += n;
+        }
+        fprintf(stderr, "ds4: expert overlay: %u tensors swapped in from %s (prefixes %s)\n",
                 swapped, overlay_path, sep + 1);
     }
     weights_bind(&e->weights,
@@ -4665,13 +4680,66 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     }
     ds4_gpu_tensor_free(dspark_logits);
 
-    /* Step 6: return accepted tokens (refined tokens 1..n_draft) */
-    for (uint32_t i = 1; i <= n_draft && n_accept < accepted_cap; i++) {
-        if (refined_ids[i] == eos_token) break;
-        accepted[n_accept++] = refined_ids[i];
+    /* Step 6: verify drafts against target, rejection sampling */
+    const int saved_len = s->checkpoint.len;
+    const int draft_n = (int)n_draft;
+
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    bool have_frontier = spec_frontier_snapshot(&frontier, s);
+
+    for (int i = 0; i < draft_n; i++)
+        token_vec_push(&s->checkpoint, refined_ids[i + 1]);
+
+    int *row_tops = xmalloc((size_t)draft_n * sizeof(int));
+    bool verify_ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
+                                                    &s->checkpoint,
+                                                    (uint32_t)saved_len,
+                                                    (uint32_t)draft_n,
+                                                    false,
+                                                    row_tops, NULL);
+
+    int commit_drafts = 0;
+    if (verify_ok) {
+        commit_drafts = 1;  /* first draft always accepted */
+        for (int i = 1; i < draft_n; i++) {
+            if (row_tops[i - 1] != refined_ids[i + 1]) break;
+            commit_drafts++;
+        }
     }
 
-    /* TODO(P1.7c): target verify + rejection sampling + KV seeding */
+    if (commit_drafts < draft_n && have_frontier) {
+        s->checkpoint.len = saved_len;
+        (void)spec_frontier_restore(&frontier, s);
+        for (int i = 0; i < commit_drafts; i++) {
+            if (ds4_session_eval(s, refined_ids[i + 1], err, errlen) != 0) {
+                spec_frontier_free(&frontier);
+                free(row_tops);
+                return -1;
+            }
+        }
+    } else if (!verify_ok) {
+        s->checkpoint.len = saved_len;
+        if (have_frontier) (void)spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        free(row_tops);
+        snprintf(err, errlen, "DSpark verifier failed");
+        return -1;
+    }
+
+    spec_frontier_free(&frontier);
+    free(row_tops);
+
+    /* Step 7: seed draft KV cache for committed positions */
+    if (commit_drafts > 0)
+        gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights);
+
+    /* Step 8: return accepted tokens */
+    for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
+        if (refined_ids[i + 1] == eos_token) break;
+        accepted[n_accept++] = refined_ids[i + 1];
+    }
+
     return n_accept;
 }
 

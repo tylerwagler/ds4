@@ -2588,6 +2588,44 @@ bool gpu_graph_dspark_project_main_x(
     return ok;
 }
 
+void gpu_graph_dspark_seed_draft_kv(
+        ds4_gpu_graph          *g,
+        const ds4_model         *dspark_model,
+        const ds4_dspark_weights *w) {
+    const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    for (int li = 0; li < 3; li++) {
+        ds4_gpu_tensor *kv_out = ds4_gpu_tensor_alloc(kv_bytes);
+        if (!kv_out) return;
+        if (!ds4_gpu_matmul_mxfp8_tensor(kv_out,
+                                          dspark_model->map,
+                                          dspark_model->size,
+                                          w->layer[li].attn_kv->abs_offset,
+                                          DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                          g->dspark_main_x, 1)) {
+            ds4_gpu_tensor_free(kv_out);
+            continue;
+        }
+        ds4_gpu_tensor *kv_norm = ds4_gpu_tensor_alloc(kv_bytes);
+        if (!kv_norm) { ds4_gpu_tensor_free(kv_out); continue; }
+        if (!ds4_gpu_rms_norm_weight_tensor(kv_norm, kv_out,
+                                             dspark_model->map,
+                                             dspark_model->size,
+                                             w->layer[li].attn_kv_a_norm->abs_offset,
+                                             DS4_N_HEAD_DIM, DS4_RMS_EPS)) {
+            ds4_gpu_tensor_free(kv_norm);
+            ds4_gpu_tensor_free(kv_out);
+            continue;
+        }
+        const uint32_t row = g->dspark_n_raw[li] % DS4_DSPARK_DRAFT_WINDOW;
+        ds4_gpu_tensor_copy(g->dspark_raw_cache[li],
+                            (uint64_t)row * kv_bytes,
+                            kv_norm, 0, kv_bytes);
+        g->dspark_n_raw[li]++;
+        ds4_gpu_tensor_free(kv_norm);
+        ds4_gpu_tensor_free(kv_out);
+    }
+}
+
 bool gpu_graph_dspark_draft_forward(
         ds4_gpu_graph          *g,
         const ds4_model         *base_model,
