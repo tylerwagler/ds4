@@ -323,6 +323,7 @@ bool gpu_graph_commit_attn_comp_stage(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
+    if (DS4_GPU_ATTN_COMP_CACHE_FP8) return true;
     if (!DS4_GPU_ATTN_COMP_CACHE_F16) return true;
     return gpu_graph_store_attn_comp_stage(g, il, first_row, rows);
 }
@@ -333,7 +334,7 @@ ds4_gpu_tensor *gpu_graph_attn_comp_row_view(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       row) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) {
         return ds4_gpu_tensor_view(g->attn_comp_stage,
                                    0,
                                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -350,7 +351,7 @@ ds4_gpu_tensor *gpu_graph_attn_comp_prefill_target(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) return g->attn_comp_stage;
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || DS4_GPU_ATTN_COMP_CACHE_FP8) return g->attn_comp_stage;
     const uint32_t view_rows = rows ? rows : 1u;
     return ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
                                (uint64_t)first_row * DS4_N_HEAD_DIM * sizeof(float),
@@ -1619,13 +1620,27 @@ bool gpu_graph_encode_decode_layer(
             ds4_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
             if (!comp_row_view) {
                 ok = false;
+            } else if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+                ds4_gpu_tensor *packed_dst = ds4_gpu_tensor_view(
+                    g->layer_attn_comp_cache[il],
+                    (uint64_t)comp_row * DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM),
+                    (uint64_t)DS4_N_HEAD_DIM);
+                ds4_gpu_tensor *scales_dst = ds4_gpu_tensor_view(
+                    g->layer_attn_comp_cache[il],
+                    (uint64_t)comp_row * DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM) + DS4_N_HEAD_DIM,
+                    (uint64_t)DS4_FP8_KV_NBLK(DS4_N_HEAD_DIM) * sizeof(float));
+                ok = packed_dst && scales_dst &&
+                     ds4_gpu_dsv4_fp8_kv_pack_tensor(comp_row_view, packed_dst, scales_dst,
+                                                     1, DS4_N_HEAD_DIM) != 0;
+                if (packed_dst) ds4_gpu_tensor_free(packed_dst);
+                if (scales_dst) ds4_gpu_tensor_free(scales_dst);
             } else {
                 ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
                 if (ok) {
                     gpu_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
                 }
-                ds4_gpu_tensor_free(comp_row_view);
             }
+            ds4_gpu_tensor_free(comp_row_view);
             if (ok) ok = gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
         }
         if (ok && emit) g->layer_n_comp[il]++;

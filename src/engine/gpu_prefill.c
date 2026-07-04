@@ -1057,11 +1057,27 @@ bool gpu_graph_encode_layer_attention_batch(
                                                             DS4_RMS_EPS) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
-                        ok = comp_row_view &&
-                             ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
-                                                                   1,
-                                                                   DS4_N_HEAD_DIM,
-                                                                   DS4_N_ROT) != 0;
+                        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+                            ds4_gpu_tensor *packed_dst = ds4_gpu_tensor_view(
+                                g->layer_attn_comp_cache[il],
+                                (uint64_t)comp_row * DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM),
+                                (uint64_t)DS4_N_HEAD_DIM);
+                            ds4_gpu_tensor *scales_dst = ds4_gpu_tensor_view(
+                                g->layer_attn_comp_cache[il],
+                                (uint64_t)comp_row * DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM) + DS4_N_HEAD_DIM,
+                                (uint64_t)DS4_FP8_KV_NBLK(DS4_N_HEAD_DIM) * sizeof(float));
+                            ok = comp_row_view && packed_dst && scales_dst &&
+                                 ds4_gpu_dsv4_fp8_kv_pack_tensor(comp_row_view, packed_dst, scales_dst,
+                                                                 1, DS4_N_HEAD_DIM) != 0;
+                            if (packed_dst) ds4_gpu_tensor_free(packed_dst);
+                            if (scales_dst) ds4_gpu_tensor_free(scales_dst);
+                        } else {
+                            ok = comp_row_view &&
+                                 ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
+                                                                      1,
+                                                                      DS4_N_HEAD_DIM,
+                                                                      DS4_N_ROT) != 0;
+                        }
                         if (ok) {
                             gpu_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
