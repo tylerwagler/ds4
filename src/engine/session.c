@@ -4689,6 +4689,13 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
         return -1;
 
+    /* Step 2b: seed the current frontier's main_kv into the drafter KV BEFORE the
+     * draft forward, matching the reference DSparkAttention (store main_kv at
+     * start_pos, then attend).  The old code seeded only at the END of the step
+     * (Step 7) and only on accepts, so the draft forward attended to an empty /
+     * stale context.  One row per step -> dspark_n_raw tracks the frontier. */
+    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
+
     /* Step 3: build draft input — position 0 = first_token, rest = noise */
     int32_t draft_ids[16];
     draft_ids[0] = (int32_t)first_token;
@@ -4861,14 +4868,10 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         return -1;
     }
 
-    /* Step 7: seed draft KV cache for the committed positions.  first_token is
-     * ALWAYS committed in Step 1, so seed 1 + commit_drafts rows UNCONDITIONALLY.
-     * The old `if (commit_drafts > 0)` gate never seeded first_token and skipped
-     * entirely on 0-accept steps, so the drafter KV stayed empty (n_raw==0): it
-     * attended to no context, drafted garbage, got ~0 accepts, and never seeded
-     * -- a chicken-and-egg deadlock that pinned acceptance near 0. */
-    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights,
-                                    (uint32_t)(1 + commit_drafts));
+    /* Step 7: the current frontier's main_kv is now seeded BEFORE the forward
+     * (Step 2b), one row per step, so nothing to seed here.  (Accepted-draft
+     * positions still don't get their own captured target hidden -- a known
+     * fidelity gap, since ds4 only projects one main_x per step.) */
 
     /* Step 8: return first_token followed by the accepted drafts.  The caller
      * emits only the tokens returned here, so first_token — committed to the

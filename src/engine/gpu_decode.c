@@ -2740,6 +2740,16 @@ void gpu_graph_dspark_seed_draft_kv(
             ds4_gpu_tensor_free(kv_out);
             continue;
         }
+        /* RoPE the seeded main_kv at its sequence position and fp8-round it, to
+         * match the draft-forward KV and the DSparkAttention reference (main_kv
+         * is rotated at start_pos).  Without this the drafter attended
+         * position-blind against a rotated query set.  Callers seed one row per
+         * step, so the position is dspark_n_raw[li]. */
+        ds4_gpu_rope_tail_tensor(kv_norm, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                 g->dspark_n_raw[li], 0, false,
+                                 (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                                 DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+        ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv_norm, 1, DS4_N_HEAD_DIM, DS4_N_ROT);
         for (uint32_t i = 0; i < n_rows; i++) {
             const uint32_t row = g->dspark_n_raw[li] % DS4_DSPARK_DRAFT_WINDOW;
             ds4_gpu_tensor_copy(g->dspark_raw_cache[li],
@@ -2802,7 +2812,11 @@ bool gpu_graph_dspark_draft_forward(
         const ds4_layer_weights *layer = &w->layer[li];
         const uint32_t raw_cap = DS4_DSPARK_DRAFT_WINDOW;
         const uint32_t q_rank = (uint32_t)layer->attn_q_a->dim[1];
-        const uint32_t pos0 = 0;
+        /* Draft queries/KV sit at the frontier (the current main_kv was seeded at
+         * dspark_n_raw[li]-1 just before this forward), so RoPE them at the real
+         * position -- NOT 0.  The reference DSparkAttention rotates draft Q/KV at
+         * start_pos+1 while the seeded main_kv is at start_pos. */
+        const uint32_t pos0 = g->dspark_n_raw[li];
 
         /* --- HC pre-processing --- */
         /* Create views from batch working set */
