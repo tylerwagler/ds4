@@ -4868,10 +4868,11 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         return -1;
     }
 
-    /* Step 7: the current frontier's main_kv is now seeded BEFORE the forward
-     * (Step 2b), one row per step, so nothing to seed here.  (Accepted-draft
-     * positions still don't get their own captured target hidden -- a known
-     * fidelity gap, since ds4 only projects one main_x per step.) */
+    /* Step 7: nothing to seed here.  Step 2b seeds first_token's main_kv before
+     * the forward (one row per step, correct content).  Reusing this step's
+     * main_x for the ACCEPTED positions was measured to HURT (28.6% -> 23.9%):
+     * the drafter is sensitive to per-position content, so accepted positions
+     * need their OWN captured target hidden (see verify-capture, TODO). */
 
     /* Step 8: return first_token followed by the accepted drafts.  The caller
      * emits only the tokens returned here, so first_token — committed to the

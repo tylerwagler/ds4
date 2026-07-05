@@ -2740,23 +2740,29 @@ void gpu_graph_dspark_seed_draft_kv(
             ds4_gpu_tensor_free(kv_out);
             continue;
         }
-        /* RoPE the seeded main_kv at its sequence position and fp8-round it, to
-         * match the draft-forward KV and the DSparkAttention reference (main_kv
-         * is rotated at start_pos).  Without this the drafter attended
-         * position-blind against a rotated query set.  Callers seed one row per
-         * step, so the position is dspark_n_raw[li]. */
-        ds4_gpu_rope_tail_tensor(kv_norm, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
-                                 g->dspark_n_raw[li], 0, false,
-                                 (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-                                 DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
-        ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv_norm, 1, DS4_N_HEAD_DIM, DS4_N_ROT);
+        /* Seed one KV row per committed position.  Each row is RoPE'd at its OWN
+         * sequence position (dspark_n_raw[li]) and fp8-rounded, matching the
+         * draft-forward KV and the DSparkAttention reference (main_kv is rotated
+         * at start_pos).  kv_norm holds the un-rotated vector; we rotate a fresh
+         * copy per position so multi-row seeds (accepted drafts) land at distinct
+         * positions rather than all sharing the first row's rotation. */
+        ds4_gpu_tensor *kv_rot = ds4_gpu_tensor_alloc(kv_bytes);
+        if (!kv_rot) { ds4_gpu_tensor_free(kv_norm); ds4_gpu_tensor_free(kv_out); continue; }
         for (uint32_t i = 0; i < n_rows; i++) {
-            const uint32_t row = g->dspark_n_raw[li] % DS4_DSPARK_DRAFT_WINDOW;
+            const uint32_t pos = g->dspark_n_raw[li];
+            const uint32_t row = pos % DS4_DSPARK_DRAFT_WINDOW;
+            ds4_gpu_tensor_copy(kv_rot, 0, kv_norm, 0, kv_bytes);
+            ds4_gpu_rope_tail_tensor(kv_rot, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                     pos, 0, false,
+                                     (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                                     DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+            ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv_rot, 1, DS4_N_HEAD_DIM, DS4_N_ROT);
             ds4_gpu_tensor_copy(g->dspark_raw_cache[li],
                                 (uint64_t)row * kv_bytes,
-                                kv_norm, 0, kv_bytes);
+                                kv_rot, 0, kv_bytes);
             g->dspark_n_raw[li]++;
         }
+        ds4_gpu_tensor_free(kv_rot);
         ds4_gpu_tensor_free(kv_norm);
         ds4_gpu_tensor_free(kv_out);
     }
