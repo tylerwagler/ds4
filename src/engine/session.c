@@ -4708,6 +4708,18 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         if (gpu_graph_read_spec_logits_row(g, 0, r0))
             dspark_base0 = sample_argmax(r0, DS4_N_VOCAB);
         free(r0);
+        /* conditioning diagnostics: is target_h captured, main_x sane, KV seeded? */
+        float *tmp = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        double mn = 0.0, th[3] = {0, 0, 0};
+        if (ds4_gpu_tensor_read(g->dspark_main_x, 0, tmp, (uint64_t)DS4_N_EMBD * 4))
+            for (int j = 0; j < (int)DS4_N_EMBD; j++) mn += (double)tmp[j] * tmp[j];
+        for (int i = 0; i < 3; i++)
+            if (ds4_gpu_tensor_read(g->dspark_target_h[i], 0, tmp, (uint64_t)DS4_N_EMBD * 4))
+                for (int j = 0; j < (int)DS4_N_EMBD; j++) th[i] += (double)tmp[j] * tmp[j];
+        free(tmp);
+        fprintf(stderr, "ds4: dspark cond main_x=%.3f target_h=[%.2f,%.2f,%.2f] n_raw=[%u,%u,%u]\n",
+                sqrt(mn), sqrt(th[0]), sqrt(th[1]), sqrt(th[2]),
+                g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2]);
     }
 
     /* Step 5: Markov refine — sequential over N positions */
@@ -4849,10 +4861,14 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         return -1;
     }
 
-    /* Step 7: seed draft KV cache for committed positions */
-    if (commit_drafts > 0)
-        gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights,
-                                        (uint32_t)commit_drafts);
+    /* Step 7: seed draft KV cache for the committed positions.  first_token is
+     * ALWAYS committed in Step 1, so seed 1 + commit_drafts rows UNCONDITIONALLY.
+     * The old `if (commit_drafts > 0)` gate never seeded first_token and skipped
+     * entirely on 0-accept steps, so the drafter KV stayed empty (n_raw==0): it
+     * attended to no context, drafted garbage, got ~0 accepts, and never seeded
+     * -- a chicken-and-egg deadlock that pinned acceptance near 0. */
+    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights,
+                                    (uint32_t)(1 + commit_drafts));
 
     /* Step 8: return first_token followed by the accepted drafts.  The caller
      * emits only the tokens returned here, so first_token — committed to the
