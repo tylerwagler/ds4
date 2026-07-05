@@ -4864,8 +4864,18 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         s->checkpoint.len = saved_len;
         ok_state = spec_frontier_restore(&frontier, s);
         for (int i = 0; ok_state && i < commit_drafts; i++) {
-            if (ds4_session_eval(s, refined_ids[i + 1], err, errlen) != 0)
+            if (ds4_session_eval(s, refined_ids[i + 1], err, errlen) != 0) {
                 ok_state = false;
+                break;
+            }
+            /* The single-token decode above just captured THIS accepted
+             * position's anchor-layer target hiddens.  Project them and seed the
+             * drafter KV so each accepted draft gets its OWN conditioning instead
+             * of first_token's (reusing first_token's was measured to hurt).
+             * This is the per-position content fix -- the real lever on
+             * acceptance -- and it is free here (the decode already ran). */
+            if (gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
+                gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
         }
     }
 
