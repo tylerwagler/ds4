@@ -4677,6 +4677,9 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     ds4_gpu_graph *g = &s->graph;
     const uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     int n_accept = 0;
+    const int dspark_stats = getenv("DS4_DSPARK_STATS") != NULL;
+    const double dspark_t0 = dspark_stats ? now_sec() : 0.0;
+    double dspark_draft_ms = 0.0;
 
     /* Step 1: run target decode for the first token */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -4692,10 +4695,15 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         draft_ids[i] = DS4_DSPARK_NOISE_TOKEN_ID;
 
     /* Step 4: run draft forward → N-token base logits in g->spec_logits */
+    const double dspark_draft_t0 = dspark_stats ? now_sec() : 0.0;
     if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
                                          &e->dspark_model, &e->dspark_weights,
                                          g->spec_logits, draft_ids, n_draft))
         return -1;
+    if (dspark_stats) {
+        (void)ds4_gpu_synchronize();
+        dspark_draft_ms = (now_sec() - dspark_draft_t0) * 1000.0;
+    }
 
     /* Step 5: Markov refine — sequential over N positions */
     const ds4_dspark_weights *w = &e->dspark_weights;
@@ -4780,6 +4788,11 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
             commit_drafts++;
         }
     }
+
+    if (dspark_stats)
+        fprintf(stderr, "ds4: dspark step draft_n=%d committed=%d draft_ms=%.1f step_ms=%.1f\n",
+                draft_n, commit_drafts, dspark_draft_ms,
+                (now_sec() - dspark_t0) * 1000.0);
 
     bool ok_state = true;
     if (commit_drafts == draft_n) {
