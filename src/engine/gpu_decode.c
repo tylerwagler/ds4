@@ -2963,10 +2963,12 @@ bool gpu_graph_dspark_draft_forward(
 
     g->comp_ratio_override = prev_comp;
 
-    /* Batch output head → N-token logits in g->spec_logits */
+    /* Batch output head → N-token logits in g->spec_logits.  Use the DSpark
+     * drafter's OWN hc_head + norm (dspark.2.*) with the shared vocab head, NOT
+     * the main model's output head (which was corrupting the draft logits). */
     if (ok) {
-        ok = gpu_graph_encode_output_head_batch(
-            g, base_model, base_weights, n_draft, DS4_N_VOCAB);
+        ok = gpu_graph_encode_dspark_output_head_batch(
+            g, dspark_model, w, base_model, base_weights, n_draft, DS4_N_VOCAB);
     }
 
     /* The output head already wrote into g->spec_logits.  Callers that pass a
@@ -3132,6 +3134,61 @@ bool gpu_graph_encode_output_head_batch(
                                             vocab_dim, output_norm, n_tokens) != 0;
     }
 
+    ds4_gpu_tensor_free(logits);
+    ds4_gpu_tensor_free(output_norm);
+    ds4_gpu_tensor_free(output_embd);
+    ds4_gpu_tensor_free(output_weights);
+    ds4_gpu_tensor_free(output_pre);
+    return ok;
+}
+
+/* DSpark drafter output head.  Collapses the drafter's final HC with the DSpark
+ * block's OWN head (dspark.2.hc_head_fn/scale/base) and norm (dspark.2.norm),
+ * then projects to vocab with the SHARED main output head (self.head in the
+ * reference).  The plain gpu_graph_encode_output_head_batch used the MAIN model's
+ * output_hc and output_norm weights for the drafter -- wrong weights that
+ * corrupted the draft base logits (base0_hit was ~29%). */
+bool gpu_graph_encode_dspark_output_head_batch(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        const ds4_model          *base_model,
+        const ds4_weights        *bw,
+        uint32_t                  n_tokens,
+        uint64_t                  vocab_dim) {
+    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *output_pre = ds4_gpu_tensor_view(g->batch_hc_mix, 0, (uint64_t)n_tokens * DS4_N_HC * sizeof(float));
+    ds4_gpu_tensor *output_weights = ds4_gpu_tensor_view(g->batch_hc_split, 0, (uint64_t)n_tokens * DS4_N_HC * sizeof(float));
+    ds4_gpu_tensor *output_embd = ds4_gpu_tensor_view(g->batch_ffn_cur, 0, (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
+    ds4_gpu_tensor *output_norm = ds4_gpu_tensor_view(g->batch_ffn_norm, 0, (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
+    bool ok = output_pre && output_weights && output_embd && output_norm && logits;
+    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, g->batch_cur_hc,
+                                                     (uint32_t)hc_dim, n_tokens, DS4_RMS_EPS) != 0;
+    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre, dspark_model, dw->hc_head_fn,
+                                               hc_dim, DS4_N_HC, g->batch_flat_hc, n_tokens) != 0;
+    if (ok) ok = ds4_gpu_output_hc_weights_tensor(output_weights, output_pre,
+                                                  dspark_model->map, dspark_model->size,
+                                                  dw->hc_head_scale->abs_offset,
+                                                  dw->hc_head_base->abs_offset,
+                                                  DS4_N_HC, DS4_HC_EPS) != 0;
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, output_weights,
+                                                DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(output_norm, output_embd,
+                                                     dspark_model->map, dspark_model->size,
+                                                     dw->final_norm->abs_offset,
+                                                     DS4_N_EMBD, n_tokens, DS4_RMS_EPS) != 0;
+    if (ok) {
+        if (bw->output->type == DS4_TENSOR_BF16)
+            ok = ds4_gpu_matmul_bf16_tensor(logits, base_model->map, base_model->size,
+                                            bw->output->abs_offset, DS4_N_EMBD, vocab_dim,
+                                            output_norm, n_tokens) != 0;
+        else
+            ok = ds4_gpu_matmul_mxfp8_tensor(logits, base_model->map, base_model->size,
+                                             bw->output->abs_offset, DS4_N_EMBD, vocab_dim,
+                                             output_norm, n_tokens) != 0;
+    }
     ds4_gpu_tensor_free(logits);
     ds4_gpu_tensor_free(output_norm);
     ds4_gpu_tensor_free(output_embd);

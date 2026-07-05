@@ -2275,6 +2275,14 @@ bool gpu_graph_encode_output_head_batch(
         const ds4_weights     *weights,
         uint32_t               n_tokens,
         uint64_t               vocab_dim);
+bool gpu_graph_encode_dspark_output_head_batch(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        const ds4_model          *base_model,
+        const ds4_weights        *bw,
+        uint32_t                  n_tokens,
+        uint64_t                  vocab_dim);
 bool gpu_graph_dspark_project_main_x(
         ds4_gpu_graph          *g,
         const ds4_model         *dspark_model,
