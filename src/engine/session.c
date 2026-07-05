@@ -4681,6 +4681,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     const double dspark_t0 = dspark_stats ? now_sec() : 0.0;
     double dspark_draft_ms = 0.0;
     int dspark_base0 = -1;   /* draft-forward's row-0 argmax (pre-markov) */
+    double dspark_markov_ms = 0.0, dspark_snap_ms = 0.0, dspark_verify_ms = 0.0;
 
     /* Step 1: run target decode for the first token */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -4739,6 +4740,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
 
     ds4_gpu_tensor *dspark_logits = ds4_gpu_tensor_alloc(vocab_bytes);
     if (!dspark_logits) return -1;
+    const double dspark_mk_t0 = dspark_stats ? now_sec() : 0.0;
 
     /* refined_ids[0] holds first_token; positions 1..n_draft hold the refined
      * drafts, so the array needs n_draft + 1 slots (17 at the clamp of 16). */
@@ -4764,6 +4766,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         }
     }
     ds4_gpu_tensor_free(dspark_logits);
+    if (dspark_stats) dspark_markov_ms = (now_sec() - dspark_mk_t0) * 1000.0;
 
     /* Step 6: verify drafts against target, rejection sampling.
      *
@@ -4778,18 +4781,22 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
 
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
+    const double dspark_snap_t0 = dspark_stats ? now_sec() : 0.0;
     bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    if (dspark_stats) dspark_snap_ms = (now_sec() - dspark_snap_t0) * 1000.0;
 
     for (int i = 0; i < draft_n; i++)
         token_vec_push(&s->checkpoint, refined_ids[i + 1]);
 
     int *row_tops = xmalloc((size_t)draft_n * sizeof(int));
+    const double dspark_verify_t0 = dspark_stats ? now_sec() : 0.0;
     bool verify_ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
                                                     &s->checkpoint,
                                                     (uint32_t)saved_len,
                                                     (uint32_t)draft_n,
                                                     false,
                                                     row_tops, NULL);
+    if (dspark_stats) dspark_verify_ms = (now_sec() - dspark_verify_t0) * 1000.0;
     if (!verify_ok) {
         s->checkpoint.len = saved_len;
         if (have_frontier) (void)spec_frontier_restore(&frontier, s);
@@ -4815,12 +4822,14 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
 
     if (dspark_stats)
         fprintf(stderr, "ds4: dspark step draft_n=%d committed=%d tgt_next=%d base0_top=%d refined1=%d "
-                        "base0_hit=%d refined1_hit=%d draft_ms=%.1f step_ms=%.1f\n",
+                        "base0_hit=%d refined1_hit=%d draft_ms=%.1f markov_ms=%.1f snap_ms=%.1f "
+                        "verify_ms=%.1f step_ms=%.1f\n",
                 draft_n, commit_drafts,
                 sample_argmax(s->logits, DS4_N_VOCAB), dspark_base0, refined_ids[1],
                 dspark_base0 == sample_argmax(s->logits, DS4_N_VOCAB),
                 refined_ids[1] == sample_argmax(s->logits, DS4_N_VOCAB),
-                dspark_draft_ms, (now_sec() - dspark_t0) * 1000.0);
+                dspark_draft_ms, dspark_markov_ms, dspark_snap_ms, dspark_verify_ms,
+                (now_sec() - dspark_t0) * 1000.0);
 
     bool ok_state = true;
     if (commit_drafts == draft_n) {
