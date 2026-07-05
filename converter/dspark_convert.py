@@ -15,7 +15,15 @@ set. Phase 2 (Sparky, GB10+CUTLASS): stream the bytes through the p0conv codecs 
 
   usage: python3 dspark_convert.py manifest [SNAPSHOT_DIR]
 """
-import json, os, re, sys, struct, collections
+import json, os, re, sys, struct, collections, subprocess
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from p0conv import SafeTensors, repack_mxfp8
+
+PACK_CLI = os.environ.get("DS4_MXFP4_PACK_CLI",
+                          os.path.expanduser("~/Projects/AI/temp/p0/mxfp4_pack_source_cli"))
+ALIGN = 32
+WK = {"gate": "w1", "up": "w3", "down": "w2"}   # ds4 routed/shared slot -> HF expert matrix
 
 DEF_SNAP = ("/mnt/pve1-fast/hub/models--deepseek-ai--DeepSeek-V4-Flash-DSpark/"
             "snapshots/913f0657a874f76844e2e91cbe706dbcaceeb6d7")
@@ -188,9 +196,127 @@ def cmd_manifest(snap):
     print(f"\n{'OK — mapping complete and covers the loader' if ok else 'INCOMPLETE — see above'}")
     return 0 if ok else 1
 
+# ---------------------------------------------------------------------------
+# Phase 2: byte materialization -> ds4 dspark sidecar GGUF
+# ---------------------------------------------------------------------------
+class ShardReader:
+    def __init__(self, snap):
+        self.snap = snap
+        self.wm = json.load(open(os.path.join(snap, "model.safetensors.index.json")))["weight_map"]
+        self._st = {}
+    def st(self, name):
+        sh = self.wm[name]
+        if sh not in self._st:
+            self._st[sh] = SafeTensors(os.path.join(self.snap, sh))
+        return self._st[sh]
+    def get(self, name):  return self.st(name).get(name)              # bf16->f32; fp8/i8->uint8/int8
+    def shape(self, name): return self.st(name).meta(name)["shape"]
+
+def gdims(shape):
+    return [shape[0]] if len(shape) == 1 else list(reversed(shape))   # [out,in] -> gguf [in,out]
+
+def w_str(s):
+    b = s.encode(); return struct.pack("<Q", len(b)) + b
+def kv_str(k, v): return w_str(k) + struct.pack("<I", 8) + w_str(v)
+def kv_u32(k, v): return w_str(k) + struct.pack("<I", 4) + struct.pack("<I", v)
+
+def _expert_stack(reader, li, tgt, tmp):
+    """Extract 256 experts' E2M1 + E8M0 for one (layer,slot), stacked, to temp files.
+    Returns (e2m1_path, e8m0_path, N, K)."""
+    wk = WK[tgt]
+    e2 = np.stack([reader.get(f"mtp.{li}.ffn.experts.{e}.{wk}.weight").astype(np.uint8)
+                   for e in range(256)])                                # [256, out, in/2]
+    e8 = np.stack([reader.get(f"mtp.{li}.ffn.experts.{e}.{wk}.scale").astype(np.uint8)
+                   for e in range(256)])                                # [256, out, in/32]
+    N = e2.shape[1]; K = e2.shape[2] * 2                                # N=out, K=in
+    pe = f"{tmp}/L{li}_{tgt}.e2m1"; ps = f"{tmp}/L{li}_{tgt}.e8m0"
+    e2.tofile(pe); e8.tofile(ps)
+    del e2, e8
+    return pe, ps, N, K
+
+def cmd_emit(snap, out_path):
+    cfg = json.load(open(os.path.join(snap, "config.json")))
+    embd = int(cfg["hidden_size"]); tids = cfg["dspark_target_layer_ids"]
+    reader = ShardReader(snap)
+    produced, dropped, unmapped, shape, dtype = build_manifest(snap)
+    assert not unmapped and set(produced) == required_dspark_tensors(), "manifest invalid; run `manifest`"
+
+    tmp = os.environ.get("DSPARK_TMP", os.path.expanduser("~/Projects/AI/temp/dspark_pack"))
+    os.makedirs(tmp, exist_ok=True)
+
+    # ---- plan every tensor: (name, gguf_type, dims, size, producer) ----
+    plan = []
+    for d in sorted(produced):
+        info = produced[d]; t = target_type(d)
+        if t == T_CUTLASS_MXFP4:
+            m = re.match(r"dspark\.(\d+)\.ffn_(gate|up|down)_exps\.weight", d)
+            li, tgt = int(m.group(1)), m.group(2)
+            print(f"  pack experts {d} ...", flush=True)
+            pe, ps, N, K = _expert_stack(reader, li, tgt, tmp)
+            blob = f"{tmp}/L{li}_{tgt}.cutlass"
+            subprocess.run([PACK_CLI, "--stacked", pe, ps, str(N), str(K), "256", blob],
+                           check=True, stdout=subprocess.DEVNULL)
+            os.remove(pe); os.remove(ps)
+            plan.append([d, T_CUTLASS_MXFP4, [K, N, 256], os.path.getsize(blob), ("blob", blob)])
+        elif t == T_FP8:
+            wsrc = info["srcs"][0]; ssrc = info["scales"][0]
+            dims = gdims(shape[wsrc]); nel = 1
+            for x in dims: nel *= x
+            plan.append([d, T_FP8, dims, nel // 32 * 33, ("mxfp8", wsrc, ssrc)])
+        else:  # F32 (upcast bf16/f32)
+            src = info["srcs"][0]; dims = gdims(shape[src]); nel = 1
+            for x in dims: nel *= x
+            plan.append([d, T_F32, dims, nel * 4, ("f32", src)])
+
+    # ---- metadata ----
+    kv = (kv_str("general.architecture", "deepseek4_dspark_support")
+          + kv_str("general.name", "DeepSeek V4 Flash DSpark support")
+          + kv_u32("deepseek_v4_dspark.embedding_length", embd)
+          + kv_u32("deepseek4.expert_count", int(cfg["n_routed_experts"]))
+          + kv_u32("dspark.target_layer_ids.0", int(tids[0]))
+          + kv_u32("dspark.target_layer_ids.1", int(tids[1]))
+          + kv_u32("dspark.target_layer_ids.2", int(tids[2])))
+    n_kv = 7
+
+    # ---- offsets + tensor infos ----
+    off = 0; infos = b""
+    for name, typ, dims, size, _ in plan:
+        infos += w_str(name) + struct.pack("<I", len(dims))
+        infos += b"".join(struct.pack("<Q", d) for d in dims)
+        infos += struct.pack("<I", typ) + struct.pack("<Q", off)
+        off = (off + size + ALIGN - 1) // ALIGN * ALIGN
+    hdr = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", len(plan)) + struct.pack("<Q", n_kv) + kv
+    pre = hdr + infos; pad = (-len(pre)) % ALIGN
+
+    # ---- write ----
+    CH = 64 * 1024 * 1024
+    with open(out_path, "wb") as o:
+        o.write(pre); o.write(b"\x00" * pad)
+        for name, typ, dims, size, prod in plan:
+            if prod[0] == "blob":
+                with open(prod[1], "rb") as bf:
+                    while (c := bf.read(CH)): o.write(c)
+                os.remove(prod[1])
+            elif prod[0] == "mxfp8":
+                w = reader.get(prod[1]); s = reader.get(prod[2])
+                b = repack_mxfp8(w, s); assert len(b) == size, (name, len(b), size)
+                o.write(b)
+            else:  # f32
+                b = reader.get(prod[1]).astype(np.float32).tobytes()
+                assert len(b) == size, (name, len(b), size)
+                o.write(b)
+            o.write(b"\x00" * ((-size) % ALIGN))
+    total = os.path.getsize(out_path)
+    print(f"WROTE {out_path}  {total/2**30:.2f} GiB  tensors={len(plan)}  kv={n_kv}")
+    print(f"  target_layer_ids={tids}  embedding_length={embd}")
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "manifest"
     snap = sys.argv[2] if len(sys.argv) > 2 else DEF_SNAP
     if cmd == "manifest":
         sys.exit(cmd_manifest(snap))
+    if cmd == "emit":
+        out = sys.argv[3] if len(sys.argv) > 3 else \
+            "/home/tyler/Projects/AI/ds4-gguf/dspark-drafter.gguf"
+        sys.exit(cmd_emit(snap, out))
     print(f"unknown command: {cmd}"); sys.exit(2)
