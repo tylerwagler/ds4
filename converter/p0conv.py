@@ -46,7 +46,10 @@ def e8m0_to_scale(b):  # uint8 -> 2^(b-127); 255 is NaN in E8M0
 
 def q8_0_encode(w_f32):
     """f32 [out,in] -> GGUF Q8_0 bytes, row-major, in/32 blocks/row of 34B = [f16 d][32 int8].
-    The fused attn-output kernels are NOT FP8-aware, so attn_output must be Q8_0 (lossy)."""
+    LEGACY / no longer needed for attn_output. As of P2e the fused attn-output kernels
+    (ds4_gpu_attention_output_low_tensor + ds4_gpu_matmul_fp8_hc_expand_tensor) ARE FP8_E4M3-
+    aware -- oracle-zeroq8 ships attn_output_a/b as FP8_E4M3 and runs coherently. So the
+    (dspark) converter emits attn_output via repack_mxfp8 (byte-lossless), NOT Q8_0."""
     out,IN=w_f32.shape; assert IN%32==0, IN
     x=w_f32.reshape(out, IN//32, 32).astype(np.float32)
     amax=np.abs(x).max(axis=2)                          # [out, in/32]
