@@ -2158,7 +2158,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                (uint32_t)routed_out_dim,
                                                g->batch_router_selected,
                                                g->batch_router_weights,
-                                               DS4_N_EXPERT,
+                                               ds4_layer_n_expert(il),
                                                DS4_N_EXPERT_USED,
                                                DS4_SWIGLU_CLAMP_EXP,
                                                g->batch_ffn_norm,

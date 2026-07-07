@@ -367,7 +367,7 @@ ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     table.model_map = model->map;
     table.model_size = model->size;
     table.layer = il;
-    table.n_total_expert = DS4_N_EXPERT;
+    table.n_total_expert = ds4_layer_n_expert(il);
     table.gate_offset = layer->ffn_gate_exps ? layer->ffn_gate_exps->abs_offset : 0;
     table.up_offset = layer->ffn_up_exps ? layer->ffn_up_exps->abs_offset : 0;
     table.down_offset = layer->ffn_down_exps ? layer->ffn_down_exps->abs_offset : 0;
@@ -658,11 +658,15 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+        /* Router + bias stay padded to the full n_expert; only the expert
+         * weight tensors are dense-trimmed to the per-layer survivor count
+         * (== n_expert for un-pruned models). */
+        const uint32_t n_layer_expert = ds4_layer_n_expert(il);
         tensor_expect_plain_or_mxfp8(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_layer_expert);
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
@@ -879,6 +883,50 @@ static void config_expect_f32(const char *name, float got, float expected);
 
 
 
+/* REAP ds4-compact-v1 expert pruning: populate g_ds4_layer_expert_count from
+ * reap.layer.keep_count. Absent/disabled -> array stays zeroed (every layer
+ * falls back to the full n_expert). When present, each entry must be in
+ * [1, n_expert]; the router/bias tensors stay padded to n_expert and only the
+ * expert weight tensors are dense-trimmed to keep_count. */
+static void validate_reap_metadata(const ds4_model *m) {
+    memset(g_ds4_layer_expert_count, 0, sizeof(g_ds4_layer_expert_count));
+
+    bool enabled = false;
+    if (!model_get_bool(m, "reap.enabled", &enabled) || !enabled) return;
+
+    const char *key = "reap.layer.keep_count";
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr) ||
+        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
+        ds4_die("reap.enabled is set but reap.layer.keep_count is missing or not an int32/uint32 array");
+    }
+    if (arr.len < DS4_N_LAYER) {
+        ds4_die("reap.layer.keep_count is shorter than the layer count");
+    }
+
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t got = 0;
+        if (arr.type == GGUF_VALUE_UINT32) {
+            if (!cursor_u32(&c, &got)) ds4_die(c.error);
+        } else {
+            int32_t v = 0;
+            if (!cursor_read(&c, &v, sizeof(v))) ds4_die(c.error);
+            if (v < 0) ds4_die("reap.layer.keep_count contains a negative value");
+            got = (uint32_t)v;
+        }
+        if (got == 0 || got > DS4_N_EXPERT) {
+            fprintf(stderr,
+                    "ds4: reap.layer.keep_count[%u]=%u out of range [1, %u]\n",
+                    il, got, DS4_N_EXPERT);
+            exit(1);
+        }
+        g_ds4_layer_expert_count[il] = got;
+    }
+}
+
+
+
 static void validate_swiglu_clamp_metadata(const ds4_model *m) {
     const char *key = "deepseek4.swiglu_clamp_exp";
     ds4_array_ref arr;
@@ -1021,6 +1069,8 @@ void config_validate_model(const ds4_model *m) {
 
     config_validate_fixed_shape(n_layer);
     validate_compress_ratio_metadata(m);
+
+    validate_reap_metadata(m);
 
     validate_swiglu_clamp_metadata(m);
 

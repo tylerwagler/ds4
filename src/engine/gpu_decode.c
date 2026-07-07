@@ -2281,7 +2281,7 @@ bool gpu_graph_encode_decode_layer(
                                                      (uint32_t)down_in_dim,
                                                      (uint32_t)routed_out_dim,
                                                      g->router_selected, g->router_weights,
-                                                     DS4_N_EXPERT,
+                                                     ds4_layer_n_expert(il),
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
         DS4_CUDA_PROFILE_DECODE_STAGE("routed_moe");
@@ -2455,7 +2455,7 @@ bool gpu_graph_encode_decode_layer(
                                                      (uint32_t)down_in_dim,
                                                      (uint32_t)routed_out_dim,
                                                      g->router_selected, g->router_weights,
-                                                     DS4_N_EXPERT,
+                                                     ds4_layer_n_expert(il),
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
         DS4_CUDA_PROFILE_DECODE_STAGE("routed_moe");
@@ -2540,7 +2540,7 @@ bool gpu_graph_encode_decode_layer(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT,
+                                                 ds4_layer_n_expert(il),
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                  il) != 0;
     DS4_CUDA_PROFILE_DECODE_STAGE("routed_moe");

@@ -120,6 +120,7 @@ ds4_shape g_ds4_shape = {
 
 
 uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
+uint32_t g_ds4_layer_expert_count[DS4_MAX_LAYER] = {0};
 
 
 int g_ds4_lock_fd = -1;

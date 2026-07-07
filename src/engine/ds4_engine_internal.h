@@ -1351,6 +1351,11 @@ extern const ds4_shape DS4_SHAPE_FLASH;
 extern const ds4_shape DS4_SHAPE_PRO;
 extern ds4_shape g_ds4_shape;
 extern uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER];
+/* REAP ds4-compact-v1: per-layer count of physically-present routed experts.
+ * 0 means "not set" -> falls back to n_expert (the un-pruned default). The
+ * router/bias tensors stay padded to n_expert (256); only the expert weight
+ * tensors are dense-trimmed to this count. Read from reap.layer.keep_count. */
+extern uint32_t g_ds4_layer_expert_count[DS4_MAX_LAYER];
 extern int g_ds4_lock_fd;
 extern const uint64_t iq2xxs_grid[256];
 extern int8_t iq2xxs_signed_grid[256][128][8];
@@ -1366,6 +1371,7 @@ bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend);
 void iq2xxs_signed_grid_init(void);
 void ds4_die(const char *msg);
 uint32_t ds4_layer_compress_ratio(uint32_t il);
+uint32_t ds4_layer_n_expert(uint32_t il);
 uint32_t ds4_expected_layer_compress_ratio(uint32_t il);
 void ds4_die_errno(const char *what, const char *path);
 bool ds4_streq(ds4_str s, const char *z);
