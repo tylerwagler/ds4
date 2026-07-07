@@ -4662,6 +4662,60 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return n_accept;
 }
 
+/* Softmax top-1 probability of a logit row (one pass; exp is done relative to
+ * the max, so p_top1 = 1 / sum(exp(l_i - l_max))). Used to gate DSpark drafting
+ * on base-model confidence. */
+static float dspark_base_top1_prob(const float *logits, int n) {
+    float m = logits[0];
+    for (int i = 1; i < n; i++) if (logits[i] > m) m = logits[i];
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += exp((double)(logits[i] - m));
+    return sum > 0.0 ? (float)(1.0 / sum) : 1.0f;
+}
+
+/* Diagnostic: dump the DSpark drafter's per-step inputs (target_h[3], main_x)
+ * and pre-markov base logits (spec_logits row 0) so an off-box reference forward
+ * can be diffed against ds4 to localize acceptance loss. Enabled by
+ * DS4_DSPARK_DUMP=<path>; caps at DS4_DSPARK_DUMP_STEPS (default 8) records.
+ * Record layout (little-endian): pos i32, first_token i32, then f32 arrays
+ * target_h[0..2] (DS4_N_EMBD each), main_x (DS4_N_EMBD), base0 (DS4_N_VOCAB). */
+static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token) {
+    const char *path = getenv("DS4_DSPARK_DUMP");
+    if (!path || !path[0]) return;
+    static int dumped = 0;
+    const char *lim = getenv("DS4_DSPARK_DUMP_STEPS");
+    const int max_steps = lim ? atoi(lim) : 8;
+    if (dumped >= max_steps) return;
+
+    float *emb = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *voc = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    FILE *f = fopen(path, dumped == 0 ? "wb" : "ab");
+    if (!f) { free(emb); free(voc); return; }
+    int32_t hdr[2] = { (int32_t)pos, (int32_t)first_token };
+    fwrite(hdr, sizeof(int32_t), 2, f);
+    for (int i = 0; i < 3; i++) {
+        memset(emb, 0, (size_t)DS4_N_EMBD * sizeof(float));
+        (void)ds4_gpu_tensor_read(g->dspark_target_h[i], 0, emb, (uint64_t)DS4_N_EMBD * 4);
+        fwrite(emb, sizeof(float), DS4_N_EMBD, f);
+    }
+    memset(emb, 0, (size_t)DS4_N_EMBD * sizeof(float));
+    (void)ds4_gpu_tensor_read(g->dspark_main_x, 0, emb, (uint64_t)DS4_N_EMBD * 4);
+    fwrite(emb, sizeof(float), DS4_N_EMBD, f);
+    memset(voc, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+    (void)gpu_graph_read_spec_logits_row(g, 0, voc);
+    fwrite(voc, sizeof(float), DS4_N_VOCAB, f);
+    /* block-2 output hidden feeding the drafter head (row 0): [DS4_N_HC, DS4_N_EMBD]. */
+    float *hc = xmalloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    memset(hc, 0, (size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    (void)ds4_gpu_tensor_read(g->batch_cur_hc, 0, hc, (uint64_t)DS4_N_HC * DS4_N_EMBD * 4);
+    fwrite(hc, sizeof(float), (size_t)DS4_N_HC * DS4_N_EMBD, f);
+    free(hc);
+    fclose(f);
+    dumped++;
+    fprintf(stderr, "ds4: dspark dump step %d pos=%d tok=%d -> %s\n", dumped, pos, first_token, path);
+    free(emb); free(voc);
+}
+
 int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -4682,6 +4736,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     double dspark_draft_ms = 0.0;
     int dspark_base0 = -1;   /* draft-forward's row-0 argmax (pre-markov) */
     double dspark_markov_ms = 0.0, dspark_snap_ms = 0.0, dspark_verify_ms = 0.0;
+    const int dump_pos = s->checkpoint.len;  /* first_token's sequence position */
 
     /* Step 1: run target decode for the first token */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -4702,6 +4757,31 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     draft_ids[0] = (int32_t)first_token;
     for (uint32_t i = 1; i < n_draft; i++)
         draft_ids[i] = DS4_DSPARK_NOISE_TOKEN_ID;
+
+    /* Step 3b: confidence gate. Draft acceptance tracks the base model's own
+     * certainty (the drafter is trained to mimic it), so only spend the
+     * draft+verify budget when the target is peaked; on uncertain tokens the
+     * verify would almost always reject and we'd pay ~100-150ms for nothing.
+     * Skipping here costs exactly a plain decode (first_token already committed
+     * in Step 1, s->logits intact). Steps 2/2b already seeded this position into
+     * the drafter KV, so its rolling context stays complete for later steps.
+     * DS4_DSPARK_MIN_CONF=0 (default) preserves the old always-draft behavior. */
+    {
+        const char *mc = getenv("DS4_DSPARK_MIN_CONF");
+        const float min_conf = mc ? (float)atof(mc) : 0.0f;
+        if (min_conf > 0.0f) {
+            const float p = dspark_base_top1_prob(s->logits, DS4_N_VOCAB);
+            if (p < min_conf) {
+                if (dspark_stats)
+                    fprintf(stderr, "ds4: dspark step draft_n=%d committed=0 conf_skip p=%.3f min=%.3f "
+                                    "step_ms=%.1f\n",
+                            (int)n_draft, (double)p, (double)min_conf,
+                            (now_sec() - dspark_t0) * 1000.0);
+                accepted[n_accept++] = first_token;
+                return n_accept;
+            }
+        }
+    }
 
     /* Step 4: run draft forward → N-token base logits in g->spec_logits */
     const double dspark_draft_t0 = dspark_stats ? now_sec() : 0.0;
@@ -4767,6 +4847,24 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     }
     ds4_gpu_tensor_free(dspark_logits);
     if (dspark_stats) dspark_markov_ms = (now_sec() - dspark_mk_t0) * 1000.0;
+
+    dspark_dump_step(g, dump_pos, first_token);
+
+    /* Step 5b: fast reject. The first draft is validated for FREE against
+     * s->logits (Step 1's P(next | first_token)); only drafts 2..N need the
+     * batch verify. If the first draft already disagrees, commit_drafts is 0 no
+     * matter what the verify says -- so skip the snapshot/verify/restore
+     * entirely (~100-150ms saved) and emit just first_token. Nothing beyond
+     * Step 1 is allocated here (dspark_logits already freed). */
+    if (sample_argmax(s->logits, DS4_N_VOCAB) != refined_ids[1]) {
+        if (dspark_stats)
+            fprintf(stderr, "ds4: dspark step draft_n=%d committed=0 verify_skip "
+                            "draft_ms=%.1f markov_ms=%.1f step_ms=%.1f\n",
+                    (int)n_draft, dspark_draft_ms, dspark_markov_ms,
+                    (now_sec() - dspark_t0) * 1000.0);
+        accepted[n_accept++] = first_token;
+        return n_accept;
+    }
 
     /* Step 6: verify drafts against target, rejection sampling.
      *
