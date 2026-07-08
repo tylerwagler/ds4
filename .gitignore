@@ -28,3 +28,6 @@ __pycache__/
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
 .claude/
+
+# --- working files (see CLAUDE.md: all temp/scratch files live here) ---
+/temp/
