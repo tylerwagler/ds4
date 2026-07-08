@@ -121,13 +121,20 @@ extern "C" int ds4_gpu_dspark_markov_step_model(
     const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
     if (grid_dim > 65535) return 0;
 
-    ds4_gpu_tensor *id_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
-    ds4_gpu_tensor *val_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-    if (!id_dev || !val_dev) {
+    /* Persistent reduce buffers: grid_dim is fixed for a given vocab, and this
+     * runs once per draft position per spec step -- per-call cudaMalloc/cudaFree
+     * pairs were 2 device-serializing allocs each. Single submission thread. */
+    static ds4_gpu_tensor *id_dev = NULL;
+    static ds4_gpu_tensor *val_dev = NULL;
+    static uint32_t reduce_cap = 0;
+    if (grid_dim > reduce_cap) {
         ds4_gpu_tensor_free(id_dev);
         ds4_gpu_tensor_free(val_dev);
-        return 0;
+        id_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+        val_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+        reduce_cap = (id_dev && val_dev) ? grid_dim : 0;
     }
+    if (!id_dev || !val_dev) return 0;
 
     dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
         (float *)refined_logits->ptr,
@@ -139,9 +146,6 @@ extern "C" int ds4_gpu_dspark_markov_step_model(
     int rc = 0;
     if (cudaGetLastError() == cudaSuccess)
         rc = dspark_markov_reduce_blocks(id_dev, val_dev, grid_dim, refined_id_dst);
-
-    ds4_gpu_tensor_free(id_dev);
-    ds4_gpu_tensor_free(val_dev);
     return rc;
 }
 

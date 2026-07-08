@@ -579,6 +579,14 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
         g->spec_comp_scratch_row = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
         ok = ok && g->spec_comp_scratch_row;
         g->spec_comp_save_n = 0;
+        g->dspark_concat = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
+        g->dspark_proj_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->dspark_seed_kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        g->dspark_seed_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        g->dspark_seed_rot = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        g->dspark_markov_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+        ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
+             g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits;
     }
     /*
      * DSpark reuses the MTP speculative-logits buffer for its N-token draft

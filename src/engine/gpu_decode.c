@@ -2683,20 +2683,17 @@ bool gpu_graph_dspark_project_main_x(
         if (!g->dspark_target_h[i]) return false;
     }
 
-    ds4_gpu_tensor *target_concat = ds4_gpu_tensor_alloc(concat_dim * sizeof(float));
-    if (!target_concat) return false;
+    /* Persistent scratch: this runs up to 5x per fused spec step and each
+     * cudaMalloc/cudaFree pair serializes the device. */
+    ds4_gpu_tensor *target_concat = g->dspark_concat;
+    ds4_gpu_tensor *proj_out = g->dspark_proj_out;
+    if (!target_concat || !proj_out) return false;
 
     bool ok = true;
     for (int i = 0; i < 3; i++) {
         ok = ds4_gpu_tensor_copy(target_concat, (uint64_t)i * E * sizeof(float),
                                  g->dspark_target_h[i], 0, E * sizeof(float)) != 0;
         if (!ok) break;
-    }
-
-    ds4_gpu_tensor *proj_out = NULL;
-    if (ok) {
-        proj_out = ds4_gpu_tensor_alloc(E * sizeof(float));
-        ok = proj_out != NULL;
     }
 
     if (ok) {
@@ -2718,8 +2715,6 @@ bool gpu_graph_dspark_project_main_x(
                                             DS4_RMS_EPS) != 0;
     }
 
-    ds4_gpu_tensor_free(proj_out);
-    ds4_gpu_tensor_free(target_concat);
     return ok;
 }
 
@@ -2729,27 +2724,27 @@ void gpu_graph_dspark_seed_draft_kv(
         const ds4_dspark_weights *w,
         uint32_t                 n_rows) {
     const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    /* Persistent scratch (dspark_seed_*): the fused loop seeds up to 5 rows per
+     * step across 3 layers; per-call cudaMalloc/cudaFree here was ~9 device-
+     * serializing pairs per call. */
+    ds4_gpu_tensor *kv_out = g->dspark_seed_kv;
+    ds4_gpu_tensor *kv_norm = g->dspark_seed_norm;
+    ds4_gpu_tensor *kv_rot = g->dspark_seed_rot;
+    if (!kv_out || !kv_norm || !kv_rot) return;
     for (int li = 0; li < 3; li++) {
-        ds4_gpu_tensor *kv_out = ds4_gpu_tensor_alloc(kv_bytes);
-        if (!kv_out) return;
         if (!ds4_gpu_matmul_mxfp8_tensor(kv_out,
                                           dspark_model->map,
                                           dspark_model->size,
                                           w->layer[li].attn_kv->abs_offset,
                                           DS4_N_EMBD, DS4_N_HEAD_DIM,
                                           g->dspark_main_x, 1)) {
-            ds4_gpu_tensor_free(kv_out);
             continue;
         }
-        ds4_gpu_tensor *kv_norm = ds4_gpu_tensor_alloc(kv_bytes);
-        if (!kv_norm) { ds4_gpu_tensor_free(kv_out); continue; }
         if (!ds4_gpu_rms_norm_weight_tensor(kv_norm, kv_out,
                                              dspark_model->map,
                                              dspark_model->size,
                                              w->layer[li].attn_kv_a_norm->abs_offset,
                                              DS4_N_HEAD_DIM, DS4_RMS_EPS)) {
-            ds4_gpu_tensor_free(kv_norm);
-            ds4_gpu_tensor_free(kv_out);
             continue;
         }
         /* Seed one KV row per committed position.  Each row is RoPE'd at its OWN
@@ -2758,8 +2753,6 @@ void gpu_graph_dspark_seed_draft_kv(
          * at start_pos).  kv_norm holds the un-rotated vector; we rotate a fresh
          * copy per position so multi-row seeds (accepted drafts) land at distinct
          * positions rather than all sharing the first row's rotation. */
-        ds4_gpu_tensor *kv_rot = ds4_gpu_tensor_alloc(kv_bytes);
-        if (!kv_rot) { ds4_gpu_tensor_free(kv_norm); ds4_gpu_tensor_free(kv_out); continue; }
         for (uint32_t i = 0; i < n_rows; i++) {
             const uint32_t pos = g->dspark_n_raw[li];
             const uint32_t row = pos % DS4_DSPARK_DRAFT_WINDOW;
@@ -2774,9 +2767,6 @@ void gpu_graph_dspark_seed_draft_kv(
                                 kv_rot, 0, kv_bytes);
             g->dspark_n_raw[li]++;
         }
-        ds4_gpu_tensor_free(kv_rot);
-        ds4_gpu_tensor_free(kv_norm);
-        ds4_gpu_tensor_free(kv_out);
     }
 }
 

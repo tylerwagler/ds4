@@ -1065,6 +1065,14 @@ typedef struct {
     ds4_gpu_tensor *spec_icomp_sc_save[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_comp_scratch_row;   /* emit sink during roll-forward */
     uint32_t spec_comp_save_n;
+    /* Persistent drafter scratch (was per-call cudaMalloc/cudaFree churn --
+     * cudaFree device-syncs, and the fused loop projects/seeds up to 5x/step). */
+    ds4_gpu_tensor *dspark_concat;       /* [3*N_EMBD] target_h concat */
+    ds4_gpu_tensor *dspark_proj_out;     /* [N_EMBD] pre-norm projection */
+    ds4_gpu_tensor *dspark_seed_kv;      /* [HEAD_DIM] seed kv scratch */
+    ds4_gpu_tensor *dspark_seed_norm;    /* [HEAD_DIM] */
+    ds4_gpu_tensor *dspark_seed_rot;     /* [HEAD_DIM] */
+    ds4_gpu_tensor *dspark_markov_logits; /* [N_VOCAB] markov refine scratch */
 
     /* DSpark draft KV raw caches (one per draft layer, window=128) */
     ds4_gpu_tensor *dspark_raw_cache[3];

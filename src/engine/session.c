@@ -4924,8 +4924,8 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                         g->spec_logits, draft_ids, n_draft))
         return n_accept;
 
-    ds4_gpu_tensor *dspark_logits = ds4_gpu_tensor_alloc(vocab_bytes);
-    if (!dspark_logits) return n_accept;
+    ds4_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
+    if (!dspark_logits || ds4_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
     int32_t refined[17];
     refined[0] = (int32_t)next_base;
     bool draft_ok = true;
@@ -4940,7 +4940,6 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                              refined[pos], vocab_size, embed_dim);
         ds4_gpu_tensor_free(base_row);
     }
-    ds4_gpu_tensor_free(dspark_logits);
     if (!draft_ok) return n_accept;
 
     /* Confidence-scheduled pending length (P1 head; keep the confident prefix). */
@@ -5085,8 +5084,8 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     const void *dmap = e->dspark_model.map;
     const uint64_t dsize = e->dspark_model.size;
 
-    ds4_gpu_tensor *dspark_logits = ds4_gpu_tensor_alloc(vocab_bytes);
-    if (!dspark_logits) return -1;
+    ds4_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
+    if (!dspark_logits || ds4_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return -1;
     const double dspark_mk_t0 = dspark_stats ? now_sec() : 0.0;
 
     /* refined_ids[0] holds first_token; positions 1..n_draft hold the refined
@@ -5097,7 +5096,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         /* Create view of spec_logits row [pos] as base logits */
         ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
             g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
-        if (!base_row) { ds4_gpu_tensor_free(dspark_logits); return -1; }
+        if (!base_row) return -1;
 
         int32_t prev = refined_ids[pos];
         bool step_ok = ds4_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
@@ -5107,12 +5106,8 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                                w->markov_w2->abs_offset,
                                                (int32_t)prev, vocab_size, embed_dim);
         ds4_gpu_tensor_free(base_row);
-        if (!step_ok) {
-            ds4_gpu_tensor_free(dspark_logits);
-            return -1;
-        }
+        if (!step_ok) return -1;
     }
-    ds4_gpu_tensor_free(dspark_logits);
     if (dspark_stats) dspark_markov_ms = (now_sec() - dspark_mk_t0) * 1000.0;
 
     dspark_dump_step(g, dump_pos, first_token, refined_ids, (int)n_draft);
