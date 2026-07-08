@@ -2938,10 +2938,21 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_heads, n_draft) != 0;
 
         /* --- HC expand + split → batch_after_attn_hc --- */
-        if (ok) ok = ds4_gpu_hc_expand_split_tensor(
-            g->batch_after_attn_hc, g->batch_attn_out,
-            g->batch_cur_hc, g->batch_hc_split,
-            DS4_N_EMBD, DS4_N_HC) != 0;
+        /* View sized to the real draft count: the CUDA side infers n_tokens from
+         * out_hc->bytes, and the raw batch tensor is allocated at prefill capacity
+         * (4096) -- passing it unviewed made every drafter block expand the FULL
+         * capacity, ~2.8 ms per call x3 blocks = ~8 ms of pure waste per spec step. */
+        if (ok) {
+            ds4_gpu_tensor *after_attn_view = ds4_gpu_tensor_view(
+                g->batch_after_attn_hc, 0,
+                (uint64_t)n_draft * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+            ok = after_attn_view &&
+                 ds4_gpu_hc_expand_split_tensor(
+                     after_attn_view, g->batch_attn_out,
+                     g->batch_cur_hc, g->batch_hc_split,
+                     DS4_N_EMBD, DS4_N_HC) != 0;
+            ds4_gpu_tensor_free(after_attn_view);
+        }
 
         /* --- FFN batch (reuses existing function) --- */
         if (ok) ok = gpu_graph_encode_layer_ffn_batch(
