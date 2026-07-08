@@ -94,11 +94,27 @@ week: per-n_batch step_ms + acceptance + text). Gates: block acceptance (target
 ≥50%), tokens/step, t/s at ctx 250 and ctx 2k. Output quality needs no gate —
 spec decode is output-lossless by construction; only speed changes.
 
+## Reference point (measured 2026-07-08)
+
+On a second system (2× DGX Spark) running **full-quality V4-Flash weights**, the
+same drafter family at draft=5 measures per-position acceptance
+**90 / 79 / 68 / 56 / 43%** (≈4.4 tokens/step) vs our
+**51 / 22 / 7 / 2%** (≈1.8 tokens/step) on the REAP25-compact 2-bit engine.
+That is the cleanest possible confirmation that requant drift — not drafter
+quality — is the ceiling, and it calibrates the retune's target envelope:
+recovering pos0 to 70–80% would make draft 3–5 profitable and put 20+ t/s in
+reach on this box. **Pilot green-light criterion: pos0 acceptance 51% → >60% on
+the 5M-token CE-only run.** The 2×Spark pair (256 GB combined) is also the
+fallback Phase-2 training venue if single-GB10 frozen-expert training proves
+tight (full-FT optimizer state fits across the pair with FSDP); training data
+still comes from this box's engine regardless.
+
 ## Risks
 
 - **H2 partially wrong** — some of the 40% ceiling may be inherent block-drafter
-  quality, not requant drift. The pilot bounds this for ~2 days of effort before
-  the full spend.
+  quality, not requant drift. ~~The pilot bounds this for ~2 days of effort
+  before the full spend.~~ *Largely retired by the full-weights reference
+  numbers above; the pilot now measures recoverability, not causality.*
 - **TV loss needs the target distribution** — top-64 logits is an approximation;
   if insufficient, re-dump with larger k (storage scales linearly).
 - **Unified-memory pressure during training** — 40 GB frozen weights + optimizer
