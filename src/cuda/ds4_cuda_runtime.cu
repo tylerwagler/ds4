@@ -2239,6 +2239,77 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 }
 
 
+/* ---- Batched tensor copy: one kernel over a device-side descriptor table. ----
+ * Built for the spec-frontier snapshot/restore paths, which copy ~126 small
+ * per-layer state tensors per fused step; as individual cudaMemcpy calls those
+ * were ~190 launches/step of pure launch overhead. Descriptors are prepared
+ * once (the tensors are fixed allocations) and replayed with a single launch.
+ * Copies are 16-byte vectorized; ds4 tensor allocations are 256B-aligned and
+ * prepare rejects any byte count that is not a multiple of 16. */
+typedef struct {
+    void *dst;
+    const void *src;
+    uint64_t bytes;
+} ds4_copy_desc;
+
+__global__ static void batched_copy_kernel(const ds4_copy_desc *descs, uint32_t n_descs) {
+    const uint32_t d = blockIdx.y;
+    if (d >= n_descs) return;
+    const ds4_copy_desc dc = descs[d];
+    const uint64_t n16 = dc.bytes >> 4;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n16;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        ((float4 *)dc.dst)[i] = ((const float4 *)dc.src)[i];
+    }
+}
+
+extern "C" void *ds4_gpu_batched_copy_prepare(
+        ds4_gpu_tensor **dst,
+        ds4_gpu_tensor **src,
+        const uint64_t *bytes,
+        uint32_t n) {
+    if (!dst || !src || !bytes || n == 0) return NULL;
+    ds4_copy_desc *h = (ds4_copy_desc *)malloc(n * sizeof(ds4_copy_desc));
+    if (!h) return NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!dst[i] || !src[i] || !dst[i]->ptr || !src[i]->ptr ||
+            bytes[i] == 0 || (bytes[i] & 15u) ||
+            bytes[i] > dst[i]->bytes || bytes[i] > src[i]->bytes) {
+            free(h);
+            return NULL;
+        }
+        h[i].dst = dst[i]->ptr;
+        h[i].src = src[i]->ptr;
+        h[i].bytes = bytes[i];
+    }
+    ds4_copy_desc *d = NULL;
+    if (cudaMalloc(&d, n * sizeof(ds4_copy_desc)) != cudaSuccess) { free(h); return NULL; }
+    if (!cuda_ok(cudaMemcpy(d, h, n * sizeof(ds4_copy_desc), cudaMemcpyHostToDevice),
+                 "batched copy descs")) {
+        cudaFree(d);
+        free(h);
+        return NULL;
+    }
+    free(h);
+    return d;
+}
+
+extern "C" void ds4_gpu_batched_copy_free(void *handle) {
+    if (handle) cudaFree(handle);
+}
+
+extern "C" int ds4_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
+    if (!handle || n_descs == 0) return 0;
+    uint32_t chunks = (uint32_t)(((max_bytes >> 4) + 255) / 256);
+    if (chunks < 1u) chunks = 1u;
+    if (chunks > 64u) chunks = 64u;
+    dim3 grid(chunks, n_descs);
+    batched_copy_kernel<<<grid, 256>>>((const ds4_copy_desc *)handle, n_descs);
+    return cuda_ok(cudaGetLastError(), "batched copy launch");
+}
+
+
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 

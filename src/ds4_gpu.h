@@ -39,6 +39,16 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
 
+/* Batched D2D copy: prepare a device-side descriptor table over fixed tensor
+ * allocations once (whole-tensor copies, byte counts multiples of 16; returns
+ * NULL on any violation), then replay all copies with one kernel launch.
+ * max_bytes is the largest descriptor's byte count (grid sizing). Built for the
+ * spec-frontier snapshot/restore paths (~126 tiny per-layer copies per step). */
+void *ds4_gpu_batched_copy_prepare(ds4_gpu_tensor **dst, ds4_gpu_tensor **src,
+                                   const uint64_t *bytes, uint32_t n);
+int ds4_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes);
+void ds4_gpu_batched_copy_free(void *handle);
+
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);

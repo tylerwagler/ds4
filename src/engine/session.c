@@ -820,29 +820,73 @@ static void spec_frontier_free(ds4_spec_frontier *f) {
 
 
 
+/* Build the batched-copy descriptor tables for the frontier snapshot/restore
+ * copy sets. All source/destination tensors are fixed allocations, so the
+ * tables are built once and replayed with one kernel launch per direction
+ * (previously ~126 cudaMemcpy launches per snapshot, again per restore). A
+ * NULL handle (prepare rejected a size, or alloc failed) keeps the loop path. */
+static void spec_frontier_copy_tables_init(ds4_gpu_graph *g) {
+    if (g->spec_frontier_copy_init) return;
+    g->spec_frontier_copy_init = 1;
+    ds4_gpu_tensor *dst[DS4_MAX_LAYER * 4];
+    ds4_gpu_tensor *src[DS4_MAX_LAYER * 4];
+    uint64_t bytes[DS4_MAX_LAYER * 4];
+    uint32_t n = 0;
+    uint64_t mx = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
+        dst[n] = g->spec_attn_state_score[il]; src[n] = g->layer_attn_state_score[il]; bytes[n++] = ab;
+        if (ab > mx) mx = ab;
+        if (ratio == 4) {
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            dst[n] = g->spec_index_state_kv[il];    src[n] = g->layer_index_state_kv[il];    bytes[n++] = ib;
+            dst[n] = g->spec_index_state_score[il]; src[n] = g->layer_index_state_score[il]; bytes[n++] = ib;
+            if (ib > mx) mx = ib;
+        }
+    }
+    if (n == 0) return;
+    g->spec_snap_copies = ds4_gpu_batched_copy_prepare(dst, src, bytes, n);
+    /* restore = the same set with src/dst swapped */
+    g->spec_restore_copies = ds4_gpu_batched_copy_prepare(src, dst, bytes, n);
+    g->spec_frontier_copy_n = n;
+    g->spec_frontier_copy_max_bytes = mx;
+}
+
 static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
     memset(f, 0, sizeof(*f));
     ds4_gpu_graph *g = &s->graph;
     f->mtp_n_raw = g->mtp_n_raw;
+    spec_frontier_copy_tables_init(g);
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         f->n_comp[il] = g->layer_n_comp[il];
         f->n_index_comp[il] = g->layer_n_index_comp[il];
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
-                                   g->layer_attn_state_kv[il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
-                                   g->layer_attn_state_score[il], 0, ab) != 0;
-        if (ratio == 4) {
-            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ok &&
-                 ds4_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
-                                       g->layer_index_state_kv[il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->spec_index_state_score[il], 0,
-                                       g->layer_index_state_score[il], 0, ib) != 0;
+    }
+    if (ok && g->spec_snap_copies) {
+        ok = ds4_gpu_batched_copy_run(g->spec_snap_copies,
+                                      g->spec_frontier_copy_n,
+                                      g->spec_frontier_copy_max_bytes) != 0;
+    } else {
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+            ok = ds4_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
+                                       g->layer_attn_state_kv[il], 0, ab) != 0 &&
+                 ds4_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
+                                       g->layer_attn_state_score[il], 0, ab) != 0;
+            if (ratio == 4) {
+                const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+                ok = ok &&
+                     ds4_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
+                                           g->layer_index_state_kv[il], 0, ib) != 0 &&
+                     ds4_gpu_tensor_copy(g->spec_index_state_score[il], 0,
+                                           g->layer_index_state_score[il], 0, ib) != 0;
+            }
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -859,22 +903,30 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
     g->mtp_n_raw = f->mtp_n_raw;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_n_comp[il] = f->n_comp[il];
         g->layer_n_index_comp[il] = f->n_index_comp[il];
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_attn_state_kv[il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_attn_state_score[il], 0, ab) != 0;
-        if (ok && ratio == 4) {
-            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_index_state_kv[il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_index_state_score[il], 0, ib) != 0;
+    }
+    if (ok && g->spec_restore_copies) {
+        ok = ds4_gpu_batched_copy_run(g->spec_restore_copies,
+                                      g->spec_frontier_copy_n,
+                                      g->spec_frontier_copy_max_bytes) != 0;
+    } else {
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+            ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                       g->spec_attn_state_kv[il], 0, ab) != 0 &&
+                 ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
+                                       g->spec_attn_state_score[il], 0, ab) != 0;
+            if (ok && ratio == 4) {
+                const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+                ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
+                                           g->spec_index_state_kv[il], 0, ib) != 0 &&
+                     ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
+                                           g->spec_index_state_score[il], 0, ib) != 0;
+            }
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;

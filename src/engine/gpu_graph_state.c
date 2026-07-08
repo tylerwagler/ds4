@@ -173,6 +173,14 @@ void gpu_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
     }
+    /* The batched-copy tables cache raw device pointers into the state tensors
+     * freed above; drop them so a rebuilt graph re-prepares fresh tables. */
+    ds4_gpu_batched_copy_free(g->spec_snap_copies);
+    ds4_gpu_batched_copy_free(g->spec_restore_copies);
+    g->spec_snap_copies = NULL;
+    g->spec_restore_copies = NULL;
+    g->spec_frontier_copy_n = 0;
+    g->spec_frontier_copy_init = 0;
     ds4_gpu_tensor_free(g->kv);
     ds4_gpu_tensor_free(g->kv_raw);
     ds4_gpu_tensor_free(g->q);

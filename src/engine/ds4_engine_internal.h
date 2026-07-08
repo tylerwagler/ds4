@@ -968,6 +968,15 @@ typedef struct {
     ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_MAX_LAYER];
+    /* Batched-copy descriptor tables for the frontier snapshot (layer->spec)
+     * and restore (spec->layer) copy sets: one kernel launch instead of ~126
+     * cudaMemcpy calls per direction. Built lazily on first snapshot; NULL
+     * handle falls back to the per-tensor copy loop. */
+    void *spec_snap_copies;
+    void *spec_restore_copies;
+    uint32_t spec_frontier_copy_n;
+    uint64_t spec_frontier_copy_max_bytes;
+    int spec_frontier_copy_init;
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_MAX_LAYER];
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
