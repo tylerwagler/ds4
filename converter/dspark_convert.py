@@ -213,7 +213,9 @@ class ShardReader:
     def shape(self, name): return self.st(name).meta(name)["shape"]
 
 def gdims(shape):
-    return [shape[0]] if len(shape) == 1 else list(reversed(shape))   # [out,in] -> gguf [in,out]
+    d = [shape[0]] if len(shape) == 1 else list(reversed(shape))      # [out,in] -> gguf [in,out]
+    d = [x for x in d if x != 1] or [1]                               # squeeze size-1 (e.g. confidence [1,4352]->[4352])
+    return d
 
 def w_str(s):
     b = s.encode(); return struct.pack("<Q", len(b)) + b
