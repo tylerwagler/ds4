@@ -2244,7 +2244,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
-    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 5;
+    /* Default draft depth 2: the measured optimum for the fused loop (16.4
+     * step_tps vs 16.0 at 3, 15.3 at 4 -- acceptance is front-loaded and the
+     * verify batch cost grows ~11ms/token in routed-expert reads). */
+    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 2;
     if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
     e->dspark_confidence = opt->dspark_confidence > 0.0f ? opt->dspark_confidence : 0.5f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
@@ -4849,7 +4852,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         s->checkpoint.len = saved_len;
         ok_state = spec_frontier_restore(&frontier, s);
         static int no_replay = -1;
-        if (no_replay < 0) no_replay = getenv("DS4_DSPARK_NO_REPLAY") != NULL;
+        if (no_replay < 0) no_replay = getenv("DS4_DSPARK_REPLAY") == NULL;
         if (ok_state && no_replay) {
             /* Stage B: transformer-free rollback. Roll only the recurrent
              * compressor/indexer pool state forward through the committed
@@ -4987,8 +4990,12 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         accepted[0] = first_token;
         return 1;
     }
+    /* The fused loop (one batched forward/step + transactional no-replay
+     * rollback) is the default: measured 16.4 vs 15.2 t/s legacy-vs-baseline
+     * and byte-identical deterministic output. DS4_DSPARK_LEGACY_LOOP restores
+     * the old Step1+verify loop as an operational fallback. */
     static int fused_cache = -1;
-    if (fused_cache < 0) fused_cache = getenv("DS4_DSPARK_FUSED") != NULL;
+    if (fused_cache < 0) fused_cache = getenv("DS4_DSPARK_LEGACY_LOOP") == NULL;
     if (fused_cache)
         return ds4_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
                                                   accepted, accepted_cap, err, errlen);
