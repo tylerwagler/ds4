@@ -541,11 +541,17 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
     for (int i = 0; i < 3; i++) {
         g->dspark_target_layer_ids[i] = target_layer_ids[i];
         g->dspark_target_h[i] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        /* Fused-loop batch capture: one anchor hidden per verify-batch position
+         * (17 = the spec block clamp of 16 drafts + first_token). */
+        g->dspark_target_h_batch[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)17 * DS4_N_EMBD * sizeof(float));
         g->dspark_raw_cache[i] = ds4_gpu_tensor_alloc(
             (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
         g->dspark_n_raw[i] = 0;
-        ok = ok && g->dspark_target_h[i] && g->dspark_raw_cache[i];
+        ok = ok && g->dspark_target_h[i] && g->dspark_target_h_batch[i] &&
+             g->dspark_raw_cache[i];
     }
+    g->dspark_capture_batch_n = 0;
     g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     ok = ok && g->dspark_main_x;
     /*

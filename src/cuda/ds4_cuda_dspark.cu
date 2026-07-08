@@ -238,3 +238,45 @@ extern "C" int ds4_gpu_dspark_hc_mean_reduce(
         n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "dspark hc mean reduce");
 }
+
+
+/* Batched variant over a [n_tokens, n_hc, n_embd] HC tensor: out[p] = mean over
+ * hc of in[p]. Captures the drafter's anchor-layer hidden for EVERY position of
+ * a spec verify batch, so the fused loop can pick the last-accepted position's
+ * hidden without replaying. */
+__global__ static void dspark_hc_mean_reduce_batch_kernel(
+        float *out,
+        const float *hc_batch,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    const uint32_t p = blockIdx.y;
+    const float *in = hc_batch + (uint64_t)p * n_hc * n_embd;
+    float *op = out + (uint64_t)p * n_embd;
+    for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
+         d += blockDim.x * gridDim.x) {
+        float sum = 0.0f;
+        for (uint32_t hc = 0; hc < n_hc; hc++)
+            sum += in[(uint64_t)hc * n_embd + d];
+        op[d] = sum / (float)n_hc;
+    }
+}
+
+
+extern "C" int ds4_gpu_dspark_hc_mean_reduce_batch(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *hc_batch,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_tokens) {
+    if (!out || !hc_batch || n_embd == 0 || n_hc == 0 || n_tokens == 0) return 0;
+    if (out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
+    if (hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * sizeof(float)) return 0;
+
+    const uint32_t block_dim = 256;
+    dim3 grid((n_embd + block_dim - 1) / block_dim, n_tokens, 1);
+    dspark_hc_mean_reduce_batch_kernel<<<grid, block_dim>>>(
+        (float *)out->ptr,
+        (const float *)hc_batch->ptr,
+        n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "dspark hc mean reduce batch");
+}

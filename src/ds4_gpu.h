@@ -1063,6 +1063,13 @@ int ds4_gpu_dspark_hc_mean_reduce(
         uint32_t               n_embd,
         uint32_t               n_hc);
 
+int ds4_gpu_dspark_hc_mean_reduce_batch(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hc_batch,
+        uint32_t               n_embd,
+        uint32_t               n_hc,
+        uint32_t               n_tokens);
+
 /* DSpark confidence head: per block position, confidence that the draft is
  * accepted. hidden = post-hc_head drafter hidden [n_positions, hidden_dim];
  * token_ids = block token per position; markov_w1/proj resolved from the dspark

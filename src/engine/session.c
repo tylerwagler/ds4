@@ -4725,6 +4725,236 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
     free(emb); free(voc); free(hc);
 }
 
+/* Fused-loop helper: make batch row `row`'s captured anchor hidden the current
+ * drafter conditioning (target_h -> main_x) and seed one drafter-KV row from it.
+ * Mirrors the reference invariant "drafter KV row j = f(hidden at position j)". */
+static bool dspark_seed_from_batch_row(ds4_session *s, uint32_t row) {
+    ds4_gpu_graph *g = &s->graph;
+    ds4_engine *e = s->engine;
+    for (int i = 0; i < 3; i++) {
+        if (!g->dspark_target_h_batch[i] || !g->dspark_target_h[i]) return false;
+        if (!ds4_gpu_tensor_copy(g->dspark_target_h[i], 0,
+                                 g->dspark_target_h_batch[i],
+                                 (uint64_t)row * DS4_N_EMBD * sizeof(float),
+                                 (uint64_t)DS4_N_EMBD * sizeof(float))) return false;
+    }
+    if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights)) return false;
+    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
+    return true;
+}
+
+/* Fused DSpark loop (P2, DS4_DSPARK_FUSED=1): ONE batched target forward per
+ * step instead of Step-1 decode + separate verify. The forward runs over
+ * [first_token, pending_drafts...] (drafts made LAST step -- EAGLE pipeline
+ * inversion), so position 0 is the base decode, positions 1..K verify the
+ * drafts, and the batched anchor-hidden capture gives the drafter its
+ * conditioning at whatever position ends up last-accepted. Drafting for the
+ * NEXT step then conditions on the hidden that PRODUCED the next base token
+ * (matching the reference generate.py forward_spec dataflow; the legacy loop
+ * conditions on the hidden AFTER re-evaluating the base token -- a one-position
+ * train/inference mismatch this path removes).
+ * Greedy-only, like the legacy block (generate.c gates on temperature<=0).
+ * Partial/zero accepts restore the frontier and replay the committed prefix
+ * (Stage A; the Stage-B transactional state removes the replay). */
+static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
+                                              int max_tokens, int eos_token,
+                                              int *accepted, int accepted_cap,
+                                              char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    const ds4_dspark_weights *w = &e->dspark_weights;
+    const uint32_t embed_dim = 256;
+    const uint32_t vocab_size = w->vocab_size;
+    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
+    const void *dmap = e->dspark_model.map;
+    const uint64_t dsize = e->dspark_model.size;
+    const int dspark_stats = getenv("DS4_DSPARK_STATS") != NULL;
+    const double t0 = dspark_stats ? now_sec() : 0.0;
+    int n_accept = 0;
+
+    /* Pending drafts continue from the greedy base we predicted last step; if
+     * the caller committed something else (tool injection, sampling change),
+     * they are stale. */
+    int32_t pend[16];
+    uint32_t K = s->dspark_n_pending;
+    if (K > 16u) K = 16u;
+    if (K && s->dspark_pending_base != (int32_t)first_token) K = 0;
+    if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
+    if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
+    for (uint32_t i = 0; i < K; i++) pend[i] = s->dspark_pending[i];
+    s->dspark_n_pending = 0;
+    const uint32_t n_batch = 1u + K;
+
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    if (!spec_frontier_snapshot(&frontier, s)) {
+        snprintf(err, errlen, "DSpark fused frontier snapshot failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    const int saved_len = s->checkpoint.len;
+    token_vec_push(&s->checkpoint, first_token);
+    for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, (int)pend[i]);
+
+    /* ONE batched forward: base decode + draft verify + anchor capture. */
+    int row_tops[16];
+    g->dspark_capture_batch_n = n_batch;
+    bool ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
+                                           &s->checkpoint,
+                                           (uint32_t)saved_len, n_batch, false,
+                                           K ? row_tops : NULL, NULL);
+    g->dspark_capture_batch_n = 0;
+    if (!ok) {
+        s->checkpoint.len = saved_len;
+        (void)spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        snprintf(err, errlen, "DSpark fused verify failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    /* Accept the longest prefix the target agrees with: row i's argmax is the
+     * target's token AFTER batch token i, i.e. its prediction for pend[i]. */
+    int commit = 0;
+    while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
+
+    /* Refresh s->logits to the last committed position's distribution. */
+    if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, s->logits)) {
+        s->checkpoint.len = saved_len;
+        (void)spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        snprintf(err, errlen, "DSpark fused logits readback failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    bool ok_state = true;
+    if (commit == (int)K) {
+        /* Full accept: the batch advanced the target state by exactly the
+         * committed tokens. Seed drafter rows for every committed position from
+         * its own captured hidden (row j = f(h_j)); the last copy leaves
+         * target_h = the drafting hidden. */
+        s->checkpoint.len = saved_len + 1 + commit;
+        for (int m = 0; ok_state && m <= commit && m < (int)n_batch; m++)
+            ok_state = dspark_seed_from_batch_row(s, (uint32_t)m);
+    } else {
+        /* Partial/zero accept: target state includes rejected positions.
+         * Stage A: restore the pre-batch frontier and replay the committed
+         * prefix (first_token + accepted drafts). The decode path re-captures
+         * each position's hidden; seed per position as the legacy loop does.
+         * (Stage B replaces this replay with transactional state rollback.) */
+        s->checkpoint.len = saved_len;
+        ok_state = spec_frontier_restore(&frontier, s);
+        int32_t replay[17];
+        replay[0] = (int32_t)first_token;
+        for (int i = 0; i < commit; i++) replay[1 + i] = pend[i];
+        for (int i = 0; ok_state && i < 1 + commit; i++) {
+            if (ds4_session_eval(s, (int)replay[i], err, errlen) != 0) {
+                ok_state = false;
+                break;
+            }
+            if (gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
+                gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
+        }
+        /* Replay refreshed s->logits from the last committed token. */
+    }
+    spec_frontier_free(&frontier);
+    if (!ok_state) {
+        snprintf(err, errlen, "DSpark fused state update failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    /* Emit first_token + accepted drafts. */
+    accepted[n_accept++] = first_token;
+    bool hit_eos = first_token == eos_token;
+    for (int i = 0; i < commit && n_accept < accepted_cap && !hit_eos; i++) {
+        accepted[n_accept++] = (int)pend[i];
+        if (pend[i] == (int32_t)eos_token) hit_eos = true;
+    }
+
+    /* Next greedy base; draft the NEXT block conditioned on the hidden that
+     * produced it (target_h already = last committed hidden on both paths). */
+    const int next_base = sample_argmax(s->logits, DS4_N_VOCAB);
+    uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
+    if (n_draft > 16u) n_draft = 16u;
+    if (hit_eos || next_base == eos_token || n_draft == 0) {
+        if (dspark_stats)
+            fprintf(stderr, "ds4: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
+                    n_batch, commit, (now_sec() - t0) * 1000.0);
+        return n_accept;
+    }
+
+    /* Draft forward + markov refine (mirrors the legacy block Steps 3-5).
+     * NOTE: no seed here -- the committed positions' rows were seeded above
+     * (row j = f(h_j)); next_base's own row is seeded NEXT step when it is
+     * processed as batch position 0. main_x is re-projected for clarity (the
+     * seeding loop left it at the same last-committed hidden). */
+    if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
+        return n_accept;   /* drafting is best-effort; the step already succeeded */
+    int32_t draft_ids[16];
+    draft_ids[0] = (int32_t)next_base;
+    for (uint32_t i = 1; i < n_draft; i++) draft_ids[i] = DS4_DSPARK_NOISE_TOKEN_ID;
+    if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
+                                        &e->dspark_model, &e->dspark_weights,
+                                        g->spec_logits, draft_ids, n_draft))
+        return n_accept;
+
+    ds4_gpu_tensor *dspark_logits = ds4_gpu_tensor_alloc(vocab_bytes);
+    if (!dspark_logits) return n_accept;
+    int32_t refined[17];
+    refined[0] = (int32_t)next_base;
+    bool draft_ok = true;
+    for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
+        ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
+            g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
+        draft_ok = base_row &&
+            ds4_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
+                                             base_row, dmap, dsize,
+                                             w->markov_w1->abs_offset,
+                                             w->markov_w2->abs_offset,
+                                             refined[pos], vocab_size, embed_dim);
+        ds4_gpu_tensor_free(base_row);
+    }
+    ds4_gpu_tensor_free(dspark_logits);
+    if (!draft_ok) return n_accept;
+
+    /* Confidence-scheduled pending length (P1 head; keep the confident prefix). */
+    uint32_t keep = n_draft;
+    {
+        const char *cs = getenv("DS4_DSPARK_CONF_SCHED");
+        const float tau = cs ? (float)atof(cs) : 0.0f;
+        if (tau > 0.0f) {
+            ds4_gpu_tensor *conf_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
+            ds4_gpu_tensor *tok_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+            float conf[16];
+            if (conf_dev && tok_dev &&
+                ds4_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
+                ds4_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
+                                                      dmap, dsize,
+                                                      w->markov_w1->abs_offset,
+                                                      w->confidence_proj->abs_offset,
+                                                      n_draft, DS4_N_EMBD, embed_dim, vocab_size) &&
+                ds4_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
+                uint32_t k = 0;
+                while (k < n_draft && conf[k] >= tau) k++;
+                keep = k;   /* 0 pending = next step is a plain n=1 forward */
+            }
+            ds4_gpu_tensor_free(conf_dev);
+            ds4_gpu_tensor_free(tok_dev);
+        }
+    }
+    s->dspark_pending_base = (int32_t)next_base;
+    s->dspark_n_pending = keep;
+    for (uint32_t i = 0; i < keep; i++) s->dspark_pending[i] = refined[i + 1];
+
+    if (dspark_stats)
+        fprintf(stderr, "ds4: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
+                n_batch, commit, keep, (now_sec() - t0) * 1000.0);
+    return n_accept;
+}
+
 int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -4735,6 +4965,11 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
         accepted[0] = first_token;
         return 1;
     }
+    static int fused_cache = -1;
+    if (fused_cache < 0) fused_cache = getenv("DS4_DSPARK_FUSED") != NULL;
+    if (fused_cache)
+        return ds4_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
+                                                  accepted, accepted_cap, err, errlen);
 
     ds4_engine *e = s->engine;
     ds4_gpu_graph *g = &s->graph;
@@ -5060,6 +5295,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
     s->cont_anchor_valid = false;
+    s->dspark_n_pending = 0;
 }
 
 
@@ -5070,6 +5306,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
     s->cont_anchor_valid = false;
+    s->dspark_n_pending = 0;
 }
 
 

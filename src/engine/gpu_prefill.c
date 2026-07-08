@@ -2265,6 +2265,24 @@ bool gpu_graph_encode_layer_batch(
         g->batch_cur_hc = g->batch_next_hc;
         g->batch_next_hc = tmp;
     }
+    /* Fused spec loop (P2): when armed, capture the drafter's anchor hidden for
+     * every batch position at the anchor layers, so the last-accepted position's
+     * hidden is available without a replay decode. Off (0) during prefill and
+     * plain decode. */
+    if (ok && g->dspark_capture_batch_n) {
+        for (int slot = 0; slot < 3; slot++) {
+            if (il != g->dspark_target_layer_ids[slot]) continue;
+            if (!g->dspark_target_h_batch[slot]) break;
+            uint32_t cap_n = g->dspark_capture_batch_n;
+            if (cap_n > n_tokens) cap_n = n_tokens;
+            if (!ds4_gpu_dspark_hc_mean_reduce_batch(g->dspark_target_h_batch[slot],
+                                                     g->batch_cur_hc,
+                                                     DS4_N_EMBD, DS4_N_HC, cap_n)) {
+                ok = false;
+            }
+            break;
+        }
+    }
     return ok;
 }
 

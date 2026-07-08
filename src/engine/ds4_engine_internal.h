@@ -1046,6 +1046,12 @@ typedef struct {
     ds4_gpu_tensor *dspark_target_h[3];
     ds4_gpu_tensor *dspark_main_x;
     uint32_t dspark_target_layer_ids[3];
+    /* Fused spec loop (P2): per-position anchor hiddens captured during the
+     * verify batch — [spec cap, N_EMBD] per anchor layer. dspark_capture_batch_n
+     * != 0 arms the capture in gpu_graph_encode_layer_batch for that many
+     * positions; 0 = off (prefill and plain decode unaffected). */
+    ds4_gpu_tensor *dspark_target_h_batch[3];
+    uint32_t dspark_capture_batch_n;
 
     /* DSpark draft KV raw caches (one per draft layer, window=128) */
     ds4_gpu_tensor *dspark_raw_cache[3];
@@ -1330,6 +1336,16 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    /* Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
+     * position's hidden, pending verification in THIS step's single batched
+     * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
+     * n=1 forward. Invalidate on rewind/invalidate like mtp_draft_valid. */
+    int32_t dspark_pending[16];
+    uint32_t dspark_n_pending;
+    /* The base token the pending drafts continue from (predicted greedy next).
+     * If the caller's next first_token differs (non-greedy interruption, tool
+     * injection), the pending drafts are stale and dropped. */
+    int32_t dspark_pending_base;
 };
 
 typedef struct {
