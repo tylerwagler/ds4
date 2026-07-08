@@ -806,7 +806,7 @@ __global__ static void mxfp8_mmvq_deint_kernel(float *out, const __nv_fp8_e4m3 *
         int k = base + lane * 4;                       /* this lane's 4 in-positions */
         uint32_t packed = *(const uint32_t *)(row + k);
         int kb = k >> 5;                               /* 32-elem block for these 4 */
-        float sc = exp2f((float)scale[mx_sfoff(o, kb, KBp)] - 127.f);
+        float sc = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);  /* 2^(e-127), no SFU */
         const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
         const float *xk = x + k;
         #pragma unroll
@@ -814,6 +814,137 @@ __global__ static void mxfp8_mmvq_deint_kernel(float *out, const __nv_fp8_e4m3 *
     }
     for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
     if (lane == 0) out[o] = acc;
+}
+
+
+/* Fused pair of the de-interleaved mmvq: two weights (out0,out1) sharing one
+ * activation x and in_dim, computed in a single launch. Each warp owns one
+ * global output row -- rows [0,out0_dim) go to weight0/out0, the rest to
+ * weight1/out1. Bit-identical to launching mxfp8_mmvq_deint_kernel twice (same
+ * per-row math); the win is one launch instead of two on the overhead-bound
+ * decode path (q_a+kv from attn_norm, shared gate+up from ffn_norm). */
+__global__ static void mxfp8_mmvq_deint_pair_kernel(
+        float *out0, float *out1,
+        const __nv_fp8_e4m3 *data0, const unsigned char *scale0, int out0_dim,
+        const __nv_fp8_e4m3 *data1, const unsigned char *scale1, int out1_dim,
+        const float *x, int in_dim, int KBp) {
+    int warp = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    const __nv_fp8_e4m3 *data;
+    const unsigned char *scale;
+    float *out;
+    int o;
+    if (warp < out0_dim) { o = warp;            data = data0; scale = scale0; out = out0; }
+    else                 { o = warp - out0_dim; if (o >= out1_dim) return;
+                           data = data1; scale = scale1; out = out1; }
+    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
+    float acc = 0.f;
+    for (int base = 0; base < in_dim; base += 128) {
+        int k = base + lane * 4;
+        uint32_t packed = *(const uint32_t *)(row + k);
+        int kb = k >> 5;
+        float sc = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
+        const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
+        const float *xk = x + k;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc += __half2float((__half)q[j]) * sc * xk[j];
+    }
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
+    if (lane == 0) out[o] = acc;
+}
+
+
+/* ============================================================================
+ * PROTOTYPE: MXFP4 attention path (DS4_ATTN_MXFP4). Requant a workhorse MXFP8
+ * weight (raw 33B blocks) -> MXFP4 (per 32-block: E8M0 byte + 16 e2m1 bytes),
+ * cached by offset, and run a batch-1 mmvq off it. Halves the weight read (4-bit
+ * vs 8-bit) for the big attention projections. Lossy requant -> measures the
+ * quality/speed tradeoff before committing to a converter change.
+ * ============================================================================ */
+__device__ __constant__ float d_kE2M1_m[16] =
+    {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+__device__ __forceinline__ static uint8_t d_to_e2m1_m(float v){
+    float best=1e30f; uint8_t bn=0;
+    #pragma unroll
+    for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1_m[n]); if(d<best){best=d;bn=n;} }
+    return bn;
+}
+
+/* raw MXFP8 [out,in] 33B blocks -> DE-INTERLEAVED MXFP4: nibbles packed contiguous in
+ * data[out,in/2] + separate E8M0 scale[out,in/32]. Contiguous nibbles let the mmvq read
+ * uint32 (8 nibbles) coalesced. one thread per (row,32-block). */
+__global__ static void mxfp8_to_mxfp4_kernel(uint8_t *data, uint8_t *scale, const uint8_t *in8, int in_dim, int out_dim){
+    const int nb = in_dim / 32;
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)out_dim * nb) return;
+    const int o = (int)(idx / nb), sb = (int)(idx % nb);
+    const uint8_t *ib = in8 + ((size_t)o * nb + sb) * 33;
+    const float ms = __int_as_float((uint32_t)ib[0] << 23);
+    float v[32], mx = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) { v[i] = __half2float((__half)*(const __nv_fp8_e4m3 *)&ib[1 + i]) * ms; mx = fmaxf(mx, fabsf(v[i])); }
+    int e = (mx > 0.f) ? (int)ceilf(log2f(mx / 6.f)) : 0; if (e < -30) e = -30; if (e > 30) e = 30;
+    const float sc = exp2f((float)e);
+    scale[(size_t)o * nb + sb] = (uint8_t)(e + 127);
+    uint8_t *ob = data + ((size_t)o * in_dim + sb * 32) / 2;   /* 16 bytes = 32 nibbles */
+    #pragma unroll
+    for (int i = 0; i < 16; i++) { uint8_t lo = d_to_e2m1_m(v[2*i]/sc), hi = d_to_e2m1_m(v[2*i+1]/sc); ob[i] = (uint8_t)(lo | (hi << 4)); }
+}
+
+/* Arithmetic e2m1 decode (NO LUT). Returns 2x the actual value (fold 0.5 into scale). */
+__device__ __forceinline__ static float e2m1_x2f(uint8_t nib){
+    const unsigned e = (nib >> 1) & 3u, m = nib & 1u;
+    const int mag = e ? (int)((1u << e) | (m << (e - 1u))) : (int)m;
+    return (nib & 8u) ? -(float)mag : (float)mag;
+}
+
+/* batch-1 de-interleaved MXFP4 mmvq: warp-per-row (8 rows/block), each lane reads a uint32
+ * (8 nibbles) per step -> coalesced. Mirrors the efficient MXFP8 mmvq. */
+__global__ static void mxfp4_mmvq_kernel(float *out, const uint8_t *data, const uint8_t *scale,
+                                         const float *x, int in_dim, int out_dim){
+    const int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    const int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    const int nb = in_dim / 32;
+    const uint8_t *drow = data + (size_t)o * (in_dim / 2);
+    const uint8_t *srow = scale + (size_t)o * nb;
+    float acc = 0.f;
+    for (int base = 0; base < in_dim; base += 256) {          /* 32 lanes * 8 elems */
+        const int k = base + lane * 8;
+        const uint32_t packed = *(const uint32_t *)(drow + (k >> 1));   /* 8 nibbles */
+        const float sc = __int_as_float((uint32_t)srow[k >> 5] << 23);  /* one 32-block */
+        const float *xk = x + k;
+        float s = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) s += e2m1_x2f((packed >> (4 * i)) & 0xF) * xk[i];
+        acc += sc * s;
+    }
+    acc *= 0.5f;
+    for (int st = 16; st > 0; st >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, st);
+    if (lane == 0) out[o] = acc;
+}
+
+struct mxfp4_weight { const void *host_base; uint64_t offset; uint64_t in_dim, out_dim; uint8_t *data; uint8_t *scale; };
+static std::unordered_map<uint64_t, mxfp4_weight> g_mxfp4_by_offset;
+
+/* Requant a raw MXFP8 weight [out,in] to de-interleaved MXFP4, cached by offset. */
+static const mxfp4_weight *cuda_mxfp4_from_mxfp8(const void *model_map, uint64_t offset, uint64_t mxfp8_bytes,
+                                                 uint64_t in_dim, uint64_t out_dim){
+    auto it = g_mxfp4_by_offset.find(offset);
+    if (it != g_mxfp4_by_offset.end() && it->second.host_base == model_map &&
+        it->second.in_dim == in_dim && it->second.out_dim == out_dim) return &it->second;
+    const unsigned char *src = (const unsigned char *)cuda_model_range_ptr(model_map, offset, mxfp8_bytes, "mxfp4_req");
+    if (!src) return NULL;
+    const uint64_t nb = in_dim / 32;
+    uint8_t *data = NULL, *scale = NULL;
+    if (cudaMalloc(&data, (size_t)out_dim * in_dim / 2) != cudaSuccess) return NULL;
+    if (cudaMalloc(&scale, (size_t)out_dim * nb) != cudaSuccess) { cudaFree(data); return NULL; }
+    const long total = (long)out_dim * nb;
+    mxfp8_to_mxfp4_kernel<<<(unsigned)((total + 255) / 256), 256>>>(data, scale, src, (int)in_dim, (int)out_dim);
+    if (!cuda_ok(cudaGetLastError(), "mxfp8->mxfp4 requant")) { cudaFree(data); cudaFree(scale); return NULL; }
+    mxfp4_weight w = { model_map, offset, in_dim, out_dim, data, scale };
+    g_mxfp4_by_offset[offset] = w;
+    return &g_mxfp4_by_offset[offset];
 }
 
 
@@ -841,6 +972,24 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         if (n_tok > 1 && getenv("DS4_FP8_NO_MXCORE") == NULL &&
                 cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
                 weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+        /* PROTOTYPE: decode MXFP4 (4-bit) instead of MXFP8 (8-bit) for the workhorse
+         * projections -> halves the weight read. Requant-from-MXFP8 cached per offset. */
+        static const int attn_mxfp4 = getenv("DS4_ATTN_MXFP4") != NULL;
+        /* DS4_ATTN_MXFP4=big -> only the two big output-side projections (q_b in=1024,
+         * output_b in=8192), sparing the sensitive latent q_a/kv + shared expert. */
+        static const int attn_mxfp4_big = []{ const char *e = getenv("DS4_ATTN_MXFP4"); return e && !strcmp(e, "big"); }();
+        const bool mxfp4_pick = attn_mxfp4 && (!attn_mxfp4_big || in_dim == 1024 || in_dim == 8192);
+        if (mxfp4_pick && in_dim % 256 == 0) {
+            const mxfp4_weight *m4 = cuda_mxfp4_from_mxfp8(model_map, weight_offset, fbytes, in_dim, out_dim);
+            if (m4) {
+                /* per-token loop (prefill n_tok>1 uses this too, so frontier logits reflect
+                 * MXFP4 attention -> a valid quality signal; slow but only a correctness path). */
+                for (uint64_t t = 0; t < n_tok; t++)
+                    mxfp4_mmvq_kernel<<<((unsigned)out_dim + 7) / 8, 256>>>((float *)out->ptr + t * out_dim,
+                            m4->data, m4->scale, (const float *)x->ptr + t * in_dim, (int)in_dim, (int)out_dim);
+                return cuda_ok(cudaGetLastError(), "mxfp4 attn mmvq");
+            }
+        }
         const unsigned wpb = 8;  /* output rows per block */
         dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
@@ -899,6 +1048,42 @@ extern "C" int ds4_gpu_matmul_mxfp8_pair_tensor(
         uint64_t n_tok) {
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
         return 0;
+    }
+    /* Decode fast path: both weights share x and in_dim, so fuse the two
+     * de-interleaved mmvq launches into one. Only when both are registered
+     * de-interleavable MXFP8 weights and neither the MXFP4 prototype nor the raw
+     * mmvq fallback is forced; otherwise defer to the per-weight path below. */
+    static const int fp8_mmvq_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
+    static const int attn_mxfp4 = getenv("DS4_ATTN_MXFP4") != NULL;
+    static const int no_pair_fuse = getenv("DS4_CUDA_NO_MXFP8_PAIR_FUSE") != NULL;
+    if (n_tok == 1 && in_dim % 128 == 0 && !fp8_mmvq_raw && !attn_mxfp4 && !no_pair_fuse &&
+        g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
+        const uint64_t fblocks = (in_dim + 31) / 32;
+        const uint64_t fbytes0 = out0_dim * fblocks * 33;
+        const uint64_t fbytes1 = out1_dim * fblocks * 33;
+        const bool bounds_ok =
+            weight0_offset <= model_size && fbytes0 <= model_size - weight0_offset &&
+            weight1_offset <= model_size && fbytes1 <= model_size - weight1_offset &&
+            x->bytes >= in_dim * sizeof(float) &&
+            out0->bytes >= out0_dim * sizeof(float) &&
+            out1->bytes >= out1_dim * sizeof(float);
+        if (bounds_ok) {
+            const fp8_mx_weight *w0 = cuda_fp8_mx_weight(model_map, weight0_offset, fbytes0,
+                                                         in_dim, out0_dim, "mxfp8_pair0");
+            const fp8_mx_weight *w1 = cuda_fp8_mx_weight(model_map, weight1_offset, fbytes1,
+                                                         in_dim, out1_dim, "mxfp8_pair1");
+            if (w0 && w1) {
+                const int KBp = mx_rup((int)(in_dim / 32), 4);
+                const unsigned wpb = 8;  /* output rows (warps) per 256-thread block */
+                dim3 grid(((unsigned)(out0_dim + out1_dim) + wpb - 1) / wpb);
+                mxfp8_mmvq_deint_pair_kernel<<<grid, wpb * 32>>>(
+                        (float *)out0->ptr, (float *)out1->ptr,
+                        w0->data, w0->scale, (int)out0_dim,
+                        w1->data, w1->scale, (int)out1_dim,
+                        (const float *)x->ptr, (int)in_dim, KBp);
+                return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint pair");
+            }
+        }
     }
     return cuda_matmul_mxfp8_tensor_labeled(out0, model_map, model_size, weight0_offset,
                                            in_dim, out0_dim, x, n_tok, "mxfp8_pair0") &&
