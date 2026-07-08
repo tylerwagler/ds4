@@ -63,6 +63,46 @@ __global__ static void matmul_f16_kernel(
 }
 
 
+/* Small-batch (2..4 token) f16 GEMV: one weight-row read serves all NT tokens,
+ * replacing the cuBLAS GemmEx path which is latency-bound at these shapes and
+ * needs an f32->f16 activation convert + tmp alloc per call. Per-token loop
+ * structure and shared-memory reduction match matmul_f16_kernel exactly, so each
+ * token's output is bit-identical to the n=1 kernel run on that token alone. */
+template <int NT>
+__global__ static void matmul_f16_nt_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    if (row >= out_dim) return;
+
+    float sum[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) sum[t] = 0.0f;
+    const __half *wr = w + row * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float wv = __half2float(wr[i]);
+        #pragma unroll
+        for (int t = 0; t < NT; t++) sum[t] += wv * x[t * in_dim + i];
+    }
+
+    __shared__ float partial[256];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) {
+        partial[threadIdx.x] = sum[t];
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) out[t * out_dim + row] = partial[0];
+        __syncthreads();
+    }
+}
+
+
 
 __global__ static void matmul_f16_serial_kernel(
         float *out,
@@ -872,6 +912,46 @@ __global__ static void mxfp8_mmvq_deint_pair_kernel(
 }
 
 
+/* Small-batch (2..4 token) variant of the de-interleaved mmvq for the spec-decode
+ * verify forward. One weight-row read serves all NT tokens (per-token accumulators),
+ * vs the tensor-core tile path (latency-bound at 2-4 rows) or NT GEMV relaunches
+ * (NT x weight traffic). Per-token multiply/accumulate order matches
+ * mxfp8_mmvq_deint_kernel exactly, so each token's output is bit-identical to the
+ * n=1 kernel run on that token alone. */
+template <int NT>
+__global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m3 *data,
+                                                  const unsigned char *scale, const float *x,
+                                                  int in_dim, int out_dim, int KBp) {
+    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
+    float acc[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) acc[t] = 0.f;
+    for (int base = 0; base < in_dim; base += 128) {
+        int k = base + lane * 4;
+        uint32_t packed = *(const uint32_t *)(row + k);
+        int kb = k >> 5;
+        float sc = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
+        const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
+        const float *xk = x + k;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float wj = __half2float((__half)q[j]) * sc;
+            #pragma unroll
+            for (int t = 0; t < NT; t++) acc[t] += wj * xk[(size_t)t * in_dim + j];
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < NT; t++) {
+        float a = acc[t];
+        for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s);
+        if (lane == 0) out[(size_t)t * out_dim + o] = a;
+    }
+}
+
+
 /* ============================================================================
  * PROTOTYPE: MXFP4 attention path (DS4_ATTN_MXFP4). Requant a workhorse MXFP8
  * weight (raw 33B blocks) -> MXFP4 (per 32-block: E8M0 byte + 16 e2m1 bytes),
@@ -984,6 +1064,36 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         if (weight_offset > model_size || fbytes > model_size - weight_offset ||
             x->bytes < n_tok * in_dim * sizeof(float) ||
             out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+        /* Small batches (spec-decode verify, n_tok 2..4): batched GEMV over the
+         * de-interleaved weight. One weight-row read serves all tokens, vs the
+         * tensor-core tile path which is latency-bound at these shapes (the
+         * measured "CUTLASS launch storm" that made verify(3) cost ~2x a decode
+         * token). Bit-identical per token to the n=1 deint mmvq, so verify logits
+         * match the decode path's numerics. DS4_FP8_GEMV_MAX_N=1 restores the
+         * tensor-core dispatch for all n_tok>1. */
+        static const int gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
+                return e ? atoi(e) : 4; }();
+        static const int nt_fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
+        static const int nt_mxfp4 = getenv("DS4_ATTN_MXFP4") != NULL;
+        if (n_tok >= 2 && n_tok <= 4 && n_tok <= (uint64_t)gemv_max_n &&
+            in_dim % 128 == 0 && !nt_fp8_raw && !nt_mxfp4) {
+            const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
+                                                         in_dim, out_dim, label);
+            if (bw) {
+                const int KBp = mx_rup((int)(in_dim / 32), 4);
+                const unsigned wpb = 8;
+                dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
+                switch (n_tok) {
+                case 2: mxfp8_mmvq_deint_nt_kernel<2><<<grid, wpb * 32>>>((float *)out->ptr,
+                        bw->data, bw->scale, (const float *)x->ptr, (int)in_dim, (int)out_dim, KBp); break;
+                case 3: mxfp8_mmvq_deint_nt_kernel<3><<<grid, wpb * 32>>>((float *)out->ptr,
+                        bw->data, bw->scale, (const float *)x->ptr, (int)in_dim, (int)out_dim, KBp); break;
+                default: mxfp8_mmvq_deint_nt_kernel<4><<<grid, wpb * 32>>>((float *)out->ptr,
+                        bw->data, bw->scale, (const float *)x->ptr, (int)in_dim, (int)out_dim, KBp); break;
+                }
+                return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt");
+            }
+        }
         /* Prefill (n_tok>1) uses the cuBLASLt MX tensor-core GEMM; decode falls
          * through to the per-token mmvq kernel below. DS4_FP8_NO_MXCORE forces
          * the mmvq path everywhere as an operational fallback. */
@@ -1206,6 +1316,21 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_router &&
         n_tok == 1u &&
         env_ordered_f16;
+    /* Small batches (spec-decode verify, n_tok 2..4): batched f16 GEMV. One
+     * weight-row read serves all tokens and there is no f32->f16 activation
+     * convert or tmp alloc; per-token output is bit-identical to the n=1
+     * matmul_f16_kernel. DS4_F16_GEMV_MAX_N=1 restores the cuBLAS dispatch. */
+    static const int f16_gemv_max_n = []{ const char *e = getenv("DS4_F16_GEMV_MAX_N");
+            return e ? atoi(e) : 4; }();
+    if (!serial_f16 && n_tok >= 2 && n_tok <= 4 && n_tok <= (uint64_t)f16_gemv_max_n) {
+        dim3 g((unsigned)out_dim);
+        switch (n_tok) {
+        case 2: matmul_f16_nt_kernel<2><<<g, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim); break;
+        case 3: matmul_f16_nt_kernel<3><<<g, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim); break;
+        default: matmul_f16_nt_kernel<4><<<g, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim); break;
+        }
+        return cuda_ok(cudaGetLastError(), "matmul_f16 nt launch");
+    }
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");

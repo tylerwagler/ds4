@@ -250,6 +250,148 @@ extern "C" int ds4_cutlass_expert_ffn(
   return rc;
 }
 
+// ---- Small-batch expert FFN via direct fp4 GEMV (spec-decode verify, n_tokens 2..4). ----
+// The grouped CUTLASS path costs ~2.8 ms per rich layer at n_tokens=3: per-expert GEMM
+// launches at M<=3 run far off roofline, behind a blocking per-layer offsets readback.
+// These GEMVs read the packed weights directly: one launch for gate+up+swiglu, one for
+// down, no readback, no sort, and f32 activations (no fp4 activation quant -- tighter
+// numerics than the GEMM path's fp4 x fp4).
+// Data layout (see ds4_cutlass_pack_source): B is ColumnMajor packed E2M1 -- logical
+// (n,k) lives at nibble n + k*N, so byte (n + k*N)/2. A thread owning row-pair
+// (2p, 2p+1) owns whole bytes, and a warp reads 32 consecutive bytes at each k ->
+// coalesced. SF is the swizzled tile-atom layout, indexed with the same layout object
+// the packers use (callable on device).
+
+__device__ __constant__ static float kE2M1_GEMV[16] =
+    {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+     -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
+  return __int_as_float((uint32_t)b << 23);   /* 2^(e-127) */
+}
+
+template <class SFL>
+__global__ static void expert_gemv_gate_up_swiglu_kernel(
+    float *mid,               // [n_slots, N]
+    const float *x,           // [n_tokens, K]
+    const int32_t *sel,       // [n_slots] expert ids
+    const float *rw,          // [n_slots] routing weights
+    const uint8_t *gate_base, const uint8_t *up_base,
+    uint64_t stride, uint64_t data_bytes, SFL sfl, float clampv,
+    int n_expert, unsigned n_total, int K, int N) {
+  const int slot = (int)blockIdx.y;
+  const int np = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (2 * np >= N) return;
+  const int n0 = 2 * np, n1 = n0 + 1;
+  float *m = mid + (size_t)slot * N;
+  const int e = sel[slot];
+  if (e < 0 || (unsigned)e >= n_total) { m[n0] = 0.f; m[n1] = 0.f; return; }
+  const uint8_t *gd = gate_base + (size_t)e * stride;
+  const uint8_t *ud = up_base + (size_t)e * stride;
+  const uint8_t *gsf = gd + data_bytes;
+  const uint8_t *usf = ud + data_bytes;
+  const float *xt = x + (size_t)(slot / n_expert) * K;
+  const size_t halfN = (size_t)(N / 2);
+  float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
+  for (int kb = 0; kb < K / 32; kb++) {
+    const float sg0 = gemv_sf_val(gsf[sfl(n0, kb * 32, 0)]);
+    const float sg1 = gemv_sf_val(gsf[sfl(n1, kb * 32, 0)]);
+    const float su0 = gemv_sf_val(usf[sfl(n0, kb * 32, 0)]);
+    const float su1 = gemv_sf_val(usf[sfl(n1, kb * 32, 0)]);
+    #pragma unroll 8
+    for (int i = 0; i < 32; i++) {
+      const int k = kb * 32 + i;
+      const float xv = xt[k];
+      const size_t byte = (size_t)np + (size_t)k * halfN;
+      const uint8_t bg = gd[byte];
+      const uint8_t bu = ud[byte];
+      g0 += kE2M1_GEMV[bg & 0xF] * sg0 * xv;
+      g1 += kE2M1_GEMV[bg >> 4] * sg1 * xv;
+      u0 += kE2M1_GEMV[bu & 0xF] * su0 * xv;
+      u1 += kE2M1_GEMV[bu >> 4] * su1 * xv;
+    }
+  }
+  /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
+  const float w = rw[slot];
+  if (clampv > 1.0e-6f) {
+    if (g0 > clampv) g0 = clampv;
+    if (g1 > clampv) g1 = clampv;
+    if (u0 > clampv) u0 = clampv;
+    if (u0 < -clampv) u0 = -clampv;
+    if (u1 > clampv) u1 = clampv;
+    if (u1 < -clampv) u1 = -clampv;
+  }
+  m[n0] = (g0 / (1.f + expf(-g0))) * u0 * w;
+  m[n1] = (g1 / (1.f + expf(-g1))) * u1 * w;
+}
+
+template <class SFL>
+__global__ static void expert_gemv_down_kernel(
+    float *down_out,          // [n_slots, N]
+    const float *mid,         // [n_slots, K]
+    const int32_t *sel,       // [n_slots] expert ids
+    const uint8_t *down_base,
+    uint64_t stride, uint64_t data_bytes, SFL sfl,
+    unsigned n_total, int K, int N) {
+  const int slot = (int)blockIdx.y;
+  const int np = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (2 * np >= N) return;
+  const int n0 = 2 * np, n1 = n0 + 1;
+  float *o = down_out + (size_t)slot * N;
+  const int e = sel[slot];
+  if (e < 0 || (unsigned)e >= n_total) { o[n0] = 0.f; o[n1] = 0.f; return; }
+  const uint8_t *dd = down_base + (size_t)e * stride;
+  const uint8_t *dsf = dd + data_bytes;
+  const float *xt = mid + (size_t)slot * K;
+  const size_t halfN = (size_t)(N / 2);
+  float a0 = 0.f, a1 = 0.f;
+  for (int kb = 0; kb < K / 32; kb++) {
+    const float s0 = gemv_sf_val(dsf[sfl(n0, kb * 32, 0)]);
+    const float s1 = gemv_sf_val(dsf[sfl(n1, kb * 32, 0)]);
+    #pragma unroll 8
+    for (int i = 0; i < 32; i++) {
+      const int k = kb * 32 + i;
+      const float xv = xt[k];
+      const uint8_t b = dd[(size_t)np + (size_t)k * halfN];
+      a0 += kE2M1_GEMV[b & 0xF] * s0 * xv;
+      a1 += kE2M1_GEMV[b >> 4] * s1 * xv;
+    }
+  }
+  o[n0] = a0;
+  o[n1] = a1;
+}
+
+// Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
+// down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
+// n_expert slices per token (moe_sum_kernel). mid_scratch: [n_tokens*n_expert, mid_dim].
+extern "C" int ds4_cutlass_expert_ffn_gemv_small(
+    float *down_out, float *mid_scratch, const float *x,
+    const int32_t *selected, const float *rweights,
+    const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
+    uint64_t gate_stride, uint64_t gate_data_bytes,
+    uint64_t down_stride, uint64_t down_data_bytes,
+    float clamp, int n_tokens, int n_expert, unsigned n_total_expert,
+    int in_dim, int mid_dim, int out_dim) {
+  if (in_dim % 32 || mid_dim % 64 || out_dim % 64) return 1;
+  const unsigned n_slots = (unsigned)(n_tokens * n_expert);
+  auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
+  auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
+  {
+    dim3 g((unsigned)((mid_dim / 2 + 255) / 256), n_slots);
+    expert_gemv_gate_up_swiglu_kernel<<<g, 256>>>(mid_scratch, x, selected, rweights,
+        gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, in_dim, mid_dim);
+  }
+  {
+    dim3 g((unsigned)((out_dim / 2 + 255) / 256), n_slots);
+    expert_gemv_down_kernel<<<g, 256>>>(down_out, mid_scratch, selected,
+        down_w, down_stride, down_data_bytes, sfl_dn,
+        n_total_expert, mid_dim, out_dim);
+  }
+  return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+
 // Pack SOURCE-format MXFP4 (separate E2M1 [N,K/2] row-major + E8M0 [N,K/32]) — exactly as the
 // DeepSeek-V4-Flash source stores rich experts — into CUTLASS B layout (ColumnMajor packed E2M1
 // data + swizzled SFB). Host-side, lossless (copies nibbles+scale verbatim). This is the permanent

@@ -904,6 +904,33 @@ int ds4_cutlass_expert_ffn_scratch(
         uint8_t        *scratch,
         size_t          scratch_bytes);
 
+/* Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights via direct
+ * fp4 GEMV: one gate+up+swiglu launch and one down launch over all (token,expert) slots,
+ * no sort, no host readback, f32 activations. down_out gets one pre-weighted FFN result
+ * per slot at [slot*out_dim]; the caller sums the n_expert slices per token (moe_sum).
+ * mid_scratch must hold n_tokens*n_expert*mid_dim floats. selected/rweights are the
+ * device [n_tokens,n_expert] routing outputs. Returns 0 on success. */
+int ds4_cutlass_expert_ffn_gemv_small(
+        float          *down_out,
+        float          *mid_scratch,
+        const float    *x,
+        const int32_t  *selected,
+        const float    *rweights,
+        const uint8_t  *gate_w,
+        const uint8_t  *up_w,
+        const uint8_t  *down_w,
+        uint64_t        gate_stride,
+        uint64_t        gate_data_bytes,
+        uint64_t        down_stride,
+        uint64_t        down_data_bytes,
+        float           clamp,
+        int             n_tokens,
+        int             n_expert,
+        unsigned        n_total_expert,
+        int             in_dim,
+        int             mid_dim,
+        int             out_dim);
+
 /* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
  * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
  * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to ds4_cutlass_pack_source so the

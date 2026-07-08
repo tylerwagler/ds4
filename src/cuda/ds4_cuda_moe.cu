@@ -3760,6 +3760,49 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (gate_type == 40u && down_type == 40u) {
+        /* PROTOTYPE (opt-in DS4_MOE_FP4_GEMV=1): small-batch (n_tokens 2..4) direct fp4
+         * GEMV over the packed expert weights -- 2 launches per layer, no readback, no
+         * sort, f32 activations. Validated numerically correct against a quant-exact CPU
+         * reference (temp/fp4gemv_test.cu: max abs err 6e-4 over 73k elements), but
+         * MEASURED SLOWER than the grouped CUTLASS path end-to-end (spec step 145 vs
+         * 128 ms): the byte-granular column-major weight loads run at ~25% transaction
+         * efficiency and the K-serial threads underfill the SMs. Would need vectorized
+         * (uint32) row-pair-quad loads to win; kept off until then. */
+        static int fp4_gemv = -1;
+        if (fp4_gemv < 0) {
+            const char *e = getenv("DS4_MOE_FP4_GEMV");
+            fp4_gemv = (e && e[0] == '1');
+        }
+        if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u &&
+            mid && mid->ptr && down && down->ptr && out && out->ptr &&
+            selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
+            mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
+            down->bytes >= (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) &&
+            out->bytes >= (uint64_t)n_tokens * out_dim * sizeof(float) &&
+            selected->bytes >= (uint64_t)n_tokens * n_expert * sizeof(int32_t) &&
+            weights->bytes >= (uint64_t)n_tokens * n_expert * sizeof(float) &&
+            x->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(float)) {
+            const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
+            const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
+            const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
+            const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
+            const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
+            if (gate_w && up_w && down_w &&
+                ds4_cutlass_expert_ffn_gemv_small(
+                        (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
+                        (const int32_t *)selected->ptr, (const float *)weights->ptr,
+                        (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
+                        gate_expert_bytes, gate_row_bytes,
+                        down_expert_bytes, down_row_bytes,
+                        clamp, (int)n_tokens, (int)n_expert, n_total_expert,
+                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim) == 0) {
+                const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
+                moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
+                        (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 1;
+            }
+            /* any failure: fall through to the grouped CUTLASS path */
+        }
         return routed_moe_launch_cutlass(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,
