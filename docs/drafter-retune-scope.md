@@ -52,6 +52,21 @@ Current head AUC is 0.720 on our numerics; a calibrated head makes
 conf-scheduled trimming actually selective. Worth a few % on its own and
 exercises the export→convert→measure loop end to end.
 
+> **Phase 0 DONE (2026-07-08, commit 08afd7d).** 30.5k labeled positions from a
+> 24-request mixed corpus (lean dump at draft=4, conf-sched off). Recalibration
+> works: held-out AUC **0.676 → 0.818**. But it does NOT ship as a config
+> change: per-position acceptance at draft=4 is **51/22/7/2%**, so deep drafts
+> are unprofitable regardless of head quality — conf-scheduled draft=4 with the
+> new head reached 15.9 t/s vs fixed draft=2's 17.8 on the same prompts. The
+> offline simulator (temp/conf_retrain.py cost model) predicted the trim
+> behavior almost exactly (avg keep 2.06 predicted, 2.04 in vivo) but
+> underestimated draft=4 base overhead. Two takeaways for Phases 1–2:
+> (1) the dump→train→splice→measure loop is validated end to end
+> (dspark-drafter-conf2.gguf); (2) base acceptance is confirmed as the binding
+> constraint — exactly what the full retune attacks. Re-run this recalibration
+> as the LAST step of Phase 2 (the retrained drafter shifts the confidence
+> feature distribution).
+
 **Phase 1 — data generation (on-box, ds4 engine).**
 Add a prefill-time bulk dumper: per position, target_h[40/41/42] (3×4096 bf16 ≈
 24 KB), token id, and top-64 target logits (~0.5 KB, for the TV loss). Corpus:
