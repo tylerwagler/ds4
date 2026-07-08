@@ -270,96 +270,133 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
   return __int_as_float((uint32_t)b << 23);   /* 2^(e-127) */
 }
 
+// v3: the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles --
+// verified empirically (temp/fp4gemv_test.cu): ds4_cutlass_pack_source's data
+// section is an IDENTITY COPY of the source's row-major e2m1 bytes, i.e. logical
+// (n,k) lives at nibble k + n*K, byte n*(K/2) + k/2. (pack_weight_f32's manual
+// "n + k*N" math -- and its byte-for-byte comment -- does NOT match pack_source;
+// v1/v2 of these kernels inherited that assumption and read scrambled weights on
+// real models while passing a self-consistent synthetic test.) Row-major K lets
+// each warp own one output row with lanes reading consecutive uint32s (8 nibbles)
+// along k -- fully coalesced, no k-split, no partial buffers: one launch for
+// gate+up+swiglu, one for down. SF stays in the swizzled tile-atom layout,
+// indexed with the same layout object the packers use (SF sections of both
+// packers agree byte-for-byte).
+
 template <class SFL>
-__global__ static void expert_gemv_gate_up_swiglu_kernel(
+__global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N]
-    const float *x,           // [n_tokens, K]
+    const float *xq,          // [n_tokens, K] fp4-roundtripped activations
     const int32_t *sel,       // [n_slots] expert ids
     const float *rw,          // [n_slots] routing weights
     const uint8_t *gate_base, const uint8_t *up_base,
     uint64_t stride, uint64_t data_bytes, SFL sfl, float clampv,
     int n_expert, unsigned n_total, int K, int N) {
+  __shared__ float lut[16];
+  if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
+  __syncthreads();
   const int slot = (int)blockIdx.y;
-  const int np = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  if (2 * np >= N) return;
-  const int n0 = 2 * np, n1 = n0 + 1;
-  float *m = mid + (size_t)slot * N;
+  const int lane = (int)(threadIdx.x & 31u);
+  const int n = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
+  if (n >= N) return;
   const int e = sel[slot];
-  if (e < 0 || (unsigned)e >= n_total) { m[n0] = 0.f; m[n1] = 0.f; return; }
-  const uint8_t *gd = gate_base + (size_t)e * stride;
-  const uint8_t *ud = up_base + (size_t)e * stride;
-  const uint8_t *gsf = gd + data_bytes;
-  const uint8_t *usf = ud + data_bytes;
-  const float *xt = x + (size_t)(slot / n_expert) * K;
-  const size_t halfN = (size_t)(N / 2);
-  float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
-  for (int kb = 0; kb < K / 32; kb++) {
-    const float sg0 = gemv_sf_val(gsf[sfl(n0, kb * 32, 0)]);
-    const float sg1 = gemv_sf_val(gsf[sfl(n1, kb * 32, 0)]);
-    const float su0 = gemv_sf_val(usf[sfl(n0, kb * 32, 0)]);
-    const float su1 = gemv_sf_val(usf[sfl(n1, kb * 32, 0)]);
-    #pragma unroll 8
-    for (int i = 0; i < 32; i++) {
-      const int k = kb * 32 + i;
-      const float xv = xt[k];
-      const size_t byte = (size_t)np + (size_t)k * halfN;
-      const uint8_t bg = gd[byte];
-      const uint8_t bu = ud[byte];
-      g0 += kE2M1_GEMV[bg & 0xF] * sg0 * xv;
-      g1 += kE2M1_GEMV[bg >> 4] * sg1 * xv;
-      u0 += kE2M1_GEMV[bu & 0xF] * su0 * xv;
-      u1 += kE2M1_GEMV[bu >> 4] * su1 * xv;
+  float *m = mid + (size_t)slot * N;
+  if (e < 0 || (unsigned)e >= n_total) { if (lane == 0) m[n] = 0.f; return; }
+  const uint8_t *ge = gate_base + (size_t)e * stride;
+  const uint8_t *ue = up_base + (size_t)e * stride;
+  const uint8_t *gd = ge + (size_t)n * (K / 2);
+  const uint8_t *ud = ue + (size_t)n * (K / 2);
+  const uint8_t *gsf = ge + data_bytes;
+  const uint8_t *usf = ue + data_bytes;
+  const float *xt = xq + (size_t)(slot / n_expert) * K;
+  float g = 0.f, u = 0.f;
+  for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
+    const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
+    const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
+    const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
+    const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const float xv = xt[k0 + j];
+      g += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
+      u += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
     }
   }
-  /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
-  const float w = rw[slot];
-  if (clampv > 1.0e-6f) {
-    if (g0 > clampv) g0 = clampv;
-    if (g1 > clampv) g1 = clampv;
-    if (u0 > clampv) u0 = clampv;
-    if (u0 < -clampv) u0 = -clampv;
-    if (u1 > clampv) u1 = clampv;
-    if (u1 < -clampv) u1 = -clampv;
+  for (int sh = 16; sh > 0; sh >>= 1) {
+    g += __shfl_xor_sync(0xffffffffu, g, sh);
+    u += __shfl_xor_sync(0xffffffffu, u, sh);
   }
-  m[n0] = (g0 / (1.f + expf(-g0))) * u0 * w;
-  m[n1] = (g1 / (1.f + expf(-g1))) * u1 * w;
+  if (lane == 0) {
+    /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
+    if (clampv > 1.0e-6f) {
+      if (g > clampv) g = clampv;
+      if (u > clampv) u = clampv;
+      if (u < -clampv) u = -clampv;
+    }
+    m[n] = (g / (1.f + expf(-g))) * u * rw[slot];
+  }
 }
 
 template <class SFL>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
-    const float *mid,         // [n_slots, K]
+    const float *midq,        // [n_slots, K] fp4-roundtripped mid
     const int32_t *sel,       // [n_slots] expert ids
     const uint8_t *down_base,
     uint64_t stride, uint64_t data_bytes, SFL sfl,
     unsigned n_total, int K, int N) {
+  __shared__ float lut[16];
+  if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
+  __syncthreads();
   const int slot = (int)blockIdx.y;
-  const int np = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  if (2 * np >= N) return;
-  const int n0 = 2 * np, n1 = n0 + 1;
-  float *o = down_out + (size_t)slot * N;
+  const int lane = (int)(threadIdx.x & 31u);
+  const int n = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
+  if (n >= N) return;
   const int e = sel[slot];
-  if (e < 0 || (unsigned)e >= n_total) { o[n0] = 0.f; o[n1] = 0.f; return; }
-  const uint8_t *dd = down_base + (size_t)e * stride;
-  const uint8_t *dsf = dd + data_bytes;
-  const float *xt = mid + (size_t)slot * K;
-  const size_t halfN = (size_t)(N / 2);
-  float a0 = 0.f, a1 = 0.f;
-  for (int kb = 0; kb < K / 32; kb++) {
-    const float s0 = gemv_sf_val(dsf[sfl(n0, kb * 32, 0)]);
-    const float s1 = gemv_sf_val(dsf[sfl(n1, kb * 32, 0)]);
-    #pragma unroll 8
-    for (int i = 0; i < 32; i++) {
-      const int k = kb * 32 + i;
-      const float xv = xt[k];
-      const uint8_t b = dd[(size_t)np + (size_t)k * halfN];
-      a0 += kE2M1_GEMV[b & 0xF] * s0 * xv;
-      a1 += kE2M1_GEMV[b >> 4] * s1 * xv;
-    }
+  float *o = down_out + (size_t)slot * N;
+  if (e < 0 || (unsigned)e >= n_total) { if (lane == 0) o[n] = 0.f; return; }
+  const uint8_t *de = down_base + (size_t)e * stride;
+  const uint8_t *dd = de + (size_t)n * (K / 2);
+  const uint8_t *dsf = de + data_bytes;
+  const float *xt = midq + (size_t)slot * K;
+  float a = 0.f;
+  for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
+    const uint32_t w = *(const uint32_t *)(dd + (k0 >> 1));
+    const float sc = gemv_sf_val(dsf[sfl(n, k0 & ~31, 0)]);
+    #pragma unroll
+    for (int j = 0; j < 8; j++)
+      a += lut[(w >> (4 * j)) & 0xFu] * sc * xt[k0 + j];
   }
-  o[n0] = a0;
-  o[n1] = a1;
+  for (int sh = 16; sh > 0; sh >>= 1) a += __shfl_xor_sync(0xffffffffu, a, sh);
+  if (lane == 0) o[n] = a;
 }
+
+/* Round-trip activations through the EXACT fp4 quantizer the GEMM path applies
+ * (pack_act_rowmajor: per-32-group e=ceil(log2(max/6)) clamped to +-30, nearest
+ * e2m1) and hand the dequantized f32 back to the GEMVs. Without this the GEMV
+ * computes a numerically different function than the grouped path (f32 vs fp4
+ * activations on every rich layer) and greedy output drifts -- the fp4
+ * activation quant is part of the model's effective, quality-gated inference
+ * function, not an implementation detail. */
+__global__ static void fp4_act_roundtrip_kernel(float *xq, const float *x, long nblk32) {
+  const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nblk32) return;
+  const float *src = x + b * 32;
+  float *dst = xq + b * 32;
+  float mx = 0.f;
+  for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
+  int e = (mx > 0.f) ? (int)ceilf(log2f(mx / 6.f)) : 0;
+  if (e < -30) e = -30;
+  if (e > 30) e = 30;
+  const float s = exp2f((float)e);
+  for (int i = 0; i < 32; i++) dst[i] = d_kE2M1[d_to_e2m1(src[i] / s)] * s;
+}
+
+/* Persistent activation round-trip buffers, grown on demand and reused across
+ * layers/calls -- single GPU-submission thread, same convention as the other
+ * static caches. */
+static float *g_fp4_gemv_actbuf = nullptr;
+static size_t g_fp4_gemv_actbuf_floats = 0;
 
 // Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
 // down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
@@ -372,19 +409,42 @@ extern "C" int ds4_cutlass_expert_ffn_gemv_small(
     uint64_t down_stride, uint64_t down_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert,
     int in_dim, int mid_dim, int out_dim) {
-  if (in_dim % 32 || mid_dim % 64 || out_dim % 64) return 1;
+  if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
+  if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
+  const size_t xq_floats = (size_t)n_tokens * in_dim;
+  const size_t midq_floats = (size_t)n_slots * mid_dim;
+  const size_t need = xq_floats + midq_floats;
+  if (need > g_fp4_gemv_actbuf_floats) {
+    if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
+    g_fp4_gemv_actbuf = nullptr;
+    if (cudaMalloc(&g_fp4_gemv_actbuf, need * sizeof(float)) != cudaSuccess) {
+      g_fp4_gemv_actbuf_floats = 0;
+      return 1;
+    }
+    g_fp4_gemv_actbuf_floats = need;
+  }
+  float *xq = g_fp4_gemv_actbuf;
+  float *midq = xq + xq_floats;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
   {
-    dim3 g((unsigned)((mid_dim / 2 + 255) / 256), n_slots);
-    expert_gemv_gate_up_swiglu_kernel<<<g, 256>>>(mid_scratch, x, selected, rweights,
+    const long nb = (long)(xq_floats / 32);
+    fp4_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb);
+  }
+  {
+    dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
+    expert_gemv_gu_swiglu_kernel<<<g, 256>>>(mid_scratch, xq, selected, rweights,
         gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, in_dim, mid_dim);
   }
   {
-    dim3 g((unsigned)((out_dim / 2 + 255) / 256), n_slots);
-    expert_gemv_down_kernel<<<g, 256>>>(down_out, mid_scratch, selected,
+    const long nb = (long)(midq_floats / 32);
+    fp4_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid_scratch, nb);
+  }
+  {
+    dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
+    expert_gemv_down_kernel<<<g, 256>>>(down_out, midq, selected,
         down_w, down_stride, down_data_bytes, sfl_dn,
         n_total_expert, mid_dim, out_dim);
   }
@@ -422,41 +482,38 @@ extern "C" size_t ds4_cutlass_weight_sf_count(int N, int K){
 extern "C" size_t ds4_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
 
 // ---- Runtime dequant->fp4 weight packer (2-bit prefill path). Quantizes a DEQUANTIZED f32
-// weight [N,K] (RowMajor: N rows of K) to MXFP4 on-device (LOSSY) directly into CUTLASS B layout
-// (ColumnMajor packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), matching ds4_cutlass_pack_source's output
-// byte-for-byte so ds4_cutlass_expert_ffn_scratch consumes it unchanged. One thread per
-// (row-pair, 32-block): CUTLASS ColumnMajor packs logical index (n + k*N), so rows n0=2*np and
-// n1=2*np+1 occupy the low/high nibble of the SAME output byte -> a thread owns whole bytes and
-// there is no cross-thread nibble RMW race. Requires N even (all expert dims are). ----
+// weight [N,K] (RowMajor: N rows of K) to MXFP4 on-device (LOSSY) directly into CUTLASS B layout.
+// LAYOUT FIX (2026-07-08): the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles
+// -- logical (n,k) at nibble k + n*K, byte n*(K/2) + k/2 -- verified empirically against
+// ds4_cutlass_pack_source, whose data section is an identity copy of the source's row-major
+// e2m1 bytes (temp/fp4gemv_test.cu). The previous "(n + k*N)/2 ColumnMajor" math here did NOT
+// match pack_source despite the old comment's claim, so the opt-in DS4_MOE_FP4_PREFILL path
+// was feeding scrambled weights to the GEMM. One thread per (row, 32-block) owns 16 whole
+// output bytes -> no cross-thread nibble RMW race. ----
 template<class TSFB>
 __global__ void pack_weight_f32_kernel(uint8_t *B_data, TSFB tSFB, const float *W, int N, int K){
   int nblk = K/32;
   long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
-  if (idx >= (long)(N/2)*nblk) return;
-  int np = (int)(idx / nblk), kb = (int)(idx % nblk);
-  int n0 = 2*np, n1 = n0+1;
-  const float *w0 = W + (size_t)n0*K;
-  const float *w1 = W + (size_t)n1*K;
-  float mx0=0.f, mx1=0.f;
-  for (int i=0;i<32;i++){ mx0=fmaxf(mx0,fabsf(w0[kb*32+i])); mx1=fmaxf(mx1,fabsf(w1[kb*32+i])); }
-  int e0=(mx0>0.f)?(int)ceilf(log2f(mx0/6.f)):0; if(e0<-127)e0=-127; if(e0>127)e0=127;
-  int e1=(mx1>0.f)?(int)ceilf(log2f(mx1/6.f)):0; if(e1<-127)e1=-127; if(e1>127)e1=127;
-  float s0=exp2f((float)e0), s1=exp2f((float)e1);
-  tSFB(n0, kb*32, 0) = ElementSF::bitcast((uint8_t)(e0+127));
-  tSFB(n1, kb*32, 0) = ElementSF::bitcast((uint8_t)(e1+127));
-  for (int i=0;i<32;i++){
-    int k = kb*32+i;
-    size_t byte = (size_t)np + (size_t)k*(N/2);   // (n0 + k*N)/2, N even
-    uint8_t lo = d_to_e2m1(w0[k]/s0);
-    uint8_t hi = d_to_e2m1(w1[k]/s1);
-    B_data[byte] = (uint8_t)(lo | (hi<<4));
+  if (idx >= (long)N*nblk) return;
+  int n = (int)(idx / nblk), kb = (int)(idx % nblk);
+  const float *w = W + (size_t)n*K + (size_t)kb*32;
+  float mx=0.f;
+  for (int i=0;i<32;i++) mx=fmaxf(mx,fabsf(w[i]));
+  int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-127)e=-127; if(e>127)e=127;
+  float s=exp2f((float)e);
+  tSFB(n, kb*32, 0) = ElementSF::bitcast((uint8_t)(e+127));
+  uint8_t *ob = B_data + (size_t)n*(K/2) + (size_t)kb*16;
+  for (int i=0;i<16;i++){
+    uint8_t lo = d_to_e2m1(w[2*i]/s);
+    uint8_t hi = d_to_e2m1(w[2*i+1]/s);
+    ob[i] = (uint8_t)(lo | (hi<<4));
   }
 }
 
 extern "C" void ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
   auto tSFB = make_tensor(reinterpret_cast<ElementSF*>(Bsf), lSFB);
-  int nb = (N/2)*(K/32), t=128, b=(nb+t-1)/t;
+  int nb = N*(K/32), t=128, b=(nb+t-1)/t;
   pack_weight_f32_kernel<<<b,t>>>(Bd, tSFB, W, N, K);   // legacy default stream
 }
 

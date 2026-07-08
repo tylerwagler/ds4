@@ -3760,18 +3760,21 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (gate_type == 40u && down_type == 40u) {
-        /* PROTOTYPE (opt-in DS4_MOE_FP4_GEMV=1): small-batch (n_tokens 2..4) direct fp4
-         * GEMV over the packed expert weights -- 2 launches per layer, no readback, no
-         * sort, f32 activations. Validated numerically correct against a quant-exact CPU
-         * reference (temp/fp4gemv_test.cu: max abs err 6e-4 over 73k elements), but
-         * MEASURED SLOWER than the grouped CUTLASS path end-to-end (spec step 145 vs
-         * 128 ms): the byte-granular column-major weight loads run at ~25% transaction
-         * efficiency and the K-serial threads underfill the SMs. Would need vectorized
-         * (uint32) row-pair-quad loads to win; kept off until then. */
+        /* Small batches (spec-decode verify, n_tokens 2..4): direct fp4 GEMV over the
+         * packed expert weights -- 4 launches per layer (act-roundtrip + gate/up+swiglu
+         * + act-roundtrip + down) vs the grouped path's BLOCKING per-layer offsets
+         * readback + ~5 launches per active expert. Computes the exact same function
+         * as the grouped GEMMs (weights read in the verified row-major CUTLASS B
+         * layout; activations round-tripped through the same fp4 quantizer) -- proven
+         * bit-exact vs a quant-exact CPU oracle (temp/fp4gemv_test.cu) and clean-text
+         * on-model. Measured verify(3) step 118.2 -> 116.5 ms; the bigger win is
+         * removing the per-rich-layer host sync from the verify path (CUDA-graph
+         * prerequisite). n_tokens==1 (decode) keeps the grouped path unchanged.
+         * DS4_MOE_FP4_GEMV=0 restores the grouped dispatch. */
         static int fp4_gemv = -1;
         if (fp4_gemv < 0) {
             const char *e = getenv("DS4_MOE_FP4_GEMV");
-            fp4_gemv = (e && e[0] == '1');
+            fp4_gemv = !(e && e[0] == '0');
         }
         if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
