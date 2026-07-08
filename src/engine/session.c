@@ -4800,11 +4800,13 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     /* ONE batched forward: base decode + draft verify + anchor capture. */
     int row_tops[16];
     g->dspark_capture_batch_n = n_batch;
+    g->spec_comp_save_n = n_batch;   /* Stage-B: save per-position comp projections */
     bool ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
                                            &s->checkpoint,
                                            (uint32_t)saved_len, n_batch, false,
                                            K ? row_tops : NULL, NULL);
     g->dspark_capture_batch_n = 0;
+    g->spec_comp_save_n = 0;
     if (!ok) {
         s->checkpoint.len = saved_len;
         (void)spec_frontier_restore(&frontier, s);
@@ -4846,18 +4848,39 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
          * (Stage B replaces this replay with transactional state rollback.) */
         s->checkpoint.len = saved_len;
         ok_state = spec_frontier_restore(&frontier, s);
-        int32_t replay[17];
-        replay[0] = (int32_t)first_token;
-        for (int i = 0; i < commit; i++) replay[1 + i] = pend[i];
-        for (int i = 0; ok_state && i < 1 + commit; i++) {
-            if (ds4_session_eval(s, (int)replay[i], err, errlen) != 0) {
-                ok_state = false;
-                break;
+        static int no_replay = -1;
+        if (no_replay < 0) no_replay = getenv("DS4_DSPARK_NO_REPLAY") != NULL;
+        if (ok_state && no_replay) {
+            /* Stage B: transformer-free rollback. Roll only the recurrent
+             * compressor/indexer pool state forward through the committed
+             * prefix from the projections saved during the verify batch
+             * (bit-identical: same update kernels, same rows, same order).
+             * Raw KV + comp-cache rows are position-addressed and already
+             * correct; counters are set by formula; s->logits was already
+             * read from the fused batch's last committed row; drafter rows
+             * seed from the batch capture. */
+            ok_state = gpu_graph_dspark_compressor_rollforward(g, &e->model, &e->weights,
+                                                               (uint32_t)saved_len,
+                                                               (uint32_t)(1 + commit));
+            if (ok_state) {
+                s->checkpoint.len = saved_len + 1 + commit;
+                for (int m = 0; ok_state && m <= commit; m++)
+                    ok_state = dspark_seed_from_batch_row(s, (uint32_t)m);
             }
-            if (gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
-                gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
+        } else if (ok_state) {
+            int32_t replay[17];
+            replay[0] = (int32_t)first_token;
+            for (int i = 0; i < commit; i++) replay[1 + i] = pend[i];
+            for (int i = 0; ok_state && i < 1 + commit; i++) {
+                if (ds4_session_eval(s, (int)replay[i], err, errlen) != 0) {
+                    ok_state = false;
+                    break;
+                }
+                if (gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
+                    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
+            }
+            /* Replay refreshed s->logits from the last committed token. */
         }
-        /* Replay refreshed s->logits from the last committed token. */
     }
     spec_frontier_free(&frontier);
     if (!ok_state) {

@@ -821,6 +821,18 @@ bool gpu_graph_encode_layer_attention_batch(
                                               (uint64_t)comp_width * n_tokens,
                                               il,
                                               pos0);
+        /* Stage-B save: keep this batch's per-position compressor projections so
+         * a partial spec accept can roll the pool state forward without a
+         * transformer replay. Must run here -- the indexer section below reuses
+         * batch_comp_kv/sc. */
+        if (ok && g->spec_comp_save_n && g->spec_comp_kv_save[il]) {
+            uint32_t sn = g->spec_comp_save_n;
+            if (sn > n_tokens) sn = n_tokens;
+            if (sn > 17u) sn = 17u;
+            const uint64_t sb = (uint64_t)sn * comp_width * sizeof(float);
+            ok = ds4_gpu_tensor_copy(g->spec_comp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
+                 ds4_gpu_tensor_copy(g->spec_comp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
+        }
         uint32_t n_comp = g->layer_n_comp[il];
         if (zero_prefix) {
             n_comp = n_tokens / ratio;
@@ -1133,6 +1145,15 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   (uint64_t)index_width * n_tokens,
                                                   il,
                                                   pos0);
+            /* Stage-B save (indexer variant; see the attn compressor hook). */
+            if (ok && g->spec_comp_save_n && g->spec_icomp_kv_save[il]) {
+                uint32_t sn = g->spec_comp_save_n;
+                if (sn > n_tokens) sn = n_tokens;
+                if (sn > 17u) sn = 17u;
+                const uint64_t sb = (uint64_t)sn * index_width * sizeof(float);
+                ok = ds4_gpu_tensor_copy(g->spec_icomp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
+                     ds4_gpu_tensor_copy(g->spec_icomp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
+            }
             if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_q,
                                                           model,
                                                           layer->indexer_attn_q_b,
@@ -3085,3 +3106,88 @@ bool gpu_graph_eval_mtp_draft(
                                               top_id);
 }
 
+
+
+
+/* Stage-B no-replay rollback for the fused spec loop: after restoring the
+ * pre-batch frontier snapshot, roll ONLY the recurrent compressor/indexer pool
+ * state forward through the committed batch positions using the projections
+ * saved during the verify batch (spec_comp_*_save). Bit-identical to what a
+ * transformer replay would produce: the same per-token update kernels run on
+ * the same input rows in the same order -- minus the 43-layer forward. The
+ * comp-cache rows and raw KV need no work (the batch already wrote the
+ * committed positions' rows from identical state; rejected rows are position-
+ * addressed and get overwritten). Counters are set by formula. The pooled-row
+ * emit goes to a scratch sink (cache rows are already correct). */
+bool gpu_graph_dspark_compressor_rollforward(
+        ds4_gpu_graph  *g,
+        const ds4_model  *model,
+        const ds4_weights *weights,
+        uint32_t          pos0,
+        uint32_t          n_positions) {
+    if (!g || !model || !weights) return false;
+    if (n_positions == 0) return true;
+    if (n_positions > 17u || !g->spec_comp_scratch_row) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const ds4_layer_weights *layer = &weights->layer[il];
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+        const uint32_t index_width = 2u * DS4_N_INDEXER_HEAD_DIM;
+        const float freq_base = layer_rope_freq_base(il);
+        const float freq_scale = layer_rope_freq_scale(il);
+        const float ext_factor = DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float attn_factor = 1.0f;
+        if (ext_factor != 0.0f && freq_scale > 0.0f) {
+            attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        if (!g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il]) return false;
+        for (uint32_t t = 0; t < n_positions; t++) {
+            const uint32_t pos = pos0 + t;
+            ds4_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], t, comp_width);
+            ds4_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], t, comp_width);
+            bool ok = kv_view && sc_view &&
+                ds4_gpu_compressor_update_tensor(kv_view, sc_view,
+                        g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                        g->spec_comp_scratch_row,
+                        model->map, model->size,
+                        layer->attn_compressor_ape->abs_offset,
+                        layer->attn_compressor_ape->type,
+                        layer->attn_compressor_norm->abs_offset,
+                        layer->attn_compressor_norm->type,
+                        DS4_N_HEAD_DIM, ratio, pos, 0,
+                        DS4_N_ROT, (uint32_t)DS4_ROPE_ORIG_CTX,
+                        freq_base, freq_scale, ext_factor, attn_factor,
+                        DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                        DS4_RMS_EPS) != 0;
+            ds4_gpu_tensor_free(sc_view);
+            ds4_gpu_tensor_free(kv_view);
+            if (!ok) return false;
+            if (ratio == 4 && g->spec_icomp_kv_save[il]) {
+                ds4_gpu_tensor *ikv = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], t, index_width);
+                ds4_gpu_tensor *isc = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], t, index_width);
+                ok = ikv && isc &&
+                    ds4_gpu_compressor_update_tensor(ikv, isc,
+                            g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                            g->spec_comp_scratch_row,
+                            model->map, model->size,
+                            layer->indexer_compressor_ape->abs_offset,
+                            layer->indexer_compressor_ape->type,
+                            layer->indexer_compressor_norm->abs_offset,
+                            layer->indexer_compressor_norm->type,
+                            DS4_N_INDEXER_HEAD_DIM, ratio, pos, 0,
+                            DS4_N_ROT, (uint32_t)DS4_ROPE_ORIG_CTX,
+                            freq_base, freq_scale, ext_factor, attn_factor,
+                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                            DS4_RMS_EPS) != 0;
+                ds4_gpu_tensor_free(isc);
+                ds4_gpu_tensor_free(ikv);
+                if (!ok) return false;
+            }
+        }
+        g->layer_n_comp[il] = (pos0 + n_positions) / ratio;
+        if (ratio == 4) g->layer_n_index_comp[il] = (pos0 + n_positions) / ratio;
+    }
+    return true;
+}

@@ -1052,6 +1052,19 @@ typedef struct {
      * positions; 0 = off (prefill and plain decode unaffected). */
     ds4_gpu_tensor *dspark_target_h_batch[3];
     uint32_t dspark_capture_batch_n;
+    /* Fused spec loop Stage B (no-replay rollback): per-position compressor
+     * projections saved during the verify batch, so a partial accept can roll
+     * the recurrent pool state forward from the frontier snapshot WITHOUT
+     * replaying the transformer (the pool update kernels re-run from these
+     * exact rows -> bit-identical state). [17 rows x width] per compressed
+     * layer; the indexer compressor reuses batch_comp_kv/sc so it needs its
+     * own save. spec_comp_save_n arms the save (0 = off). */
+    ds4_gpu_tensor *spec_comp_kv_save[DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_comp_sc_save[DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_icomp_kv_save[DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_icomp_sc_save[DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_comp_scratch_row;   /* emit sink during roll-forward */
+    uint32_t spec_comp_save_n;
 
     /* DSpark draft KV raw caches (one per draft layer, window=128) */
     ds4_gpu_tensor *dspark_raw_cache[3];
@@ -2478,6 +2491,12 @@ bool gpu_graph_eval_mtp_draft_from_hc(
         uint32_t               pos,
         float                 *logits,
         int                   *top_id);
+bool gpu_graph_dspark_compressor_rollforward(
+        ds4_gpu_graph  *g,
+        const ds4_model  *model,
+        const ds4_weights *weights,
+        uint32_t          pos0,
+        uint32_t          n_positions);
 bool gpu_graph_eval_mtp_draft(
         ds4_gpu_graph       *g,
         const ds4_model       *base_model,

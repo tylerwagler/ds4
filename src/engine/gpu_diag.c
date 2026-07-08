@@ -554,6 +554,32 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
     g->dspark_capture_batch_n = 0;
     g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     ok = ok && g->dspark_main_x;
+    /* Stage-B no-replay rollback: per-position compressor projection saves for
+     * every compressed layer (attn comp_width <= 2*DS4_N_HEAD_DIM; indexer width
+     * = 2*DS4_N_INDEXER_HEAD_DIM) + one emit-sink scratch row. ~8 MB total. */
+    {
+        const uint64_t attn_w = 2ull * DS4_N_HEAD_DIM;
+        const uint64_t idx_w = 2ull * DS4_N_INDEXER_HEAD_DIM;
+        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            g->spec_comp_kv_save[il] = NULL;
+            g->spec_comp_sc_save[il] = NULL;
+            g->spec_icomp_kv_save[il] = NULL;
+            g->spec_icomp_sc_save[il] = NULL;
+            if (ratio == 0) continue;
+            g->spec_comp_kv_save[il] = ds4_gpu_tensor_alloc(17ull * attn_w * sizeof(float));
+            g->spec_comp_sc_save[il] = ds4_gpu_tensor_alloc(17ull * attn_w * sizeof(float));
+            ok = ok && g->spec_comp_kv_save[il] && g->spec_comp_sc_save[il];
+            if (ratio == 4) {
+                g->spec_icomp_kv_save[il] = ds4_gpu_tensor_alloc(17ull * idx_w * sizeof(float));
+                g->spec_icomp_sc_save[il] = ds4_gpu_tensor_alloc(17ull * idx_w * sizeof(float));
+                ok = ok && g->spec_icomp_kv_save[il] && g->spec_icomp_sc_save[il];
+            }
+        }
+        g->spec_comp_scratch_row = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        ok = ok && g->spec_comp_scratch_row;
+        g->spec_comp_save_n = 0;
+    }
     /*
      * DSpark reuses the MTP speculative-logits buffer for its N-token draft
      * base logits and for the target verify pass.  --mtp and --dspark are
