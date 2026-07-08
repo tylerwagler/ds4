@@ -146,6 +146,66 @@ extern "C" int ds4_gpu_dspark_markov_step_model(
 }
 
 
+/* DSpark confidence head (model.py DSparkConfidenceHead): per block position,
+ * scores[p] = sigmoid( proj . cat(hidden[p], markov_embed[token_ids[p]]) ), where
+ * hidden is the post-hc_head drafter hidden and markov_embed is a row of markov_w1
+ * gathered by token id. Used to size the verify budget (confidence-scheduled
+ * verification) -- higher confidence => the draft is more likely accepted. */
+__global__ static void dspark_confidence_score_kernel(
+        float *scores,
+        const float *hidden,        /* [n_positions, hidden_dim] */
+        const int32_t *token_ids,   /* [n_positions] */
+        const float *markov_w1,     /* [vocab, embed_dim] */
+        const float *proj,          /* [hidden_dim + embed_dim] */
+        uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size) {
+    uint32_t p = blockIdx.x;
+    if (p >= n_positions) return;
+    int32_t t = token_ids[p];
+    if (t < 0 || (uint32_t)t >= vocab_size) t = 0;
+    const float *hp = hidden + (uint64_t)p * hidden_dim;
+    const float *emb = markov_w1 + (uint64_t)t * embed_dim;
+    float dot = 0.0f;
+    for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x) dot += hp[i] * proj[i];
+    for (uint32_t i = threadIdx.x; i < embed_dim; i += blockDim.x) dot += emb[i] * proj[hidden_dim + i];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = dot;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) scores[p] = 1.0f / (1.0f + expf(-partial[0]));
+}
+
+
+extern "C" int ds4_gpu_dspark_confidence_score_model(
+        ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *token_ids,
+        const void *dspark_model_map,
+        uint64_t dspark_model_size,
+        uint64_t markov_w1_offset,
+        uint64_t proj_offset,
+        uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size) {
+    if (!scores || !hidden || !token_ids || !dspark_model_map) return 0;
+    if (n_positions == 0 || hidden_dim == 0 || embed_dim == 0 || vocab_size == 0) return 0;
+    if (scores->bytes < (uint64_t)n_positions * sizeof(float)) return 0;
+    if (hidden->bytes < (uint64_t)n_positions * hidden_dim * sizeof(float)) return 0;
+    if (token_ids->bytes < (uint64_t)n_positions * sizeof(int32_t)) return 0;
+    const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);
+    const uint64_t proj_bytes = (uint64_t)(hidden_dim + embed_dim) * sizeof(float);
+    if (markov_w1_offset > dspark_model_size || w1_bytes > dspark_model_size - markov_w1_offset) return 0;
+    if (proj_offset > dspark_model_size || proj_bytes > dspark_model_size - proj_offset) return 0;
+    const float *w1 = (const float *)cuda_model_range_ptr(dspark_model_map, markov_w1_offset, w1_bytes, "dspark_conf_w1");
+    const float *proj = (const float *)cuda_model_range_ptr(dspark_model_map, proj_offset, proj_bytes, "dspark_conf_proj");
+    if (!w1 || !proj) return 0;
+    dspark_confidence_score_kernel<<<n_positions, 256>>>(
+        (float *)scores->ptr, (const float *)hidden->ptr, (const int32_t *)token_ids->ptr,
+        w1, proj, n_positions, hidden_dim, embed_dim, vocab_size);
+    return cuda_ok(cudaGetLastError(), "dspark confidence score");
+}
+
+
 __global__ static void dspark_hc_mean_reduce_kernel(
         float *out,
         const float *after_ffn_hc,

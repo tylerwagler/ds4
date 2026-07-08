@@ -4679,7 +4679,8 @@ static float dspark_base_top1_prob(const float *logits, int n) {
  * DS4_DSPARK_DUMP=<path>; caps at DS4_DSPARK_DUMP_STEPS (default 8) records.
  * Record layout (little-endian): pos i32, first_token i32, then f32 arrays
  * target_h[0..2] (DS4_N_EMBD each), main_x (DS4_N_EMBD), base0 (DS4_N_VOCAB). */
-static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token) {
+static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
+                             const int32_t *refined_ids, int n_draft) {
     const char *path = getenv("DS4_DSPARK_DUMP");
     if (!path || !path[0]) return;
     static int dumped = 0;
@@ -4687,12 +4688,19 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token) {
     const int max_steps = lim ? atoi(lim) : 8;
     if (dumped >= max_steps) return;
 
+    const uint64_t hcw = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     float *emb = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *voc = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *hc = xmalloc((size_t)hcw * sizeof(float));
     FILE *f = fopen(path, dumped == 0 ? "wb" : "ab");
-    if (!f) { free(emb); free(voc); return; }
-    int32_t hdr[2] = { (int32_t)pos, (int32_t)first_token };
-    fwrite(hdr, sizeof(int32_t), 2, f);
+    if (!f) { free(emb); free(voc); free(hc); return; }
+    /* Record: pos, tok, n_draft, refined_ids[0..n_draft], target_h[3], main_x,
+     * base0(vocab), then cur_hc for each of the n_draft block positions. n_draft
+     * is fixed per run -> fixed record size. Used to validate offline whether the
+     * DSpark confidence head predicts per-position acceptance on our requant. */
+    int32_t hdr[3] = { (int32_t)pos, (int32_t)first_token, (int32_t)n_draft };
+    fwrite(hdr, sizeof(int32_t), 3, f);
+    fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
     for (int i = 0; i < 3; i++) {
         memset(emb, 0, (size_t)DS4_N_EMBD * sizeof(float));
         (void)ds4_gpu_tensor_read(g->dspark_target_h[i], 0, emb, (uint64_t)DS4_N_EMBD * 4);
@@ -4704,16 +4712,17 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token) {
     memset(voc, 0, (size_t)DS4_N_VOCAB * sizeof(float));
     (void)gpu_graph_read_spec_logits_row(g, 0, voc);
     fwrite(voc, sizeof(float), DS4_N_VOCAB, f);
-    /* block-2 output hidden feeding the drafter head (row 0): [DS4_N_HC, DS4_N_EMBD]. */
-    float *hc = xmalloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
-    memset(hc, 0, (size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
-    (void)ds4_gpu_tensor_read(g->batch_cur_hc, 0, hc, (uint64_t)DS4_N_HC * DS4_N_EMBD * 4);
-    fwrite(hc, sizeof(float), (size_t)DS4_N_HC * DS4_N_EMBD, f);
-    free(hc);
+    /* block-2 output hidden (pre-hc_head) for each draft position [HC, EMBD]. */
+    for (int p = 0; p < n_draft; p++) {
+        memset(hc, 0, (size_t)hcw * sizeof(float));
+        (void)ds4_gpu_tensor_read(g->batch_cur_hc, (uint64_t)p * hcw * 4, hc, hcw * 4);
+        fwrite(hc, sizeof(float), (size_t)hcw, f);
+    }
     fclose(f);
     dumped++;
-    fprintf(stderr, "ds4: dspark dump step %d pos=%d tok=%d -> %s\n", dumped, pos, first_token, path);
-    free(emb); free(voc);
+    fprintf(stderr, "ds4: dspark dump step %d pos=%d tok=%d n_draft=%d -> %s\n",
+            dumped, pos, first_token, n_draft, path);
+    free(emb); free(voc); free(hc);
 }
 
 int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
@@ -4848,7 +4857,47 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     ds4_gpu_tensor_free(dspark_logits);
     if (dspark_stats) dspark_markov_ms = (now_sec() - dspark_mk_t0) * 1000.0;
 
-    dspark_dump_step(g, dump_pos, first_token);
+    dspark_dump_step(g, dump_pos, first_token, refined_ids, (int)n_draft);
+
+    /* Step 5c: confidence-scheduled verification (P1). The trained DSpark
+     * confidence head predicts, per block position, whether the draft will be
+     * accepted (from the post-hc_head hidden in batch_ffn_cur + the drafted
+     * token's markov embed). Size the verify budget to the confident prefix so
+     * we don't spend the batch verify on low-confidence tail drafts. Threshold
+     * DS4_DSPARK_CONF_SCHED (default 0 = verify all n_draft, unchanged behavior).
+     * OUTPUT-PRESERVING: reducing the budget only limits how many drafts we
+     * verify/commit; the emitted tokens are still exact greedy. */
+    uint32_t eff_draft = n_draft;
+    {
+        const char *cs = getenv("DS4_DSPARK_CONF_SCHED");
+        const float tau = cs ? (float)atof(cs) : 0.0f;
+        if (tau > 0.0f) {
+            ds4_gpu_tensor *conf_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
+            ds4_gpu_tensor *tok_dev  = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+            if (conf_dev && tok_dev &&
+                ds4_gpu_tensor_write(tok_dev, 0, refined_ids, (uint64_t)n_draft * sizeof(int32_t)) &&
+                ds4_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
+                                                      dmap, dsize,
+                                                      w->markov_w1->abs_offset,
+                                                      w->confidence_proj->abs_offset,
+                                                      n_draft, DS4_N_EMBD, embed_dim, vocab_size)) {
+                float conf[16];
+                if (ds4_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
+                    uint32_t k = 0;
+                    while (k < n_draft && conf[k] >= tau) k++;
+                    eff_draft = k < 1 ? 1u : k;   /* floor 1: draft_1 is free-validated below */
+                    if (dspark_stats)
+                        fprintf(stderr, "ds4: dspark conf_sched tau=%.2f conf=[%.2f,%.2f,%.2f,%.2f] eff=%u/%u\n",
+                                (double)tau, (double)conf[0],
+                                n_draft > 1 ? (double)conf[1] : 0.0,
+                                n_draft > 2 ? (double)conf[2] : 0.0,
+                                n_draft > 3 ? (double)conf[3] : 0.0, eff_draft, n_draft);
+                }
+            }
+            ds4_gpu_tensor_free(conf_dev);
+            ds4_gpu_tensor_free(tok_dev);
+        }
+    }
 
     /* Step 5b: fast reject. The first draft is validated for FREE against
      * s->logits (Step 1's P(next | first_token)); only drafts 2..N need the
@@ -4875,7 +4924,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * so it validates drafts 2..draft_n; the first draft is validated for free
      * against s->logits. */
     const int saved_len = s->checkpoint.len;
-    const int draft_n = (int)n_draft;
+    const int draft_n = (int)eff_draft;   /* confidence-scheduled verify budget (Step 5c) */
 
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));

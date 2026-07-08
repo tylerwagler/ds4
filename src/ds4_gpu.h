@@ -1063,6 +1063,23 @@ int ds4_gpu_dspark_hc_mean_reduce(
         uint32_t               n_embd,
         uint32_t               n_hc);
 
+/* DSpark confidence head: per block position, confidence that the draft is
+ * accepted. hidden = post-hc_head drafter hidden [n_positions, hidden_dim];
+ * token_ids = block token per position; markov_w1/proj resolved from the dspark
+ * model map. Drives confidence-scheduled verification (sizing the draft length). */
+int ds4_gpu_dspark_confidence_score_model(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *token_ids,
+        const void             *dspark_model_map,
+        uint64_t                dspark_model_size,
+        uint64_t                markov_w1_offset,
+        uint64_t                proj_offset,
+        uint32_t                n_positions,
+        uint32_t                hidden_dim,
+        uint32_t                embed_dim,
+        uint32_t                vocab_size);
+
 #ifdef __cplusplus
 }
 #endif
