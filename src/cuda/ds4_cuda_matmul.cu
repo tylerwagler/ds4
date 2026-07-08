@@ -585,9 +585,25 @@ static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
 /* lazily de-interleave + swizzle an MXFP8 weight into device buffers, cached by offset. */
 static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t offset, uint64_t weight_bytes,
                                                uint64_t in_dim, uint64_t out_dim, const char *label) {
+    /* The same ~300 weight offsets are resolved once per layer every token on
+     * the launch-serializing host thread. A tiny direct-mapped cache in front
+     * of the unordered_map skips the probe on the hot repeat; a miss or hash
+     * collision just falls through (benign), and the cached pointer is
+     * re-validated (map references are stable across inserts). */
+    constexpr uint32_t FC = 2048u;
+    static uint64_t fc_off[FC];              /* zero-init; real offsets are never 0 */
+    static const fp8_mx_weight *fc_ptr[FC];
+    const uint32_t slot = (uint32_t)(((offset >> 5) ^ (offset >> 17)) & (FC - 1u));
+    if (offset != 0 && fc_off[slot] == offset) {
+        const fp8_mx_weight *p = fc_ptr[slot];
+        if (p && p->host_base == model_map && p->in_dim == in_dim && p->out_dim == out_dim) return p;
+    }
     auto it = g_fp8_mx_by_offset.find(offset);
     if (it != g_fp8_mx_by_offset.end() && it->second.host_base == model_map &&
-        it->second.in_dim == in_dim && it->second.out_dim == out_dim) return &it->second;
+        it->second.in_dim == in_dim && it->second.out_dim == out_dim) {
+        fc_off[slot] = offset; fc_ptr[slot] = &it->second;
+        return &it->second;
+    }
     const unsigned char *src = (const unsigned char *)cuda_model_range_ptr(model_map, offset, weight_bytes, "fp8_mx");
     if (!src) return NULL;
     int KB = (int)(in_dim / 32), KBp = mx_rup(KB, 4);
@@ -603,7 +619,9 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
     fp8_mx_weight w = { model_map, offset, in_dim, out_dim, data, scale };
     g_fp8_mx_by_offset[offset] = w;
     (void)label;
-    return &g_fp8_mx_by_offset[offset];
+    const fp8_mx_weight *wp = &g_fp8_mx_by_offset[offset];
+    fc_off[slot] = offset; fc_ptr[slot] = wp;
+    return wp;
 }
 
 
