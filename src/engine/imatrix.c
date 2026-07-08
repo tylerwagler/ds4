@@ -238,7 +238,71 @@ static void gpu_graph_report_prefill_display_progress(
 
 
 
+/* Bulk anchor-hidden dump for drafter retraining: after a chunk syncs, append
+ * one record to DS4_DSPARK_PREFILL_DUMP -- {u32 n, u32 start, i32 ids[n],
+ * f32 h0[n*4096], f32 h1[...], f32 h2[...]} -- and clear the arm flag. Records
+ * with start==0 mark request boundaries for the trainer. Failure paths clear
+ * the arm without writing so the verify batch path never sees a stale arm. */
+static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
+                              uint32_t start, uint32_t n, bool ok) {
+    if (!g->dspark_bulk_n) return;
+    const uint32_t cap_n = g->dspark_bulk_n < n ? g->dspark_bulk_n : n;
+    g->dspark_bulk_n = 0;
+    if (!ok) return;
+    const char *path = getenv("DS4_DSPARK_PREFILL_DUMP");
+    if (!path || !path[0] || !g->dspark_bulk_h[0]) return;
+    static FILE *f = NULL;
+    static float *host = NULL;
+    if (!f) f = fopen(path, "wb");
+    if (!f) return;
+    if (!host) host = xmalloc((size_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+    uint32_t hdr[2] = { cap_n, start };
+    fwrite(hdr, sizeof(uint32_t), 2, f);
+    fwrite(prompt->v + start, sizeof(int32_t), cap_n, f);
+    for (int s = 0; s < 3; s++) {
+        if (!ds4_gpu_tensor_read(g->dspark_bulk_h[s], 0, host,
+                                 (uint64_t)cap_n * DS4_N_EMBD * sizeof(float)))
+            return;
+        fwrite(host, sizeof(float), (size_t)cap_n * DS4_N_EMBD, f);
+    }
+    fflush(f);
+}
+
+static bool gpu_graph_prefill_layer_major_inner(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud);
+
 bool gpu_graph_prefill_layer_major(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud) {
+    const bool ok = gpu_graph_prefill_layer_major_inner(g, model, weights, prompt,
+                                                        start, n_tokens, logits,
+                                                        show_progress, imatrix,
+                                                        display_progress,
+                                                        display_progress_ud);
+    dspark_bulk_drain(g, prompt, start, n_tokens, ok);
+    return ok;
+}
+
+static bool gpu_graph_prefill_layer_major_inner(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -262,6 +326,11 @@ bool gpu_graph_prefill_layer_major(
 
 
     if (!gpu_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
+
+    /* Bulk anchor-hidden capture (drafter retraining): armed per chunk, after
+     * warmup so warmup encodes don't pollute the buffers; drained (and cleared)
+     * by gpu_graph_prefill_chunked_range after the chunk syncs. */
+    g->dspark_bulk_n = g->dspark_bulk_h[0] ? n_tokens : 0;
 
     const bool split_profile = getenv("DS4_CUDA_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*

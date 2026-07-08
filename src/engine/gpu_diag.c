@@ -554,6 +554,16 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
     g->dspark_capture_batch_n = 0;
     g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     ok = ok && g->dspark_main_x;
+    /* Bulk prefill capture buffers for drafter retraining (~200 MB at
+     * prefill_cap 4096); only when the dump is requested. */
+    g->dspark_bulk_n = 0;
+    if (getenv("DS4_DSPARK_PREFILL_DUMP")) {
+        for (int i = 0; i < 3; i++) {
+            g->dspark_bulk_h[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+            ok = ok && g->dspark_bulk_h[i];
+        }
+    }
     /* Stage-B no-replay rollback: per-position compressor projection saves for
      * every compressed layer (attn comp_width <= 2*DS4_N_HEAD_DIM; indexer width
      * = 2*DS4_N_INDEXER_HEAD_DIM) + one emit-sink scratch row. ~8 MB total. */

@@ -1055,6 +1055,12 @@ typedef struct {
     ds4_gpu_tensor *dspark_target_h[3];
     ds4_gpu_tensor *dspark_main_x;
     uint32_t dspark_target_layer_ids[3];
+    /* Bulk prefill anchor-hidden capture for drafter retraining
+     * (DS4_DSPARK_PREFILL_DUMP): per-chunk [prefill_cap, N_EMBD] buffers, one
+     * per anchor layer. dspark_bulk_n is armed to the chunk's token count by
+     * the prefill path and cleared by the drain; 0 everywhere else. */
+    ds4_gpu_tensor *dspark_bulk_h[3];
+    uint32_t dspark_bulk_n;
     /* Fused spec loop (P2): per-position anchor hiddens captured during the
      * verify batch — [spec cap, N_EMBD] per anchor layer. dspark_capture_batch_n
      * != 0 arms the capture in gpu_graph_encode_layer_batch for that many

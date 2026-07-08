@@ -2304,6 +2304,23 @@ bool gpu_graph_encode_layer_batch(
             break;
         }
     }
+    /* Bulk prefill capture for drafter retraining (DS4_DSPARK_PREFILL_DUMP):
+     * same reduction as the verify capture above, but over EVERY chunk position
+     * into the per-layer bulk buffers. Armed only by the prefill path. */
+    if (ok && g->dspark_bulk_n) {
+        for (int slot = 0; slot < 3; slot++) {
+            if (il != g->dspark_target_layer_ids[slot]) continue;
+            if (!g->dspark_bulk_h[slot]) break;
+            uint32_t cap_n = g->dspark_bulk_n;
+            if (cap_n > n_tokens) cap_n = n_tokens;
+            if (!ds4_gpu_dspark_hc_mean_reduce_batch(g->dspark_bulk_h[slot],
+                                                     g->batch_cur_hc,
+                                                     DS4_N_EMBD, DS4_N_HC, cap_n)) {
+                ok = false;
+            }
+            break;
+        }
+    }
     return ok;
 }
 
