@@ -272,9 +272,13 @@ bool gpu_graph_prefill_layer_major(
      * cosmetic.
      */
     const bool throttle = graph_power_throttle_enabled(g);
-    const bool callback_split = display_progress != NULL && n_tokens >= 32;
+    /* Do NOT split (per-layer cudaDeviceSynchronize) just to fire a display
+     * progress callback: on this backend end_commands() is a full device sync,
+     * so per-layer progress drains the async launch pipeline 43x/chunk. Chunk-
+     * level progress (gpu_graph_prefill_chunked_range) still fires; intra-chunk
+     * progress is dropped in favor of throughput. */
     const bool split_commands = g->ssd_streaming ||
-                                split_profile || throttle || callback_split ||
+                                split_profile || throttle ||
                                 n_tokens > 2048 || imatrix != NULL;
     const bool profile = getenv("DS4_CUDA_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
@@ -875,7 +879,11 @@ bool gpu_graph_prefill_chunked_range(
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
-        float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
+        /* Only the final chunk's logits are consumed (the progress callback below
+         * reports position only, never reads logits). Running the full output
+         * head + vocab GEMM + readback on every non-final chunk is wasted work
+         * whose result is immediately overwritten. */
+        float *chunk_logits = (chunk_end == end) ? logits : NULL;
         bool ok = gpu_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
