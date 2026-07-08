@@ -1170,12 +1170,14 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
-    const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+    static const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+    static const int env_serial_router = getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+    static const int env_ordered_f16 = getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
     const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
     const int serial_router =
         !serial_f16 &&
         router_shape &&
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+        env_serial_router;
     /* Decode f16 matmuls default to the coalesced 256-thread matmul_f16_kernel (the
      * fall-through below): ~+6% decode vs the uncoalesced 32-thread ordered_chunks
      * kernel. Both are deterministic; the reduction order differs by ~1 ULP, which is
@@ -1185,7 +1187,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
+        env_ordered_f16;
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
@@ -1282,11 +1284,15 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     }
     /* Default: two separate coalesced matmuls (each fast via matmul_f16_kernel). The
      * fused pair_ordered_chunks kernel is opt-in with the exact old order. */
+    static const int env_no_pair = getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL;
+    static const int env_serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+    static const int env_serial_router = getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+    static const int env_ordered_f16 = getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
     if (n_tok != 1 ||
-        getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_ORDERED_F16_MATMUL") == NULL) {
+        env_no_pair ||
+        env_serial_f16 ||
+        env_serial_router ||
+        !env_ordered_f16) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
