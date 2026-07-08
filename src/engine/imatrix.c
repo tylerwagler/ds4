@@ -1043,14 +1043,25 @@ bool gpu_graph_verify_suffix_tops(
                                        g->spec_logits,
                                        DS4_N_VOCAB) != 0;
         } else if (top_rows) {
-            /* top-1 of each of the top_rows rows: n_tokens=top_rows, top_k=1.
-             * The order is transposed vs the indexer-score callers; a swap
-             * silently scores row 0's runner-ups instead of each row. */
-            ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                               g->spec_logits,
-                                               DS4_N_VOCAB,
-                                               top_rows,
-                                               1) != 0;
+            /* top-1 of each of the top_rows rows. The legacy
+             * indexer_topk_tensor fall-through for this shape launches ONE
+             * THREAD per row scanning the whole vocab (~14ms at 4 rows);
+             * per-row argmax launches (1024-thread tree-reduce each) do the
+             * same job in <1ms and write the same [top_rows] i32 layout. */
+            for (uint32_t r = 0; ok && r < top_rows; r++) {
+                ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                        g->spec_logits,
+                        (uint64_t)r * DS4_N_VOCAB * sizeof(float),
+                        (uint64_t)DS4_N_VOCAB * sizeof(float));
+                ds4_gpu_tensor *dst = ds4_gpu_tensor_view(
+                        g->comp_selected,
+                        (uint64_t)r * sizeof(int32_t),
+                        sizeof(int32_t));
+                ok = row && dst &&
+                     ds4_gpu_argmax_tensor(dst, row, DS4_N_VOCAB) != 0;
+                ds4_gpu_tensor_free(row);
+                ds4_gpu_tensor_free(dst);
+            }
         }
     }
     const double t_head_encoded = timing ? now_sec() : 0.0;

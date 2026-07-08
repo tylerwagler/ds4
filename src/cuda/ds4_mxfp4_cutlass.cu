@@ -112,7 +112,21 @@ static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
                     void *workspace){
   auto args = make_gemm_args(D,A_data,A_sf,B_data,B_sf,M,N,K);
   Gemm gemm;
-  if (gemm.can_implement(args)!=cutlass::Status::kSuccess) return 1;
+  /* can_implement is pure host-side argument validation and is deterministic
+   * per (M,N,K); the expert loop re-ran it for every expert's every GEMM. Cache
+   * validated shapes (single-threaded GPU submission thread; the shape set is
+   * tiny -- a few (T,mid,in)/(T,out,mid) combos). */
+  {
+    static uint64_t seen[64];
+    static int n_seen = 0;
+    const uint64_t key = ((uint64_t)(uint32_t)M << 42) ^ ((uint64_t)(uint32_t)N << 21) ^ (uint32_t)K;
+    bool hit = false;
+    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { hit = true; break; }
+    if (!hit) {
+      if (gemm.can_implement(args)!=cutlass::Status::kSuccess) return 1;
+      if (n_seen < 64) seen[n_seen++] = key;
+    }
+  }
   if (gemm.initialize(args, workspace)!=cutlass::Status::kSuccess) return 2;
   auto st = gemm.run();
   return st==cutlass::Status::kSuccess ? 0 : 3;
@@ -196,8 +210,12 @@ extern "C" int ds4_cutlass_expert_ffn_scratch(
   void *ws_gate = L.ws_gate_bytes ? scratch + L.ws_gate_off : nullptr;
   void *ws_up   = L.ws_up_bytes   ? scratch + L.ws_up_off   : nullptr;
   void *ws_down = L.ws_down_bytes ? scratch + L.ws_down_off : nullptr;
-  if (L.xSF_n) cudaMemset(xSF,0,L.xSF_n*sizeof(ElementSF));
-  if (L.midSF_n) cudaMemset(midSF,0,L.midSF_n*sizeof(ElementSF));
+  /* Async: blocking cudaMemset serializes the host against ALL in-flight device
+   * work -- in the per-expert FFN loop that was 2 full device syncs per expert
+   * per rich layer, dominating small-batch verify encode time. The null-stream
+   * async memset is still ordered before the pack/GEMM launches below. */
+  if (L.xSF_n) cudaMemsetAsync(xSF,0,L.xSF_n*sizeof(ElementSF));
+  if (L.midSF_n) cudaMemsetAsync(midSF,0,L.midSF_n*sizeof(ElementSF));
   int rc=0;
   pack_activation(xA,xSF,x,T,in_dim);
   rc|=run_gemm(gate,xA,xSF,Wg_d,Wg_sf_e,T,mid_dim,in_dim,ws_gate);
@@ -256,6 +274,48 @@ extern "C" void ds4_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8
 extern "C" size_t ds4_cutlass_weight_sf_count(int N, int K){
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
   return cute::size(cute::filter_zeros(lSFB));
+}
+
+// Packed E2M1 weight-data byte count for a weight of shape (N=out, K=in): 2 nibbles/byte.
+extern "C" size_t ds4_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
+
+// ---- Runtime dequant->fp4 weight packer (2-bit prefill path). Quantizes a DEQUANTIZED f32
+// weight [N,K] (RowMajor: N rows of K) to MXFP4 on-device (LOSSY) directly into CUTLASS B layout
+// (ColumnMajor packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), matching ds4_cutlass_pack_source's output
+// byte-for-byte so ds4_cutlass_expert_ffn_scratch consumes it unchanged. One thread per
+// (row-pair, 32-block): CUTLASS ColumnMajor packs logical index (n + k*N), so rows n0=2*np and
+// n1=2*np+1 occupy the low/high nibble of the SAME output byte -> a thread owns whole bytes and
+// there is no cross-thread nibble RMW race. Requires N even (all expert dims are). ----
+template<class TSFB>
+__global__ void pack_weight_f32_kernel(uint8_t *B_data, TSFB tSFB, const float *W, int N, int K){
+  int nblk = K/32;
+  long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
+  if (idx >= (long)(N/2)*nblk) return;
+  int np = (int)(idx / nblk), kb = (int)(idx % nblk);
+  int n0 = 2*np, n1 = n0+1;
+  const float *w0 = W + (size_t)n0*K;
+  const float *w1 = W + (size_t)n1*K;
+  float mx0=0.f, mx1=0.f;
+  for (int i=0;i<32;i++){ mx0=fmaxf(mx0,fabsf(w0[kb*32+i])); mx1=fmaxf(mx1,fabsf(w1[kb*32+i])); }
+  int e0=(mx0>0.f)?(int)ceilf(log2f(mx0/6.f)):0; if(e0<-127)e0=-127; if(e0>127)e0=127;
+  int e1=(mx1>0.f)?(int)ceilf(log2f(mx1/6.f)):0; if(e1<-127)e1=-127; if(e1>127)e1=127;
+  float s0=exp2f((float)e0), s1=exp2f((float)e1);
+  tSFB(n0, kb*32, 0) = ElementSF::bitcast((uint8_t)(e0+127));
+  tSFB(n1, kb*32, 0) = ElementSF::bitcast((uint8_t)(e1+127));
+  for (int i=0;i<32;i++){
+    int k = kb*32+i;
+    size_t byte = (size_t)np + (size_t)k*(N/2);   // (n0 + k*N)/2, N even
+    uint8_t lo = d_to_e2m1(w0[k]/s0);
+    uint8_t hi = d_to_e2m1(w1[k]/s1);
+    B_data[byte] = (uint8_t)(lo | (hi<<4));
+  }
+}
+
+extern "C" void ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
+  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
+  auto tSFB = make_tensor(reinterpret_cast<ElementSF*>(Bsf), lSFB);
+  int nb = (N/2)*(K/32), t=128, b=(nb+t-1)/t;
+  pack_weight_f32_kernel<<<b,t>>>(Bd, tSFB, W, N, K);   // legacy default stream
 }
 
 #ifdef DS4_MXFP4_REPACK_CLI
