@@ -52,6 +52,71 @@ __device__ static void hc4_split_one(float *out, const float *mix, const float *
 
 
 
+/* Parallel hc4 split for the fused decode kernels: lanes 0..31 of warp 0
+ * cooperate (guards inside; all lanes must enter for the __syncwarp()s).
+ * BIT-IDENTICAL to hc4_split_one: rows (and columns) are normalized
+ * INDEPENDENTLY in the serial version, so distributing one row/column per lane
+ * with serial per-lane reductions preserves every element's exact float
+ * operation sequence -- only genuinely independent work runs concurrently.
+ * This removes the ~1k-cycle single-thread critical section (24 expf + 20
+ * Sinkhorn iterations) that ran while 255 threads idled, x2 per layer per
+ * decode token. c is a per-block shared[16] scratch. */
+__device__ static void hc4_split_par(float *out, const float *mix, const float *scale,
+                                     const float *base, uint32_t sinkhorn_iters, float epsv,
+                                     uint32_t lane, float *c) {
+    const float pre_scale = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+    if (lane < 4u) {
+        float z = mix[lane] * pre_scale + base[lane];
+        out[lane] = 1.0f / (1.0f + expf(-z)) + epsv;
+    } else if (lane < 8u) {
+        float z = mix[lane] * post_scale + base[lane];
+        out[lane] = 2.0f / (1.0f + expf(-z));
+    }
+    if (lane < 4u) {
+        const uint32_t r = lane;
+        float v[4];
+        float m = -INFINITY;
+        for (int col = 0; col < 4; col++) {
+            v[col] = mix[8 + r * 4 + col] * comb_scale + base[8 + r * 4 + col];
+            m = fmaxf(m, v[col]);
+        }
+        float ss = 0.0f;
+        for (int col = 0; col < 4; col++) {
+            v[col] = expf(v[col] - m);
+            ss += v[col];
+        }
+        for (int col = 0; col < 4; col++) c[r * 4 + col] = v[col] / ss + epsv;
+    }
+    __syncwarp();
+    if (lane < 4u) {
+        const uint32_t col = lane;
+        float ss = epsv;
+        for (int r = 0; r < 4; r++) ss += c[r * 4 + col];
+        for (int r = 0; r < 4; r++) c[r * 4 + col] /= ss;
+    }
+    __syncwarp();
+    for (uint32_t iter = 1; iter < sinkhorn_iters; iter++) {
+        if (lane < 4u) {
+            const uint32_t r = lane;
+            float ss = epsv;
+            for (int col = 0; col < 4; col++) ss += c[r * 4 + col];
+            for (int col = 0; col < 4; col++) c[r * 4 + col] /= ss;
+        }
+        __syncwarp();
+        if (lane < 4u) {
+            const uint32_t col = lane;
+            float ss = epsv;
+            for (int r = 0; r < 4; r++) ss += c[r * 4 + col];
+            for (int r = 0; r < 4; r++) c[r * 4 + col] /= ss;
+        }
+        __syncwarp();
+    }
+    if (lane < 16u) out[8 + lane] = c[lane];
+}
+
+
 __global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, const float *scale, const float *base, uint32_t n_rows, uint32_t sinkhorn_iters, float epsv) {
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
@@ -127,7 +192,8 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     if (t >= n_rows || n_hc != 4) return;
     const uint32_t mix_hc = 24;
     float *sp = split + (uint64_t)t * mix_hc;
-    if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
+    __shared__ float hc4_c[16];
+    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
     __syncthreads();
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
@@ -160,7 +226,8 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     if (t >= n_rows || n_hc != 4) return;
     const uint32_t mix_hc = 24;
     float *sp = split + (uint64_t)t * mix_hc;
-    if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
+    __shared__ float hc4_c[16];
+    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
     __syncthreads();
 
     float sum = 0.0f;
