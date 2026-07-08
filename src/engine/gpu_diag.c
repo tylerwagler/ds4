@@ -48,8 +48,8 @@ void gpu_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -79,8 +79,8 @@ void gpu_graph_debug_dump_f16_tensor(
         uint64_t          n_f16,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
     if (!t || n_f16 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -113,8 +113,8 @@ void gpu_graph_debug_dump_i32_tensor(
         uint64_t          n_i32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
     if (!t || n_i32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);

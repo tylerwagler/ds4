@@ -61,6 +61,18 @@ static bool gpu_graph_use_reference_attn_out_hc(void) {
     return gpu_graph_env_flag("DS4_CUDA_DISABLE_ATTN_OUT_HC_FUSION", &cache);
 }
 
+/* Evaluated every layer on the decode path; cache the flag reads (like the
+ * fusion toggles above) instead of scanning environ per layer. */
+static bool gpu_graph_disable_shared_gate_up_swiglu(void) {
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_CUDA_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION", &cache);
+}
+
+static bool gpu_graph_moe_replay_selected_ids(void) {
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_MOE_REPLAY_SELECTED_IDS", &cache);
+}
+
 
 
 static bool gpu_graph_decode_hc_pre(
@@ -2182,7 +2194,7 @@ bool gpu_graph_encode_decode_layer(
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_gate_up =
         !g->quality &&
-        getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+        !gpu_graph_disable_shared_gate_up_swiglu();
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !gpu_graph_use_reference_shared_down_hc();
     const bool iq2_selected_shared_overlap =
@@ -2196,7 +2208,7 @@ bool gpu_graph_encode_decode_layer(
         !decode_stage_profile &&
         !gpu_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
+        !gpu_graph_moe_replay_selected_ids() &&
         (iq2_selected_shared_overlap ||
          cuda_selected_shared_overlap);
     const bool async_selected_load =
@@ -2212,7 +2224,7 @@ bool gpu_graph_encode_decode_layer(
         gpu_graph_decode_iq2_selected_slots_expected(g, layer) &&
         !gpu_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+        !gpu_graph_moe_replay_selected_ids();
     const bool cuda_stream_selected_load =
         ok &&
         !overlap_selected_shared &&
@@ -2220,7 +2232,7 @@ bool gpu_graph_encode_decode_layer(
         g->ssd_streaming &&
         gpu_graph_decode_cuda_selected_slots_expected(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+        !gpu_graph_moe_replay_selected_ids();
     if (cuda_stream_selected_load) {
         ok = gpu_graph_decode_cuda_selected_load(g,
                                                    model,

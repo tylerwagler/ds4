@@ -115,8 +115,17 @@ ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
  */
 
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
-    if (!prefix || !prefix[0]) return false;
+    /* Called ~60x/layer x 43 layers/token on the release decode path, where it
+     * is a no-op unless dumping is enabled.  Cache the enabled flag so the
+     * common (disabled) case costs one branch, not a linear environ scan per
+     * call.  The dump env vars are read once at process start like every other
+     * flag; caching does not change runtime behavior. */
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *p = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    if (!enabled) return false;
 
     const char *name_env = getenv("DS4_CUDA_GRAPH_DUMP_NAME");
     if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
