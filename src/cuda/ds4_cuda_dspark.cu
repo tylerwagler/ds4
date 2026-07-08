@@ -87,54 +87,6 @@ static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
 }
 
 
-extern "C" int ds4_gpu_dspark_markov_step(
-        ds4_gpu_tensor *refined_logits,
-        int32_t *refined_id_dst,
-        const ds4_gpu_tensor *base_logits,
-        const ds4_gpu_tensor *markov_w1,
-        const ds4_gpu_tensor *markov_w2,
-        int32_t prev_token,
-        uint32_t vocab_size,
-        uint32_t embed_dim) {
-    if (!refined_logits || !refined_id_dst || !base_logits || !markov_w1 || !markov_w2)
-        return 0;
-    if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return 0;
-    if (refined_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
-    if (base_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
-    if (markov_w1->bytes < (uint64_t)vocab_size * embed_dim * sizeof(float)) return 0;
-    if (markov_w2->bytes < (uint64_t)vocab_size * embed_dim * sizeof(float)) return 0;
-    if ((uint64_t)prev_token >= vocab_size) return 0;
-
-    const uint32_t block_dim = 256;
-    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
-    if (grid_dim > 65535) return 0;
-
-    ds4_gpu_tensor *id_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
-    ds4_gpu_tensor *val_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-    if (!id_dev || !val_dev) {
-        ds4_gpu_tensor_free(id_dev);
-        ds4_gpu_tensor_free(val_dev);
-        return 0;
-    }
-
-    dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
-        (float *)refined_logits->ptr,
-        (int32_t *)id_dev->ptr,
-        (float *)val_dev->ptr,
-        (const float *)base_logits->ptr,
-        (const float *)markov_w1->ptr,
-        (const float *)markov_w2->ptr,
-        prev_token, vocab_size, embed_dim);
-
-    int rc = 0;
-    if (cudaGetLastError() == cudaSuccess)
-        rc = dspark_markov_reduce_blocks(id_dev, val_dev, grid_dim, refined_id_dst);
-
-    ds4_gpu_tensor_free(id_dev);
-    ds4_gpu_tensor_free(val_dev);
-    return rc;
-}
-
 extern "C" int ds4_gpu_dspark_markov_step_model(
         ds4_gpu_tensor *refined_logits,
         int32_t *refined_id_dst,
@@ -192,68 +144,6 @@ extern "C" int ds4_gpu_dspark_markov_step_model(
     ds4_gpu_tensor_free(val_dev);
     return rc;
 }
-
-
-__global__ static void dspark_confidence_score_kernel(
-        float *scores,
-        const float *hidden,
-        const float *markov_embed,
-        const float *proj_weight,
-        uint32_t n_positions,
-        uint32_t hidden_dim,
-        uint32_t embed_dim) {
-    uint32_t p = blockIdx.x;
-    if (p >= n_positions) return;
-
-    const float *hp = hidden + (uint64_t)p * hidden_dim;
-    const float *mp = markov_embed + (uint64_t)p * embed_dim;
-    float dot = 0.0f;
-
-    for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x)
-        dot += hp[i] * proj_weight[i];
-    for (uint32_t i = threadIdx.x; i < embed_dim; i += blockDim.x)
-        dot += mp[i] * proj_weight[hidden_dim + i];
-
-    __shared__ float partial[256];
-    partial[threadIdx.x] = dot;
-    __syncthreads();
-
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0)
-        scores[p] = 1.0f / (1.0f + expf(-partial[0]));
-}
-
-
-extern "C" int ds4_gpu_dspark_confidence_score(
-        ds4_gpu_tensor *scores,
-        const ds4_gpu_tensor *hidden,
-        const ds4_gpu_tensor *markov_embed,
-        const ds4_gpu_tensor *proj_weight,
-        uint32_t n_positions,
-        uint32_t hidden_dim,
-        uint32_t embed_dim) {
-    if (!scores || !hidden || !markov_embed || !proj_weight) return 0;
-    if (n_positions == 0 || hidden_dim == 0 || embed_dim == 0) return 0;
-    if (scores->bytes < (uint64_t)n_positions * sizeof(float)) return 0;
-    if (hidden->bytes < (uint64_t)n_positions * hidden_dim * sizeof(float)) return 0;
-    if (markov_embed->bytes < (uint64_t)n_positions * embed_dim * sizeof(float)) return 0;
-    if (proj_weight->bytes < (uint64_t)(hidden_dim + embed_dim) * sizeof(float)) return 0;
-
-    dspark_confidence_score_kernel<<<n_positions, 256>>>(
-        (float *)scores->ptr,
-        (const float *)hidden->ptr,
-        (const float *)markov_embed->ptr,
-        (const float *)proj_weight->ptr,
-        n_positions, hidden_dim, embed_dim);
-
-    return cuda_ok(cudaGetLastError(), "dspark confidence score");
-}
-
 
 
 __global__ static void dspark_hc_mean_reduce_kernel(

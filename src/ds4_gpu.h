@@ -904,6 +904,14 @@ int ds4_cutlass_expert_ffn_scratch(
         uint8_t        *scratch,
         size_t          scratch_bytes);
 
+/* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
+ * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
+ * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to ds4_cutlass_pack_source so the
+ * FFN above consumes it unchanged. N must be even. Sizes below give the two output regions. */
+size_t ds4_cutlass_weight_data_bytes(int N, int K);
+size_t ds4_cutlass_weight_sf_count(int N, int K);
+void   ds4_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K);
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
@@ -1037,16 +1045,6 @@ int ds4_gpu_matmul_fp8_hc_expand_tensor(
 
 /* DSpark Markov + confidence heads */
 
-int ds4_gpu_dspark_markov_step(
-        ds4_gpu_tensor       *refined_logits,
-        int32_t               *refined_id_dst,
-        const ds4_gpu_tensor *base_logits,
-        const ds4_gpu_tensor *markov_w1,
-        const ds4_gpu_tensor *markov_w2,
-        int32_t                prev_token,
-        uint32_t               vocab_size,
-        uint32_t               embed_dim);
-
 int ds4_gpu_dspark_markov_step_model(
         ds4_gpu_tensor       *refined_logits,
         int32_t               *refined_id_dst,
@@ -1057,15 +1055,6 @@ int ds4_gpu_dspark_markov_step_model(
         uint64_t                markov_w2_offset,
         int32_t                prev_token,
         uint32_t               vocab_size,
-        uint32_t               embed_dim);
-
-int ds4_gpu_dspark_confidence_score(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *hidden,
-        const ds4_gpu_tensor *markov_embed,
-        const ds4_gpu_tensor *proj_weight,
-        uint32_t               n_positions,
-        uint32_t               hidden_dim,
         uint32_t               embed_dim);
 
 int ds4_gpu_dspark_hc_mean_reduce(
