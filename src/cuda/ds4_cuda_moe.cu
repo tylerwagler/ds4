@@ -3776,6 +3776,18 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
             const char *e = getenv("DS4_MOE_FP4_GEMV");
             fp4_gemv = !(e && e[0] == '0');
         }
+        static int path_log = -1;
+        if (path_log < 0) path_log = getenv("DS4_MOE_PATH_LOG") != NULL ? 400 : 0;
+        if (path_log > 0) {
+            path_log--;
+            fprintf(stderr,
+                    "ds4: moe40 layer=%u n_tok=%u n_total=%u stride=%llu split=%llu mid=%d down=%d midb=%llu need=%llu\n",
+                    layer_index, n_tokens, n_total_expert,
+                    (unsigned long long)gate_expert_bytes, (unsigned long long)gate_row_bytes,
+                    mid && mid->ptr ? 1 : 0, down && down->ptr ? 1 : 0,
+                    (unsigned long long)(mid ? mid->bytes : 0),
+                    (unsigned long long)((uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)));
+        }
         if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
@@ -3802,10 +3814,14 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                 const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
                 moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
                         (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 1;
+                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) {
+                    if (path_log > 0) fprintf(stderr, "ds4: moe40 layer=%u -> gemv\n", layer_index);
+                    return 1;
+                }
             }
             /* any failure: fall through to the grouped CUTLASS path */
         }
+        if (path_log > 0) fprintf(stderr, "ds4: moe40 layer=%u -> grouped\n", layer_index);
         return routed_moe_launch_cutlass(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,

@@ -506,6 +506,66 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
 }
 
 
+/* Small-batch (2..4 token) variant of the grouped o_a GEMV: one launch whose
+ * weight blocks are read once and served from L1 across the NT tokens' dots,
+ * replacing the per-group block-scaled tensor-core GEMMs that dominated the
+ * spec-verify launch storm (8 GEMMs/layer at 2-4 rows each). Per-(row,token)
+ * block order and dot helper match grouped_fp8mx_a_warp8_kernel's DEINT fast
+ * path exactly, so each token's output is bit-identical to the n=1 kernel.
+ * Caller guarantees: deint weight available, rank % DS4_FP8MX_ROWS == 0 (row
+ * quads never straddle a group), group_dim % 32 == 0 (whole blocks). */
+template <int NT>
+__global__ static void grouped_fp8mx_a_nt_kernel(
+        float *low,
+        const __nv_fp8_e4m3 *wdata,
+        const unsigned char *wscale,
+        int KBp,
+        const float *x,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint64_t blocks) {
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * DS4_FP8MX_ROWS;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row0 >= low_dim) return;
+    const uint64_t group = row0 / rank;
+    float acc[DS4_FP8MX_ROWS][NT];
+#pragma unroll
+    for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++)
+#pragma unroll
+        for (int t = 0; t < NT; t++) acc[r][t] = 0.0f;
+    const float *xg = x + group * group_dim;
+    const uint64_t tok_stride = (uint64_t)n_groups * group_dim;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            float xb[32];
+            const float *xr = xg + (uint64_t)t * tok_stride + i0;
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+                *(float4 *)&xb[k * 4] = *(const float4 *)&xr[(uint32_t)k * 4u];
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+                const uint32_t rw = (uint32_t)(row0 + r);
+                acc[r][t] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * group_dim + i0,
+                                                       wscale[mx_sfoff((int)rw, (int)b, KBp)], xb);
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < DS4_FP8MX_ROWS; r++) {
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            const float red = warp_sum_f32(acc[r][t]);
+            if (lane == 0) low[(uint64_t)t * low_dim + row0 + r] = red;
+        }
+    }
+}
+
+
 
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     (void)n_vocab;
@@ -1531,6 +1591,21 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
     const fp8_mx_weight *dw = (group_dim % 32 == 0 && !fp8_raw)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
     const int KBp = mx_rup((int)(group_dim / 32), 4);
+    /* Small verify batches: one nt launch, weight blocks L1-shared across tokens;
+     * per-token bit-identical to the n=1 DEINT kernel below. */
+    if (dw && n_tokens >= 2u && n_tokens <= 4u &&
+        rank % DS4_FP8MX_ROWS == 0 && low_dim % DS4_FP8MX_ROWS == 0) {
+        const dim3 g(((unsigned)low_dim + 31u) / 32u);
+        switch (n_tokens) {
+        case 2: grouped_fp8mx_a_nt_kernel<2><<<g, 256>>>(low, dw->data, dw->scale, KBp,
+                heads, group_dim, rank, n_groups, blocks_a); break;
+        case 3: grouped_fp8mx_a_nt_kernel<3><<<g, 256>>>(low, dw->data, dw->scale, KBp,
+                heads, group_dim, rank, n_groups, blocks_a); break;
+        default: grouped_fp8mx_a_nt_kernel<4><<<g, 256>>>(low, dw->data, dw->scale, KBp,
+                heads, group_dim, rank, n_groups, blocks_a); break;
+        }
+        return cuda_ok(cudaGetLastError(), "attention_output_a nt launch");
+    }
     if (dw) {
         grouped_fp8mx_a_warp8_kernel<true><<<grid_a, 256>>>(low, out_a, dw->data, dw->scale, KBp,
                 heads, group_dim, rank, n_groups, n_tokens, blocks_a);
@@ -1576,10 +1651,15 @@ extern "C" int ds4_gpu_attention_output_batch_tensor(
     }
 
     /* "a" projection: prefill takes the block-scaled MXFP8xMXFP8 tensor-core
-     * GEMMs; decode (and any shape/heuristic miss) falls back to the
-     * register-blocked raw-f32-activation kernel. */
+     * GEMMs; decode and small verify batches (n_tokens<=4) take the
+     * register-blocked GEMV path (launch_grouped_fp8mx_a dispatches the nt
+     * variant at 2..4 -- one launch vs 8 per-group GEMMs, bit-identical per
+     * token to decode's kernel). DS4_FP8_GEMV_MAX_N=1 restores the tensor-core
+     * dispatch for all n_tokens>1, same as the dense-matmul gate. */
+    static const int a_gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
+            return e ? atoi(e) : 4; }();
     int a_done = 0;
-    if (n_tokens > 1 && getenv("DS4_FP8_NO_MXCORE") == NULL) {
+    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && getenv("DS4_FP8_NO_MXCORE") == NULL) {
         a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
                                                  group_dim, rank, n_groups, heads, n_tokens);
     }
