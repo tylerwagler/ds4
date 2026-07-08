@@ -4749,6 +4749,29 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
     float *hc = xmalloc((size_t)hcw * sizeof(float));
     FILE *f = fopen(path, dumped == 0 ? "wb" : "ab");
     if (!f) { free(emb); free(voc); free(hc); return; }
+    /* Lean mode (DS4_DSPARK_DUMP_LEAN=1): confidence-head training records only —
+     * hdr + refined_ids + the post-hc_head hidden rows (batch_ffn_cur) that the
+     * engine's confidence kernel consumes (Step 5c), ~64 KB/step at draft=4
+     * instead of ~1 MB. Bulk-collectable for the drafter-retune Phase 0. */
+    static int lean = -1;
+    if (lean < 0) lean = getenv("DS4_DSPARK_DUMP_LEAN") != NULL;
+    if (lean) {
+        int32_t hdr[3] = { (int32_t)pos, (int32_t)first_token, (int32_t)n_draft };
+        fwrite(hdr, sizeof(int32_t), 3, f);
+        fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
+        for (int p = 0; p < n_draft; p++) {
+            memset(emb, 0, (size_t)DS4_N_EMBD * sizeof(float));
+            (void)ds4_gpu_tensor_read(g->batch_ffn_cur, (uint64_t)p * DS4_N_EMBD * 4,
+                                      emb, (uint64_t)DS4_N_EMBD * 4);
+            fwrite(emb, sizeof(float), DS4_N_EMBD, f);
+        }
+        fclose(f);
+        dumped++;
+        if ((dumped & 1023) == 1)
+            fprintf(stderr, "ds4: dspark lean dump step %d pos=%d -> %s\n", dumped, pos, path);
+        free(emb); free(voc); free(hc);
+        return;
+    }
     /* Record: pos, tok, n_draft, refined_ids[0..n_draft], target_h[3], main_x,
      * base0(vocab), then cur_hc for each of the n_draft block positions. n_draft
      * is fixed per run -> fixed record size. Used to validate offline whether the
@@ -4996,6 +5019,12 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         ds4_gpu_tensor_free(base_row);
     }
     if (!draft_ok) return n_accept;
+
+    /* Offline-validation / confidence-training dump (same hook as the legacy
+     * loop, which the production fused path previously never reached). Emitted
+     * after markov refine, while batch_ffn_cur still holds the post-hc_head
+     * hidden rows the confidence kernel consumes. */
+    dspark_dump_step(g, (int)s->checkpoint.len, (int)next_base, refined, (int)n_draft);
 
     /* Confidence-scheduled pending length (P1 head; keep the confident prefix). */
     uint32_t keep = n_draft;
