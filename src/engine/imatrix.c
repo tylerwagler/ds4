@@ -1637,7 +1637,21 @@ int gpu_graph_prompt_logits_test(
                 if (n_index != 0 && g.layer_index_comp_cache[il]) {
                     const uint64_t ni = (uint64_t)n_index * DS4_N_INDEXER_HEAD_DIM;
                     float *gpu_index = xmalloc((size_t)ni * sizeof(float));
-                    if (ds4_gpu_tensor_read(g.layer_index_comp_cache[il], 0, gpu_index, ni * sizeof(float)) != 0) {
+                    ds4_gpu_tensor *index_src = g.layer_index_comp_cache[il];
+                    if (gpu_graph_idx_fp4_enabled()) {
+                        /* Packed cache: dequant into the f32 staging or skip the
+                         * trace — reading packed bytes as f32 would print garbage. */
+                        index_src = (g.idx_comp_stage &&
+                                     ds4_gpu_mxkv_dequant_tensor(g.layer_index_comp_cache[il],
+                                                                 g.idx_comp_stage,
+                                                                 DS4_ENGINE_MXKV_FMT_FP4,
+                                                                 n_index,
+                                                                 DS4_N_INDEXER_HEAD_DIM) != 0)
+                            ? g.idx_comp_stage
+                            : NULL;
+                    }
+                    if (index_src &&
+                        ds4_gpu_tensor_read(index_src, 0, gpu_index, ni * sizeof(float)) != 0) {
                         fprintf(stderr,
                                 "ds4: comp trace layer %u n=%u index_max=%g index_rms=%g\n",
                                 il, n_index,

@@ -219,6 +219,61 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
 
 
 
+/* Session files always store the indexer comp cache as f32 rows.  Under
+ * DS4_IDX_FP4 the persistent cache is MXKV-FP4-packed, so save dequantizes
+ * into the f32 staging first and load repacks from it.  The repack is
+ * value-exact for all realistic rows (QAT-roundtripped fp4 values on
+ * power-of-two block scales survive re-encoding); the one exception is a
+ * 32-block whose amax sits below the mxkv encode floor (1e-20), which would
+ * flush to zero — unreachable for RMS-normed indexer rows. */
+static int payload_write_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+                                    uint32_t n_rows, uint8_t *buf, size_t cap,
+                                    char *err, size_t errlen) {
+    const uint64_t bytes = (uint64_t)n_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    ds4_gpu_tensor *src = g->layer_index_comp_cache[il];
+    if (gpu_graph_idx_fp4_enabled() && n_rows != 0) {
+        if (!g->idx_comp_stage ||
+            ds4_gpu_mxkv_dequant_tensor(g->layer_index_comp_cache[il],
+                                        g->idx_comp_stage,
+                                        DS4_ENGINE_MXKV_FMT_FP4,
+                                        n_rows,
+                                        DS4_N_INDEXER_HEAD_DIM) == 0) {
+            payload_set_err(err, errlen, "failed to dequantize fp4 indexer cache for session save");
+            return 1;
+        }
+        src = g->idx_comp_stage;
+    }
+    return payload_write_tensor_span(fp, src, 0, bytes, buf, cap, err, errlen);
+}
+
+static int payload_read_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+                                   uint32_t n_rows, uint8_t *buf, size_t cap,
+                                   uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t bytes = (uint64_t)n_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    if (!gpu_graph_idx_fp4_enabled() || n_rows == 0) {
+        return payload_read_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
+                                        buf, cap, remaining, err, errlen);
+    }
+    if (!g->idx_comp_stage) {
+        payload_set_err(err, errlen, "fp4 indexer cache staging missing on session load");
+        return 1;
+    }
+    int rc = payload_read_tensor_span(fp, g->idx_comp_stage, 0, bytes,
+                                      buf, cap, remaining, err, errlen);
+    if (rc != 0) return rc;
+    if (ds4_gpu_mxkv_pack_tensor(g->idx_comp_stage,
+                                 g->layer_index_comp_cache[il],
+                                 DS4_ENGINE_MXKV_FMT_FP4,
+                                 n_rows,
+                                 DS4_N_INDEXER_HEAD_DIM) == 0) {
+        payload_set_err(err, errlen, "failed to repack fp4 indexer cache on session load");
+        return 1;
+    }
+    return 0;
+}
+
+
+
 static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const ds4_gpu_tensor *tensor,
                                                                  uint64_t offset_f16, uint64_t count,
                                                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
@@ -503,14 +558,12 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_index_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            rc = payload_write_index_comp(fp, g, il,
+                                          g->layer_n_index_comp[il],
+                                          buf,
+                                          DS4_SESSION_IO_CHUNK,
+                                          err,
+                                          errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_kv[il],
                                                         0,
@@ -707,15 +760,13 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_index_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_index_comp[i] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            rc = payload_read_index_comp(fp, g, il,
+                                         n_index_comp[i],
+                                         buf,
+                                         DS4_SESSION_IO_CHUNK,
+                                         &remaining,
+                                         err,
+                                         errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
                                                        0,
@@ -1273,14 +1324,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_index_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            rc = payload_write_index_comp(fp, g, il,
+                                          g->layer_n_index_comp[il],
+                                          buf,
+                                          DS4_SESSION_IO_CHUNK,
+                                          err,
+                                          errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_kv[il],
                                                         0,
@@ -1624,15 +1673,13 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_index_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            rc = payload_read_index_comp(fp, g, il,
+                                         n_index_comp[il],
+                                         buf,
+                                         DS4_SESSION_IO_CHUNK,
+                                         &remaining,
+                                         err,
+                                         errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
                                                        0,

@@ -330,9 +330,12 @@ bool gpu_graph_alloc_raw_cap(
             if (ratio == 4) {
                 const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
                 const uint64_t index_rows = (uint64_t)coff * ratio;
+                const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
+                    ? DS4_ENGINE_IDXFP4_ROWBYTES
+                    : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
                 g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
-                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                        (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 if (enable_mtp) {
@@ -365,6 +368,21 @@ bool gpu_graph_alloc_raw_cap(
          * MXFP8 comp cache is dequantized (see gpu_graph_attn_comp_read_cache). */
         g->attn_comp_dequant = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap *
                                                     DS4_N_HEAD_DIM * sizeof(float));
+    }
+    if (gpu_graph_idx_fp4_enabled()) {
+        if (DS4_N_INDEXER_HEAD_DIM != 128u) {
+            /* The packed loader and QAT+pack kernels hard-code the 68-byte
+             * head_dim-128 row; fail loud here instead of deep in a launch. */
+            fprintf(stderr,
+                    "ds4: DS4_IDX_FP4 requires indexer head_dim 128 (model has %u)\n",
+                    DS4_N_INDEXER_HEAD_DIM);
+            return false;
+        }
+        /* f32 emit/repack staging for the packed indexer cache: comp-cap rows so
+         * the compressor writers can keep their absolute row indices. */
+        g->idx_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap *
+                                                 DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        ds4_gpu_indexer_set_fp4(1);
     }
     g->indexer_q = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
     g->indexer_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
@@ -479,6 +497,7 @@ bool gpu_graph_alloc_raw_cap(
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
+                             (!gpu_graph_idx_fp4_enabled() || g->idx_comp_stage != NULL) &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL &&
                              (!enable_mtp ||

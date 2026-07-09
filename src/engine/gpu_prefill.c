@@ -1190,8 +1190,10 @@ bool gpu_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
+                const int idx_fp4 = gpu_graph_idx_fp4_enabled();
                 if (ok) {
-                    ok = ds4_gpu_compressor_prefill_tensor(g->layer_index_comp_cache[il],
+                    ok = ds4_gpu_compressor_prefill_tensor(idx_fp4 ? g->idx_comp_stage
+                                                                   : g->layer_index_comp_cache[il],
                                                              g->layer_index_state_kv[il],
                                                              g->layer_index_state_score[il],
                                                              g->batch_comp_kv,
@@ -1218,7 +1220,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              DS4_RMS_EPS) != 0;
                 }
                 if (ok && n_comp != 0) {
-                    ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
+                    ok = idx_fp4
+                        ? ds4_gpu_dsv4_indexer_qat_pack_tensor(g->idx_comp_stage,
+                                                                g->layer_index_comp_cache[il],
+                                                                0,
+                                                                n_comp,
+                                                                DS4_N_INDEXER_HEAD_DIM) != 0
+                        : ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
                                                           n_comp,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
                 }
@@ -1242,7 +1250,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     if (n_comp != 0) {
                         gpu_graph_debug_dump_tensor("indexer_KVcompress",
-                                                      g->layer_index_comp_cache[il],
+                                                      idx_fp4 ? g->idx_comp_stage
+                                                              : g->layer_index_comp_cache[il],
                                                       (uint64_t)n_comp * DS4_N_INDEXER_HEAD_DIM,
                                                       il,
                                                       pos0);
@@ -1267,10 +1276,11 @@ bool gpu_graph_encode_layer_attention_batch(
                         fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                     }
+                    const int idx_fp4 = gpu_graph_idx_fp4_enabled();
                     ds4_gpu_tensor *index_view = NULL;
                     if (ok) {
                         index_view = ds4_gpu_tensor_view(
-                                g->layer_index_comp_cache[il],
+                                idx_fp4 ? g->idx_comp_stage : g->layer_index_comp_cache[il],
                                 (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                 (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                         ok = index_view != NULL;
@@ -1303,7 +1313,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                 DS4_RMS_EPS) != 0;
                     }
                     if (ok && index_chunk != 0) {
-                        ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
+                        ok = idx_fp4
+                            ? ds4_gpu_dsv4_indexer_qat_pack_tensor(index_view,
+                                                                    g->layer_index_comp_cache[il],
+                                                                    index_before,
+                                                                    index_chunk,
+                                                                    DS4_N_INDEXER_HEAD_DIM) != 0
+                            : ds4_gpu_dsv4_indexer_qat_tensor(index_view,
                                                               index_chunk,
                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
                     }
@@ -1356,12 +1372,14 @@ bool gpu_graph_encode_layer_attention_batch(
                         ds4_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                         ds4_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
                         const uint32_t index_row = g->layer_n_index_comp[il];
+                        const int idx_fp4 = gpu_graph_idx_fp4_enabled();
                         ok = kv_view && sc_view &&
                              ds4_gpu_compressor_update_tensor(kv_view,
                                                                 sc_view,
                                                                 g->layer_index_state_kv[il],
                                                                 g->layer_index_state_score[il],
-                                                                g->layer_index_comp_cache[il],
+                                                                idx_fp4 ? g->idx_comp_stage
+                                                                        : g->layer_index_comp_cache[il],
                                                                 model->map,
                                                                 model->size,
                                                                 layer->indexer_compressor_ape->abs_offset,
@@ -1383,11 +1401,18 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                 DS4_RMS_EPS) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
-                                    g->layer_index_comp_cache[il],
+                                    idx_fp4 ? g->idx_comp_stage : g->layer_index_comp_cache[il],
                                     (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                     (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                             if (!index_row_view) {
                                 ok = false;
+                            } else if (idx_fp4) {
+                                ok = ds4_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,
+                                                                           g->layer_index_comp_cache[il],
+                                                                           index_row,
+                                                                           1,
+                                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
+                                ds4_gpu_tensor_free(index_row_view);
                             } else {
                                 ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
                                                                       1,

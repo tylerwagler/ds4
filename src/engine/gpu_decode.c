@@ -270,6 +270,12 @@ int gpu_graph_attn_mx_enabled(void) {
     return cached;
 }
 
+int gpu_graph_idx_fp4_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_IDX_FP4") != NULL ? 1 : 0;
+    return cached;
+}
+
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
     if (gpu_graph_attn_mx_enabled()) return DS4_ENGINE_MXKV_FP8_ROWBYTES;
     return (uint64_t)DS4_N_HEAD_DIM *
@@ -1786,11 +1792,13 @@ bool gpu_graph_encode_decode_layer(
                                                               g->attn_norm, 1);
             }
             const uint32_t index_row = g->layer_n_index_comp[il];
+            const int idx_fp4 = gpu_graph_idx_fp4_enabled();
             if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
                                                             g->comp_sc_cur,
                                                             g->layer_index_state_kv[il],
                                                             g->layer_index_state_score[il],
-                                                            g->layer_index_comp_cache[il],
+                                                            idx_fp4 ? g->idx_comp_stage
+                                                                    : g->layer_index_comp_cache[il],
                                                             model->map,
                                                             model->size,
                                                             layer->indexer_compressor_ape->abs_offset,
@@ -1812,11 +1820,18 @@ bool gpu_graph_encode_decode_layer(
                                                             DS4_RMS_EPS) != 0;
             if (ok && emit) {
                 ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
-                        g->layer_index_comp_cache[il],
+                        idx_fp4 ? g->idx_comp_stage : g->layer_index_comp_cache[il],
                         (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                         (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 if (!index_row_view) {
                     ok = false;
+                } else if (idx_fp4) {
+                    ok = ds4_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,
+                                                               g->layer_index_comp_cache[il],
+                                                               index_row,
+                                                               1,
+                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
+                    ds4_gpu_tensor_free(index_row_view);
                 } else {
                     ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
                                                           1,

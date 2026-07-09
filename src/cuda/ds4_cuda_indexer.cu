@@ -1,5 +1,42 @@
 #include "ds4_cuda_internal.h"
 
+/* When set, the indexer compressed cache is stored MXKV-FP4-packed
+ * (DS4_MXKV_FP4_ROWBYTES(128) = 68 B/row: 64 E2M1 nibble pairs low-nibble-first
+ * + 4 E8M0 block-32 scales) instead of f32.  The cache rows are QAT-roundtripped
+ * to exactly these values in both modes, so the scores are bit-identical; packed
+ * mode only changes storage and read traffic.  head_dim must be 128. */
+static int g_indexer_fp4 = 0;
+
+extern "C" void ds4_gpu_indexer_set_fp4(int on) { g_indexer_fp4 = on ? 1 : 0; }
+
+__device__ static inline float idx_e2m1_value_dev(int i) {
+    switch (i & 7) {
+    case 0: return 0.0f;
+    case 1: return 0.5f;
+    case 2: return 1.0f;
+    case 3: return 1.5f;
+    case 4: return 2.0f;
+    case 5: return 3.0f;
+    case 6: return 4.0f;
+    default: return 6.0f;
+    }
+}
+
+__device__ static inline float idx_comp_load_dev(const float *index_comp, int fp4,
+                                                 uint64_t row, uint32_t d,
+                                                 uint32_t head_dim) {
+    if (!fp4) return index_comp[row * head_dim + d];
+    const uint8_t *r = (const uint8_t *)index_comp + row * DS4_MXKV_FP4_ROWBYTES(128u);
+    /* 2^(e8-127) built directly as a float exponent — exact for e8 in [1,254],
+     * and the pack amax floor (7e-38 -> e8 >= 2) rules out byte 0. ~20% cheaper
+     * per scan call than exp2f in the occupancy-bound small-ctx regime. */
+    const float scale = __uint_as_float((uint32_t)r[64u + (d >> 5u)] << 23);
+    const uint8_t byte = r[d >> 1u];
+    const uint8_t nib = (d & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
+    const float mag = idx_e2m1_value_dev((int)(nib & 7u));
+    return (nib & 8u) ? -mag * scale : mag * scale;
+}
+
 
 
 __global__ static void indexer_scores_kernel(
@@ -14,7 +51,8 @@ __global__ static void indexer_scores_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        int fp4) {
     uint32_t c = blockIdx.x;
     uint32_t t = blockIdx.y;
     if (c >= n_comp || t >= n_tokens) return;
@@ -28,9 +66,9 @@ __global__ static void indexer_scores_kernel(
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-        const float *kh = index_comp + (uint64_t)c * head_dim;
         float dot = 0.0f;
-        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) dot += qh[d] * kh[d];
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
+            dot += qh[d] * idx_comp_load_dev(index_comp, fp4, c, d, head_dim);
         __shared__ float partial[256];
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -55,7 +93,8 @@ __global__ static void indexer_score_one_direct_kernel(
         uint32_t pos0,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        int fp4) {
     const uint32_t c = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -71,7 +110,7 @@ __global__ static void indexer_score_one_direct_kernel(
 
     __shared__ float krow[128];
     __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
+    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_comp, fp4, c, tid, 128u);
     __syncthreads();
 
     float total = 0.0f;
@@ -103,7 +142,8 @@ __global__ static void indexer_scores_wmma_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        int fp4) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 16u;
@@ -141,7 +181,7 @@ __global__ static void indexer_scores_wmma_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = idx_comp_load_dev(index_comp, fp4, comp, d, head_dim);
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -213,7 +253,8 @@ __global__ static void indexer_scores_wmma32_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        int fp4) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 32u;
@@ -252,7 +293,7 @@ __global__ static void indexer_scores_wmma32_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = idx_comp_load_dev(index_comp, fp4, comp, d, head_dim);
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -331,7 +372,8 @@ __global__ static void indexer_scores_wmma64_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        int fp4) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 64u;
@@ -370,7 +412,7 @@ __global__ static void indexer_scores_wmma64_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = idx_comp_load_dev(index_comp, fp4, comp, d, head_dim);
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -449,7 +491,8 @@ __global__ static void indexer_scores_wmma128_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        int fp4) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 128u;
@@ -490,7 +533,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = idx_comp_load_dev(index_comp, fp4, comp, d, head_dim);
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -1084,11 +1127,16 @@ static int indexer_scores_launch(
         uint32_t                ratio,
         float                   scale,
         uint32_t                causal) {
+    const int fp4 = g_indexer_fp4;
+    const uint64_t comp_bytes = fp4
+        ? (uint64_t)n_comp * DS4_MXKV_FP4_ROWBYTES(128u)
+        : (uint64_t)n_comp * head_dim * sizeof(float);
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        (fp4 && head_dim != 128u) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
-        index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        index_comp->bytes < comp_bytes ||
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
         return 0;
     }
@@ -1100,7 +1148,7 @@ static int indexer_scores_launch(
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
                                                          n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0);
+                                                         scale, causal ? 1 : 0, fp4);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
@@ -1112,7 +1160,7 @@ static int indexer_scores_launch(
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
                                                          n_comp, n_tokens, pos0, n_head,
-                                                         head_dim, ratio, scale, causal ? 1 : 0);
+                                                         head_dim, ratio, scale, causal ? 1 : 0, fp4);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
             dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
@@ -1121,7 +1169,7 @@ static int indexer_scores_launch(
                                                         (const float *)weights->ptr,
                                                         (const float *)index_comp->ptr,
                                                         n_comp, n_tokens, pos0, n_head,
-                                                        head_dim, ratio, scale, causal ? 1 : 0);
+                                                        head_dim, ratio, scale, causal ? 1 : 0, fp4);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
             dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
@@ -1130,7 +1178,7 @@ static int indexer_scores_launch(
                                                        (const float *)weights->ptr,
                                                        (const float *)index_comp->ptr,
                                                        n_comp, n_tokens, pos0, n_head,
-                                                       head_dim, ratio, scale, causal ? 1 : 0);
+                                                       head_dim, ratio, scale, causal ? 1 : 0, fp4);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma32 launch");
         } else {
             dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
@@ -1139,7 +1187,7 @@ static int indexer_scores_launch(
                                                      (const float *)weights->ptr,
                                                      (const float *)index_comp->ptr,
                                                      n_comp, n_tokens, pos0, n_head,
-                                                     head_dim, ratio, scale, causal ? 1 : 0);
+                                                     head_dim, ratio, scale, causal ? 1 : 0, fp4);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
         }
     }
@@ -1149,7 +1197,7 @@ static int indexer_scores_launch(
                                          (const float *)weights->ptr,
                                          (const float *)index_comp->ptr,
                                          n_comp, n_tokens, pos0, n_head,
-                                         head_dim, ratio, scale, causal ? 1 : 0);
+                                         head_dim, ratio, scale, causal ? 1 : 0, fp4);
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
 }
 

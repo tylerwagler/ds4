@@ -177,8 +177,14 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * mxkv_pack/dequant kernels and assemble_kv_mxcomp (src/cuda). For DS4_N_HEAD_DIM
  * == 512 that is 512 + 16 = 528 B/row (vs 2048 for f32). */
 #define DS4_ENGINE_MXKV_FMT_FP8 1u
+#define DS4_ENGINE_MXKV_FMT_FP4 2u
 #define DS4_ENGINE_MXKV_FP8_ROWBYTES \
     ((uint64_t)DS4_N_HEAD_DIM + (((uint64_t)DS4_N_HEAD_DIM + 31u) / 32u))
+/* MXKV FP4 row bytes for the indexer compressed cache (head_dim 128):
+ * 64 nibble-pair bytes + 4 E8M0 block-32 scale bytes = 68 B (vs 512 f32). */
+#define DS4_ENGINE_IDXFP4_ROWBYTES \
+    (((uint64_t)DS4_N_INDEXER_HEAD_DIM + 1u) / 2u + \
+     (((uint64_t)DS4_N_INDEXER_HEAD_DIM + 31u) / 32u))
 
 /* The compressed-KV cache has one storage representation at a time: the write,
  * allocation, and attention-read paths all branch on exactly one of these. */
@@ -1004,6 +1010,12 @@ typedef struct {
      * cache is dequantized here (up to max layer_comp_cap rows) before each
      * prefill-attention read. Decode reads the MXFP8 cache directly (CUTLASS). */
     ds4_gpu_tensor *attn_comp_dequant;
+    /* f32 staging used only when DS4_IDX_FP4 is on: the compressor emits new
+     * indexer rows here (comp-cap rows, same row indices as the cache), and
+     * the QAT+pack step stores them MXKV-FP4-packed into the persistent
+     * layer_index_comp_cache.  Also reused for session-save dequant and
+     * session-load repack. */
+    ds4_gpu_tensor *idx_comp_stage;
     ds4_gpu_tensor *indexer_q;
     ds4_gpu_tensor *indexer_weights;
     ds4_gpu_tensor *indexer_scores;
@@ -2255,6 +2267,12 @@ uint32_t gpu_graph_attn_comp_cache_is_fp8(void);
  * stored MXFP8 (DS4_ENGINE_MXKV_FP8_ROWBYTES/row) and decode attention runs the
  * CUTLASS Sm120 MX path; when off the build is byte-identical to before. */
 int gpu_graph_attn_mx_enabled(void);
+/* True when DS4_IDX_FP4 is set (cached). When on, the ratio-4 indexer
+ * compressed cache is stored MXKV-FP4-packed (DS4_ENGINE_IDXFP4_ROWBYTES/row,
+ * 7.5x smaller than f32) and the indexer score kernels read it packed.  The
+ * cache rows are QAT-roundtripped to exactly these fp4 values in both modes,
+ * so scores and outputs are bit-identical; only storage and traffic change. */
+int gpu_graph_idx_fp4_enabled(void);
 /* Comp-cache row stride in bytes for the active storage format (MX-aware). */
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
 /* Returns the comp-cache tensor to hand to the (f32/f16/fp8) prefill attention

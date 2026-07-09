@@ -415,6 +415,20 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim);
 
+/* QAT-roundtrip n_rows f32 rows of x in place AND store them MXKV-FP4-packed
+ * into `packed` at rows [out_row0, out_row0+n_rows).  The f32 result in x is
+ * bit-identical to ds4_gpu_dsv4_indexer_qat_tensor. */
+int ds4_gpu_dsv4_indexer_qat_pack_tensor(
+        ds4_gpu_tensor *x,
+        ds4_gpu_tensor *packed,
+        uint32_t          out_row0,
+        uint32_t          n_rows,
+        uint32_t          head_dim);
+
+/* Tell the indexer score kernels the indexer compressed cache is stored
+ * MXKV-FP4-packed (68 B/row at head_dim 128) instead of f32. */
+void ds4_gpu_indexer_set_fp4(int on);
+
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
