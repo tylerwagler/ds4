@@ -109,6 +109,36 @@ fallback Phase-2 training venue if single-GB10 frozen-expert training proves
 tight (full-FT optimizer state fits across the pair with FSDP); training data
 still comes from this box's engine regardless.
 
+## Outcome (2026-07-09) — retune NOT needed; bug fix + conf-sched shipped instead
+
+The Phase-0/pilot gates falsified the retune premise: the torch reference
+drafter scored **86/81/76/70/65%** teacher-forced on our quantized hiddens
+(H2-requant refuted, ~4 pts only), and the acceptance gap was an **engine bug**
+— the drafter's attention output was missing the inverse rope
+(`gpu_decode.c`, commit 7b47cdb; +~30 pts pos0). Post-fix production:
+**80/61%** at pos0/1, 23.8 t/s at fixed draft=3 (commit 3d10e8f).
+
+Phase-1 (this doc's Phase-0 confidence pipeline, re-run on post-fix features):
+lean dump at draft=5 over 24 mixed requests (temp/conf_collect2.sh, 15.5k
+labeled positions, accept 75/53/36/22/13% at pos0-4), logistic recalibration
+(temp/conf_retrain.py, AUC 0.843→0.861 pooled — the shipped head's AUC was
+fine post-fix; the retrain's real value is **calibration**: shipped-head scores
+barely trim at any economic threshold), splice → `dspark-drafter-conf3.gguf`.
+
+**In-vivo sweep (3-prompt 512-token suite, eff t/s from fused-step logs):**
+fixed draft=3 = 23.18; conf-sched draft=5 tau=0.35 (conf3 head) = **24.46
+(+5.5%)**; tau=0.30 = 23.20; tau=0.50 = 22.44; draft=6 tau=0.35 = 23.31;
+tau=0.35 with the shipped head = 22.78 (mean n_batch 5.06 — no trimming).
+tau 0.35 sits exactly at the economic breakeven (marginal verify row ≈19.7 ms
+vs ≈55 ms/token saved → keep drafts with P(accept) ≳ 0.36; nsys audit in the
+decode-roofline memory).
+
+**Production recipe:** `--dspark /mnt/pve1-fast/ds4-gguf/dspark-drafter-conf3.gguf
+--dspark-draft 5` + `DS4_DSPARK_CONF_SCHED=0.35`. Output-preserving (trim only
+bounds the verify budget; emitted tokens stay exact greedy). Campaign total:
+14.6 → 24.5 t/s (+68%). The full retune below stays shelved as the +3-5%
+dessert; its data/training plan remains valid if ever needed.
+
 ## Risks
 
 - **H2 partially wrong** — some of the 40% ceiling may be inherent block-drafter
