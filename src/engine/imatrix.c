@@ -249,6 +249,39 @@ static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
     const uint32_t cap_n = g->dspark_bulk_n < n ? g->dspark_bulk_n : n;
     g->dspark_bulk_n = 0;
     if (!ok) return;
+    /* Prompt-window capture: keep the last <=128 positions' anchor hiddens in
+     * the position%128 ring so generation can seed the drafter's context
+     * window (contiguous positions -> at most two segment copies per layer). */
+    if (g->dspark_prompt_h[0] && cap_n > 0) {
+        const uint32_t win = DS4_DSPARK_DRAFT_WINDOW;
+        const uint32_t take = cap_n < win ? cap_n : win;
+        const uint32_t p0 = start + cap_n - take;
+        for (int s2 = 0; s2 < 3; s2++) {
+            uint32_t done = 0;
+            while (done < take) {
+                const uint32_t pos = p0 + done;
+                const uint32_t slot = pos % win;
+                uint32_t run = win - slot;
+                if (run > take - done) run = take - done;
+                (void)ds4_gpu_tensor_copy(g->dspark_prompt_h[s2],
+                                          (uint64_t)slot * DS4_N_EMBD * sizeof(float),
+                                          g->dspark_bulk_h[s2],
+                                          (uint64_t)(pos - start) * DS4_N_EMBD * sizeof(float),
+                                          (uint64_t)run * DS4_N_EMBD * sizeof(float));
+                done += run;
+            }
+        }
+        /* Contiguity guard: after a rewind + partial re-prefill the ring may
+         * hold rows from an older prompt below `start`; mark them invalid. */
+        if (start == 0 || start != g->dspark_prompt_n) g->dspark_prompt_lo = start;
+        g->dspark_prompt_n = start + cap_n;
+        /* Any prefill replaces the generation context, so the drafter's
+         * committed-row window is stale by definition: empty it and let the
+         * next generation start reseed from the prompt ring. (The server's
+         * between-request reset does not go through invalidate/rewind, so
+         * this is the invariant that catches every new prompt.) */
+        for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[i2] = 0;
+    }
     const char *path = getenv("DS4_DSPARK_PREFILL_DUMP");
     if (!path || !path[0] || !g->dspark_bulk_h[0]) return;
     static FILE *f = NULL;

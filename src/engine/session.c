@@ -4863,6 +4863,35 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     s->dspark_n_pending = 0;
     const uint32_t n_batch = 1u + K;
 
+    /* Prompt-window seeding (one-time per prompt): fresh drafter state + a
+     * captured prompt window -> replay the last <=128 prompt positions into
+     * the drafter's context-KV ring, exactly as the reference prefills it.
+     * Without this the window starts empty (or, before the invalidate fix,
+     * stale from the previous request), and the drafter is near-useless
+     * without a valid window (masked-window eval: 4.7% vs 86% top-1). */
+    if (g->dspark_n_raw[0] == 0 && g->dspark_prompt_n > 0 && g->dspark_prompt_h[0]) {
+        const uint32_t win = DS4_DSPARK_DRAFT_WINDOW;
+        uint32_t avail = g->dspark_prompt_n - g->dspark_prompt_lo;
+        const uint32_t take = avail < win ? avail : win;
+        const uint32_t first = g->dspark_prompt_n - take;
+        bool seed_ok = true;
+        for (uint32_t j = 0; seed_ok && j < take; j++) {
+            const uint32_t slot = (first + j) % win;
+            for (int i = 0; seed_ok && i < 3; i++) {
+                seed_ok = ds4_gpu_tensor_copy(g->dspark_target_h[i], 0,
+                                              g->dspark_prompt_h[i],
+                                              (uint64_t)slot * DS4_N_EMBD * sizeof(float),
+                                              (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+            }
+            if (seed_ok && gpu_graph_dspark_project_main_x(g, &e->dspark_model, w))
+                gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, w, 1);
+        }
+        if (dspark_stats)
+            fprintf(stderr, "ds4: dspark prompt-window seeded %u rows (prompt_n=%u)\n",
+                    take, g->dspark_prompt_n);
+        g->dspark_prompt_n = 0;   /* consumed; commits take over from here */
+    }
+
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     if (!spec_frontier_snapshot(&frontier, s)) {
@@ -5402,6 +5431,14 @@ void ds4_session_invalidate(ds4_session *s) {
     s->mtp_draft_valid = false;
     s->cont_anchor_valid = false;
     s->dspark_n_pending = 0;
+    /* The drafter's context-KV ring must not survive into a new prompt: it was
+     * never reset before, so in the server every request after the first
+     * attended over the PREVIOUS request's window rows for its first ~128
+     * generated tokens (and the drafter is near-useless without a valid
+     * window: masked-window eval 4.7% vs 86% top-1). Positions are
+     * drafter-relative, so restarting at 0 is exact. */
+    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
+    s->graph.dspark_prompt_n = 0;
 }
 
 
@@ -5413,6 +5450,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->mtp_draft_valid = false;
     s->cont_anchor_valid = false;
     s->dspark_n_pending = 0;
+    /* Rewound positions' drafter rows are stale; empty the window (it refills
+     * from the prompt capture on the next prefill, or from commits). */
+    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
+    s->graph.dspark_prompt_n = 0;
 }
 
 

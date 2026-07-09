@@ -554,15 +554,22 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
     g->dspark_capture_batch_n = 0;
     g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     ok = ok && g->dspark_main_x;
-    /* Bulk prefill capture buffers for drafter retraining (~200 MB at
-     * prefill_cap 4096); only when the dump is requested. */
+    /* Bulk prefill capture buffers: always allocated when the drafter is
+     * loaded (~200 MB at prefill_cap 4096) -- the prompt-window seeding
+     * reduces every chunk through them; DS4_DSPARK_PREFILL_DUMP additionally
+     * streams them to disk for retraining data. */
     g->dspark_bulk_n = 0;
-    if (getenv("DS4_DSPARK_PREFILL_DUMP")) {
-        for (int i = 0; i < 3; i++) {
-            g->dspark_bulk_h[i] = ds4_gpu_tensor_alloc(
-                (uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
-            ok = ok && g->dspark_bulk_h[i];
-        }
+    for (int i = 0; i < 3; i++) {
+        g->dspark_bulk_h[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+        ok = ok && g->dspark_bulk_h[i];
+    }
+    /* Prompt-window ring: last <=128 prompt positions' anchor hiddens. */
+    g->dspark_prompt_n = 0;
+    for (int i = 0; i < 3; i++) {
+        g->dspark_prompt_h[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float));
+        ok = ok && g->dspark_prompt_h[i];
     }
     /* Stage-B no-replay rollback: per-position compressor projection saves for
      * every compressed layer (attn comp_width <= 2*DS4_N_HEAD_DIM; indexer width

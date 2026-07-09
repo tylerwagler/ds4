@@ -1061,6 +1061,14 @@ typedef struct {
      * the prefill path and cleared by the drain; 0 everywhere else. */
     ds4_gpu_tensor *dspark_bulk_h[3];
     uint32_t dspark_bulk_n;
+    /* Prompt-window capture for drafter seeding: the anchor hiddens of the
+     * last <=128 prompt positions, kept as a position%128 ring so the fused
+     * loop can seed the drafter's context window at generation start (the
+     * reference prefills this window; an empty or stale window collapses
+     * drafter acceptance). dspark_prompt_n counts captured prompt positions. */
+    ds4_gpu_tensor *dspark_prompt_h[3];
+    uint32_t dspark_prompt_n;    /* positions captured: ring valid for [lo, n) */
+    uint32_t dspark_prompt_lo;
     /* Fused spec loop (P2): per-position anchor hiddens captured during the
      * verify batch — [spec cap, N_EMBD] per anchor layer. dspark_capture_batch_n
      * != 0 arms the capture in gpu_graph_encode_layer_batch for that many
