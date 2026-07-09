@@ -397,6 +397,29 @@ int ds4_gpu_mxkv_dequant_tensor(
         uint32_t               n_tok,
         uint32_t               head_dim);
 
+/* DS4_ATTN_PACK compressed-KV storage (value-preserving).  One packed row is
+ * [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot f32 rope]
+ * (712 B at head_dim 512 / n_rot 64).  The stored values are exactly the
+ * ds4_gpu_dsv4_fp8_kv_quantize_tensor roundtrip for the nope dims and the
+ * untouched f32 rope tail, so read-back is bit-identical to the f32 cache.
+ * quantize_store additionally roundtrips the f32 source rows IN PLACE
+ * (identical to the plain quantize entry) so stages/dumps stay consistent.
+ * Requires n_rot == 64 and (head_dim - n_rot) % 64 == 0. */
+int ds4_gpu_attn_pack_quantize_store_tensor(
+        ds4_gpu_tensor *x,
+        ds4_gpu_tensor *packed,
+        uint32_t          out_row0,
+        uint32_t          n_rows,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+int ds4_gpu_attn_pack_dequant_tensor(
+        const ds4_gpu_tensor *in,
+        ds4_gpu_tensor       *out,
+        uint32_t               n_rows,
+        uint32_t               head_dim,
+        uint32_t               n_rot);
+
 /* Gathered dequant of n_sel rows selected by `rows` (indices into a cap_rows MX
  * cache) into f32 `out`: [n_sel][head_dim] when transpose==0, or [head_dim][n_sel]
  * when transpose!=0 (builds a PV V^T operand). The attention gather primitive. */
@@ -613,6 +636,7 @@ int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
+        uint32_t                comp_kv_pack,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -691,6 +715,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
+        uint32_t                comp_kv_pack,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -716,6 +741,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_kv,
         uint32_t                comp_kv_f16,
         uint32_t                comp_kv_fp8,
+        uint32_t                comp_kv_pack,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,

@@ -186,6 +186,19 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
     (((uint64_t)DS4_N_INDEXER_HEAD_DIM + 1u) / 2u + \
      (((uint64_t)DS4_N_INDEXER_HEAD_DIM + 31u) / 32u))
 
+/* DS4_ATTN_PACK (runtime env, see gpu_graph_attn_pack_enabled()): VALUE-
+ * PRESERVING packed attn comp cache.  One row = [448 e4m3 nope bytes][7 E8M0
+ * block-64 scale bytes][1 pad][64 f32 rope] = 712 B (vs 2048 f32).  The nope
+ * dims store exactly the fp8_kv_quantize roundtrip the f32 pipeline applies
+ * in place; the rope tail stays f32 — read-back is bit-identical.  Must stay
+ * in sync with DS4_ATTN_PACK_ROWBYTES in src/cuda/ds4_cuda_internal.h.
+ * Mutually exclusive with DS4_ATTN_MX and the compile-time F16/FP8 formats
+ * (enforced loudly at graph alloc). */
+#define DS4_ENGINE_ATTN_PACK_ROWBYTES \
+    ((uint64_t)(DS4_N_HEAD_DIM - DS4_N_ROT) + \
+     ((((uint64_t)(DS4_N_HEAD_DIM - DS4_N_ROT) / 64u) + 3u) & ~3ull) + \
+     (uint64_t)DS4_N_ROT * 4u)
+
 /* The compressed-KV cache has one storage representation at a time: the write,
  * allocation, and attention-read paths all branch on exactly one of these. */
 #if DS4_GPU_ATTN_COMP_CACHE_F16 && DS4_GPU_ATTN_COMP_CACHE_FP8
@@ -2263,10 +2276,12 @@ bool gpu_graph_use_reference_qkv_norm(void);
 bool gpu_graph_enable_batch_hc_norm_fusion(void);
 uint32_t gpu_graph_attn_comp_cache_is_f16(void);
 uint32_t gpu_graph_attn_comp_cache_is_fp8(void);
+uint32_t gpu_graph_attn_comp_cache_is_pack(void);
 /* True when DS4_ATTN_MX is set (cached). When on, the compressed-KV cache is
  * stored MXFP8 (DS4_ENGINE_MXKV_FP8_ROWBYTES/row) and decode attention runs the
  * CUTLASS Sm120 MX path; when off the build is byte-identical to before. */
 int gpu_graph_attn_mx_enabled(void);
+int gpu_graph_attn_pack_enabled(void);
 /* True when DS4_IDX_FP4 is set (cached). When on, the ratio-4 indexer
  * compressed cache is stored MXKV-FP4-packed (DS4_ENGINE_IDXFP4_ROWBYTES/row,
  * 7.5x smaller than f32) and the indexer score kernels read it packed.  The

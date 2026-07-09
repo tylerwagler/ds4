@@ -846,7 +846,8 @@ bool gpu_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) &&
+            if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled() ||
+                       gpu_graph_attn_pack_enabled()) &&
                 n_comp > g->attn_comp_stage_cap) {
                 fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
@@ -872,7 +873,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                          n_tokens,
                                                          DS4_N_ROT,
                                                          compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                         true,
+                                                         /* Under DS4_ATTN_PACK the commit's pack-store kernel
+                                                          * is the single fp8 quantizer (same recipe); a second
+                                                          * quantize is NOT bit-idempotent for borderline block
+                                                          * amax (scale can shift, re-rounding small values). */
+                                                         !gpu_graph_attn_pack_enabled(),
                                                          freq_base,
                                                          freq_scale,
                                                          ext_factor,
@@ -930,7 +935,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) &&
+                if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled() ||
+                           gpu_graph_attn_pack_enabled()) &&
                     comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
@@ -956,7 +962,8 @@ bool gpu_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            /* pack: quantize once, in the commit (see above) */
+                            !gpu_graph_attn_pack_enabled(),
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -983,7 +990,8 @@ bool gpu_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            /* pack: quantize once, in the commit (see above) */
+                            !gpu_graph_attn_pack_enabled(),
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -1071,7 +1079,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                             DS4_RMS_EPS) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
-                        if (gpu_graph_attn_mx_enabled()) {
+                        if (gpu_graph_attn_pack_enabled()) {
+                            /* comp_row_view aliases the f32 stage; commit below
+                             * quantizes+packs and roundtrips the stage in place
+                             * — dump after commit to match f32-mode values. */
+                            ok = comp_row_view != NULL;
+                        } else if (gpu_graph_attn_mx_enabled()) {
                             /* comp_row_view aliases the f32 stage; commit packs
                              * it to MXFP8 below. */
                             ok = comp_row_view != NULL;
@@ -1096,7 +1109,15 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                       DS4_N_HEAD_DIM,
                                                                       DS4_N_ROT) != 0;
                         }
-                        if (ok) {
+                        if (ok && !gpu_graph_attn_pack_enabled()) {
+                            gpu_graph_debug_dump_tensor("KVcompress",
+                                                          comp_row_view,
+                                                          DS4_N_HEAD_DIM,
+                                                          il,
+                                                          pos);
+                        }
+                        if (ok) ok = gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
+                        if (ok && gpu_graph_attn_pack_enabled()) {
                             gpu_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
                                                           DS4_N_HEAD_DIM,
@@ -1104,7 +1125,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           pos);
                         }
                         ds4_gpu_tensor_free(comp_row_view);
-                        if (ok) ok = gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
@@ -1528,6 +1548,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               g->layer_raw_cache[il],
                                                                               gpu_graph_attn_comp_read_cache(g, il, n_comp),
                                                                               gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                              0 /* shadow is f32 */,
                                                                               g->comp_selected,
                                                                               n_tokens,
                                                                               pos0,
@@ -1558,6 +1579,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                              g->layer_raw_cache[il],
                                                                              gpu_graph_attn_comp_read_cache(g, il, n_comp),
                                                                              gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                             0 /* shadow is f32 */,
                                                                              use_comp_mask ? g->comp_mask : NULL,
                                                                              use_comp_mask,
                                                                              n_tokens,
@@ -1645,6 +1667,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           g->layer_raw_cache[il],
                                                                           gpu_graph_attn_comp_read_cache(g, il, n_comp),
                                                                           gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                          0 /* shadow is f32 */,
                                                                           g->comp_selected,
                                                                           n_tokens,
                                                                           pos0,
@@ -1776,6 +1799,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               g->layer_raw_cache[il],
                                                                               gpu_graph_attn_comp_read_cache(g, il, cur_comp),
                                                                               gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                              0 /* shadow is f32 */,
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -1801,6 +1825,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  raw_start,
                                                                  cur_comp ? gpu_graph_attn_comp_read_cache(g, il, cur_comp) : NULL,
                                                                  gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                 0 /* shadow is f32 */,
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,

@@ -455,6 +455,78 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
     }
 }
 
+/* DS4_ATTN_PACK store: quantize the nope dims of n_rows f32 rows of x with
+ * EXACTLY the fp8_kv_quantize_kernel recipe (same reduction, same scale
+ * formula, same clamp/roundtrip), write the roundtripped f32 back into x (so
+ * the stage/dumps show the same values the f32 pipeline produces), and store
+ * the packed rows (see DS4_ATTN_PACK_* in ds4_cuda_internal.h; 712 B at
+ * head_dim 512) into `out` at rows [out_row0, out_row0+n_rows).  The rope tail
+ * is copied f32 untouched.  Read-back is bit-identical to the f32 path. */
+__global__ static void attn_pack_store_kernel(float *x, uint8_t *out, uint32_t out_row0, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
+    uint32_t row = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t nblk = n_nope / DS4_FP8_KV_BLOCK;
+    const uint32_t nblk_pad = (nblk + 3u) & ~3u;
+    const uint64_t rowbytes = DS4_ATTN_PACK_ROWBYTES(head_dim);
+    float *xr = x + (uint64_t)row * head_dim;
+    uint8_t *outr = out + (uint64_t)(out_row0 + row) * rowbytes;
+    uint8_t *sc = outr + n_nope;
+    float *rope = (float *)(outr + n_nope + nblk_pad);
+    __shared__ float scratch[64];
+    for (uint32_t off = 0; off < n_nope; off += DS4_FP8_KV_BLOCK) {
+        float v = 0.0f;
+        if (off + tid < n_nope) v = xr[off + tid];
+        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        const float lg = ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f));
+        const float scale = exp2f(lg);
+        if (tid == 0) {
+            int e = (int)lg + 127;
+            if (e < 0) e = 0;
+            if (e > 254) e = 254;
+            sc[off / DS4_FP8_KV_BLOCK] = (uint8_t)e;
+        }
+        if (off + tid < n_nope) {
+            const float c = fminf(448.0f, fmaxf(-448.0f, v / scale));
+            xr[off + tid] = dsv4_e4m3fn_dequant_dev(c) * scale;
+            outr[off + tid] = dsv4_e4m3fn_encode_dev(c);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        for (uint32_t p = nblk; p < nblk_pad; p++) sc[p] = 0;
+    }
+    for (uint32_t d = tid; d < n_rot; d += blockDim.x) rope[d] = xr[n_nope + d];
+}
+
+/* DS4_ATTN_PACK dequant: packed rows -> f32 rows (nope = e4m3 value *
+ * 2^(e8-127), rope = f32 direct).  Bit-identical to the f32 cache values. */
+__global__ static void attn_pack_dequant_kernel(const uint8_t *in, float *out, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
+    uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t nblk_pad = (n_nope / DS4_FP8_KV_BLOCK + 3u) & ~3u;
+    const uint64_t rowbytes = DS4_ATTN_PACK_ROWBYTES(head_dim);
+    const uint8_t *inr = in + (uint64_t)row * rowbytes;
+    const uint8_t *sc = inr + n_nope;
+    const float *rope = (const float *)(inr + n_nope + nblk_pad);
+    float *outr = out + (uint64_t)row * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        if (d < n_nope) {
+            outr[d] = dsv4_e4m3fn_decode_dev(inr[d],
+                                             dsv4_e8m0_decode_scale_dev(sc[d / DS4_FP8_KV_BLOCK]));
+        } else {
+            outr[d] = rope[d - n_nope];
+        }
+    }
+}
+
 
 
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
@@ -979,6 +1051,45 @@ extern "C" int ds4_gpu_mxkv_dequant_tensor(const ds4_gpu_tensor *in, ds4_gpu_ten
         out->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     mxkv_dequant_kernel<<<n_tok, 256>>>((const uint8_t *)in->ptr, (float *)out->ptr, n_tok, head_dim, fmt);
     return cuda_ok(cudaGetLastError(), "mxkv_dequant launch");
+}
+
+/* DS4_ATTN_PACK quantize+store: fp8-roundtrip the nope dims of n_rows f32 rows
+ * of x IN PLACE (identical to ds4_gpu_dsv4_fp8_kv_quantize_tensor) and store
+ * the packed rows into `packed` at rows [out_row0, out_row0+n_rows). */
+extern "C" int ds4_gpu_attn_pack_quantize_store_tensor(ds4_gpu_tensor *x,
+                                                       ds4_gpu_tensor *packed,
+                                                       uint32_t out_row0,
+                                                       uint32_t n_rows,
+                                                       uint32_t head_dim,
+                                                       uint32_t n_rot) {
+    if (!x || !packed || n_rows == 0 ||
+        n_rot != DS4_ATTN_PACK_NROT || head_dim <= n_rot ||
+        ((head_dim - n_rot) % DS4_FP8_KV_BLOCK) != 0 ||
+        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        packed->bytes < ((uint64_t)out_row0 + n_rows) * DS4_ATTN_PACK_ROWBYTES(head_dim)) {
+        return 0;
+    }
+    attn_pack_store_kernel<<<n_rows, 64>>>((float *)x->ptr, (uint8_t *)packed->ptr,
+                                           out_row0, n_rows, head_dim, n_rot);
+    return cuda_ok(cudaGetLastError(), "attn_pack_store launch");
+}
+
+/* DS4_ATTN_PACK dequant: the first n_rows packed rows -> f32 rows in `out`. */
+extern "C" int ds4_gpu_attn_pack_dequant_tensor(const ds4_gpu_tensor *in,
+                                                ds4_gpu_tensor *out,
+                                                uint32_t n_rows,
+                                                uint32_t head_dim,
+                                                uint32_t n_rot) {
+    if (!in || !out || n_rows == 0 ||
+        n_rot != DS4_ATTN_PACK_NROT || head_dim <= n_rot ||
+        ((head_dim - n_rot) % DS4_FP8_KV_BLOCK) != 0 ||
+        in->bytes < (uint64_t)n_rows * DS4_ATTN_PACK_ROWBYTES(head_dim) ||
+        out->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
+        return 0;
+    }
+    attn_pack_dequant_kernel<<<n_rows, 256>>>((const uint8_t *)in->ptr, (float *)out->ptr,
+                                              n_rows, head_dim, n_rot);
+    return cuda_ok(cudaGetLastError(), "attn_pack_dequant launch");
 }
 
 /*

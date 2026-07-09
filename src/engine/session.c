@@ -272,6 +272,56 @@ static int payload_read_index_comp(FILE *fp, ds4_gpu_graph *g, uint32_t il,
     return 0;
 }
 
+/* Attn comp cache spans under DS4_ATTN_PACK: session files always store f32
+ * rows, so save dequantizes the packed cache into the f32 shadow first and
+ * load repacks from it.  Save is bit-exact by construction (packed rows decode
+ * to exactly the fp8-roundtripped values the f32 pipeline holds).  Load
+ * re-quantizes already-roundtripped rows; that is value-preserving except for
+ * blocks whose amax sits exactly on a scale boundary, where the recomputed
+ * block scale can shift one step and re-round small values (the same
+ * non-idempotency that forced quantize_fp8=false in the pack prefill paths).
+ * Sub-1e-3-relative on isolated dims; acceptable for session restore, but do
+ * NOT rely on save/load being bit-exact under pack. */
+static int payload_write_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+                                        uint32_t n_rows, uint8_t *buf, size_t cap,
+                                        char *err, size_t errlen) {
+    const uint64_t bytes = (uint64_t)n_rows * DS4_N_HEAD_DIM * sizeof(float);
+    ds4_gpu_tensor *src = g->attn_comp_dequant;
+    if (n_rows != 0) {
+        if (!src ||
+            ds4_gpu_attn_pack_dequant_tensor(g->layer_attn_comp_cache[il],
+                                             src, n_rows,
+                                             DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
+            payload_set_err(err, errlen, "failed to dequantize packed attn comp cache for session save");
+            return 1;
+        }
+    }
+    if (n_rows == 0) return 0;
+    return payload_write_tensor_span(fp, src, 0, bytes, buf, cap, err, errlen);
+}
+
+static int payload_read_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
+                                       uint32_t n_rows, uint8_t *buf, size_t cap,
+                                       uint64_t *remaining, char *err, size_t errlen) {
+    if (n_rows == 0) return 0;
+    const uint64_t bytes = (uint64_t)n_rows * DS4_N_HEAD_DIM * sizeof(float);
+    if (!g->attn_comp_dequant) {
+        payload_set_err(err, errlen, "packed attn comp cache staging missing on session load");
+        return 1;
+    }
+    int rc = payload_read_tensor_span(fp, g->attn_comp_dequant, 0, bytes,
+                                      buf, cap, remaining, err, errlen);
+    if (rc != 0) return rc;
+    if (ds4_gpu_attn_pack_quantize_store_tensor(g->attn_comp_dequant,
+                                                g->layer_attn_comp_cache[il],
+                                                0, n_rows,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
+        payload_set_err(err, errlen, "failed to repack attn comp cache on session load");
+        return 1;
+    }
+    return 0;
+}
+
 
 
 static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const ds4_gpu_tensor *tensor,
@@ -545,7 +595,14 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (gpu_graph_attn_pack_enabled()) {
+            rc = payload_write_attn_comp_pack(fp, g, il,
+                                              g->layer_n_comp[il],
+                                              buf,
+                                              DS4_SESSION_IO_CHUNK,
+                                              err,
+                                              errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
                                                       0,
@@ -736,7 +793,15 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (gpu_graph_attn_pack_enabled()) {
+            rc = payload_read_attn_comp_pack(fp, g, il,
+                                             n_comp[i],
+                                             buf,
+                                             DS4_SESSION_IO_CHUNK,
+                                             &remaining,
+                                             err,
+                                             errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
                                                      0,
@@ -1289,7 +1354,14 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+        if (gpu_graph_attn_pack_enabled()) {
+            rc = payload_write_attn_comp_pack(fp, g, il,
+                                              g->layer_n_comp[il],
+                                              buf,
+                                              DS4_SESSION_IO_CHUNK,
+                                              err,
+                                              errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
                                            0,
@@ -1626,7 +1698,15 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
+        if (gpu_graph_attn_pack_enabled()) {
+            rc = payload_read_attn_comp_pack(fp, g, il,
+                                             n_comp[il],
+                                             buf,
+                                             DS4_SESSION_IO_CHUNK,
+                                             &remaining,
+                                             err,
+                                             errlen);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
             rc = payload_read_tensor_span(fp,
                                           g->layer_attn_comp_cache[il],
                                           0,

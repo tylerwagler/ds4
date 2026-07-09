@@ -78,6 +78,26 @@ enum {
    : (FMT) == DS4_MXKV_FMT_FP8 ? DS4_MXKV_FP8_ROWBYTES(HD) \
    : (HD) * sizeof(float))
 
+/*
+ * DS4_ATTN_PACK compressed-KV storage (value-preserving).  A comp row today is
+ * f32 with the nope dims already fp8-roundtripped in place (fp8_kv_quantize:
+ * per-64 block scale = exp2f(ceilf(log2f(fmaxf(amax,1e-4)/448))), e4m3
+ * clamp-roundtrip) and the n_rot rope tail untouched f32.  The packed row
+ * stores exactly those values:
+ *   [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot f32]
+ * head_dim 512 / n_rot 64 -> 448 + 7 + 1 + 256 = 712 B/row (vs 2048 f32).
+ * The E8M0 byte is the scale exponent + 127 (power-of-two by construction),
+ * so decode (e4m3 value * 2^(e8-127); rope read f32) is bit-identical to the
+ * f32 cache.  Must stay in sync with DS4_ENGINE_ATTN_PACK_ROWBYTES.
+ */
+#define DS4_ATTN_PACK_NROT 64u
+#define DS4_ATTN_PACK_NOPE(HD) ((HD) - DS4_ATTN_PACK_NROT)
+#define DS4_ATTN_PACK_SCALES_PAD(HD) \
+    ((DS4_ATTN_PACK_NOPE(HD) / DS4_FP8_KV_BLOCK + 3u) & ~3u)
+#define DS4_ATTN_PACK_ROWBYTES(HD) \
+    ((uint64_t)DS4_ATTN_PACK_NOPE(HD) + DS4_ATTN_PACK_SCALES_PAD(HD) + \
+     (uint64_t)DS4_ATTN_PACK_NROT * 4u)
+
 struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;

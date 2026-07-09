@@ -218,6 +218,24 @@ bool gpu_graph_alloc_raw_cap(
             }
         }
     }
+    /* DS4_ATTN_PACK validation lives up here with the FP8 refusal: no
+     * allocations have happened yet, so these early returns need no cleanup. */
+    if (gpu_graph_attn_pack_enabled() &&
+        (gpu_graph_attn_mx_enabled() || DS4_GPU_ATTN_COMP_CACHE_F16 ||
+         DS4_GPU_ATTN_COMP_CACHE_FP8)) {
+        fprintf(stderr,
+                "ds4: DS4_ATTN_PACK cannot be combined with DS4_ATTN_MX or a "
+                "non-f32 compile-time attn comp cache format\n");
+        return false;
+    }
+    if (gpu_graph_attn_pack_enabled() &&
+        (DS4_N_ROT != 64u || ((DS4_N_HEAD_DIM - DS4_N_ROT) % 64u) != 0u)) {
+        fprintf(stderr,
+                "ds4: DS4_ATTN_PACK requires n_rot 64 and 64-aligned nope dims "
+                "(head_dim %u / n_rot %u)\n",
+                (unsigned)DS4_N_HEAD_DIM, (unsigned)DS4_N_ROT);
+        return false;
+    }
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -226,7 +244,8 @@ bool gpu_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled() ||
+        gpu_graph_attn_pack_enabled()) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
@@ -309,6 +328,7 @@ bool gpu_graph_alloc_raw_cap(
             uint64_t comp_row_bytes = (uint64_t)DS4_N_HEAD_DIM * (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
             if (DS4_GPU_ATTN_COMP_CACHE_FP8) comp_row_bytes = DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM);
             if (gpu_graph_attn_mx_enabled()) comp_row_bytes = DS4_ENGINE_MXKV_FP8_ROWBYTES;
+            if (gpu_graph_attn_pack_enabled()) comp_row_bytes = DS4_ENGINE_ATTN_PACK_ROWBYTES;
             g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
                     (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
@@ -359,15 +379,17 @@ bool gpu_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled()) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled() ||
+        gpu_graph_attn_pack_enabled()) {
         /* f32 staging: the compressor writes real f32 rows here, then the commit
-         * step packs them to the persistent MXFP8 (or F16) comp cache. */
+         * step packs them to the persistent MXFP8/F16/ATTN_PACK comp cache. */
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
     }
-    if (gpu_graph_attn_mx_enabled()) {
-        /* f32 shadow the prefill attention consumers read after the persistent
-         * MXFP8 comp cache is dequantized (see gpu_graph_attn_comp_read_cache). */
+    if (gpu_graph_attn_mx_enabled() || gpu_graph_attn_pack_enabled()) {
+        /* f32 shadow the prefill attention consumers (and session save) read
+         * after the persistent packed comp cache is dequantized (see
+         * gpu_graph_attn_comp_read_cache). */
         g->attn_comp_dequant = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap *
                                                     DS4_N_HEAD_DIM * sizeof(float));
     }
@@ -517,6 +539,8 @@ bool gpu_graph_alloc_raw_cap(
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
                     (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->attn_comp_stage) &&
+                    (!gpu_graph_attn_pack_enabled() ||
+                     (g->attn_comp_stage && g->attn_comp_dequant)) &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
                     g->comp_mask && g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&

@@ -1627,7 +1627,13 @@ int gpu_graph_prompt_logits_test(
                 const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
                 float *gpu_comp = xmalloc((size_t)n * sizeof(float));
                 bool comp_read = false;
-                if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                if (gpu_graph_attn_pack_enabled()) {
+                    /* Packed cache: read through the bit-exact f32 dequant
+                     * shadow (mirrors the prefill readers). */
+                    ds4_gpu_tensor *shadow = gpu_graph_attn_comp_read_cache(&g, il, n_comp);
+                    comp_read = shadow &&
+                                ds4_gpu_tensor_read(shadow, 0, gpu_comp, n * sizeof(float)) != 0;
+                } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
                     uint16_t *gpu_comp_h = xmalloc((size_t)n * sizeof(uint16_t));
                     if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
                                             gpu_comp_h, n * sizeof(uint16_t)) != 0) {
