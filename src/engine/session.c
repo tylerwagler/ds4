@@ -2299,7 +2299,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     /* Default draft depth 2: the measured optimum for the fused loop (16.4
      * step_tps vs 16.0 at 3, 15.3 at 4 -- acceptance is front-loaded and the
      * verify batch cost grows ~11ms/token in routed-expert reads). */
-    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 2;
+    /* Default draft depth: 3 (post inverse-rope fix sweep, 3-prompt 512-token
+     * suites: draft2 22.8 / draft3 23.8 / draft5 21.1 t/s -- acceptance holds
+     * deep but verify rows cost ~20ms each, so 3 is the fixed-depth optimum). */
+    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 3;
     if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
     e->dspark_confidence = opt->dspark_confidence > 0.0f ? opt->dspark_confidence : 0.5f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
@@ -5091,6 +5094,36 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                     }
                 }
                 free(row2);
+                /* Bug-#4 localization payload (DS4_DSPARK_DUMP_RING=1): the
+                 * drafter's context-KV ring + counters as the NEXT draft
+                 * forward will read them (post-seeding for this step's
+                 * commits), plus this step's block outputs (cur_hc rows).
+                 * Lets the torch reference attend over the ENGINE'S OWN ring
+                 * to split "seed rows wrong" from "block compute wrong". */
+                static int dump_ring = -1;
+                if (dump_ring < 0) dump_ring = getenv("DS4_DSPARK_DUMP_RING") != NULL;
+                if (dump_ring) {
+                    const uint64_t ring_bytes =
+                        (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float);
+                    float *ring = xmalloc(ring_bytes);
+                    for (int li2 = 0; li2 < 3; li2++) {
+                        int32_t nr = (int32_t)g->dspark_n_raw[li2];
+                        fwrite(&nr, sizeof(int32_t), 1, f2);
+                        memset(ring, 0, ring_bytes);
+                        (void)ds4_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes);
+                        fwrite(ring, sizeof(float), ring_bytes / sizeof(float), f2);
+                    }
+                    free(ring);
+                    const uint64_t hcw2 = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+                    float *hcrow = xmalloc(hcw2 * sizeof(float));
+                    for (uint32_t p2 = 0; p2 < n_draft; p2++) {
+                        memset(hcrow, 0, hcw2 * sizeof(float));
+                        (void)ds4_gpu_tensor_read(g->batch_cur_hc, (uint64_t)p2 * hcw2 * 4,
+                                                  hcrow, hcw2 * 4);
+                        fwrite(hcrow, sizeof(float), hcw2, f2);
+                    }
+                    free(hcrow);
+                }
                 fclose(f2);
                 opdone++;
             }
