@@ -355,6 +355,35 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
     return 0;
 }
 
+/* Raw-ring row spans: session files always store f32 rows.  Under DS4_RAW_F16
+ * the ring holds __half containers, so save expands f16->f32 and load packs
+ * f32->f16 — bit-exact both ways because the values are f16-rounded at store
+ * time in both modes. */
+static int payload_write_raw_row(FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_t phys,
+                                 uint8_t *buf, size_t cap, char *err, size_t errlen) {
+    if (gpu_graph_raw_f16_enabled()) {
+        return payload_write_tensor_span_f16_as_f32(fp, g->layer_raw_cache[il],
+                (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(uint16_t),
+                (uint64_t)DS4_N_HEAD_DIM, buf, cap, err, errlen);
+    }
+    return payload_write_tensor_span(fp, g->layer_raw_cache[il],
+            (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+            (uint64_t)DS4_N_HEAD_DIM * sizeof(float), buf, cap, err, errlen);
+}
+
+static int payload_read_raw_row(FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_t phys,
+                                uint8_t *buf, size_t cap, uint64_t *remaining,
+                                char *err, size_t errlen) {
+    if (gpu_graph_raw_f16_enabled()) {
+        return payload_read_tensor_span_f32_as_f16(fp, g->layer_raw_cache[il],
+                (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(uint16_t),
+                (uint64_t)DS4_N_HEAD_DIM, buf, cap, remaining, err, errlen);
+    }
+    return payload_read_tensor_span(fp, g->layer_raw_cache[il],
+            (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+            (uint64_t)DS4_N_HEAD_DIM * sizeof(float), buf, cap, remaining, err, errlen);
+}
+
 
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
@@ -511,14 +540,8 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_raw_cache[il],
-                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            rc = payload_write_raw_row(fp, g, il, phys,
+                                       buf, DS4_SESSION_IO_CHUNK, err, errlen);
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
@@ -708,15 +731,8 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_raw_cache[il],
-                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            rc = payload_read_raw_row(fp, g, il, phys,
+                                      buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
@@ -1265,14 +1281,8 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_raw_cache[il],
-                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            rc = payload_write_raw_row(fp, g, il, phys,
+                                       buf, DS4_SESSION_IO_CHUNK, err, errlen);
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
@@ -1611,15 +1621,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_raw_cache[il],
-                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            rc = payload_read_raw_row(fp, g, il, phys,
+                                      buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;

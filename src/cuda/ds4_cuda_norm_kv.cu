@@ -560,14 +560,20 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
 
 
 
-__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+/* raw_f16: per-call flag describing the storage format of the PASSED raw
+ * cache (__half when set, f32 otherwise).  The value stored is the same
+ * __float2half rounding the f32 path roundtrips through, so read-back (as
+ * __half2float) is bit-identical in both modes. */
+__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, int raw_f16) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t t = gid / head_dim;
     uint32_t row = (pos0 + t) % raw_cap;
-    raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
+    const __half h = __float2half(kv[(uint64_t)t * head_dim + d]);
+    if (raw_f16) ((__half *)raw)[(uint64_t)row * head_dim + d] = h;
+    else         raw[(uint64_t)row * head_dim + d] = __half2float(h);
 }
 
 
@@ -1069,7 +1075,7 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
 }
 
 
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
+extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16);
 
 
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
@@ -1078,27 +1084,28 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          raw_row,
         uint32_t          head_dim,
-        uint32_t          n_rot) {
+        uint32_t          n_rot,
+        uint32_t          raw_f16) {
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
-           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
+           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim, raw_f16);
 }
 
 
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
+extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16) {
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
+    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim, (int)raw_f16);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 
 
-extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_f16) {
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     uint64_t n = (uint64_t)n_tokens * head_dim;
-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
+    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim, (int)raw_f16);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
 

@@ -248,10 +248,11 @@ static bool gpu_graph_decode_kv_store(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
-        uint32_t          raw_row) {
+        uint32_t          raw_row,
+        uint32_t          raw_f16) {
     if (gpu_graph_use_reference_kv_decode()) {
         return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0 &&
-               ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
+               ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM, raw_f16) != 0;
     }
 
     return ds4_gpu_kv_fp8_store_raw_tensor(kv,
@@ -259,7 +260,8 @@ static bool gpu_graph_decode_kv_store(
                                              raw_cap,
                                              raw_row,
                                              DS4_N_HEAD_DIM,
-                                             DS4_N_ROT) != 0;
+                                             DS4_N_ROT,
+                                             raw_f16) != 0;
 }
 
 
@@ -274,6 +276,30 @@ int gpu_graph_idx_fp4_enabled(void) {
     static int cached = -1;
     if (cached < 0) cached = getenv("DS4_IDX_FP4") != NULL ? 1 : 0;
     return cached;
+}
+
+int gpu_graph_raw_f16_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_RAW_F16") != NULL ? 1 : 0;
+    return cached;
+}
+
+/* Diagnostic raw-ring row read as f32 regardless of the active storage format. */
+static int gpu_graph_read_raw_row_f32(ds4_gpu_graph *g, uint32_t il, uint32_t phys, float *out) {
+    if (!gpu_graph_raw_f16_enabled()) {
+        return ds4_gpu_tensor_read(g->layer_raw_cache[il],
+                                   (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                   out, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    }
+    uint16_t *tmp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(uint16_t));
+    int ok = ds4_gpu_tensor_read(g->layer_raw_cache[il],
+                                 (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(uint16_t),
+                                 tmp, (uint64_t)DS4_N_HEAD_DIM * sizeof(uint16_t));
+    if (ok != 0) {
+        for (uint32_t d = 0; d < DS4_N_HEAD_DIM; d++) out[d] = f16_to_f32(tmp[d]);
+    }
+    free(tmp);
+    return ok;
 }
 
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
@@ -1402,6 +1428,11 @@ bool gpu_graph_encode_decode_layer(
         int                     token) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    /* Storage format of the raw cache PASSED to this call: only the persistent
+     * layer ring is __half under DS4_RAW_F16.  The MTP block's raw cache is
+     * always allocated f32 (gpu_diag.c), so key the flag off the tensor. */
+    const uint32_t raw_f16 = (raw_cache == g->mtp_raw_cache)
+        ? 0u : (uint32_t)gpu_graph_raw_f16_enabled();
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint32_t n_groups = DS4_N_OUT_GROUP;
@@ -1621,7 +1652,7 @@ bool gpu_graph_encode_decode_layer(
     /* RoPE stays as the exact standalone kernel above.  The decode fusion
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
-    if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row, raw_f16);
     DS4_CUDA_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
@@ -1987,7 +2018,8 @@ bool gpu_graph_encode_decode_layer(
                     model->map, model->size, layer->attn_sinks->abs_offset,
                     pos, g->raw_window, ds4_layer_compress_ratio(il),
                     DS4_N_HEAD, DS4_N_HEAD_DIM,
-                    &g->attn_mx_scratch, &g->attn_mx_scratch_bytes) == 0;
+                    &g->attn_mx_scratch, &g->attn_mx_scratch_bytes,
+                    raw_f16) == 0;
         } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
@@ -2009,7 +2041,8 @@ bool gpu_graph_encode_decode_layer(
                     g->raw_window,
                     ds4_layer_compress_ratio(il),
                     DS4_N_HEAD,
-                    DS4_N_HEAD_DIM) != 0;
+                    DS4_N_HEAD_DIM,
+                    raw_f16) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = gpu_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -2030,7 +2063,8 @@ bool gpu_graph_encode_decode_layer(
                                                          n_comp,
                                                          NULL,
                                                          0,
-                                                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                                                         DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                         raw_f16) != 0;
         }
     }
     DS4_CUDA_PROFILE_DECODE_STAGE("attention");
@@ -2925,7 +2959,8 @@ bool gpu_graph_dspark_draft_forward(
         const uint32_t kv_store_pos = saved_n_raw % raw_cap;
         if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(
             g->dspark_raw_cache[li], g->batch_kv,
-            raw_cap, kv_store_pos, n_draft, DS4_N_HEAD_DIM) != 0;
+            raw_cap, kv_store_pos, n_draft, DS4_N_HEAD_DIM,
+            0 /* drafter ring is always f32 */) != 0;
         const uint32_t vis_raw = saved_n_raw + n_draft;
         const uint32_t cap_raw = vis_raw < raw_cap ? vis_raw : raw_cap;
         const uint32_t raw_start = vis_raw > raw_cap
@@ -2943,7 +2978,8 @@ bool gpu_graph_dspark_draft_forward(
             cap_raw, raw_cap, raw_start,
             0,
             DS4_N_HEAD, DS4_N_HEAD_DIM,
-            1) != 0;
+            1,
+            0 /* drafter ring is always f32 */) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
                                              (uint64_t)n_draft * DS4_N_HEAD * DS4_N_HEAD_DIM, li, pos0);
@@ -3727,7 +3763,7 @@ int gpu_graph_decode_test(
              ds4_gpu_tensor_read(g.attn_norm, 0, gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.q, 0, gpu_q, q_dim * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.kv, 0, gpu_kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(g.layer_raw_cache[0], 0, gpu_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
+             gpu_graph_read_raw_row_f32(&g, 0, 0, gpu_raw) != 0 &&
              ds4_gpu_tensor_read(g.attn_out, 0, gpu_attn_out, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.after_attn_hc, 0, gpu_after_attn_hc, hc_dim * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.ffn_cur, 0, gpu_ffn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&

@@ -295,10 +295,12 @@ bool gpu_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
+    const uint64_t raw_elem_bytes = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
+                                                                : sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
-                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+                (uint64_t)raw_cap * DS4_N_HEAD_DIM * raw_elem_bytes);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;

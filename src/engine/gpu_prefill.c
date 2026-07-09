@@ -725,7 +725,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     g->raw_cap,
                                                                     pos0,
                                                                     n_tokens,
-                                                                    DS4_N_HEAD_DIM) != 0;
+                                                                    DS4_N_HEAD_DIM,
+                                                                    (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
 
@@ -739,7 +740,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           n_tokens,
                                                           g->raw_window,
                                                           DS4_N_HEAD,
-                                                          DS4_N_HEAD_DIM) != 0;
+                                                          DS4_N_HEAD_DIM,
+                                                          0 /* batch_kv is f32 */) != 0;
         if (ok) batch_attention_done = true;
     } else if (ok && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
         /*
@@ -760,8 +762,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                  g->raw_cap,
                                                  pos0,
                                                  n_tokens,
-                                                 DS4_N_HEAD_DIM) != 0;
-        if (ok) {
+                                                 DS4_N_HEAD_DIM,
+                                                 (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+        if (ok && !gpu_graph_raw_f16_enabled()) {
+            /* diag-only dump; the dumper reads f32 and would misinterpret a
+             * __half ring — skip it under DS4_RAW_F16. */
             gpu_graph_debug_dump_tensor("raw_cache",
                                           g->layer_raw_cache[il],
                                           (uint64_t)n_raw * DS4_N_HEAD_DIM,
@@ -783,7 +788,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     g->raw_window,
                                                                     DS4_N_HEAD,
                                                                     DS4_N_HEAD_DIM,
-                                                                    0) != 0;
+                                                                    0,
+                                                                    (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -1447,7 +1453,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      g->raw_cap,
                                                      pos0,
                                                      n_tokens,
-                                                     DS4_N_HEAD_DIM) != 0;
+                                                     DS4_N_HEAD_DIM,
+                                                     (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
@@ -1532,7 +1539,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               g->raw_window,
                                                                               ratio,
                                                                               DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM) != 0;
+                                                                              DS4_N_HEAD_DIM,
+                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
                     if (ok && index_stage_profile) {
                         ok = gpu_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -1562,7 +1570,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              0) != 0;
+                                                                              0,
+                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
                 }
             }
             if (ok) batch_attention_done = true;
@@ -1647,7 +1656,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           g->raw_window,
                                                                           ratio,
                                                                           DS4_N_HEAD,
-                                                                          DS4_N_HEAD_DIM) != 0;
+                                                                          DS4_N_HEAD_DIM,
+                                                                          (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
                 if (ok && index_stage_profile) {
                     ok = gpu_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -1673,7 +1683,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        g->raw_window,
                                                                        ratio,
                                                                        DS4_N_HEAD,
-                                                                       DS4_N_HEAD_DIM) != 0;
+                                                                       DS4_N_HEAD_DIM,
+                                                                       0 /* batch_kv is f32 */) != 0;
             if (ok) batch_attention_done = true;
         }
     }
@@ -1696,7 +1707,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                               raw_prefix_tokens,
                                                               g->raw_window,
                                                               DS4_N_HEAD,
-                                                              DS4_N_HEAD_DIM) != 0;
+                                                              DS4_N_HEAD_DIM,
+                                                              0 /* batch_kv is f32 */) != 0;
         }
         if (raw_prefix_tokens < n_tokens) {
             for (uint32_t t = raw_prefix_tokens; ok && t < n_tokens; t++) {
@@ -1752,7 +1764,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                        kv_cache_view,
                                                        g->raw_cap,
                                                        pos % g->raw_cap,
-                                                       DS4_N_HEAD_DIM) != 0;
+                                                       DS4_N_HEAD_DIM,
+                                                       (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
                 }
                 if (ok && comp_mask != NULL && n_selected != 0) {
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
@@ -1774,7 +1787,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               g->raw_window,
                                                                               ratio,
                                                                               DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM) != 0;
+                                                                              DS4_N_HEAD_DIM,
+                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,
@@ -1791,7 +1805,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  comp_mask,
                                                                  n_selected,
                                                                  DS4_N_HEAD,
-                                                                 DS4_N_HEAD_DIM) != 0;
+                                                                 DS4_N_HEAD_DIM,
+                                                                 (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);

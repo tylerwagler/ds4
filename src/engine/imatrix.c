@@ -1590,7 +1590,22 @@ int gpu_graph_prompt_logits_test(
                     const uint32_t raw_start = n_raw < raw_cap ? 0u : ((uint32_t)n_test % raw_cap);
                     float *gpu_raw_phys = xmalloc((size_t)raw_phys_n * sizeof(float));
                     float *gpu_raw_logical = xmalloc((size_t)raw_logical_n * sizeof(float));
-                    if (ds4_gpu_tensor_read(g.layer_raw_cache[il], 0, gpu_raw_phys, raw_phys_n * sizeof(float)) != 0) {
+                    int raw_read_ok;
+                    if (gpu_graph_raw_f16_enabled()) {
+                        uint16_t *raw_h = xmalloc((size_t)raw_phys_n * sizeof(uint16_t));
+                        raw_read_ok = ds4_gpu_tensor_read(g.layer_raw_cache[il], 0, raw_h,
+                                                          raw_phys_n * sizeof(uint16_t));
+                        if (raw_read_ok != 0) {
+                            for (uint64_t i2 = 0; i2 < raw_phys_n; i2++) {
+                                gpu_raw_phys[i2] = f16_to_f32(raw_h[i2]);
+                            }
+                        }
+                        free(raw_h);
+                    } else {
+                        raw_read_ok = ds4_gpu_tensor_read(g.layer_raw_cache[il], 0, gpu_raw_phys,
+                                                          raw_phys_n * sizeof(float));
+                    }
+                    if (raw_read_ok != 0) {
                         for (uint32_t r = 0; r < n_raw; r++) {
                             const uint32_t phys = (raw_start + r) % raw_cap;
                             memcpy(gpu_raw_logical + (uint64_t)r * DS4_N_HEAD_DIM,

@@ -14,6 +14,7 @@
 //        -DDS4_ATTN_CUTLASS_STANDALONE -I cutlass/include -I cutlass/tools/util/include \
 //        src/cuda/ds4_attn_cutlass.cu -o temp/attn_cutlass_test
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 #include "cutlass/cutlass.h"
@@ -279,6 +280,15 @@ static size_t mx_sfb_count_bat(int N, int K, int L) {
 }
 
 // ---- MXFP8 decoders + K/V assembly for the decode attention entry point ----
+
+/* raw_f16: per-call flag describing the storage format of the PASSED raw KV
+ * operand (__half when set, f32 otherwise).  The store kernels already round
+ * every raw row through __float2half, so a __half load + __half2float returns
+ * the exact float the f32 path reads — bit-identical. */
+__device__ static inline float raw_kv_ld(const float *raw_kv, int f16, uint64_t idx) {
+    return f16 ? __half2float(((const __half *)raw_kv)[idx]) : raw_kv[idx];
+}
+
 __device__ __forceinline__ float a_e4m3_dec(uint8_t b, float scale) {
   float v = a_e4m3_val(b & 0x7f);
   return (b & 0x80) ? (-v * scale) : (v * scale);
@@ -294,15 +304,16 @@ __global__ void assemble_kv_mxfp8(float *Kf, float *VbT,
                                   const uint8_t *comp_k, const uint8_t *comp_v,
                                   const int32_t *comp_rows,
                                   uint32_t n_raw, uint32_t n_comp,
-                                  uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim) {
+                                  uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim,
+                                  int raw_f16) {
   uint32_t row = blockIdx.x;
   if (row >= n_kv_pad) return;
   const uint32_t nblk = head_dim / 32, rowbytes = head_dim + nblk;
   for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
     float kv = 0.f, vv = 0.f;
     if (row < n_raw) {
-      kv = raw_k[(uint64_t)row * head_dim + d];
-      vv = raw_v[(uint64_t)row * head_dim + d];
+      kv = raw_kv_ld(raw_k, raw_f16, (uint64_t)row * head_dim + d);
+      vv = raw_kv_ld(raw_v, raw_f16, (uint64_t)row * head_dim + d);
     } else if (row < n_kv) {
       int32_t r = comp_rows[row - n_raw];
       if (r >= 0) {
@@ -395,7 +406,7 @@ extern "C" int ds4_attn_mx_decode_scratch(
     const uint8_t *comp_k, const uint8_t *comp_v, const int32_t *comp_rows,
     const float *sinks,
     uint32_t n_head, uint32_t head_dim, uint32_t n_raw, uint32_t n_comp,
-    uint8_t *scratch, size_t scratch_bytes) {
+    uint8_t *scratch, size_t scratch_bytes, uint32_t raw_f16) {
   const uint32_t n_kv = n_raw + n_comp;
   if (n_kv == 0 || (head_dim % 32) != 0 || !scratch) return -1;
   const uint32_t n_kv_pad = (n_kv + 31u) & ~31u;
@@ -413,7 +424,7 @@ extern "C" int ds4_attn_mx_decode_scratch(
   cudaMemsetAsync(Qs, 0, L.qa * 2); cudaMemsetAsync(Ks, 0, L.kb * 2);
   cudaMemsetAsync(Ps, 0, L.pa * 2); cudaMemsetAsync(Vs, 0, L.vb * 2);
   assemble_kv_mxfp8<<<n_kv_pad, 256>>>(Kf, Vb, raw_k, raw_v, comp_k, comp_v, comp_rows,
-                                       n_raw, n_comp, n_kv, n_kv_pad, head_dim);
+                                       n_raw, n_comp, n_kv, n_kv_pad, head_dim, (int)raw_f16);
   mx_pack_a8(Qd, Qs, q, M, D);
   mx_pack_b8<G88>(Kd, Ks, Kf, KV, D);
   mx_pack_b8<G88>(Vd, Vs, Vb, D, KV);
@@ -431,14 +442,15 @@ extern "C" int ds4_attn_mx_decode_scratch(
 __global__ void assemble_kv_f32comp(float *Kf, float *VbT,
                                     const float *kv_raw, const float *kv_comp, const int32_t *comp_rows,
                                     uint32_t raw_start, uint32_t raw_cap, uint32_t raw_first,
-                                    uint32_t n_raw, uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim) {
+                                    uint32_t n_raw, uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim,
+                                    int raw_f16) {
   uint32_t row = blockIdx.x;
   if (row >= n_kv_pad) return;
   for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
     float v = 0.f;
     if (row < n_raw) {
       uint32_t phys = (raw_start + raw_first + row) % raw_cap;
-      v = kv_raw[(uint64_t)phys * head_dim + d];
+      v = raw_kv_ld(kv_raw, raw_f16, (uint64_t)phys * head_dim + d);
     } else if (row < n_kv) {
       uint32_t i = row - n_raw;
       int32_t r = comp_rows ? comp_rows[i] : (int32_t)i;
@@ -454,7 +466,8 @@ __global__ void assemble_kv_f32comp(float *Kf, float *VbT,
 __global__ void assemble_kv_mxcomp(float *Kf, float *VbT,
                                    const float *kv_raw, const uint8_t *kv_comp_mx, const int32_t *comp_rows,
                                    uint32_t raw_start, uint32_t raw_cap, uint32_t raw_first,
-                                   uint32_t n_raw, uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim) {
+                                   uint32_t n_raw, uint32_t n_kv, uint32_t n_kv_pad, uint32_t head_dim,
+                                   int raw_f16) {
   uint32_t row = blockIdx.x;
   if (row >= n_kv_pad) return;
   const uint32_t nblk = head_dim / 32, rowbytes = head_dim + nblk;
@@ -462,7 +475,7 @@ __global__ void assemble_kv_mxcomp(float *Kf, float *VbT,
     float v = 0.f;
     if (row < n_raw) {
       uint32_t phys = (raw_start + raw_first + row) % raw_cap;
-      v = kv_raw[(uint64_t)phys * head_dim + d];
+      v = raw_kv_ld(kv_raw, raw_f16, (uint64_t)phys * head_dim + d);
     } else if (row < n_kv) {
       uint32_t i = row - n_raw;
       int32_t r = comp_rows ? comp_rows[i] : (int32_t)i;
@@ -484,7 +497,7 @@ extern "C" int ds4_attn_mx_decode_mx_scratch(
     const float *sinks,
     uint32_t n_head, uint32_t head_dim,
     uint32_t raw_start, uint32_t raw_cap, uint32_t raw_first, uint32_t n_raw, uint32_t n_comp,
-    uint8_t *scratch, size_t scratch_bytes) {
+    uint8_t *scratch, size_t scratch_bytes, uint32_t raw_f16) {
   const uint32_t n_kv = n_raw + n_comp;
   if (n_kv == 0 || (head_dim % 32) != 0 || !scratch) return -1;
   const uint32_t n_kv_pad = (n_kv + 31u) & ~31u;
@@ -501,7 +514,8 @@ extern "C" int ds4_attn_mx_decode_mx_scratch(
   cudaMemsetAsync(Qs, 0, L.qa * 2); cudaMemsetAsync(Ks, 0, L.kb * 2);
   cudaMemsetAsync(Ps, 0, L.pa * 2); cudaMemsetAsync(Vs, 0, L.vb * 2);
   assemble_kv_mxcomp<<<n_kv_pad, 256>>>(Kf, Vb, kv_raw, kv_comp_mx, comp_rows,
-                                        raw_start, raw_cap, raw_first, n_raw, n_kv, n_kv_pad, head_dim);
+                                        raw_start, raw_cap, raw_first, n_raw, n_kv, n_kv_pad, head_dim,
+                                        (int)raw_f16);
   mx_pack_a8(Qd, Qs, q, M, D);
   mx_pack_b8<G88>(Kd, Ks, Kf, KV, D);
   mx_pack_b8<G88>(Vd, Vs, Vb, D, KV);
@@ -521,7 +535,7 @@ extern "C" int ds4_attn_mx_decode_f32_scratch(
     const float *sinks,
     uint32_t n_head, uint32_t head_dim,
     uint32_t raw_start, uint32_t raw_cap, uint32_t raw_first, uint32_t n_raw, uint32_t n_comp,
-    uint8_t *scratch, size_t scratch_bytes) {
+    uint8_t *scratch, size_t scratch_bytes, uint32_t raw_f16) {
   const uint32_t n_kv = n_raw + n_comp;
   if (n_kv == 0 || (head_dim % 32) != 0 || !scratch) return -1;
   const uint32_t n_kv_pad = (n_kv + 31u) & ~31u;
@@ -538,7 +552,8 @@ extern "C" int ds4_attn_mx_decode_f32_scratch(
   cudaMemsetAsync(Qs, 0, L.qa * 2); cudaMemsetAsync(Ks, 0, L.kb * 2);
   cudaMemsetAsync(Ps, 0, L.pa * 2); cudaMemsetAsync(Vs, 0, L.vb * 2);
   assemble_kv_f32comp<<<n_kv_pad, 256>>>(Kf, Vb, kv_raw, kv_comp, comp_rows,
-                                         raw_start, raw_cap, raw_first, n_raw, n_kv, n_kv_pad, head_dim);
+                                         raw_start, raw_cap, raw_first, n_raw, n_kv, n_kv_pad, head_dim,
+                                         (int)raw_f16);
   mx_pack_a8(Qd, Qs, q, M, D);
   mx_pack_b8<G88>(Kd, Ks, Kf, KV, D);
   mx_pack_b8<G88>(Vd, Vs, Vb, D, KV);
@@ -555,12 +570,12 @@ extern "C" int ds4_attn_mx_decode(
     const float *raw_k, const float *raw_v,
     const uint8_t *comp_k, const uint8_t *comp_v, const int32_t *comp_rows,
     const float *sinks,
-    uint32_t n_head, uint32_t head_dim, uint32_t n_raw, uint32_t n_comp) {
+    uint32_t n_head, uint32_t head_dim, uint32_t n_raw, uint32_t n_comp, uint32_t raw_f16) {
   size_t nbytes = ds4_attn_mx_decode_scratch_bytes(n_head, head_dim, n_raw + n_comp);
   uint8_t *scratch = nullptr;
   if (cudaMalloc(&scratch, nbytes) != cudaSuccess) return -3;
   int rc = ds4_attn_mx_decode_scratch(heads, q, raw_k, raw_v, comp_k, comp_v, comp_rows, sinks,
-                                      n_head, head_dim, n_raw, n_comp, scratch, nbytes);
+                                      n_head, head_dim, n_raw, n_comp, scratch, nbytes, raw_f16);
   cudaDeviceSynchronize();
   cudaFree(scratch);
   return rc;
@@ -582,7 +597,7 @@ extern "C" int ds4_gpu_attn_mx_decode(
     ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *comp_selected, uint32_t n_comp, uint32_t n_selected,
     const void *model_map, uint64_t model_size, uint64_t sinks_offset,
     uint32_t pos, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim,
-    uint8_t **scratch, uint64_t *scratch_bytes) {
+    uint8_t **scratch, uint64_t *scratch_bytes, uint32_t raw_f16) {
   const float *sinks = (const float *)cuda_model_range_ptr(
       model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
   if (!sinks || !heads || !q || !raw_cache || !scratch || !scratch_bytes) return -1;
@@ -616,7 +631,8 @@ extern "C" int ds4_gpu_attn_mx_decode(
   return ds4_attn_mx_decode_mx_scratch(
       (float *)heads->ptr, (const float *)q->ptr,
       (const float *)raw_cache->ptr, comp_ptr, comp_rows, sinks,
-      n_head, head_dim, raw_start, raw_cap, raw_first, raw_vis, comp_vis, *scratch, *scratch_bytes);
+      n_head, head_dim, raw_start, raw_cap, raw_first, raw_vis, comp_vis, *scratch, *scratch_bytes,
+      raw_f16);
 }
 #endif  // !DS4_ATTN_CUTLASS_STANDALONE
 
@@ -824,7 +840,7 @@ static int run_decode_test(int n_head, int n_raw, int n_comp, int cap, int head_
   cudaMemcpy(dRV,rawV.data(),rawV.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dSink,sinks.data(),(size_t)n_head*4,cudaMemcpyHostToDevice);
   cudaMemcpy(dCK,cacheK.data(),cacheK.size(),cudaMemcpyHostToDevice); cudaMemcpy(dCV,cacheV.data(),cacheV.size(),cudaMemcpyHostToDevice);
   cudaMemcpy(dRows,rows.data(),(size_t)n_comp*4,cudaMemcpyHostToDevice);
-  int rc=ds4_attn_mx_decode(dHeads,dQ,dRK,dRV,dCK,dCV,dRows,dSink,n_head,head_dim,n_raw,n_comp);
+  int rc=ds4_attn_mx_decode(dHeads,dQ,dRK,dRV,dCK,dCV,dRows,dSink,n_head,head_dim,n_raw,n_comp,0);
   std::vector<float> got((size_t)n_head*head_dim); cudaMemcpy(got.data(),dHeads,got.size()*4,cudaMemcpyDeviceToHost);
   double maxrel=0; int bad=0; for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-outref[i]); double r=a/(fabs(outref[i])+1e-2); maxrel=fmax(maxrel,r); if(r>0.04&&a>0.03)bad++; }
   printf("decode entry n_head=%d n_raw=%d n_comp=%d (n_kv=%d) rc=%d max_rel=%.4f bad=%d/%zu -> %s\n",
@@ -868,7 +884,7 @@ static int run_decode_f32_test(const char* tag, int n_head, int raw_cap, int raw
   cudaMemcpy(dIdx,idx.data(),(size_t)n_comp*4,cudaMemcpyHostToDevice);
   size_t nb=ds4_attn_mx_decode_scratch_bytes(n_head,head_dim,n_kv); uint8_t*sc=nullptr; cudaMalloc(&sc,nb);
   int rc=ds4_attn_mx_decode_f32_scratch(dHeads,dQ,dRaw,dComp,use_index?dIdx:nullptr,dSink,n_head,head_dim,
-                                        (uint32_t)raw_start,(uint32_t)raw_cap,(uint32_t)raw_first,(uint32_t)n_raw,(uint32_t)n_comp,sc,nb);
+                                        (uint32_t)raw_start,(uint32_t)raw_cap,(uint32_t)raw_first,(uint32_t)n_raw,(uint32_t)n_comp,sc,nb,0);
   cudaDeviceSynchronize();
   std::vector<float> got((size_t)n_head*head_dim); cudaMemcpy(got.data(),dHeads,got.size()*4,cudaMemcpyDeviceToHost);
   double maxrel=0; int bad=0; for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-outref[i]); double r=a/(fabs(outref[i])+1e-2); maxrel=fmax(maxrel,r); if(r>0.04&&a>0.03)bad++; }
@@ -910,7 +926,7 @@ static int run_decode_mx_test(const char* tag, int n_head, int raw_cap, int raw_
   cudaMemcpy(dSink,sinks.data(),(size_t)n_head*4,cudaMemcpyHostToDevice); cudaMemcpy(dComp,cache.data(),cache.size(),cudaMemcpyHostToDevice); cudaMemcpy(dIdx,idx.data(),(size_t)n_comp*4,cudaMemcpyHostToDevice);
   size_t nb=ds4_attn_mx_decode_scratch_bytes(n_head,head_dim,n_kv); uint8_t*sc=nullptr; cudaMalloc(&sc,nb);
   int rc=ds4_attn_mx_decode_mx_scratch(dHeads,dQ,dRaw,dComp,use_index?dIdx:nullptr,dSink,n_head,head_dim,
-                                       (uint32_t)raw_start,(uint32_t)raw_cap,(uint32_t)raw_first,(uint32_t)n_raw,(uint32_t)n_comp,sc,nb);
+                                       (uint32_t)raw_start,(uint32_t)raw_cap,(uint32_t)raw_first,(uint32_t)n_raw,(uint32_t)n_comp,sc,nb,0);
   cudaDeviceSynchronize();
   std::vector<float> got((size_t)n_head*head_dim); cudaMemcpy(got.data(),dHeads,got.size()*4,cudaMemcpyDeviceToHost);
   double maxrel=0; int bad=0; for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-outref[i]); double r=a/(fabs(outref[i])+1e-2); maxrel=fmax(maxrel,r); if(r>0.04&&a>0.03)bad++; }

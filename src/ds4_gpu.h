@@ -429,6 +429,15 @@ int ds4_gpu_dsv4_indexer_qat_pack_tensor(
  * MXKV-FP4-packed (68 B/row at head_dim 128) instead of f32. */
 void ds4_gpu_indexer_set_fp4(int on);
 
+/* raw_f16 parameter convention (attention readers / raw KV writers below):
+ * the flag describes the STORAGE FORMAT OF THE PASSED raw tensor for THIS
+ * call — 1 means the raw operand is a __half cache, 0 means f32.  Raw values
+ * are already f16-rounded at write time (the f32 store path roundtrips
+ * through __float2half), so a __half cache reads back bit-identical floats;
+ * f16 only halves storage and read traffic.  Callers must pass the format of
+ * the specific buffer they hand in (the persistent layer ring may be __half
+ * while e.g. batch/drafter buffers stay f32). */
+
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
@@ -454,7 +463,8 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          row,
         uint32_t          head_dim,
-        uint32_t          n_rot);
+        uint32_t          n_rot,
+        uint32_t          raw_f16);
 
 /* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * ds4_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
@@ -464,7 +474,8 @@ int ds4_gpu_store_raw_kv_tensor(
         const ds4_gpu_tensor *kv,
         uint32_t                raw_cap,
         uint32_t                row,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                raw_f16);
 
 int ds4_gpu_store_raw_kv_batch_tensor(
         ds4_gpu_tensor       *raw_cache,
@@ -472,7 +483,8 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                raw_cap,
         uint32_t                pos0,
         uint32_t                n_tokens,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                raw_f16);
 
 /* =========================================================================
  * KV Compression and Attention.
@@ -605,7 +617,8 @@ int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                raw_f16);
 
 /* MXFP8 decode attention over the current f32 KV caches (CUTLASS Sm120 MX GEMM
  * path). Compute-path drop-in for the decode attention, gated behind DS4_ATTN_MX.
@@ -631,7 +644,8 @@ int ds4_gpu_attn_mx_decode(
         uint32_t                n_head,
         uint32_t                head_dim,
         unsigned char         **scratch,
-        uint64_t               *scratch_bytes);
+        uint64_t               *scratch_bytes,
+        uint32_t                raw_f16);
 
 /* Free a scratch buffer grown by ds4_gpu_attn_mx_decode (raw cudaFree). */
 void ds4_gpu_attn_mx_scratch_free(void *p);
@@ -646,7 +660,8 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                n_tokens,
         uint32_t                window,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                raw_f16);
 
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -663,7 +678,8 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim,
-        uint32_t                non_causal);
+        uint32_t                non_causal,
+        uint32_t                raw_f16);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -687,7 +703,8 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        uint32_t                non_causal);
+        uint32_t                non_causal,
+        uint32_t                raw_f16);
 
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -710,7 +727,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                raw_f16);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -727,7 +745,8 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                raw_f16);
 
 int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -745,7 +764,8 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                raw_f16);
 
 int ds4_gpu_attention_output_batch_tensor(
         ds4_gpu_tensor       *out,
