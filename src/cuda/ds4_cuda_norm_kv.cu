@@ -527,6 +527,59 @@ __global__ static void attn_pack_dequant_kernel(const uint8_t *in, float *out, u
     }
 }
 
+/* EXACT ceil-log2 scale bucket for repacking already-roundtripped rows.
+ * k = ceil(log2(max(amax,1e-4)/448)) computed from the float bit pattern:
+ * 448*2^k has bits ((135+k)<<23)|0x600000, and comparing positive floats is
+ * comparing their bit patterns as unsigned ints — no log2f/ceilf, so no
+ * fast-math misrounding at bucket boundaries.  For inputs that are already
+ * e4m3-grid multiples of a power-of-two scale (every session file row), this
+ * makes the repack value-idempotent: elements y*2^m stay on the e4m3 grid up
+ * to 448 and re-encode exactly. */
+__device__ static inline uint8_t attn_pack_exact_e8_dev(float amax) {
+    const float a = fmaxf(amax, 1.0e-4f);
+    const uint32_t u = __float_as_uint(a);
+    int e = (int)(u >> 23) - 135 + (((u & 0x7fffffu) > 0x600000u) ? 1 : 0) + 127;
+    if (e < 0) e = 0;
+    if (e > 254) e = 254;
+    return (uint8_t)e;
+}
+
+__global__ static void attn_pack_repack_kernel(const float *x, uint8_t *out, uint32_t out_row0, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
+    uint32_t row = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t nblk = n_nope / DS4_FP8_KV_BLOCK;
+    const uint32_t nblk_pad = (nblk + 3u) & ~3u;
+    const uint64_t rowbytes = DS4_ATTN_PACK_ROWBYTES(head_dim);
+    const float *xr = x + (uint64_t)row * head_dim;
+    uint8_t *outr = out + (uint64_t)(out_row0 + row) * rowbytes;
+    uint8_t *sc = outr + n_nope;
+    float *rope = (float *)(outr + n_nope + nblk_pad);
+    __shared__ float scratch[64];
+    for (uint32_t off = 0; off < n_nope; off += DS4_FP8_KV_BLOCK) {
+        float v = 0.0f;
+        if (off + tid < n_nope) v = xr[off + tid];
+        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        const uint8_t e8 = attn_pack_exact_e8_dev(scratch[0]);
+        const float scale = dsv4_e8m0_decode_scale_dev(e8);
+        if (tid == 0) sc[off / DS4_FP8_KV_BLOCK] = e8;
+        if (off + tid < n_nope) {
+            outr[off + tid] = dsv4_e4m3fn_encode_dev(fminf(448.0f, fmaxf(-448.0f, v / scale)));
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        for (uint32_t p = nblk; p < nblk_pad; p++) sc[p] = 0;
+    }
+    for (uint32_t d = tid; d < n_rot; d += blockDim.x) rope[d] = xr[n_nope + d];
+}
+
 
 
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
@@ -1090,6 +1143,29 @@ extern "C" int ds4_gpu_attn_pack_dequant_tensor(const ds4_gpu_tensor *in,
     attn_pack_dequant_kernel<<<n_rows, 256>>>((const uint8_t *)in->ptr, (float *)out->ptr,
                                               n_rows, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "attn_pack_dequant launch");
+}
+
+/* DS4_ATTN_PACK REPACK-ONLY entry (session load): pack n_rows f32 rows that
+ * are ALREADY fp8-roundtripped (session files always contain such rows) into
+ * `packed` at [out_row0, out_row0+n_rows), using the exact integer-math scale
+ * bucket — value-idempotent, unlike the fast-math quantize path which can
+ * misround the bucket at scale boundaries.  x is not modified. */
+extern "C" int ds4_gpu_attn_pack_repack_tensor(const ds4_gpu_tensor *x,
+                                               ds4_gpu_tensor *packed,
+                                               uint32_t out_row0,
+                                               uint32_t n_rows,
+                                               uint32_t head_dim,
+                                               uint32_t n_rot) {
+    if (!x || !packed || n_rows == 0 ||
+        n_rot != DS4_ATTN_PACK_NROT || head_dim <= n_rot ||
+        ((head_dim - n_rot) % DS4_FP8_KV_BLOCK) != 0 ||
+        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        packed->bytes < ((uint64_t)out_row0 + n_rows) * DS4_ATTN_PACK_ROWBYTES(head_dim)) {
+        return 0;
+    }
+    attn_pack_repack_kernel<<<n_rows, 64>>>((const float *)x->ptr, (uint8_t *)packed->ptr,
+                                            out_row0, n_rows, head_dim, n_rot);
+    return cuda_ok(cudaGetLastError(), "attn_pack_repack launch");
 }
 
 /*

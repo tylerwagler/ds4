@@ -45,16 +45,71 @@ __device__ static float ds4a_fp8_kv_dequant(uint8_t byte, float scale) {
  * f32 directly, so scores/outputs are bit-identical to the f32 comp cache.
  * The 2^(e8-127) scale is built as a float exponent; the pack amax floor
  * (1e-4 -> e8 >= 105) rules out byte 0. */
+/* e4m3 byte * scale by pure bit math — bit-identical to
+ * ds4a_e4m3_value(b & 0x7f) * scale with the sign applied (normals become the
+ * exact float (1 + mant/8)*2^(exp-7) built directly from its bit pattern;
+ * subnormals use the same mant*2^-9 product; scale is an exact power of two,
+ * and (-v)*s == -(v*s) in IEEE), but with no exp2f in the inner loops. */
+__device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
+    const uint32_t e = (b >> 3) & 15u;
+    const uint32_t m = b & 7u;
+    const float v = e ? __uint_as_float(((e + 120u) << 23) | (m << 20))
+                      : (float)m * 0.001953125f;
+    const float sv = v * scale;
+    return (b & 0x80u) ? -sv : sv;
+}
+
 __device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
     const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
     const uint8_t *r = (const uint8_t *)comp_kv + row * DS4_ATTN_PACK_ROWBYTES(head_dim);
     if (d < n_nope) {
         const float scale = __uint_as_float((uint32_t)r[n_nope + (d / DS4_FP8_KV_BLOCK)] << 23);
-        const uint8_t b = r[d];
-        const float val = ds4a_e4m3_value((int)(b & 0x7f));
-        return (b & 0x80) ? (-val * scale) : (val * scale);
+        return attn_pack_e4m3(r[d], scale);
     }
     return ((const float *)(r + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope];
+}
+
+/* Packed-row dot walked d = 0..head_dim-1 by one thread: per-64-block scale
+ * hoisted, e4m3 bytes fetched four at a time as one uint32 (rows are 4-byte
+ * aligned: 712-byte stride).  Accumulation order is identical to the scalar
+ * d-ascending loop, so the result is bit-identical. */
+__device__ static inline float attn_pack_dot_full(const float *qh, const float *comp_kv, uint64_t row, uint32_t head_dim, float dot) {
+    const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
+    const uint8_t *pr = (const uint8_t *)comp_kv + row * DS4_ATTN_PACK_ROWBYTES(head_dim);
+    const uint8_t *psc = pr + n_nope;
+    for (uint32_t off = 0; off < n_nope; off += DS4_FP8_KV_BLOCK) {
+        const float scale = __uint_as_float((uint32_t)psc[off / DS4_FP8_KV_BLOCK] << 23);
+        const uint32_t *pw = (const uint32_t *)(pr + off);
+        for (uint32_t i = 0; i < DS4_FP8_KV_BLOCK / 4u; i++) {
+            const uint32_t w = pw[i];
+            const uint32_t d = off + i * 4u;
+            dot += qh[d + 0u] * attn_pack_e4m3(w & 0xffu, scale);
+            dot += qh[d + 1u] * attn_pack_e4m3((w >> 8) & 0xffu, scale);
+            dot += qh[d + 2u] * attn_pack_e4m3((w >> 16) & 0xffu, scale);
+            dot += qh[d + 3u] * attn_pack_e4m3(w >> 24, scale);
+        }
+    }
+    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
+    for (uint32_t d = 0; d < DS4_ATTN_PACK_NROT; d++) dot += qh[n_nope + d] * rope[d];
+    return dot;
+}
+
+/* Packed-row dot walked d = lane, lane+8, ... by one thread (8-lane strided
+ * kernels): per-64-block scale hoisted (8 dims per block per thread share it).
+ * Same d-ascending visit order as the plain strided loop — bit-identical. */
+__device__ static inline float attn_pack_dot_lane8(const float *qh, const float *comp_kv, uint64_t row, uint32_t lane, uint32_t head_dim, float dot) {
+    const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
+    const uint8_t *pr = (const uint8_t *)comp_kv + row * DS4_ATTN_PACK_ROWBYTES(head_dim);
+    const uint8_t *psc = pr + n_nope;
+    for (uint32_t off = 0; off < n_nope; off += DS4_FP8_KV_BLOCK) {
+        const float scale = __uint_as_float((uint32_t)psc[off / DS4_FP8_KV_BLOCK] << 23);
+        for (uint32_t d = off + lane; d < off + DS4_FP8_KV_BLOCK; d += 8u) {
+            dot += qh[d] * attn_pack_e4m3(pr[d], scale);
+        }
+    }
+    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
+    for (uint32_t d = n_nope + lane; d < head_dim; d += 8u) dot += qh[d] * rope[d - n_nope];
+    return dot;
 }
 
 
@@ -431,8 +486,7 @@ __global__ static void attention_decode_mixed_kernel(
                     for (uint32_t d = 0; d < head_dim; d++)
                         dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
                 } else if (comp_kv_pack) {
-                    for (uint32_t d = 0; d < head_dim; d++)
-                        dot += qh[d] * attn_comp_pack_ld(comp_kv, c, d, head_dim);
+                    dot = attn_pack_dot_full(qh, comp_kv, c, head_dim, dot);
                 } else {
                     const float *kvrow = comp_kv + (uint64_t)c * head_dim;
                     for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
@@ -469,7 +523,7 @@ __global__ static void attention_decode_mixed_kernel(
                         const float *sc = (const float *)(kv_u8 + head_dim);
                         for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
                     } else if (comp_kv_pack) {
-                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * attn_comp_pack_ld(comp_kv, c_idx, d, head_dim);
+                        dot = attn_pack_dot_lane8(qh, comp_kv, c_idx, qlane, head_dim, dot);
                     } else {
                         const float *kvrow = comp_kv + (uint64_t)c_idx * head_dim;
                         for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
@@ -660,8 +714,7 @@ __global__ static void attention_indexed_mixed_kernel(
                     const uint64_t rbase = (uint64_t)raw_rows[row] * head_dim;
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * raw_kv_ld(raw_kv, raw_f16, rbase + d);
                 } else if (comp_kv_pack) {
-                    const uint64_t crow = (uint64_t)comp_rows[row - raw_count];
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * attn_comp_pack_ld(comp_kv, crow, d, head_dim);
+                    dot = attn_pack_dot_lane8(qh, comp_kv, (uint64_t)comp_rows[row - raw_count], qlane, head_dim, dot);
                 } else {
                     const float *kvrow = comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
@@ -1322,13 +1375,27 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                 v.w = ds4a_fp8_kv_dequant(kv_u8[base + 3], sc[(base + 3) >> 6]);
                 kv_shared[off] = v;
             } else if (comp_kv_pack) {
-                const uint64_t crow = (uint64_t)(sr - raw_count);
+                const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
+                const uint8_t *pr = (const uint8_t *)comp_kv +
+                    (uint64_t)(sr - raw_count) * DS4_ATTN_PACK_ROWBYTES(head_dim);
                 const uint32_t base = c4 << 2;
                 float4 v;
-                v.x = attn_comp_pack_ld(comp_kv, crow, base + 0u, head_dim);
-                v.y = attn_comp_pack_ld(comp_kv, crow, base + 1u, head_dim);
-                v.z = attn_comp_pack_ld(comp_kv, crow, base + 2u, head_dim);
-                v.w = attn_comp_pack_ld(comp_kv, crow, base + 3u, head_dim);
+                if (base < n_nope) {
+                    /* base%4 == 0 and blocks are 64-aligned, so the four dims
+                     * share one scale and one aligned uint32 of e4m3 bytes. */
+                    const float scale = __uint_as_float((uint32_t)pr[n_nope + (base / DS4_FP8_KV_BLOCK)] << 23);
+                    const uint32_t w = *(const uint32_t *)(pr + base);
+                    v.x = attn_pack_e4m3(w & 0xffu, scale);
+                    v.y = attn_pack_e4m3((w >> 8) & 0xffu, scale);
+                    v.z = attn_pack_e4m3((w >> 16) & 0xffu, scale);
+                    v.w = attn_pack_e4m3(w >> 24, scale);
+                } else {
+                    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
+                    v.x = rope[base - n_nope + 0u];
+                    v.y = rope[base - n_nope + 1u];
+                    v.z = rope[base - n_nope + 2u];
+                    v.w = rope[base - n_nope + 3u];
+                }
                 kv_shared[off] = v;
             } else {
                 const float4 *src = (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);

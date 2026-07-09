@@ -312,10 +312,12 @@ static int payload_read_attn_comp_pack(FILE *fp, ds4_gpu_graph *g, uint32_t il,
     int rc = payload_read_tensor_span(fp, g->attn_comp_dequant, 0, bytes,
                                       buf, cap, remaining, err, errlen);
     if (rc != 0) return rc;
-    if (ds4_gpu_attn_pack_quantize_store_tensor(g->attn_comp_dequant,
-                                                g->layer_attn_comp_cache[il],
-                                                0, n_rows,
-                                                DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
+    /* Exact-scale repack: file rows are already roundtripped, and the
+     * fast-math quantize bucket is not bit-idempotent at scale boundaries. */
+    if (ds4_gpu_attn_pack_repack_tensor(g->attn_comp_dequant,
+                                        g->layer_attn_comp_cache[il],
+                                        0, n_rows,
+                                        DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
         payload_set_err(err, errlen, "failed to repack attn comp cache on session load");
         return 1;
     }
