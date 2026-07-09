@@ -5055,6 +5055,48 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * hidden rows the confidence kernel consumes. */
     dspark_dump_step(g, (int)s->checkpoint.len, (int)next_base, refined, (int)n_draft);
 
+    /* On-policy trajectory dump (DS4_DSPARK_DUMP_ONPOLICY=<max steps>,
+     * _PATH=<file>): self-contained per-step records for teacher-forcing the
+     * offline torch drafter on THE ENGINE'S OWN trajectory — discriminates
+     * "remaining acceptance gap is on-policy distribution" (torch matches the
+     * engine's level on identical data) from "engine draft-forward middle is
+     * numerically wrong" (torch scores much higher). Record: {pos, next_base,
+     * n_draft, n_batch, commit, refined[n_draft+1], th[n_batch][3][4096] f32};
+     * batch row m holds the anchor hiddens of position pos-1-commit+m; rows
+     * 0..commit are the committed positions, row commit the drafting anchor. */
+    {
+        static int opsteps = -1;
+        if (opsteps < 0) {
+            const char *e2 = getenv("DS4_DSPARK_DUMP_ONPOLICY");
+            opsteps = e2 && e2[0] ? atoi(e2) : 0;
+        }
+        static int opdone = 0;
+        const char *oppath = getenv("DS4_DSPARK_DUMP_ONPOLICY_PATH");
+        if (opdone < opsteps && oppath && oppath[0]) {
+            FILE *f2 = fopen(oppath, opdone == 0 ? "wb" : "ab");
+            if (f2) {
+                int32_t hdr2[5] = { (int32_t)s->checkpoint.len, (int32_t)next_base,
+                                    (int32_t)n_draft, (int32_t)n_batch, (int32_t)commit };
+                fwrite(hdr2, sizeof(int32_t), 5, f2);
+                fwrite(refined, sizeof(int32_t), (size_t)n_draft + 1, f2);
+                float *row2 = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+                for (uint32_t m2 = 0; m2 < n_batch; m2++) {
+                    for (int sl = 0; sl < 3; sl++) {
+                        memset(row2, 0, (size_t)DS4_N_EMBD * sizeof(float));
+                        (void)ds4_gpu_tensor_read(g->dspark_target_h_batch[sl],
+                                                  (uint64_t)m2 * DS4_N_EMBD * sizeof(float),
+                                                  row2,
+                                                  (uint64_t)DS4_N_EMBD * sizeof(float));
+                        fwrite(row2, sizeof(float), DS4_N_EMBD, f2);
+                    }
+                }
+                free(row2);
+                fclose(f2);
+                opdone++;
+            }
+        }
+    }
+
     /* Confidence-scheduled pending length (P1 head; keep the confident prefix). */
     uint32_t keep = n_draft;
     {
