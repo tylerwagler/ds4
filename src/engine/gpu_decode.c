@@ -2860,6 +2860,8 @@ bool gpu_graph_dspark_draft_forward(
             layer->attn_norm->abs_offset,
             DS4_N_EMBD, n_draft, DS4_RMS_EPS) != 0;
 
+        if (ok) gpu_graph_debug_dump_tensor("dsp_attn_norm", g->batch_attn_norm,
+                                             (uint64_t)n_draft * DS4_N_EMBD, li, pos0);
         /* --- Q projection --- */
         if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(
             g->batch_qr, dspark_model->map, dspark_model->size,
@@ -2928,6 +2930,23 @@ bool gpu_graph_dspark_draft_forward(
             DS4_N_HEAD, DS4_N_HEAD_DIM,
             1) != 0;
 
+        if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
+                                             (uint64_t)n_draft * DS4_N_HEAD * DS4_N_HEAD_DIM, li, pos0);
+        /* Inverse-rotate the attention output's rope dims before the o
+         * projection (reference: apply_rotary_emb(o, freqs_cis, inverse=True);
+         * the verify/prefill path does the same via its "kqv_back" rope).
+         * This call was MISSING here: wo_a/wo_b consumed position-rotated
+         * rope dims -- 64/512 dims per head scrambled in every drafter block,
+         * the ~30-point acceptance bug (#4). Verified vs the torch reference:
+         * the engine attention output matches exactly WITHOUT inverse rope
+         * (cos 0.99999) and diverges with it (cos 0.57), so everything
+         * downstream of this line computed on corrupted features. */
+        if (ok) ok = ds4_gpu_rope_tail_tensor(
+            g->batch_heads, n_draft,
+            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
+            pos0, 0, true,
+            (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
         /* --- Attention output projection (LoRA grouped) --- */
         if (ok) ok = ds4_gpu_attention_output_batch_tensor(
             g->batch_attn_out, g->batch_attn_low,
@@ -2936,6 +2955,8 @@ bool gpu_graph_dspark_draft_forward(
             layer->attn_output_b->abs_offset,
             group_dim, rank, n_groups, DS4_N_EMBD,
             g->batch_heads, n_draft) != 0;
+        if (ok) gpu_graph_debug_dump_tensor("dsp_attn_out", g->batch_attn_out,
+                                             (uint64_t)n_draft * DS4_N_EMBD, li, pos0);
 
         /* --- HC expand + split → batch_after_attn_hc --- */
         /* View sized to the real draft count: the CUDA side infers n_tokens from
@@ -2958,12 +2979,16 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) ok = gpu_graph_encode_layer_ffn_batch(
             g, dspark_model, layer, li, pos0, n_draft);
 
+        if (ok) gpu_graph_debug_dump_tensor("dsp_after_attn_hc", g->batch_after_attn_hc,
+                                             (uint64_t)n_draft * DS4_N_HC * DS4_N_EMBD, li, pos0);
         /* --- HC swap for next layer --- */
         if (ok) {
             ds4_gpu_tensor *tmp = g->batch_cur_hc;
             g->batch_cur_hc = g->batch_next_hc;
             g->batch_next_hc = tmp;
         }
+        if (ok) gpu_graph_debug_dump_tensor("dsp_block_out", g->batch_cur_hc,
+                                             (uint64_t)n_draft * DS4_N_HC * DS4_N_EMBD, li, pos0);
         /* Draft KV is transient; dspark_n_raw remains at the persistent count.
          * Committed positions are seeded via gpu_graph_dspark_seed_draft_kv(). */
 
