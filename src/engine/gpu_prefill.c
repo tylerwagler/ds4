@@ -1464,8 +1464,6 @@ bool gpu_graph_encode_layer_attention_batch(
             const uint32_t raw_start = gpu_graph_raw_start_for_span(g,
                                                                       pos0 + n_tokens - 1u,
                                                                       n_raw);
-            uint32_t use_comp_mask = 0;
-            bool use_indexed_comp = false;
             double index_stage_t0 = 0.0;
 
             ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
@@ -1477,124 +1475,153 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
-                if (index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary(NULL,
-                                                                    il,
-                                                                    pos0,
-                                                                    n_tokens,
-                                                                    n_comp,
-                                                                    &index_stage_t0);
-                }
-                ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
-                                                                  g->batch_indexer_q,
-                                                                  g->batch_indexer_weights,
-                                                                  g->layer_index_comp_cache[il],
-                                                                  n_comp,
-                                                                  n_tokens,
-                                                                  pos0,
-                                                                  DS4_N_INDEXER_HEAD,
-                                                                  DS4_N_INDEXER_HEAD_DIM,
-                                                                  ratio,
-                                                                  index_scale) != 0;
-                if (ok && index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary("score",
-                                                                    il,
-                                                                    pos0,
-                                                                    n_tokens,
-                                                                    n_comp,
-                                                                    &index_stage_t0);
-                }
-                if (ok) {
-                    gpu_graph_debug_dump_tensor("indexer_scores",
-                                                  g->indexer_scores,
-                                                  (uint64_t)n_comp * n_tokens,
-                                                  il,
-                                                  pos0);
-                }
-                if (ok) {
-                    ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                                       g->indexer_scores,
-                                                       n_comp,
-                                                       n_tokens,
-                                                       DS4_N_INDEXER_TOP_K) != 0;
+                /* DS4_PREFILL_SLICE: run [score -> top-k -> indexed attention]
+                 * over <=slice-token spans so indexer_scores only ever holds
+                 * one span of rows.  Per-token math is keyed on the absolute
+                 * position (pos0+t) and the raw window/comp visibility are
+                 * recomputed per span exactly like a smaller chunk, so slicing
+                 * is bit-identical; slice==0 (unset) is one full-chunk span
+                 * with pointer-identical arguments. */
+                const uint32_t slice = gpu_graph_prefill_slice();
+                const uint32_t span = (slice != 0u && slice < n_tokens) ? slice : n_tokens;
+                const uint64_t iq_row = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+                for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += span) {
+                    const uint32_t sn = n_tokens - s0 < span ? n_tokens - s0 : span;
+                    const uint32_t spos0 = pos0 + s0;
+                    const uint32_t s_n_raw = gpu_graph_raw_span_for_batch(g, spos0, sn);
+                    const uint32_t s_raw_start = gpu_graph_raw_start_for_span(g,
+                                                                                spos0 + sn - 1u,
+                                                                                s_n_raw);
+                    ds4_gpu_tensor *iq_view = ds4_gpu_tensor_view(g->batch_indexer_q,
+                            (uint64_t)s0 * iq_row * sizeof(float),
+                            (uint64_t)sn * iq_row * sizeof(float));
+                    ds4_gpu_tensor *iw_view = ds4_gpu_tensor_view(g->batch_indexer_weights,
+                            (uint64_t)s0 * DS4_N_INDEXER_HEAD * sizeof(float),
+                            (uint64_t)sn * DS4_N_INDEXER_HEAD * sizeof(float));
+                    ds4_gpu_tensor *sq_view = ds4_gpu_tensor_view(g->batch_q,
+                            (uint64_t)s0 * q_dim * sizeof(float),
+                            (uint64_t)sn * q_dim * sizeof(float));
+                    ds4_gpu_tensor *sh_view = ds4_gpu_tensor_view(g->batch_heads,
+                            (uint64_t)s0 * q_dim * sizeof(float),
+                            (uint64_t)sn * q_dim * sizeof(float));
+                    ok = iq_view && iw_view && sq_view && sh_view;
                     if (ok && index_stage_profile) {
-                        ok = gpu_graph_indexer_stage_profile_boundary("topk",
+                        ok = gpu_graph_indexer_stage_profile_boundary(NULL,
                                                                         il,
-                                                                        pos0,
-                                                                        n_tokens,
+                                                                        spos0,
+                                                                        sn,
+                                                                        n_comp,
+                                                                        &index_stage_t0);
+                    }
+                    if (ok) ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
+                                                                              iq_view,
+                                                                              iw_view,
+                                                                              g->layer_index_comp_cache[il],
+                                                                              n_comp,
+                                                                              sn,
+                                                                              spos0,
+                                                                              DS4_N_INDEXER_HEAD,
+                                                                              DS4_N_INDEXER_HEAD_DIM,
+                                                                              ratio,
+                                                                              index_scale) != 0;
+                    if (ok && index_stage_profile) {
+                        ok = gpu_graph_indexer_stage_profile_boundary("score",
+                                                                        il,
+                                                                        spos0,
+                                                                        sn,
                                                                         n_comp,
                                                                         &index_stage_t0);
                     }
                     if (ok) {
-                        gpu_graph_debug_dump_i32_tensor("indexer_topk",
-                                                          g->comp_selected,
-                                                          (uint64_t)n_tokens * DS4_N_INDEXER_TOP_K,
-                                                          il,
-                                                          pos0);
+                        gpu_graph_debug_dump_tensor("indexer_scores",
+                                                      g->indexer_scores,
+                                                      (uint64_t)n_comp * sn,
+                                                      il,
+                                                      spos0);
                     }
-                }
-                if (ok) {
-                    use_indexed_comp = true;
-                }
-                use_comp_mask = 1;
-            }
-            if (ok) {
-                if (use_indexed_comp) {
-                    ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
-                                                                              model->map,
-                                                                              model->size,
-                                                                              layer->attn_sinks->abs_offset,
-                                                                              g->batch_q,
-                                                                              g->layer_raw_cache[il],
-                                                                              gpu_graph_attn_comp_read_cache(g, il, n_comp),
-                                                                              gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
-                                                                              0 /* shadow is f32 */,
-                                                                              g->comp_selected,
-                                                                              n_tokens,
-                                                                              pos0,
-                                                                              n_raw,
-                                                                              g->raw_cap,
-                                                                              raw_start,
-                                                                              n_comp,
-                                                                              DS4_N_INDEXER_TOP_K,
-                                                                              g->raw_window,
-                                                                              ratio,
-                                                                              DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM,
-                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
-                    if (ok && index_stage_profile) {
-                        ok = gpu_graph_indexer_stage_profile_boundary("attention",
-                                                                        il,
-                                                                        pos0,
-                                                                        n_tokens,
-                                                                        n_comp,
-                                                                        &index_stage_t0);
+                    if (ok) {
+                        ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
+                                                           g->indexer_scores,
+                                                           n_comp,
+                                                           sn,
+                                                           DS4_N_INDEXER_TOP_K) != 0;
+                        if (ok && index_stage_profile) {
+                            ok = gpu_graph_indexer_stage_profile_boundary("topk",
+                                                                            il,
+                                                                            spos0,
+                                                                            sn,
+                                                                            n_comp,
+                                                                            &index_stage_t0);
+                        }
+                        if (ok) {
+                            gpu_graph_debug_dump_i32_tensor("indexer_topk",
+                                                              g->comp_selected,
+                                                              (uint64_t)sn * DS4_N_INDEXER_TOP_K,
+                                                              il,
+                                                              spos0);
+                        }
                     }
-                } else {
-                    ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
-                                                                             model->map,
-                                                                             model->size,
-                                                                             layer->attn_sinks->abs_offset,
-                                                                             g->batch_q,
-                                                                             g->layer_raw_cache[il],
-                                                                             gpu_graph_attn_comp_read_cache(g, il, n_comp),
-                                                                             gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
-                                                                             0 /* shadow is f32 */,
-                                                                             use_comp_mask ? g->comp_mask : NULL,
-                                                                             use_comp_mask,
-                                                                             n_tokens,
-                                                                             pos0,
-                                                                             n_raw,
-                                                                             g->raw_cap,
-                                                                             raw_start,
-                                                                             n_comp,
-                                                                              g->raw_window,
-                                                                              ratio,
-                                                                              DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM,
-                                                                              0,
-                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                    if (ok) {
+                        ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
+                                                                                  model->map,
+                                                                                  model->size,
+                                                                                  layer->attn_sinks->abs_offset,
+                                                                                  sq_view,
+                                                                                  g->layer_raw_cache[il],
+                                                                                  gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                                  gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                                  0 /* shadow is f32 */,
+                                                                                  g->comp_selected,
+                                                                                  sn,
+                                                                                  spos0,
+                                                                                  s_n_raw,
+                                                                                  g->raw_cap,
+                                                                                  s_raw_start,
+                                                                                  n_comp,
+                                                                                  DS4_N_INDEXER_TOP_K,
+                                                                                  g->raw_window,
+                                                                                  ratio,
+                                                                                  DS4_N_HEAD,
+                                                                                  DS4_N_HEAD_DIM,
+                                                                                  (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                        if (ok && index_stage_profile) {
+                            ok = gpu_graph_indexer_stage_profile_boundary("attention",
+                                                                            il,
+                                                                            spos0,
+                                                                            sn,
+                                                                            n_comp,
+                                                                            &index_stage_t0);
+                        }
+                    }
+                    ds4_gpu_tensor_free(sh_view);
+                    ds4_gpu_tensor_free(sq_view);
+                    ds4_gpu_tensor_free(iw_view);
+                    ds4_gpu_tensor_free(iq_view);
                 }
+            } else if (ok) {
+                ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
+                                                                         model->map,
+                                                                         model->size,
+                                                                         layer->attn_sinks->abs_offset,
+                                                                         g->batch_q,
+                                                                         g->layer_raw_cache[il],
+                                                                         gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                         gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                         0 /* shadow is f32 */,
+                                                                         NULL,
+                                                                         0,
+                                                                         n_tokens,
+                                                                         pos0,
+                                                                         n_raw,
+                                                                         g->raw_cap,
+                                                                         raw_start,
+                                                                         n_comp,
+                                                                          g->raw_window,
+                                                                          ratio,
+                                                                          DS4_N_HEAD,
+                                                                          DS4_N_HEAD_DIM,
+                                                                          0,
+                                                                          (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
             }
             if (ok) batch_attention_done = true;
         }
@@ -1611,84 +1638,115 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                 n_comp,
                                                                 &index_stage_t0);
             }
-            ok = ds4_gpu_indexer_scores_prefill_tensor(g->indexer_scores,
-                                                         g->batch_indexer_q,
-                                                         g->batch_indexer_weights,
-                                                         g->layer_index_comp_cache[il],
-                                                         n_comp,
-                                                         n_tokens,
-                                                         DS4_N_INDEXER_HEAD,
-                                                         DS4_N_INDEXER_HEAD_DIM,
-                                                         ratio,
-                                                         index_scale) != 0;
-            if (ok && index_stage_profile) {
-                ok = gpu_graph_indexer_stage_profile_boundary("score",
-                                                                il,
-                                                                pos0,
-                                                                n_tokens,
-                                                                n_comp,
-                                                                &index_stage_t0);
-            }
-            if (ok) {
-                gpu_graph_debug_dump_tensor("indexer_scores",
-                                              g->indexer_scores,
-                                              (uint64_t)n_comp * n_tokens,
-                                              il,
-                                              pos0);
-            }
-            if (ok) {
-                ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                                   g->indexer_scores,
-                                                   n_comp,
-                                                   n_tokens,
-                                                   DS4_N_INDEXER_TOP_K) != 0;
+            /* DS4_PREFILL_SLICE: same span loop as the chunked branch.  The
+             * historical ds4_gpu_indexer_scores_prefill_tensor is exactly the
+             * decode-batch entry with pos0 == 0 (zero_prefix means pos0 == 0,
+             * same launcher, causal), so a span at offset s0 scores the same
+             * per-token values with pos0 = s0.  Attention per span keeps
+             * first_raw_pos == 0 by passing n_raw = s0 + sn with raw_start 0. */
+            const uint32_t zslice = gpu_graph_prefill_slice();
+            const uint32_t zspan = (zslice != 0u && zslice < n_tokens) ? zslice : n_tokens;
+            const uint64_t ziq_row = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+            for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += zspan) {
+                const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
+                const uint32_t spos0 = pos0 + s0;
+                ds4_gpu_tensor *iq_view = ds4_gpu_tensor_view(g->batch_indexer_q,
+                        (uint64_t)s0 * ziq_row * sizeof(float),
+                        (uint64_t)sn * ziq_row * sizeof(float));
+                ds4_gpu_tensor *iw_view = ds4_gpu_tensor_view(g->batch_indexer_weights,
+                        (uint64_t)s0 * DS4_N_INDEXER_HEAD * sizeof(float),
+                        (uint64_t)sn * DS4_N_INDEXER_HEAD * sizeof(float));
+                ds4_gpu_tensor *sq_view = ds4_gpu_tensor_view(g->batch_q,
+                        (uint64_t)s0 * q_dim * sizeof(float),
+                        (uint64_t)sn * q_dim * sizeof(float));
+                ds4_gpu_tensor *sh_view = ds4_gpu_tensor_view(g->batch_heads,
+                        (uint64_t)s0 * q_dim * sizeof(float),
+                        (uint64_t)sn * q_dim * sizeof(float));
+                ok = iq_view && iw_view && sq_view && sh_view;
+                if (ok) ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
+                                                                          iq_view,
+                                                                          iw_view,
+                                                                          g->layer_index_comp_cache[il],
+                                                                          n_comp,
+                                                                          sn,
+                                                                          spos0,
+                                                                          DS4_N_INDEXER_HEAD,
+                                                                          DS4_N_INDEXER_HEAD_DIM,
+                                                                          ratio,
+                                                                          index_scale) != 0;
                 if (ok && index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary("topk",
+                    ok = gpu_graph_indexer_stage_profile_boundary("score",
                                                                     il,
-                                                                    pos0,
-                                                                    n_tokens,
+                                                                    spos0,
+                                                                    sn,
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
                 if (ok) {
-                    gpu_graph_debug_dump_i32_tensor("indexer_topk",
-                                                      g->comp_selected,
-                                                      (uint64_t)n_tokens * DS4_N_INDEXER_TOP_K,
-                                                      il,
-                                                      pos0);
+                    gpu_graph_debug_dump_tensor("indexer_scores",
+                                                  g->indexer_scores,
+                                                  (uint64_t)n_comp * sn,
+                                                  il,
+                                                  spos0);
                 }
-            }
-            if (ok) {
-                ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
-                                                                          model->map,
-                                                                          model->size,
-                                                                          layer->attn_sinks->abs_offset,
-                                                                          g->batch_q,
-                                                                          g->layer_raw_cache[il],
-                                                                          gpu_graph_attn_comp_read_cache(g, il, n_comp),
-                                                                          gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
-                                                                          0 /* shadow is f32 */,
-                                                                          g->comp_selected,
-                                                                          n_tokens,
-                                                                          pos0,
-                                                                          n_tokens,
-                                                                          g->raw_cap,
-                                                                          0,
-                                                                          n_comp,
-                                                                          DS4_N_INDEXER_TOP_K,
-                                                                          g->raw_window,
-                                                                          ratio,
-                                                                          DS4_N_HEAD,
-                                                                          DS4_N_HEAD_DIM,
-                                                                          (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
-                if (ok && index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary("attention",
-                                                                    il,
-                                                                    pos0,
-                                                                    n_tokens,
-                                                                    n_comp,
-                                                                    &index_stage_t0);
+                if (ok) {
+                    ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
+                                                       g->indexer_scores,
+                                                       n_comp,
+                                                       sn,
+                                                       DS4_N_INDEXER_TOP_K) != 0;
+                    if (ok && index_stage_profile) {
+                        ok = gpu_graph_indexer_stage_profile_boundary("topk",
+                                                                        il,
+                                                                        spos0,
+                                                                        sn,
+                                                                        n_comp,
+                                                                        &index_stage_t0);
+                    }
+                    if (ok) {
+                        gpu_graph_debug_dump_i32_tensor("indexer_topk",
+                                                          g->comp_selected,
+                                                          (uint64_t)sn * DS4_N_INDEXER_TOP_K,
+                                                          il,
+                                                          spos0);
+                    }
                 }
+                if (ok) {
+                    ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
+                                                                              model->map,
+                                                                              model->size,
+                                                                              layer->attn_sinks->abs_offset,
+                                                                              sq_view,
+                                                                              g->layer_raw_cache[il],
+                                                                              gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                              gpu_graph_attn_comp_read_is_f16(), gpu_graph_attn_comp_read_is_fp8(),
+                                                                              0 /* shadow is f32 */,
+                                                                              g->comp_selected,
+                                                                              sn,
+                                                                              spos0,
+                                                                              s0 + sn,
+                                                                              g->raw_cap,
+                                                                              0,
+                                                                              n_comp,
+                                                                              DS4_N_INDEXER_TOP_K,
+                                                                              g->raw_window,
+                                                                              ratio,
+                                                                              DS4_N_HEAD,
+                                                                              DS4_N_HEAD_DIM,
+                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                    if (ok && index_stage_profile) {
+                        ok = gpu_graph_indexer_stage_profile_boundary("attention",
+                                                                        il,
+                                                                        spos0,
+                                                                        sn,
+                                                                        n_comp,
+                                                                        &index_stage_t0);
+                    }
+                }
+                ds4_gpu_tensor_free(sh_view);
+                ds4_gpu_tensor_free(sq_view);
+                ds4_gpu_tensor_free(iw_view);
+                ds4_gpu_tensor_free(iq_view);
             }
             if (ok) batch_attention_done = true;
         }

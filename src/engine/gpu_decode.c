@@ -290,6 +290,20 @@ int gpu_graph_raw_f16_enabled(void) {
     return cached;
 }
 
+/* DS4_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
+ * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
+ * work buffers (indexer_scores, comp_mask) are allocated with only N token
+ * rows instead of prefill_cap.  0 (unset) = historical full-chunk behavior. */
+uint32_t gpu_graph_prefill_slice(void) {
+    static long cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_PREFILL_SLICE");
+        long v = e ? strtol(e, NULL, 10) : 0;
+        cached = v > 0 ? v : 0;
+    }
+    return (uint32_t)cached;
+}
+
 /* Diagnostic raw-ring row read as f32 regardless of the active storage format. */
 static int gpu_graph_read_raw_row_f32(ds4_gpu_graph *g, uint32_t il, uint32_t phys, float *out) {
     if (!gpu_graph_raw_f16_enabled()) {

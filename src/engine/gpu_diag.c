@@ -410,8 +410,14 @@ bool gpu_graph_alloc_raw_cap(
     }
     g->indexer_q = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
     g->indexer_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-    g->indexer_scores = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
-    g->comp_mask = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
+    /* DS4_PREFILL_SLICE: these two are the only ctx-scaling f32 work buffers
+     * with a prefill_cap token dimension; under slicing they only ever hold
+     * one <=slice-token span at a time. */
+    const uint64_t score_rows = (gpu_graph_prefill_slice() != 0u &&
+                                 (uint64_t)gpu_graph_prefill_slice() < pc)
+        ? (uint64_t)gpu_graph_prefill_slice() : pc;
+    g->indexer_scores = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
+    g->comp_mask = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
     g->comp_selected = ds4_gpu_tensor_alloc((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
     g->heads = ds4_gpu_tensor_alloc(q_dim * sizeof(float));

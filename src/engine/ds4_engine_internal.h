@@ -2282,6 +2282,7 @@ uint32_t gpu_graph_attn_comp_cache_is_pack(void);
  * CUTLASS Sm120 MX path; when off the build is byte-identical to before. */
 int gpu_graph_attn_mx_enabled(void);
 int gpu_graph_attn_pack_enabled(void);
+uint32_t gpu_graph_prefill_slice(void);
 /* True when DS4_IDX_FP4 is set (cached). When on, the ratio-4 indexer
  * compressed cache is stored MXKV-FP4-packed (DS4_ENGINE_IDXFP4_ROWBYTES/row,
  * 7.5x smaller than f32) and the indexer score kernels read it packed.  The

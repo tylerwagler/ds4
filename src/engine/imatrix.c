@@ -1463,9 +1463,16 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
+        /* indexer_scores/comp_mask token rows shrink to the slice size under
+         * DS4_PREFILL_SLICE (see gpu_graph_prefill_slice / gpu_diag alloc). */
+        uint64_t score_rows = (uint64_t)m.prefill_cap;
+        if (gpu_graph_prefill_slice() != 0u &&
+            (uint64_t)gpu_graph_prefill_slice() < score_rows) {
+            score_rows = (uint64_t)gpu_graph_prefill_slice();
+        }
         m.scratch_bytes = 2ull *
                           m.comp_cap *
-                          m.prefill_cap *
+                          score_rows *
                           sizeof(float) +
                           attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
     } else {
