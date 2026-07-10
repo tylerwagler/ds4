@@ -111,6 +111,35 @@ static ds4_backend default_server_backend(void) {
 
 
 
+/* Default gguf resolution, in order: the project gguf/ directory (canonical
+ * production filename, then the generic name), the current directory, then
+ * $DS4_MODEL_DIR/<canonical> when that env var is set.  No store path is
+ * baked into the binary.  Returns NULL if nothing readable — callers decide
+ * whether that is fatal (main model) or a warning (drafter).  Heap results
+ * intentionally live for the process lifetime (they become engine paths). */
+static const char *resolve_gguf_at(const char *dir, const char *name) {
+    size_t n = strlen(dir) + 1 + strlen(name) + 1;
+    char *p = malloc(n);
+    if (!p) return NULL;
+    snprintf(p, n, "%s/%s", dir, name);
+    if (access(p, R_OK) == 0) return p;
+    free(p);
+    return NULL;
+}
+
+/* Naming convention: gguf/ holds immutable versioned artifacts
+ * (ds4flash-<variant>-<mods>-vN.gguf, dspark-<variant>-vN.gguf) plus two
+ * ACTIVE-POINTER symlinks — model.gguf and dspark.gguf — that select what a
+ * bare `ds4-server` runs.  Deploy = repoint the symlink. */
+static const char *resolve_default_gguf(const char *pointer) {
+    const char *p;
+    if ((p = resolve_gguf_at("gguf", pointer)) != NULL) return p;
+    if (access(pointer, R_OK) == 0) return pointer;
+    const char *dir = getenv("DS4_MODEL_DIR");
+    if (dir && dir[0] && (p = resolve_gguf_at(dir, pointer)) != NULL) return p;
+    return NULL;
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -121,7 +150,7 @@ static server_config parse_options(int argc, char **argv) {
         },
         .host = "127.0.0.1",
         .port = 8000,
-        .ctx_size = 32768,
+        .ctx_size = 262144,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
@@ -288,6 +317,28 @@ static server_config parse_options(int argc, char **argv) {
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
         exit(2);
+    }
+    /* Production defaults: when -m/--dspark are not given, resolve the
+     * canonical ggufs (cwd first, then the model store) so a bare
+     * `ds4-server` is the full validated launch. */
+    if (!strcmp(c.engine.model_path, "ds4flash.gguf") &&
+        access(c.engine.model_path, R_OK) != 0) {
+        const char *m = resolve_default_gguf("model.gguf");
+        if (m) {
+            c.engine.model_path = m;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: default model %s", m);
+        }
+    }
+    if (!c.engine.dspark_path) {
+        const char *d = resolve_default_gguf("dspark.gguf");
+        if (d) {
+            c.engine.dspark_path = d;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: default drafter %s", d);
+        } else {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: no drafter found (gguf/dspark.gguf); "
+                       "running without speculative decoding");
+        }
     }
     return c;
 }

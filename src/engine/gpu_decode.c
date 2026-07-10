@@ -266,39 +266,61 @@ static bool gpu_graph_decode_kv_store(
 
 
 
+/* The validated packed storage formats and the prefill work-buffer slice
+ * default ON (2026-07-09: each proven bit-exact by golden byte-compare; see
+ * commits 0647621, 34f6a95, 87f8374, 39c6526).  Their env vars are
+ * OFF-switches: unset or "1"/"on" enables, "0"/"off"/"false" restores the
+ * classic f32 containers — the escape hatch for regression bisects. */
+static int gpu_graph_env_default_flag(const char *name, int def) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return def;
+    if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
+        strcasecmp(v, "false") == 0) return 0;
+    return 1;
+}
+
 int gpu_graph_attn_mx_enabled(void) {
+    /* Default OFF: superseded by DS4_ATTN_PACK (MX re-quantizes rope dims and
+     * measurably costs drafter acceptance); kept for comparative baselines. */
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_ATTN_MX") != NULL ? 1 : 0;
+    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_ATTN_MX", 0);
     return cached;
 }
 
 int gpu_graph_attn_pack_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_ATTN_PACK") != NULL ? 1 : 0;
+    if (cached < 0) {
+        cached = gpu_graph_env_default_flag("DS4_ATTN_PACK", 1);
+        /* MX and PACK are mutually exclusive; an explicit MX request wins so
+         * the comparative baseline stays reachable without also passing
+         * DS4_ATTN_PACK=0. */
+        if (cached && gpu_graph_attn_mx_enabled()) cached = 0;
+    }
     return cached;
 }
 
 int gpu_graph_idx_fp4_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_IDX_FP4") != NULL ? 1 : 0;
+    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_IDX_FP4", 1);
     return cached;
 }
 
 int gpu_graph_raw_f16_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_RAW_F16") != NULL ? 1 : 0;
+    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_RAW_F16", 1);
     return cached;
 }
 
 /* DS4_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
  * work buffers (indexer_scores, comp_mask) are allocated with only N token
- * rows instead of prefill_cap.  0 (unset) = historical full-chunk behavior. */
+ * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
+ * 0 restores the historical full-chunk buffers. */
 uint32_t gpu_graph_prefill_slice(void) {
     static long cached = -1;
     if (cached < 0) {
         const char *e = getenv("DS4_PREFILL_SLICE");
-        long v = e ? strtol(e, NULL, 10) : 0;
+        long v = (e && e[0]) ? strtol(e, NULL, 10) : 512;
         cached = v > 0 ? v : 0;
     }
     return (uint32_t)cached;

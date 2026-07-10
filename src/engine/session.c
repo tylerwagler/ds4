@@ -1,6 +1,24 @@
 #include "ds4_engine_internal.h"
 
 
+/* Confidence-scheduled draft trim threshold.  Defaults to the measured
+ * optimum tau=0.35 (2026-07-09 sweep: 24.46 vs 23.18 eff t/s at draft 5 with
+ * the recalibrated conf3 head).  DS4_DSPARK_CONF_SCHED=<tau> overrides;
+ * "0"/"off" disables (verify all n_draft, the classic behavior). */
+static float dspark_conf_sched_tau(void) {
+    static float cached = -1.0f;
+    if (cached < 0.0f) {
+        const char *cs = getenv("DS4_DSPARK_CONF_SCHED");
+        if (!cs || !cs[0]) cached = 0.35f;
+        else if (!strcmp(cs, "off") || !strcmp(cs, "false")) cached = 0.0f;
+        else {
+            float v = (float)atof(cs);
+            cached = v > 0.0f ? v : 0.0f;
+        }
+    }
+    return cached;
+}
+
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
 }
@@ -2434,7 +2452,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     /* Default draft depth: 3 (post inverse-rope fix sweep, 3-prompt 512-token
      * suites: draft2 22.8 / draft3 23.8 / draft5 21.1 t/s -- acceptance holds
      * deep but verify rows cost ~20ms each, so 3 is the fixed-depth optimum). */
-    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 3;
+    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 5;
     if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
     e->dspark_confidence = opt->dspark_confidence > 0.0f ? opt->dspark_confidence : 0.5f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
@@ -5265,8 +5283,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     /* Confidence-scheduled pending length (P1 head; keep the confident prefix). */
     uint32_t keep = n_draft;
     {
-        const char *cs = getenv("DS4_DSPARK_CONF_SCHED");
-        const float tau = cs ? (float)atof(cs) : 0.0f;
+        const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f) {
             ds4_gpu_tensor *conf_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
             ds4_gpu_tensor *tok_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
@@ -5446,8 +5463,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * verify/commit; the emitted tokens are still exact greedy. */
     uint32_t eff_draft = n_draft;
     {
-        const char *cs = getenv("DS4_DSPARK_CONF_SCHED");
-        const float tau = cs ? (float)atof(cs) : 0.0f;
+        const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f) {
             ds4_gpu_tensor *conf_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
             ds4_gpu_tensor *tok_dev  = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
