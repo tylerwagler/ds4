@@ -1,15 +1,18 @@
 #include "ds4_engine_internal.h"
 
 
-/* Confidence-scheduled draft trim threshold.  Defaults to the measured
- * optimum tau=0.35 (2026-07-09 sweep: 24.46 vs 23.18 eff t/s at draft 5 with
- * the recalibrated conf3 head).  DS4_DSPARK_CONF_SCHED=<tau> overrides;
- * "0"/"off" disables (verify all n_draft, the classic behavior). */
+/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25: the
+ * 2026-07-10 long-context sweep measured 0.25 > 0.35 at both 32k (22.42 vs
+ * 21.20 eff t/s) and 128k (23.90 vs 22.08); 0.35 only wins at ~2k ctx
+ * (24.46 vs ~23.2).  Acceptance falls with context depth, so the optimal
+ * trim loosens — tuned for the long-context workloads this box serves.
+ * DS4_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off" disables (verify all
+ * n_draft).  The principled fix is adaptive tau (docs/plans.md). */
 static float dspark_conf_sched_tau(void) {
     static float cached = -1.0f;
     if (cached < 0.0f) {
         const char *cs = getenv("DS4_DSPARK_CONF_SCHED");
-        if (!cs || !cs[0]) cached = 0.35f;
+        if (!cs || !cs[0]) cached = 0.25f;
         else if (!strcmp(cs, "off") || !strcmp(cs, "false")) cached = 0.0f;
         else {
             float v = (float)atof(cs);

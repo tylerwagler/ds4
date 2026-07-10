@@ -52,19 +52,25 @@ bool gpu_graph_apply_directional_steering_ffn(
 
 
 static uint64_t gpu_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t raw_cap) {
-    uint64_t bytes = (uint64_t)DS4_N_LAYER *
-                     raw_cap *
-                     DS4_N_HEAD_DIM *
-                     sizeof(float);
+    /* Must track the ACTUAL storage formats (raw f16, packed attn comp, MXFP4
+     * indexer) — an f32-priced estimate overshoots ~3x under the default-on
+     * packed formats and needlessly trips the managed-KV (demand-paged) path
+     * at the 512k+ contexts where performance matters most. */
+    const uint64_t raw_elem = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
+                                                          : sizeof(float);
+    uint64_t bytes = (uint64_t)DS4_N_LAYER * raw_cap * DS4_N_HEAD_DIM * raw_elem;
 
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
-        bytes += comp_cap * DS4_N_HEAD_DIM *
-                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        bytes += comp_cap * attn_row;
         if (ratio == 4) {
-            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += comp_cap * idx_row;
         }
     }
     return bytes;
