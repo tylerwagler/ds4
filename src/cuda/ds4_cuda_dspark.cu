@@ -2,17 +2,26 @@
 
 
 /*
- * Each block reduces the argmax over its slice of the vocabulary and writes
- * that partial winner to block_best_id[blockIdx.x] / block_best_val[blockIdx.x].
- * The kernel does NOT reduce across blocks — the host caller reads the
- * grid_dim partials back and picks the global argmax.  (An earlier version
- * wrote only element 0 into a 4-byte buffer, which both overran the allocation
- * and returned block 0's argmax over just the first blockDim entries.)
+ * Each block reduces the TOP-2 over its slice of the vocabulary and writes the
+ * partial winner + runner-up to block_best_id/val[blockIdx.x] and
+ * block_second_id/val[blockIdx.x].  The kernel does NOT reduce across blocks —
+ * the host caller reads the grid_dim partials back and merges to the global
+ * top-2.  (An earlier version wrote only element 0 into a 4-byte buffer, which
+ * both overran the allocation and returned block 0's argmax over just the first
+ * blockDim entries.)
+ *
+ * DTree Phase 0: the top-1 (best) track is BYTE-IDENTICAL to the prior
+ * argmax-only kernel — every best_* update below is unchanged and the added
+ * second_* track never feeds back into it — so refined_id_dst is bit-exact with
+ * or without the runner-up requested.  The runner-up (drafter #2) is used only
+ * when the host passes a non-NULL refined_id2_dst (measurement path).
  */
 __global__ static void dspark_markov_step_kernel(
         float *refined_logits,
         int32_t *block_best_id,
         float *block_best_val,
+        int32_t *block_second_id,
+        float *block_second_val,
         const float *base_logits,
         const float *markov_w1,
         const float *markov_w2,
@@ -22,6 +31,8 @@ __global__ static void dspark_markov_step_kernel(
     const float *embed = markov_w1 + (uint64_t)prev_token * embed_dim;
     float best_val = -INFINITY;
     int32_t best_id = 0;
+    float second_val = -INFINITY;
+    int32_t second_id = 0;
 
     for (uint32_t v = threadIdx.x + blockIdx.x * blockDim.x; v < vocab_size;
          v += blockDim.x * gridDim.x) {
@@ -30,22 +41,39 @@ __global__ static void dspark_markov_step_kernel(
         for (uint32_t i = 0; i < embed_dim; i++) dot += w2_row[i] * embed[i];
         float val = base_logits[v] + dot;
         refined_logits[v] = val;
-        if (val > best_val) { best_val = val; best_id = (int32_t)v; }
+        if (val > best_val) { second_val = best_val; second_id = best_id;
+                              best_val = val; best_id = (int32_t)v; }
+        else if (val > second_val) { second_val = val; second_id = (int32_t)v; }
     }
 
     __shared__ float best_vals[256];
     __shared__ int32_t best_ids[256];
+    __shared__ float sec_vals[256];
+    __shared__ int32_t sec_ids[256];
     const uint32_t tid = threadIdx.x;
     best_vals[tid] = best_val;
     best_ids[tid] = best_id;
+    sec_vals[tid] = second_val;
+    sec_ids[tid] = second_id;
     __syncthreads();
 
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            if (best_vals[tid + stride] > best_vals[tid]) {
-                best_vals[tid] = best_vals[tid + stride];
-                best_ids[tid] = best_ids[tid + stride];
+            /* Merge two sorted (best>=sec) pairs into the top-2 at tid. The
+             * best branch is exactly the original strict-'>' update, so best_*
+             * evolves identically to the argmax-only kernel. */
+            const float ob = best_vals[tid];        const int32_t oi = best_ids[tid];
+            const float os = sec_vals[tid];         const int32_t oj = sec_ids[tid];
+            const float nb = best_vals[tid + stride]; const int32_t ni = best_ids[tid + stride];
+            const float ns = sec_vals[tid + stride]; const int32_t nj = sec_ids[tid + stride];
+            if (nb > ob) {
+                best_vals[tid] = nb; best_ids[tid] = ni;
+                if (ob > ns) { sec_vals[tid] = ob; sec_ids[tid] = oi; }
+                else         { sec_vals[tid] = ns; sec_ids[tid] = nj; }
+            } else if (nb > os) {
+                sec_vals[tid] = nb; sec_ids[tid] = ni;
             }
+            (void)oj;
         }
         __syncthreads();
     }
@@ -53,36 +81,60 @@ __global__ static void dspark_markov_step_kernel(
     if (tid == 0) {
         block_best_id[blockIdx.x] = best_ids[0];
         block_best_val[blockIdx.x] = best_vals[0];
+        block_second_id[blockIdx.x] = sec_ids[0];
+        block_second_val[blockIdx.x] = sec_vals[0];
     }
 }
 
 /*
- * Read the per-block argmax partials back to the host and pick the global
- * winner.  Blocks map to ascending contiguous vocab ranges (grid_dim =
+ * Read the per-block top-2 partials back to the host and merge to the global
+ * top-2.  Blocks map to ascending contiguous vocab ranges (grid_dim =
  * ceil(vocab/blockDim), one range per block), and the per-block reduction
  * breaks ties toward the lowest id, so a strict '>' here yields the
- * lowest-id global argmax — matching a sequential argmax over the vocab.
+ * lowest-id global argmax — matching a sequential argmax over the vocab.  The
+ * best track is exactly the original argmax merge; refined_id2_dst (runner-up)
+ * is optional (NULL on the production top-1 path).
  */
 static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
                                         const ds4_gpu_tensor *val_dev,
+                                        const ds4_gpu_tensor *id2_dev,
+                                        const ds4_gpu_tensor *val2_dev,
                                         uint32_t grid_dim,
-                                        int32_t *refined_id_dst) {
+                                        int32_t *refined_id_dst,
+                                        int32_t *refined_id2_dst) {
     int32_t *ids = (int32_t *)malloc((size_t)grid_dim * sizeof(int32_t));
     float *vals = (float *)malloc((size_t)grid_dim * sizeof(float));
+    int32_t *ids2 = (int32_t *)malloc((size_t)grid_dim * sizeof(int32_t));
+    float *vals2 = (float *)malloc((size_t)grid_dim * sizeof(float));
     int rc = 0;
-    if (ids && vals &&
+    if (ids && vals && ids2 && vals2 &&
         ds4_gpu_tensor_read(id_dev, 0, ids, (uint64_t)grid_dim * sizeof(int32_t)) &&
-        ds4_gpu_tensor_read(val_dev, 0, vals, (uint64_t)grid_dim * sizeof(float))) {
+        ds4_gpu_tensor_read(val_dev, 0, vals, (uint64_t)grid_dim * sizeof(float)) &&
+        ds4_gpu_tensor_read(id2_dev, 0, ids2, (uint64_t)grid_dim * sizeof(int32_t)) &&
+        ds4_gpu_tensor_read(val2_dev, 0, vals2, (uint64_t)grid_dim * sizeof(float))) {
         int32_t best_id = ids[0];
         float best_val = vals[0];
+        int32_t sec_id = ids2[0];
+        float sec_val = vals2[0];
         for (uint32_t b = 1; b < grid_dim; b++) {
-            if (vals[b] > best_val) { best_val = vals[b]; best_id = ids[b]; }
+            const float nb = vals[b];  const int32_t ni = ids[b];
+            const float ns = vals2[b]; const int32_t nj = ids2[b];
+            if (nb > best_val) {
+                if (best_val > ns) { sec_val = best_val; sec_id = best_id; }
+                else               { sec_val = ns;       sec_id = nj; }
+                best_val = nb; best_id = ni;
+            } else if (nb > sec_val) {
+                sec_val = nb; sec_id = ni;
+            }
         }
         *refined_id_dst = best_id;
+        if (refined_id2_dst) *refined_id2_dst = sec_id;
         rc = 1;
     }
     free(ids);
     free(vals);
+    free(ids2);
+    free(vals2);
     return rc;
 }
 
@@ -90,6 +142,7 @@ static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
 extern "C" int ds4_gpu_dspark_markov_step_model(
         ds4_gpu_tensor *refined_logits,
         int32_t *refined_id_dst,
+        int32_t *refined_id2_dst,
         const ds4_gpu_tensor *base_logits,
         const void *dspark_model_map,
         uint64_t dspark_model_size,
@@ -126,26 +179,35 @@ extern "C" int ds4_gpu_dspark_markov_step_model(
      * pairs were 2 device-serializing allocs each. Single submission thread. */
     static ds4_gpu_tensor *id_dev = NULL;
     static ds4_gpu_tensor *val_dev = NULL;
+    static ds4_gpu_tensor *id2_dev = NULL;
+    static ds4_gpu_tensor *val2_dev = NULL;
     static uint32_t reduce_cap = 0;
     if (grid_dim > reduce_cap) {
         ds4_gpu_tensor_free(id_dev);
         ds4_gpu_tensor_free(val_dev);
+        ds4_gpu_tensor_free(id2_dev);
+        ds4_gpu_tensor_free(val2_dev);
         id_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
         val_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-        reduce_cap = (id_dev && val_dev) ? grid_dim : 0;
+        id2_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+        val2_dev = ds4_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+        reduce_cap = (id_dev && val_dev && id2_dev && val2_dev) ? grid_dim : 0;
     }
-    if (!id_dev || !val_dev) return 0;
+    if (!id_dev || !val_dev || !id2_dev || !val2_dev) return 0;
 
     dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
         (float *)refined_logits->ptr,
         (int32_t *)id_dev->ptr,
         (float *)val_dev->ptr,
+        (int32_t *)id2_dev->ptr,
+        (float *)val2_dev->ptr,
         (const float *)base_logits->ptr,
         w1, w2, prev_token, vocab_size, embed_dim);
 
     int rc = 0;
     if (cudaGetLastError() == cudaSuccess)
-        rc = dspark_markov_reduce_blocks(id_dev, val_dev, grid_dim, refined_id_dst);
+        rc = dspark_markov_reduce_blocks(id_dev, val_dev, id2_dev, val2_dev,
+                                         grid_dim, refined_id_dst, refined_id2_dst);
     return rc;
 }
 

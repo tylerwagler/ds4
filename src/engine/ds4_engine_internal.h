@@ -1381,6 +1381,12 @@ struct ds4_session {
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
     int32_t dspark_pending_base;
+    /* DTree Phase 0 (DS4_DTREE_STATS): the drafter #2 token and confidence
+     * score for each pending draft, carried from the drafting step to the
+     * verify step so a rejection can be scored p2 = P(target correction ==
+     * drafter #2 | #1 rejected), bucketed by conf. Measurement-only. */
+    int32_t dspark_pending_alt[16];
+    float   dspark_pending_conf[16];
 };
 
 typedef struct {

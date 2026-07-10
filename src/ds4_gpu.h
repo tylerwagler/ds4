@@ -1124,6 +1124,7 @@ int ds4_gpu_matmul_fp8_hc_expand_tensor(
 int ds4_gpu_dspark_markov_step_model(
         ds4_gpu_tensor       *refined_logits,
         int32_t               *refined_id_dst,
+        int32_t               *refined_id2_dst,
         const ds4_gpu_tensor *base_logits,
         const void             *dspark_model_map,
         uint64_t                dspark_model_size,

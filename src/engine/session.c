@@ -4926,6 +4926,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     const void *dmap = e->dspark_model.map;
     const uint64_t dsize = e->dspark_model.size;
     const int dspark_stats = getenv("DS4_DSPARK_STATS") != NULL;
+    const int dtree_stats = getenv("DS4_DTREE_STATS") != NULL;
     const double t0 = dspark_stats ? now_sec() : 0.0;
     int n_accept = 0;
 
@@ -4939,6 +4940,14 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
     for (uint32_t i = 0; i < K; i++) pend[i] = s->dspark_pending[i];
+    /* DTree Phase 0: carry last step's drafter #2 + conf for these pendings. */
+    int32_t pend_alt[16];
+    float pend_conf[16];
+    if (dtree_stats)
+        for (uint32_t i = 0; i < K; i++) {
+            pend_alt[i] = s->dspark_pending_alt[i];
+            pend_conf[i] = s->dspark_pending_conf[i];
+        }
     s->dspark_n_pending = 0;
     const uint32_t n_batch = 1u + K;
 
@@ -5006,6 +5015,24 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * target's token AFTER batch token i, i.e. its prediction for pend[i]. */
     int commit = 0;
     while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
+
+    /* DTree Phase 0 (§6): emit one record per ON-POLICY verified position — the
+     * accepted prefix 0..commit-1 plus the split (first rejected draft) at
+     * commit. Each carries that position's drafter confidence, whether the
+     * chain #1 was accepted (acc), and — at the split — whether the target's
+     * corrected token equals the drafter's #2 (alt_hit). This yields both the
+     * accept-rate-by-conf a(c) and the p2-by-conf table the go/no-go gate needs
+     * (the sibling row's marginal yield at a split is (1-a(c))*p2(c)). Positions
+     * past commit are off-policy (conditioned on a rejected token) and skipped. */
+    if (dtree_stats)
+        for (int i = 0; i <= commit && i < (int)K; i++) {
+            const int acc = (i < commit) ? 1 : 0;
+            const int alt_hit = acc ? -1 : (row_tops[i] == pend_alt[i] ? 1 : 0);
+            fprintf(stderr,
+                    "DTREE_V pos=%d k=%d conf=%.4f acc=%d alt_hit=%d r1=%d r2=%d tgt=%d nb=%u\n",
+                    saved_len + 1 + i, i, (double)pend_conf[i], acc, alt_hit,
+                    (int)pend[i], pend_alt[i], row_tops[i], n_batch);
+        }
 
     /* Refresh s->logits to the last committed position's distribution. */
     if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, s->logits)) {
@@ -5113,13 +5140,16 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     ds4_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
     if (!dspark_logits || ds4_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
     int32_t refined[17];
+    int32_t refined2[17];   /* DTree Phase 0: markov runner-up per draft position */
     refined[0] = (int32_t)next_base;
+    refined2[0] = -1;
     bool draft_ok = true;
     for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
         ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
             g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
         draft_ok = base_row &&
             ds4_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
+                                             dtree_stats ? &refined2[pos + 1] : NULL,
                                              base_row, dmap, dsize,
                                              w->markov_w1->abs_offset,
                                              w->markov_w2->abs_offset,
@@ -5206,14 +5236,18 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         }
     }
 
-    /* Confidence-scheduled pending length (P1 head; keep the confident prefix). */
+    /* Confidence-scheduled pending length (P1 head; keep the confident prefix).
+     * DTree Phase 0: compute conf even when conf-sched is off, so the p2 table
+     * can bucket by the actual confidence at every drafted position (collect
+     * with DS4_DSPARK_CONF_SCHED=off for an unbiased, fully-verified sample). */
     uint32_t keep = n_draft;
+    float conf[16];
+    bool have_conf = false;
     {
         const float tau = dspark_conf_sched_tau();
-        if (tau > 0.0f) {
+        if (tau > 0.0f || dtree_stats) {
             ds4_gpu_tensor *conf_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
             ds4_gpu_tensor *tok_dev = ds4_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
-            float conf[16];
             if (conf_dev && tok_dev &&
                 ds4_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
                 ds4_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
@@ -5222,9 +5256,12 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                                       w->confidence_proj->abs_offset,
                                                       n_draft, DS4_N_EMBD, embed_dim, vocab_size) &&
                 ds4_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
-                uint32_t k = 0;
-                while (k < n_draft && conf[k] >= tau) k++;
-                keep = k;   /* 0 pending = next step is a plain n=1 forward */
+                have_conf = true;
+                if (tau > 0.0f) {
+                    uint32_t k = 0;
+                    while (k < n_draft && conf[k] >= tau) k++;
+                    keep = k;   /* 0 pending = next step is a plain n=1 forward */
+                }
             }
             ds4_gpu_tensor_free(conf_dev);
             ds4_gpu_tensor_free(tok_dev);
@@ -5233,6 +5270,29 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     s->dspark_pending_base = (int32_t)next_base;
     s->dspark_n_pending = keep;
     for (uint32_t i = 0; i < keep; i++) s->dspark_pending[i] = refined[i + 1];
+    if (dtree_stats)
+        for (uint32_t i = 0; i < keep; i++) {
+            s->dspark_pending_alt[i] = refined2[i + 1];
+            s->dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
+        }
+
+    /* DTree Phase 0: mid-band frequency — how often the drafted chain carries a
+     * position whose confidence lands in the ~[0.25,0.65] split band (where a
+     * confidence-gated sibling row could pay), and where the first such split
+     * point falls. next_base sits at abs position s->checkpoint.len; drafted
+     * position pos is next_base+1+pos. */
+    if (dtree_stats && have_conf) {
+        int firstmid = -1;
+        for (uint32_t i = 0; i < n_draft; i++)
+            if (conf[i] >= 0.25f && conf[i] <= 0.65f) { firstmid = (int)i; break; }
+        char cbuf[160];
+        int off = 0;
+        for (uint32_t i = 0; i < n_draft && off < (int)sizeof(cbuf) - 8; i++)
+            off += snprintf(cbuf + off, sizeof(cbuf) - off, "%s%.3f",
+                            i ? "," : "", (double)conf[i]);
+        fprintf(stderr, "DTREE_MID base_pos=%d nd=%u firstmid=%d conf=[%s]\n",
+                (int)s->checkpoint.len, n_draft, firstmid, cbuf);
+    }
 
     if (dspark_stats)
         fprintf(stderr, "ds4: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
@@ -5367,6 +5427,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
 
         int32_t prev = refined_ids[pos];
         bool step_ok = ds4_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
+                                               NULL,
                                                base_row,
                                                dmap, dsize,
                                                w->markov_w1->abs_offset,
