@@ -35,9 +35,6 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
-int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
-                                   const ds4_gpu_tensor *src, uint64_t src_offset,
-                                   uint64_t count);
 
 /* Batched D2D copy: prepare a device-side descriptor table over fixed tensor
  * allocations once (whole-tensor copies, byte counts multiples of 16; returns
@@ -655,36 +652,6 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16);
-
-/* MXFP8 decode attention over the current f32 KV caches (CUTLASS Sm120 MX GEMM
- * path). Compute-path drop-in for the decode attention, gated behind DS4_ATTN_MX.
- * Resolves sinks from the model map and the visible KV set (raw SWA window +
- * comp: comp_selected topk when indexed, else visible_comp=(pos+1)/ratio). */
-int ds4_gpu_attn_mx_decode(
-        ds4_gpu_tensor       *heads,
-        ds4_gpu_tensor       *q,
-        ds4_gpu_tensor       *raw_cache,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        uint32_t                n_raw,
-        ds4_gpu_tensor       *comp_cache,
-        ds4_gpu_tensor       *comp_selected,
-        uint32_t                n_comp,
-        uint32_t                n_selected,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        uint32_t                pos,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        unsigned char         **scratch,
-        uint64_t               *scratch_bytes,
-        uint32_t                raw_f16);
-
-/* Free a scratch buffer grown by ds4_gpu_attn_mx_decode (raw cudaFree). */
-void ds4_gpu_attn_mx_scratch_free(void *p);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,

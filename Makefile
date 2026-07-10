@@ -27,8 +27,8 @@ SERVER_SRCS = $(wildcard src/server/*.c)
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
 # so keep them out of the generic src/cuda/%.o rule.
-CUTLASS_CUDA_OBJS = src/cuda/ds4_mxfp4_cutlass.o src/cuda/ds4_attn_cutlass.o
-CUDA_SRCS = $(filter-out src/cuda/ds4_mxfp4_cutlass.cu src/cuda/ds4_attn_cutlass.cu,$(wildcard src/cuda/*.cu))
+CUTLASS_CUDA_OBJS = src/cuda/ds4_mxfp4_cutlass.o
+CUDA_SRCS = $(filter-out src/cuda/ds4_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
 LIB_HDRS = src/lib/ds4_distributed.h src/lib/ds4_help.h src/lib/ds4_kvstore.h src/lib/ds4_ssd.h src/lib/ds4_web.h
 CORE_OBJS = $(ENGINE_OBJS) src/lib/ds4_distributed.o src/lib/ds4_ssd.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
@@ -113,12 +113,6 @@ src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
 src/cuda/ds4_mxfp4_cutlass.o: src/cuda/ds4_mxfp4_cutlass.cu src/ds4_gpu.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/ds4_mxfp4_cutlass.cu
-
-# CUTLASS Sm120 block-scaled MX GEMM engine for fused attention (QK^T + PV). Same build
-# requirements as the MoE CUTLASS TU; the block-scaled MMA needs a family arch (sm_120f) at
-# RUNTIME, so build the engine with CUDA_ARCH=sm_120f when the attention CUTLASS path is live.
-src/cuda/ds4_attn_cutlass.o: src/cuda/ds4_attn_cutlass.cu src/ds4_gpu.h src/cuda/ds4_cuda_internal.h
-	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/ds4_attn_cutlass.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

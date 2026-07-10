@@ -101,11 +101,6 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
     }
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * score_rows * sizeof(float);
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
-        if (attn_stage_cap < 2u) attn_stage_cap = 2u;
-        bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
-    }
     return bytes;
 }
 

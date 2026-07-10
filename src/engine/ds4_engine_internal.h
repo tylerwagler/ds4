@@ -155,31 +155,9 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_MAX_THREADS 32
 
 
-/*
- * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
- * compressor still pools, normalizes, RoPEs, and FP8-rounds rows in F32 staging
- * before writing the cache, while checkpoints and debug dumps expand back to
- * F32 for the stable external format.  This is a storage optimization rather
- * than a semantic approximation: all Metal attention consumers already run the
- * compressed K/V rows through F16 FlashAttention/indexed-attention paths.
- */
-#define DS4_GPU_ATTN_COMP_CACHE_F16 0
-
-#define DS4_GPU_ATTN_COMP_CACHE_FP8 0
-#define DS4_FP8_KV_BLOCK 64u
-#define DS4_FP8_KV_NBLK(HD) (((HD) + DS4_FP8_KV_BLOCK - 1u) / DS4_FP8_KV_BLOCK)
-#define DS4_FP8_KV_ROWBYTES(HD) ((HD) + DS4_FP8_KV_NBLK(HD) * sizeof(float))
-
-/* MXFP8 (OCP micro-scaling) compressed-KV storage, selected at *runtime* by the
- * DS4_ATTN_MX env (see gpu_graph_attn_mx_enabled()) rather than a compile-time
- * macro like the F16/FP8 paths above.  One row = HD e4m3 bytes followed by
- * ceil(HD/32) e8m0 (uint8) block scales; must stay byte-identical to the CUDA
- * mxkv_pack/dequant kernels and assemble_kv_mxcomp (src/cuda). For DS4_N_HEAD_DIM
- * == 512 that is 512 + 16 = 528 B/row (vs 2048 for f32). */
-#define DS4_ENGINE_MXKV_FMT_FP8 1u
+/* MXKV format selector passed to the ds4_gpu_mxkv_* kernels (must match
+ * DS4_MXKV_FMT_FP4 in src/cuda/ds4_cuda_internal.h). */
 #define DS4_ENGINE_MXKV_FMT_FP4 2u
-#define DS4_ENGINE_MXKV_FP8_ROWBYTES \
-    ((uint64_t)DS4_N_HEAD_DIM + (((uint64_t)DS4_N_HEAD_DIM + 31u) / 32u))
 /* MXKV FP4 row bytes for the indexer compressed cache (head_dim 128):
  * 64 nibble-pair bytes + 4 E8M0 block-32 scale bytes = 68 B (vs 512 f32). */
 #define DS4_ENGINE_IDXFP4_ROWBYTES \
@@ -191,19 +169,11 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * block-64 scale bytes][1 pad][64 f32 rope] = 712 B (vs 2048 f32).  The nope
  * dims store exactly the fp8_kv_quantize roundtrip the f32 pipeline applies
  * in place; the rope tail stays f32 — read-back is bit-identical.  Must stay
- * in sync with DS4_ATTN_PACK_ROWBYTES in src/cuda/ds4_cuda_internal.h.
- * Mutually exclusive with DS4_ATTN_MX and the compile-time F16/FP8 formats
- * (enforced loudly at graph alloc). */
+ * in sync with DS4_ATTN_PACK_ROWBYTES in src/cuda/ds4_cuda_internal.h. */
 #define DS4_ENGINE_ATTN_PACK_ROWBYTES \
     ((uint64_t)(DS4_N_HEAD_DIM - DS4_N_ROT) + \
      ((((uint64_t)(DS4_N_HEAD_DIM - DS4_N_ROT) / 64u) + 3u) & ~3ull) + \
      (uint64_t)DS4_N_ROT * 4u)
-
-/* The compressed-KV cache has one storage representation at a time: the write,
- * allocation, and attention-read paths all branch on exactly one of these. */
-#if DS4_GPU_ATTN_COMP_CACHE_F16 && DS4_GPU_ATTN_COMP_CACHE_FP8
-#error "DS4_GPU_ATTN_COMP_CACHE_F16 and DS4_GPU_ATTN_COMP_CACHE_FP8 are mutually exclusive"
-#endif
 
 
 /* =========================================================================
@@ -1018,10 +988,11 @@ typedef struct {
     ds4_gpu_tensor *comp_kv_cur;
     ds4_gpu_tensor *comp_sc_cur;
     ds4_gpu_tensor *attn_comp_stage;
-    /* f32 shadow used only when DS4_ATTN_MX is on: the prefill attention
-     * consumers read plain-f32/f16/fp8 comp rows, so the persistent MXFP8 comp
-     * cache is dequantized here (up to max layer_comp_cap rows) before each
-     * prefill-attention read. Decode reads the MXFP8 cache directly (CUTLASS). */
+    /* f32 shadow used only when DS4_ATTN_PACK is on: the prefill attention
+     * consumers (and session save) read plain-f32 comp rows, so the persistent
+     * packed comp cache is dequantized here (up to max layer_comp_cap rows,
+     * bit-exact) before each prefill-attention read.  Decode reads the packed
+     * cache natively. */
     ds4_gpu_tensor *attn_comp_dequant;
     /* f32 staging used only when DS4_IDX_FP4 is on: the compressor emits new
      * indexer rows here (comp-cap rows, same row indices as the cache), and
@@ -1129,11 +1100,6 @@ typedef struct {
     /* Override compression ratio for DSpark draft layers (set to 0 before
      * calling gpu_graph_encode_decode_layer for draft model forwarding). */
     int comp_ratio_override;
-
-    /* Reused scratch for the MXFP8 decode attention path (DS4_ATTN_MX); grown on
-     * demand by ds4_gpu_attn_mx_decode, freed in gpu_graph_free. */
-    unsigned char *attn_mx_scratch;
-    uint64_t       attn_mx_scratch_bytes;
 
     uint32_t prefill_cap;
     uint32_t raw_window;
@@ -2274,13 +2240,7 @@ bool gpu_graph_env_flag(const char *name, int *cache);
 bool gpu_graph_use_reference_hc_decode(void);
 bool gpu_graph_use_reference_qkv_norm(void);
 bool gpu_graph_enable_batch_hc_norm_fusion(void);
-uint32_t gpu_graph_attn_comp_cache_is_f16(void);
-uint32_t gpu_graph_attn_comp_cache_is_fp8(void);
 uint32_t gpu_graph_attn_comp_cache_is_pack(void);
-/* True when DS4_ATTN_MX is set (cached). When on, the compressed-KV cache is
- * stored MXFP8 (DS4_ENGINE_MXKV_FP8_ROWBYTES/row) and decode attention runs the
- * CUTLASS Sm120 MX path; when off the build is byte-identical to before. */
-int gpu_graph_attn_mx_enabled(void);
 int gpu_graph_attn_pack_enabled(void);
 uint32_t gpu_graph_prefill_slice(void);
 /* True when DS4_IDX_FP4 is set (cached). When on, the ratio-4 indexer
@@ -2295,18 +2255,16 @@ int gpu_graph_idx_fp4_enabled(void);
  * __float2half, and the fp8-roundtripped nope dims are exactly
  * f16-representable), so reads are bit-identical; only storage changes. */
 int gpu_graph_raw_f16_enabled(void);
-/* Comp-cache row stride in bytes for the active storage format (MX-aware). */
+/* Comp-cache row stride in bytes for the active storage format (pack-aware). */
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
-/* Returns the comp-cache tensor to hand to the (f32/f16/fp8) prefill attention
- * consumers for `n_rows` rows: the cache itself normally, or the f32 shadow
- * (attn_comp_dequant) after dequantizing when MX storage is on. NULL on error.
- * The matching format flags are gpu_graph_attn_comp_read_is_f16/_is_fp8(). */
+/* Returns the comp-cache tensor to hand to the f32 prefill attention consumers
+ * for `n_rows` rows: the cache itself normally, or the f32 shadow
+ * (attn_comp_dequant) after a bit-exact dequant when DS4_ATTN_PACK storage is
+ * on.  NULL on error. */
 ds4_gpu_tensor *gpu_graph_attn_comp_read_cache(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       n_rows);
-uint32_t gpu_graph_attn_comp_read_is_f16(void);
-uint32_t gpu_graph_attn_comp_read_is_fp8(void);
 ds4_gpu_tensor *gpu_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il);

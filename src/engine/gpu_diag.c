@@ -198,34 +198,15 @@ bool gpu_graph_alloc_raw_cap(
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
 
-    /*
-     * FP8 compressed-KV storage is only read back by the single-token decode
-     * path and the batched decode-mixed prefill path.  The indexed-attention
-     * and static-mixed prefill kernels still bail on comp_kv_fp8, so any model
-     * with compressed (ratio != 0) layers would fail those paths at runtime
-     * once the cache is FP8-packed.  Refuse the combination up front with a
-     * clear message rather than allocating a cache that prefill cannot read.
-     * (No allocations have happened yet, so returning here needs no cleanup.)
-     */
-    if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (ds4_layer_compress_ratio(il) != 0) {
-                fprintf(stderr,
-                        "ds4: FP8 compressed-KV cache is not yet supported for compressed "
-                        "layers (indexed/static-mixed prefill kernels lack an FP8 read path); "
-                        "disable DS4_GPU_ATTN_COMP_CACHE_FP8\n");
-                return false;
-            }
-        }
-    }
-    /* DS4_ATTN_PACK validation lives up here with the FP8 refusal: no
-     * allocations have happened yet, so these early returns need no cleanup. */
-    if (gpu_graph_attn_pack_enabled() &&
-        (gpu_graph_attn_mx_enabled() || DS4_GPU_ATTN_COMP_CACHE_F16 ||
-         DS4_GPU_ATTN_COMP_CACHE_FP8)) {
+    /* DS4_ATTN_PACK validation lives up here: no allocations have happened
+     * yet, so these early returns need no cleanup. */
+    if (getenv("DS4_ATTN_MX") != NULL) {
+        /* Removed 2026-07-10: superseded by DS4_ATTN_PACK (bit-exact, smaller
+         * rows; MX re-quantized the rope dims and cost drafter acceptance).
+         * Refuse loudly instead of silently running a different format. */
         fprintf(stderr,
-                "ds4: DS4_ATTN_PACK cannot be combined with DS4_ATTN_MX or a "
-                "non-f32 compile-time attn comp cache format\n");
+                "ds4: DS4_ATTN_MX has been removed (superseded by DS4_ATTN_PACK); "
+                "unset DS4_ATTN_MX (use DS4_ATTN_PACK=0 for the classic f32 comp cache)\n");
         return false;
     }
     if (gpu_graph_attn_pack_enabled() &&
@@ -244,8 +225,7 @@ bool gpu_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled() ||
-        gpu_graph_attn_pack_enabled()) {
+    if (gpu_graph_attn_pack_enabled()) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
@@ -325,10 +305,7 @@ bool gpu_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            uint64_t comp_row_bytes = (uint64_t)DS4_N_HEAD_DIM * (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
-            if (DS4_GPU_ATTN_COMP_CACHE_FP8) comp_row_bytes = DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM);
-            if (gpu_graph_attn_mx_enabled()) comp_row_bytes = DS4_ENGINE_MXKV_FP8_ROWBYTES;
-            if (gpu_graph_attn_pack_enabled()) comp_row_bytes = DS4_ENGINE_ATTN_PACK_ROWBYTES;
+            const uint64_t comp_row_bytes = gpu_graph_attn_comp_cache_row_bytes();
             g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
                     (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
@@ -379,14 +356,11 @@ bool gpu_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || gpu_graph_attn_mx_enabled() ||
-        gpu_graph_attn_pack_enabled()) {
+    if (gpu_graph_attn_pack_enabled()) {
         /* f32 staging: the compressor writes real f32 rows here, then the commit
-         * step packs them to the persistent MXFP8/F16/ATTN_PACK comp cache. */
+         * step packs them to the persistent DS4_ATTN_PACK comp cache. */
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
-    }
-    if (gpu_graph_attn_mx_enabled() || gpu_graph_attn_pack_enabled()) {
         /* f32 shadow the prefill attention consumers (and session save) read
          * after the persistent packed comp cache is dequantized (see
          * gpu_graph_attn_comp_read_cache). */
@@ -544,7 +518,6 @@ bool gpu_graph_alloc_raw_cap(
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
-                    (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->attn_comp_stage) &&
                     (!gpu_graph_attn_pack_enabled() ||
                      (g->attn_comp_stage && g->attn_comp_dequant)) &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&

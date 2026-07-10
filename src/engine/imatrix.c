@@ -1454,7 +1454,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
             const uint32_t layer_comp_cap = ctx / ratio + 2u;
             m.compressed_bytes += (uint64_t)layer_comp_cap *
                                   DS4_N_HEAD_DIM *
-                                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+                                  sizeof(float);
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
@@ -1640,14 +1640,6 @@ int gpu_graph_prompt_logits_test(
                     ds4_gpu_tensor *shadow = gpu_graph_attn_comp_read_cache(&g, il, n_comp);
                     comp_read = shadow &&
                                 ds4_gpu_tensor_read(shadow, 0, gpu_comp, n * sizeof(float)) != 0;
-                } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-                    uint16_t *gpu_comp_h = xmalloc((size_t)n * sizeof(uint16_t));
-                    if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
-                                            gpu_comp_h, n * sizeof(uint16_t)) != 0) {
-                        for (uint64_t i = 0; i < n; i++) gpu_comp[i] = f16_to_f32(gpu_comp_h[i]);
-                        comp_read = true;
-                    }
-                    free(gpu_comp_h);
                 } else {
                     comp_read = ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
                                                     gpu_comp, n * sizeof(float)) != 0;

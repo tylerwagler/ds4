@@ -167,9 +167,9 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
 static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
-    const uint64_t comp_row = DS4_GPU_ATTN_COMP_CACHE_FP8
-        ? DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM)
-        : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    /* Session files always store comp rows as f32 (packed caches dequant to
+     * the f32 shadow on save), so payload sizing is format-independent. */
+    const uint64_t comp_row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -567,12 +567,6 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
     }
-    if (gpu_graph_attn_mx_enabled()) {
-        /* The compressed-KV cache is MXFP8 under DS4_ATTN_MX; its on-disk
-         * serialization is not implemented yet. Deferred (see Stage 4). */
-        payload_set_err(err, errlen, "session save unsupported with DS4_ATTN_MX (MXFP8 KV)");
-        return 1;
-    }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before layer snapshot");
         return 1;
@@ -625,15 +619,6 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                               DS4_SESSION_IO_CHUNK,
                                               err,
                                               errlen);
-        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_write_tensor_span_f16_as_f32(fp,
-                                                      g->layer_attn_comp_cache[il],
-                                                      0,
-                                                      (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
-                                                      buf,
-                                                      DS4_SESSION_IO_CHUNK,
-                                                      err,
-                                                      errlen);
         } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
@@ -703,10 +688,6 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     }
     if (ds4_session_is_cpu(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
-        return 1;
-    }
-    if (gpu_graph_attn_mx_enabled()) {
-        payload_set_err(err, errlen, "session load unsupported with DS4_ATTN_MX (MXFP8 KV)");
         return 1;
     }
     uint64_t remaining = payload_bytes;
@@ -824,16 +805,6 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                              &remaining,
                                              err,
                                              errlen);
-        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_read_tensor_span_f32_as_f16(fp,
-                                                     g->layer_attn_comp_cache[il],
-                                                     0,
-                                                     (uint64_t)n_comp[i] * DS4_N_HEAD_DIM,
-                                                     buf,
-                                                     DS4_SESSION_IO_CHUNK,
-                                                     &remaining,
-                                                     err,
-                                                     errlen);
         } else {
             rc = payload_read_tensor_span(fp,
                                           g->layer_attn_comp_cache[il],
@@ -1248,11 +1219,6 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
-    if (!ds4_session_is_cpu(s) && gpu_graph_attn_mx_enabled()) {
-        /* GPU path serializes the MXFP8 comp cache raw; not implemented. Deferred. */
-        payload_set_err(err, errlen, "session save unsupported with DS4_ATTN_MX (MXFP8 KV)");
-        return 1;
-    }
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -1384,24 +1350,6 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                               DS4_SESSION_IO_CHUNK,
                                               err,
                                               errlen);
-        } else if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_attn_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_comp[il] * DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
-        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_write_tensor_span_f16_as_f32(fp,
-                                                      g->layer_attn_comp_cache[il],
-                                                      0,
-                                                      (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
-                                                      buf,
-                                                      DS4_SESSION_IO_CHUNK,
-                                                      err,
-                                                      errlen);
         } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
@@ -1466,10 +1414,6 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
-    }
-    if (!ds4_session_is_cpu(s) && gpu_graph_attn_mx_enabled()) {
-        payload_set_err(err, errlen, "session load unsupported with DS4_ATTN_MX (MXFP8 KV)");
-        return 1;
     }
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
@@ -1729,26 +1673,6 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                              &remaining,
                                              err,
                                              errlen);
-        } else if (DS4_GPU_ATTN_COMP_CACHE_FP8) {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_attn_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_comp[il] * DS4_FP8_KV_ROWBYTES(DS4_N_HEAD_DIM),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
-        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_read_tensor_span_f32_as_f16(fp,
-                                                      g->layer_attn_comp_cache[il],
-                                                      0,
-                                                      (uint64_t)n_comp[il] * DS4_N_HEAD_DIM,
-                                                      buf,
-                                                      DS4_SESSION_IO_CHUNK,
-                                                      &remaining,
-                                                      err,
-                                                      errlen);
         } else {
             rc = payload_read_tensor_span(fp,
                                           g->layer_attn_comp_cache[il],
@@ -2449,12 +2373,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
-    /* Default draft depth 2: the measured optimum for the fused loop (16.4
-     * step_tps vs 16.0 at 3, 15.3 at 4 -- acceptance is front-loaded and the
-     * verify batch cost grows ~11ms/token in routed-expert reads). */
-    /* Default draft depth: 3 (post inverse-rope fix sweep, 3-prompt 512-token
-     * suites: draft2 22.8 / draft3 23.8 / draft5 21.1 t/s -- acceptance holds
-     * deep but verify rows cost ~20ms each, so 3 is the fixed-depth optimum). */
+    /* Default draft depth 5: the measured optimum WITH confidence-scheduled
+     * verification (2026-07-09 sweep, conf3 head, tau 0.35: 24.46 eff t/s vs
+     * 23.18 at draft 3).  Without conf-sched (tau 0) the fixed-depth optimum
+     * was 3; the tau default in dspark_conf_sched_tau() keeps 5 profitable by
+     * trimming the low-confidence tail before the batch verify. */
     e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 5;
     if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
     e->dspark_confidence = opt->dspark_confidence > 0.0f ? opt->dspark_confidence : 0.5f;
@@ -5461,7 +5384,8 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * accepted (from the post-hc_head hidden in batch_ffn_cur + the drafted
      * token's markov embed). Size the verify budget to the confident prefix so
      * we don't spend the batch verify on low-confidence tail drafts. Threshold
-     * DS4_DSPARK_CONF_SCHED (default 0 = verify all n_draft, unchanged behavior).
+     * DS4_DSPARK_CONF_SCHED (defaults to the measured tau in
+     * dspark_conf_sched_tau(); "0"/"off" = verify all n_draft, classic behavior).
      * OUTPUT-PRESERVING: reducing the budget only limits how many drafts we
      * verify/commit; the emitted tokens are still exact greedy. */
     uint32_t eff_draft = n_draft;
