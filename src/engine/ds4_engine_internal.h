@@ -1334,6 +1334,15 @@ struct ds4_engine {
     bool dspark_ready;
     ds4_model overlay_model;
     bool overlay_ready;
+    /* Prometheus /metrics spec-decode counters (server /metrics endpoint via
+     * ds4_engine_spec_metrics). Incremented from the DSpark fused verify loop;
+     * monotonic. GPU decode submission is single-threaded, so plain uint64 is
+     * adequate for these monitoring counters. */
+    uint64_t spec_accepted_tokens;         /* accepted draft tokens */
+    uint64_t spec_draft_tokens;            /* proposed/verified draft tokens */
+    uint64_t spec_num_drafts;              /* draft rounds (verify steps w/ drafts) */
+    uint64_t spec_gen_tokens;              /* tokens emitted by the spec loop */
+    uint64_t spec_accepted_per_pos[16];    /* accepted count per draft position */
 };
 
 typedef struct {

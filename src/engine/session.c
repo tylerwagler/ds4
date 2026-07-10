@@ -2890,6 +2890,19 @@ const char *ds4_engine_model_name(ds4_engine *e) {
     return DS4_MODEL_SHAPE_NAME;
 }
 
+void ds4_engine_spec_metrics(ds4_engine *e, ds4_spec_metrics *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!e) return;
+    out->accepted_tokens = e->spec_accepted_tokens;
+    out->draft_tokens = e->spec_draft_tokens;
+    out->num_drafts = e->spec_num_drafts;
+    out->gen_tokens = e->spec_gen_tokens;
+    for (int i = 0; i < 16; i++) out->accepted_per_pos[i] = e->spec_accepted_per_pos[i];
+    out->max_draft = e->dspark_draft_tokens;
+    out->has_dspark = e->dspark_ready;
+}
+
 
 
 int ds4_engine_layer_count(ds4_engine *e) {
@@ -5015,6 +5028,17 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * target's token AFTER batch token i, i.e. its prediction for pend[i]. */
     int commit = 0;
     while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
+
+    /* Prometheus /metrics spec-decode counters (server /metrics endpoint). The
+     * base token is always emitted; K drafts were verified this step and the
+     * accepted prefix is [0,commit). num_drafts counts draft rounds only. */
+    e->spec_gen_tokens += 1u + (uint64_t)commit;
+    if (K > 0) {
+        e->spec_draft_tokens += K;
+        e->spec_accepted_tokens += (uint64_t)commit;
+        e->spec_num_drafts += 1u;
+        for (int i = 0; i < commit && i < 16; i++) e->spec_accepted_per_pos[i]++;
+    }
 
     /* DTree Phase 0 (§6): emit one record per ON-POLICY verified position — the
      * accepted prefix 0..commit-1 plus the split (first rejected draft) at

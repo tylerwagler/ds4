@@ -157,6 +157,20 @@ int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
+
+/* DSpark speculative-decode counters for the server /metrics endpoint. All
+ * cumulative/monotonic since engine open. accepted_per_pos[i] counts how often
+ * draft position i was accepted; rate[i] = accepted_per_pos[i]/num_drafts. */
+typedef struct {
+    uint64_t accepted_tokens;       /* accepted draft tokens */
+    uint64_t draft_tokens;          /* proposed/verified draft tokens */
+    uint64_t num_drafts;            /* draft rounds (verify steps with drafts) */
+    uint64_t gen_tokens;            /* tokens emitted by the spec loop */
+    uint64_t accepted_per_pos[16];  /* accepted count per draft position */
+    int      max_draft;             /* configured draft depth (dspark_draft_tokens) */
+    bool     has_dspark;            /* spec decode active */
+} ds4_spec_metrics;
+void ds4_engine_spec_metrics(ds4_engine *e, ds4_spec_metrics *out);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old

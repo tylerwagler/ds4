@@ -161,6 +161,62 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+/* Prometheus /metrics — DSpark speculative-decode counters in vLLM naming, so
+ * tool-eval-bench --spec-live (and any vLLM-oriented scraper) reads acceptance
+ * rate, acceptance length, and the per-position waterfall unchanged. All
+ * counters are cumulative since engine open; gauges are point-in-time. */
+static bool send_metrics(server *s, int fd) {
+    ds4_spec_metrics m;
+    ds4_engine_spec_metrics(s->engine, &m);
+    const char *model = server_model_id_from_engine(s->engine);
+    const int pos = ds4_session_pos(s->session);
+    const int ctx = ds4_session_ctx(s->session);
+    double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
+    if (kv > 1.0) kv = 1.0;
+    const int running = s->clients;
+
+    buf b = {0};
+    /* Spec-decode counters (the core of --spec-live). model_name label lets the
+     * scraper detect the drafter identity and the spec_decode method. */
+    buf_puts(&b, "# HELP vllm:spec_decode_num_draft_tokens_total Cumulative draft tokens proposed.\n");
+    buf_puts(&b, "# TYPE vllm:spec_decode_num_draft_tokens_total counter\n");
+    buf_printf(&b, "vllm:spec_decode_num_draft_tokens_total{model_name=\"%s\"} %llu\n",
+               model, (unsigned long long)m.draft_tokens);
+    buf_puts(&b, "# HELP vllm:spec_decode_num_accepted_tokens_total Cumulative draft tokens accepted.\n");
+    buf_puts(&b, "# TYPE vllm:spec_decode_num_accepted_tokens_total counter\n");
+    buf_printf(&b, "vllm:spec_decode_num_accepted_tokens_total{model_name=\"%s\"} %llu\n",
+               model, (unsigned long long)m.accepted_tokens);
+    buf_puts(&b, "# HELP vllm:spec_decode_num_drafts_total Cumulative draft rounds.\n");
+    buf_puts(&b, "# TYPE vllm:spec_decode_num_drafts_total counter\n");
+    buf_printf(&b, "vllm:spec_decode_num_drafts_total{model_name=\"%s\"} %llu\n",
+               model, (unsigned long long)m.num_drafts);
+    /* Per-position accepted counters -> the scraper derives per-position
+     * acceptance = count/num_drafts (the waterfall). Emit 0..max_draft-1 so the
+     * chart has a full row even before every position has fired. */
+    if (m.max_draft > 0) {
+        int np = m.max_draft > 16 ? 16 : m.max_draft;
+        buf_puts(&b, "# HELP vllm:spec_decode_num_accepted_tokens_per_pos_total Accepted count per draft position.\n");
+        buf_puts(&b, "# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_total counter\n");
+        for (int i = 0; i < np; i++)
+            buf_printf(&b, "vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"%s\",position=\"%d\"} %llu\n",
+                       model, i, (unsigned long long)m.accepted_per_pos[i]);
+    }
+    /* Throughput fallback source + engine gauges. */
+    buf_puts(&b, "# HELP vllm:generation_tokens_total Cumulative tokens emitted.\n");
+    buf_puts(&b, "# TYPE vllm:generation_tokens_total counter\n");
+    buf_printf(&b, "vllm:generation_tokens_total %llu\n", (unsigned long long)m.gen_tokens);
+    buf_puts(&b, "# HELP vllm:kv_cache_usage_perc KV cache utilization (0-1).\n");
+    buf_puts(&b, "# TYPE vllm:kv_cache_usage_perc gauge\n");
+    buf_printf(&b, "vllm:kv_cache_usage_perc %.6f\n", kv);
+    buf_puts(&b, "# HELP vllm:num_requests_running Requests currently in flight.\n");
+    buf_puts(&b, "# TYPE vllm:num_requests_running gauge\n");
+    buf_printf(&b, "vllm:num_requests_running %d\n", running < 0 ? 0 : running);
+
+    bool ok = http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 
 
 static void client_done(server *s) {
@@ -196,6 +252,11 @@ void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics")) {
+        send_metrics(s, fd);
         http_request_free(&hr);
         goto done;
     }
