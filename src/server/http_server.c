@@ -173,7 +173,13 @@ static bool send_metrics(server *s, int fd) {
     const int ctx = ds4_session_ctx(s->session);
     double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
     if (kv > 1.0) kv = 1.0;
-    const int running = s->clients;
+    /* s->clients counts every accepted connection (cli_main bumps it before
+     * dispatch), so it includes THIS /metrics scrape — subtract it to report
+     * the other in-flight requests. */
+    pthread_mutex_lock(&s->mu);
+    int running = s->clients - 1;
+    pthread_mutex_unlock(&s->mu);
+    if (running < 0) running = 0;
 
     buf b = {0};
     /* Spec-decode counters (the core of --spec-live). model_name label lets the
