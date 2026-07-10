@@ -1,5 +1,20 @@
 # DTree: tree speculation for the DSpark fused loop — design (2026-07-10)
 
+> **PHASE 0 VERDICT (2026-07-10): KILLED. Do not build Phase 1.** The go/no-go
+> hinged on p₂ (§6), now measured (commit 6ded65f, DS4_DTREE_STATS). p₂ is
+> informative (0.44 short / 0.585 @446k) but the depth-1 sibling's marginal
+> yield (1−a(c))·p₂(c) peaks at 0.22 tok/row — under the bar at every operating
+> point — because a(c) > (1−a)·p₂ at essentially every confidence bucket: the
+> chain's #1 verify row always out-yields a #2 sibling row, so the conf-sched
+> chain already allocates verify rows optimally. The §1 long-ctx hope is
+> refuted empirically: acceptance RISES with context (fewer split
+> opportunities, not more) and the marginal verify row gets ~2.6× more
+> expensive at 446k (measured 51 ms/row vs the 19.7 ms this doc assumed), so
+> the bar rises rather than dropping to 0.27. No operating point clears the +5%
+> gate even for an oracle upper bound (max +4.2% @446k, flat-row optimistic).
+> Full p₂ table + projection: the ds4-dspark-drafter memory note. The design
+> below is preserved as the record of what was evaluated.
+
 Produced by design exploration against the code as of commit 5698afe; every
 mechanism cited was verified at the referenced file:line. See docs/plans.md
 for the one-paragraph scope; this is the working design.

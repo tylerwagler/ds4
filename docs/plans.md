@@ -26,17 +26,19 @@ fixed point; the real value is workload-proofing (no re-sweeps as ctx/corpus
 change). Cannot fix head miscalibration (none observed — acceptance holds
 3.79 tok/step at 446k ctx).
 
-## Tree speculation ("DTree") — ACTIVE next
+## Tree speculation ("DTree") — KILLED at Phase 0 (2026-07-10)
 
-DSpark drafts a single chain; a tree verifies alternative branches at
-low-confidence positions in one batch (typical +10-20% over chain spec).
-Needs: branch-aware verify batching (positions share a prefix; attention masks
-per branch), KV forking/rewind per branch (the spec frontier
-snapshot/restore machinery generalizes), drafter multi-sample at split points
-(markov head already yields a distribution), and accept logic that picks the
-surviving branch. The only remaining double-digit decode lever — verify-row
-marginal cost is bandwidth physics (19.7 ms/row), so the win must come from
-higher accepted-tokens-per-row, which trees provide.
+Measured non-win; do not build. Phase 0 measured p₂ = P(target correction ==
+drafter #2 | #1 rejected) bucketed by the conf head (commit 6ded65f,
+DS4_DTREE_STATS). p₂ is informative (0.44 short / 0.585 @446k) but the sibling
+row's marginal yield (1−a(c))·p₂(c) peaks at 0.22 tok/row — below the bar at
+every operating point — because a(c) > (1−a)·p₂ at every conf bucket (the
+chain's #1 row always out-yields a #2 sibling). Long-ctx thesis refuted:
+acceptance RISES with ctx (fewer splits) and the marginal verify row gets more
+expensive (~26/34/51 ms at short/128k/446k), so the bar rises rather than
+dropping to 0.27. No operating point clears +5% even for an oracle upper bound
+(max +4.2% @446k). Full evidence + p₂ table in the ds4-dspark-drafter memory
+note; design in docs/dtree-design.md (annotated with the Phase-0 verdict).
 
 ## Drafter retune (shelved dessert, ~+3-5%)
 
