@@ -173,13 +173,16 @@ static bool send_metrics(server *s, int fd) {
     const int ctx = ds4_session_ctx(s->session);
     double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
     if (kv > 1.0) kv = 1.0;
-    /* s->clients counts every accepted connection (cli_main bumps it before
-     * dispatch), so it includes THIS /metrics scrape — subtract it to report
-     * the other in-flight requests. */
+    /* Scheduler gauges + prefill counters (single worker -> running is 0/1). */
     pthread_mutex_lock(&s->mu);
-    int running = s->clients - 1;
+    int running = s->n_generating;
+    int waiting = s->n_queued;
+    unsigned long long prompt_toks = (unsigned long long)s->m_prompt_tokens;
+    unsigned long long pfx_queries = (unsigned long long)s->m_prefix_queries;
+    unsigned long long pfx_hits = (unsigned long long)s->m_prefix_hits;
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
+    if (waiting < 0) waiting = 0;
 
     buf b = {0};
     /* Spec-decode counters (the core of --spec-live). model_name label lets the
@@ -207,16 +210,30 @@ static bool send_metrics(server *s, int fd) {
             buf_printf(&b, "vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"%s\",position=\"%d\"} %llu\n",
                        model, i, (unsigned long long)m.accepted_per_pos[i]);
     }
-    /* Throughput fallback source + engine gauges. */
+    /* Token-throughput counters (the scraper derives prompt/gen t/s from deltas). */
+    buf_puts(&b, "# HELP vllm:prompt_tokens_total Cumulative prompt tokens prefilled.\n");
+    buf_puts(&b, "# TYPE vllm:prompt_tokens_total counter\n");
+    buf_printf(&b, "vllm:prompt_tokens_total %llu\n", prompt_toks);
     buf_puts(&b, "# HELP vllm:generation_tokens_total Cumulative tokens emitted.\n");
     buf_puts(&b, "# TYPE vllm:generation_tokens_total counter\n");
     buf_printf(&b, "vllm:generation_tokens_total %llu\n", (unsigned long long)m.gen_tokens);
+    /* Prefix-cache hit rate (scraper computes hits/queries). */
+    buf_puts(&b, "# HELP vllm:prefix_cache_queries_total Cumulative prompt tokens looked up in the prefix cache.\n");
+    buf_puts(&b, "# TYPE vllm:prefix_cache_queries_total counter\n");
+    buf_printf(&b, "vllm:prefix_cache_queries_total %llu\n", pfx_queries);
+    buf_puts(&b, "# HELP vllm:prefix_cache_hits_total Cumulative prompt tokens served from the prefix cache.\n");
+    buf_puts(&b, "# TYPE vllm:prefix_cache_hits_total counter\n");
+    buf_printf(&b, "vllm:prefix_cache_hits_total %llu\n", pfx_hits);
+    /* Scheduler + KV gauges. */
     buf_puts(&b, "# HELP vllm:kv_cache_usage_perc KV cache utilization (0-1).\n");
     buf_puts(&b, "# TYPE vllm:kv_cache_usage_perc gauge\n");
     buf_printf(&b, "vllm:kv_cache_usage_perc %.6f\n", kv);
-    buf_puts(&b, "# HELP vllm:num_requests_running Requests currently in flight.\n");
+    buf_puts(&b, "# HELP vllm:num_requests_running Requests currently generating.\n");
     buf_puts(&b, "# TYPE vllm:num_requests_running gauge\n");
-    buf_printf(&b, "vllm:num_requests_running %d\n", running < 0 ? 0 : running);
+    buf_printf(&b, "vllm:num_requests_running %d\n", running);
+    buf_puts(&b, "# HELP vllm:num_requests_waiting Requests queued and not yet started.\n");
+    buf_puts(&b, "# TYPE vllm:num_requests_waiting gauge\n");
+    buf_printf(&b, "vllm:num_requests_waiting %d\n", waiting);
 
     bool ok = http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);

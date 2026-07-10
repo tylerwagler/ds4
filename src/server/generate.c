@@ -769,6 +769,13 @@ void generate_job(server *s, job *j) {
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
+    /* Prometheus /metrics: prompt-throughput + prefix-cache-hit counters. */
+    pthread_mutex_lock(&s->mu);
+    s->m_prompt_tokens += (uint64_t)(prompt_tokens > 0 ? prompt_tokens : 0);
+    s->m_prefix_queries += (uint64_t)(prompt_tokens > 0 ? prompt_tokens : 0);
+    s->m_prefix_hits += (uint64_t)(cached > 0 ? cached : 0);
+    pthread_mutex_unlock(&s->mu);
+
     const double t0 = server_now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
@@ -1707,6 +1714,7 @@ bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    s->n_queued++;
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
     return true;
@@ -1724,6 +1732,7 @@ static job *dequeue(server *s) {
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
+    if (s->n_queued > 0) s->n_queued--;
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
@@ -1736,7 +1745,13 @@ void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        pthread_mutex_lock(&s->mu);
+        s->n_generating++;
+        pthread_mutex_unlock(&s->mu);
         generate_job(s, j);
+        pthread_mutex_lock(&s->mu);
+        if (s->n_generating > 0) s->n_generating--;
+        pthread_mutex_unlock(&s->mu);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);

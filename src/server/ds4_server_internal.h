@@ -572,6 +572,15 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
+    /* /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
+     * enqueued not yet started; n_generating = jobs the single worker is
+     * actively decoding (0/1). m_* are cumulative prefill counters feeding the
+     * Prometheus prompt-throughput and prefix-cache-hit metrics. */
+    int n_queued;
+    int n_generating;
+    uint64_t m_prompt_tokens;     /* cumulative prompt tokens prefilled */
+    uint64_t m_prefix_queries;    /* cumulative prompt tokens seen (hit-rate denom) */
+    uint64_t m_prefix_hits;       /* cumulative prompt tokens served from prefix cache */
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
