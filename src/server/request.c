@@ -367,14 +367,6 @@ const char *server_model_id_from_engine(ds4_engine *engine) {
 
 
 
-bool server_model_alias_known(const char *id) {
-    return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
-}
-
-
-
 void stop_list_clear(stop_list *stops) {
     for (int i = 0; i < stops->len; i++) free(stops->v[i]);
     stops->len = 0;

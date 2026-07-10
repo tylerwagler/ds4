@@ -148,7 +148,7 @@ static server_config parse_options(int argc, char **argv) {
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
-        .host = "127.0.0.1",
+        .host = "0.0.0.0",
         .port = 8000,
         .ctx_size = 262144,
         .default_tokens = 393216,

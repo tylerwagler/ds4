@@ -718,7 +718,6 @@ bool parse_output_config_effort(const char **p, ds4_think_mode *effort);
 bool model_alias_disables_thinking(const char *model);
 bool model_alias_enables_thinking(const char *model);
 const char *server_model_id_from_engine(ds4_engine *engine);
-bool server_model_alias_known(const char *id);
 void stop_list_clear(stop_list *stops);
 void stop_list_push(stop_list *stops, char *s);
 bool parse_stop(const char **p, stop_list *out);

@@ -150,11 +150,11 @@ static bool send_model(server *s, int fd, const char *id) {
 
 
 static bool send_models(server *s, int fd) {
+    /* Advertise only the model actually loaded (its shape id), not both
+     * flash/pro aliases — the server serves one GGUF at a time. */
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
+    append_model_json(&b, s, server_model_id_from_engine(s->engine));
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -270,7 +270,8 @@ void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        !strcmp(hr.path + model_path_prefix_len,
+                server_model_id_from_engine(s->engine)))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
