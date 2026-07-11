@@ -715,6 +715,11 @@ bool gpu_graph_prefill_raw_swa(
  * compression windows and row finalization follow the same schedule after the
  * cached prefix.
  */
+static uint32_t gcd_u32(uint32_t a, uint32_t b) {
+    while (b) { uint32_t t = a % b; a = b; b = t; }
+    return a;
+}
+
 bool gpu_graph_prefill_chunked_range(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -765,7 +770,26 @@ bool gpu_graph_prefill_chunked_range(
                 if (to_boundary < local_cap) local_cap = to_boundary;
             }
         }
-        const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
+        uint32_t chunk = remaining < local_cap ? remaining : local_cap;
+        /* Keep every NON-final chunk boundary aligned to the layer compress
+         * ratios (LCM, i.e. 4 for the ratio-4 layers): one unaligned boundary
+         * makes pos0 unaligned for every later chunk, and each of those takes
+         * the per-token compressor fallback instead of the batched aligned
+         * path for the whole rest of the prompt. The final chunk keeps its
+         * exact remainder; an unaligned START (continuation from an arbitrary
+         * position) pays the fallback for its first chunk only, because that
+         * chunk still ENDS on an aligned boundary. */
+        if (chunk < remaining) {
+            uint32_t align = 1;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const uint32_t r = ds4_layer_compress_ratio(il);
+                if (r > 1 && align % r != 0) align *= r / gcd_u32(align, r);
+            }
+            if (align > 1) {
+                const uint32_t aligned_end = ((pos0 + chunk) / align) * align;
+                if (aligned_end > pos0) chunk = aligned_end - pos0;
+            }
+        }
         const uint32_t chunk_end = pos0 + chunk;
         /* Only the final chunk's logits are consumed (the progress callback below
          * reports position only, never reads logits). Running the full output
