@@ -113,19 +113,24 @@ __global__ static void indexer_score_one_direct_kernel(
     if (tid < 128u) krow[tid] = idx_comp_load_dev(index_comp, fp4, c, tid, 128u);
     __syncthreads();
 
-    float total = 0.0f;
+    /* Per-warp accumulation: warp w owns heads w, w+4, ..., w+60 and keeps a
+     * private running sum, so the loop needs no block-wide synchronization
+     * (the old version paid two __syncthreads() per 4-head group = 32 per
+     * row). One sync at the end combines the four warp totals. The reduction
+     * order changes by ~1 ULP vs the old serial accumulate, far below the
+     * model's run-to-run float-atomic nondeterminism. */
+    float wtotal = 0.0f;
     for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
         const uint32_t h = h0 + warp;
         const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
         const float4 kv = ((const float4 *)krow)[lane];
         float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
         dot = warp_sum_f32(dot);
-        if (lane == 0) partial[warp] = fmaxf(dot, 0.0f) * weights[h] * scale;
-        __syncthreads();
-        if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
-        __syncthreads();
+        if (lane == 0) wtotal += fmaxf(dot, 0.0f) * weights[h] * scale;
     }
-    if (tid == 0) scores[c] = total;
+    if (lane == 0) partial[warp] = wtotal;
+    __syncthreads();
+    if (tid == 0) scores[c] = partial[0] + partial[1] + partial[2] + partial[3];
 }
 
 
