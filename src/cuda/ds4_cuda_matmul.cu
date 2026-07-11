@@ -105,107 +105,6 @@ __global__ static void matmul_f16_nt_kernel(
 
 
 
-__global__ static void matmul_f16_serial_kernel(
-        float *out,
-        const __half *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t n_tok) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    uint64_t tok = (uint64_t)blockIdx.y;
-    if (row >= out_dim || tok >= n_tok || threadIdx.x != 0) return;
-
-    float sum = 0.0f;
-    const __half *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
-    for (uint64_t i = 0; i < in_dim; i++) {
-        sum += __half2float(wr[i]) * xr[i];
-    }
-    out[tok * out_dim + row] = sum;
-}
-
-
-
-__global__ static void matmul_f16_ordered_chunks_kernel(
-        float *out,
-        const __half *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t n_tok) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    uint64_t tok = (uint64_t)blockIdx.y;
-    if (row >= out_dim || tok >= n_tok) return;
-
-    __shared__ float partial[32];
-    const uint32_t tid = threadIdx.x;
-    float sum = 0.0f;
-    const uint64_t chunk = (in_dim + 31u) / 32u;
-    const uint64_t k0 = (uint64_t)tid * chunk;
-    uint64_t k1 = k0 + chunk;
-    if (k1 > in_dim) k1 = in_dim;
-    const __half *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
-    for (uint64_t i = k0; i < k1; i++) {
-        sum += __half2float(wr[i]) * xr[i];
-    }
-    partial[tid] = sum;
-    __syncthreads();
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint32_t i = 0; i < 32u; i++) total += partial[i];
-        out[tok * out_dim + row] = total;
-    }
-}
-
-
-
-__global__ static void matmul_f16_pair_ordered_chunks_kernel(
-        float *out0,
-        float *out1,
-        const __half *w0,
-        const __half *w1,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out0_dim,
-        uint64_t out1_dim) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    if (row >= out0_dim && row >= out1_dim) return;
-
-    __shared__ float partial0[32];
-    __shared__ float partial1[32];
-    const uint32_t tid = threadIdx.x;
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    const uint64_t chunk = (in_dim + 31u) / 32u;
-    const uint64_t k0 = (uint64_t)tid * chunk;
-    uint64_t k1 = k0 + chunk;
-    if (k1 > in_dim) k1 = in_dim;
-    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
-    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
-    for (uint64_t i = k0; i < k1; i++) {
-        const float xv = x[i];
-        if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
-        if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;
-    }
-    partial0[tid] = sum0;
-    partial1[tid] = sum1;
-    __syncthreads();
-    if (tid == 0) {
-        float total0 = 0.0f;
-        float total1 = 0.0f;
-        for (uint32_t i = 0; i < 32u; i++) {
-            total0 += partial0[i];
-            total1 += partial1[i];
-        }
-        if (row < out0_dim) out0[row] = total0;
-        if (row < out1_dim) out1[row] = total1;
-    }
-}
-
-
-
 __global__ static void matmul_f32_kernel(
         float *out,
         const float *w,
@@ -1012,100 +911,6 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m
 }
 
 
-/* ============================================================================
- * PROTOTYPE: MXFP4 attention path (DS4_ATTN_MXFP4). Requant a workhorse MXFP8
- * weight (raw 33B blocks) -> MXFP4 (per 32-block: E8M0 byte + 16 e2m1 bytes),
- * cached by offset, and run a batch-1 mmvq off it. Halves the weight read (4-bit
- * vs 8-bit) for the big attention projections. Lossy requant -> measures the
- * quality/speed tradeoff before committing to a converter change.
- * ============================================================================ */
-__device__ __constant__ float d_kE2M1_m[16] =
-    {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-__device__ __forceinline__ static uint8_t d_to_e2m1_m(float v){
-    float best=1e30f; uint8_t bn=0;
-    #pragma unroll
-    for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1_m[n]); if(d<best){best=d;bn=n;} }
-    return bn;
-}
-
-/* raw MXFP8 [out,in] 33B blocks -> DE-INTERLEAVED MXFP4: nibbles packed contiguous in
- * data[out,in/2] + separate E8M0 scale[out,in/32]. Contiguous nibbles let the mmvq read
- * uint32 (8 nibbles) coalesced. one thread per (row,32-block). */
-__global__ static void mxfp8_to_mxfp4_kernel(uint8_t *data, uint8_t *scale, const uint8_t *in8, int in_dim, int out_dim){
-    const int nb = in_dim / 32;
-    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (long)out_dim * nb) return;
-    const int o = (int)(idx / nb), sb = (int)(idx % nb);
-    const uint8_t *ib = in8 + ((size_t)o * nb + sb) * 33;
-    const float ms = __int_as_float((uint32_t)ib[0] << 23);
-    float v[32], mx = 0.f;
-    #pragma unroll
-    for (int i = 0; i < 32; i++) { v[i] = __half2float((__half)*(const __nv_fp8_e4m3 *)&ib[1 + i]) * ms; mx = fmaxf(mx, fabsf(v[i])); }
-    int e = (mx > 0.f) ? (int)ceilf(log2f(mx / 6.f)) : 0; if (e < -30) e = -30; if (e > 30) e = 30;
-    const float sc = exp2f((float)e);
-    scale[(size_t)o * nb + sb] = (uint8_t)(e + 127);
-    uint8_t *ob = data + ((size_t)o * in_dim + sb * 32) / 2;   /* 16 bytes = 32 nibbles */
-    #pragma unroll
-    for (int i = 0; i < 16; i++) { uint8_t lo = d_to_e2m1_m(v[2*i]/sc), hi = d_to_e2m1_m(v[2*i+1]/sc); ob[i] = (uint8_t)(lo | (hi << 4)); }
-}
-
-/* Arithmetic e2m1 decode (NO LUT). Returns 2x the actual value (fold 0.5 into scale). */
-__device__ __forceinline__ static float e2m1_x2f(uint8_t nib){
-    const unsigned e = (nib >> 1) & 3u, m = nib & 1u;
-    const int mag = e ? (int)((1u << e) | (m << (e - 1u))) : (int)m;
-    return (nib & 8u) ? -(float)mag : (float)mag;
-}
-
-/* batch-1 de-interleaved MXFP4 mmvq: warp-per-row (8 rows/block), each lane reads a uint32
- * (8 nibbles) per step -> coalesced. Mirrors the efficient MXFP8 mmvq. */
-__global__ static void mxfp4_mmvq_kernel(float *out, const uint8_t *data, const uint8_t *scale,
-                                         const float *x, int in_dim, int out_dim){
-    const int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    const int lane = threadIdx.x & 31;
-    if (o >= out_dim) return;
-    const int nb = in_dim / 32;
-    const uint8_t *drow = data + (size_t)o * (in_dim / 2);
-    const uint8_t *srow = scale + (size_t)o * nb;
-    float acc = 0.f;
-    for (int base = 0; base < in_dim; base += 256) {          /* 32 lanes * 8 elems */
-        const int k = base + lane * 8;
-        const uint32_t packed = *(const uint32_t *)(drow + (k >> 1));   /* 8 nibbles */
-        const float sc = __int_as_float((uint32_t)srow[k >> 5] << 23);  /* one 32-block */
-        const float *xk = x + k;
-        float s = 0.f;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) s += e2m1_x2f((packed >> (4 * i)) & 0xF) * xk[i];
-        acc += sc * s;
-    }
-    acc *= 0.5f;
-    for (int st = 16; st > 0; st >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, st);
-    if (lane == 0) out[o] = acc;
-}
-
-struct mxfp4_weight { const void *host_base; uint64_t offset; uint64_t in_dim, out_dim; uint8_t *data; uint8_t *scale; };
-static std::unordered_map<uint64_t, mxfp4_weight> g_mxfp4_by_offset;
-
-/* Requant a raw MXFP8 weight [out,in] to de-interleaved MXFP4, cached by offset. */
-static const mxfp4_weight *cuda_mxfp4_from_mxfp8(const void *model_map, uint64_t offset, uint64_t mxfp8_bytes,
-                                                 uint64_t in_dim, uint64_t out_dim){
-    auto it = g_mxfp4_by_offset.find(offset);
-    if (it != g_mxfp4_by_offset.end() && it->second.host_base == model_map &&
-        it->second.in_dim == in_dim && it->second.out_dim == out_dim) return &it->second;
-    const unsigned char *src = (const unsigned char *)cuda_model_range_ptr(model_map, offset, mxfp8_bytes, "mxfp4_req");
-    if (!src) return NULL;
-    const uint64_t nb = in_dim / 32;
-    uint8_t *data = NULL, *scale = NULL;
-    if (cudaMalloc(&data, (size_t)out_dim * in_dim / 2) != cudaSuccess) return NULL;
-    if (cudaMalloc(&scale, (size_t)out_dim * nb) != cudaSuccess) { cudaFree(data); return NULL; }
-    const long total = (long)out_dim * nb;
-    mxfp8_to_mxfp4_kernel<<<(unsigned)((total + 255) / 256), 256>>>(data, scale, src, (int)in_dim, (int)out_dim);
-    if (!cuda_ok(cudaGetLastError(), "mxfp8->mxfp4 requant")) { cudaFree(data); cudaFree(scale); return NULL; }
-    mxfp4_weight w = { model_map, offset, in_dim, out_dim, data, scale };
-    g_mxfp4_by_offset[offset] = w;
-    return &g_mxfp4_by_offset[offset];
-}
-
-
 /* PER-TENSOR routing: every offset registered at load (the MXFP8 workhorse
  * weights: attn_kv/q_a/q_b, attn_output_a/b, shared experts, output head)
  * takes the FP8 path; anything unregistered is rejected below. */
@@ -1134,9 +939,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         static const int gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
                 return e ? atoi(e) : 4; }();
         static const int nt_fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
-        static const int nt_mxfp4 = getenv("DS4_ATTN_MXFP4") != NULL;
         if (n_tok >= 2 && n_tok <= 4 && n_tok <= (uint64_t)gemv_max_n &&
-            in_dim % 128 == 0 && !nt_fp8_raw && !nt_mxfp4) {
+            in_dim % 128 == 0 && !nt_fp8_raw) {
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
             if (bw) {
@@ -1160,24 +964,6 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         if (n_tok > 1 && getenv("DS4_FP8_NO_MXCORE") == NULL &&
                 cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
                 weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
-        /* PROTOTYPE: decode MXFP4 (4-bit) instead of MXFP8 (8-bit) for the workhorse
-         * projections -> halves the weight read. Requant-from-MXFP8 cached per offset. */
-        static const int attn_mxfp4 = getenv("DS4_ATTN_MXFP4") != NULL;
-        /* DS4_ATTN_MXFP4=big -> only the two big output-side projections (q_b in=1024,
-         * output_b in=8192), sparing the sensitive latent q_a/kv + shared expert. */
-        static const int attn_mxfp4_big = []{ const char *e = getenv("DS4_ATTN_MXFP4"); return e && !strcmp(e, "big"); }();
-        const bool mxfp4_pick = attn_mxfp4 && (!attn_mxfp4_big || in_dim == 1024 || in_dim == 8192);
-        if (mxfp4_pick && in_dim % 256 == 0) {
-            const mxfp4_weight *m4 = cuda_mxfp4_from_mxfp8(model_map, weight_offset, fbytes, in_dim, out_dim);
-            if (m4) {
-                /* per-token loop (prefill n_tok>1 uses this too, so frontier logits reflect
-                 * MXFP4 attention -> a valid quality signal; slow but only a correctness path). */
-                for (uint64_t t = 0; t < n_tok; t++)
-                    mxfp4_mmvq_kernel<<<((unsigned)out_dim + 7) / 8, 256>>>((float *)out->ptr + t * out_dim,
-                            m4->data, m4->scale, (const float *)x->ptr + t * in_dim, (int)in_dim, (int)out_dim);
-                return cuda_ok(cudaGetLastError(), "mxfp4 attn mmvq");
-            }
-        }
         const unsigned wpb = 8;  /* output rows per block */
         dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
@@ -1239,12 +1025,11 @@ extern "C" int ds4_gpu_matmul_mxfp8_pair_tensor(
     }
     /* Decode fast path: both weights share x and in_dim, so fuse the two
      * de-interleaved mmvq launches into one. Only when both are registered
-     * de-interleavable MXFP8 weights and neither the MXFP4 prototype nor the raw
-     * mmvq fallback is forced; otherwise defer to the per-weight path below. */
+     * de-interleavable MXFP8 weights and the raw mmvq fallback is not forced;
+     * otherwise defer to the per-weight path below. */
     static const int fp8_mmvq_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
-    static const int attn_mxfp4 = getenv("DS4_ATTN_MXFP4") != NULL;
     static const int no_pair_fuse = getenv("DS4_CUDA_NO_MXFP8_PAIR_FUSE") != NULL;
-    if (n_tok == 1 && in_dim % 128 == 0 && !fp8_mmvq_raw && !attn_mxfp4 && !no_pair_fuse &&
+    if (n_tok == 1 && in_dim % 128 == 0 && !fp8_mmvq_raw && !no_pair_fuse &&
         g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes0 = out0_dim * fblocks * 33;
@@ -1358,31 +1143,13 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
-    static const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
-    static const int env_serial_router = getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
-    static const int env_ordered_f16 = getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
-    const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
-    const int serial_router =
-        !serial_f16 &&
-        router_shape &&
-        env_serial_router;
-    /* Decode f16 matmuls default to the coalesced 256-thread matmul_f16_kernel (the
-     * fall-through below): ~+6% decode vs the uncoalesced 32-thread ordered_chunks
-     * kernel. Both are deterministic; the reduction order differs by ~1 ULP, which is
-     * far below this model's run-to-run nondeterminism (float atomics elsewhere). The
-     * exact old order is opt-in via DS4_CUDA_ORDERED_F16_MATMUL. */
-    const int ordered_router =
-        !serial_f16 &&
-        !serial_router &&
-        n_tok == 1u &&
-        env_ordered_f16;
     /* Small batches (spec-decode verify, n_tok 2..4): batched f16 GEMV. One
      * weight-row read serves all tokens and there is no f32->f16 activation
      * convert or tmp alloc; per-token output is bit-identical to the n=1
      * matmul_f16_kernel. DS4_F16_GEMV_MAX_N=1 restores the cuBLAS dispatch. */
     static const int f16_gemv_max_n = []{ const char *e = getenv("DS4_F16_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
-    if (!serial_f16 && n_tok >= 2 && n_tok <= 4 && n_tok <= (uint64_t)f16_gemv_max_n) {
+    if (n_tok >= 2 && n_tok <= 4 && n_tok <= (uint64_t)f16_gemv_max_n) {
         dim3 g((unsigned)out_dim);
         switch (n_tok) {
         case 2: matmul_f16_nt_kernel<2><<<g, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim); break;
@@ -1391,7 +1158,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         }
         return cuda_ok(cudaGetLastError(), "matmul_f16 nt launch");
     }
-    if (!serial_f16 && g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
@@ -1421,14 +1188,6 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cublas_ok(st, "f16 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    if (serial_f16 || serial_router) {
-        matmul_f16_serial_kernel<<<grid, 1>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-        return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
-    }
-    if (ordered_router) {
-        matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-        return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
-    }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
@@ -1445,7 +1204,7 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
     const uint16_t *w = (const uint16_t *)wptr;
-    if (g_cublas_ready && n_tok > 1 && getenv("DS4_CUDA_SERIAL_BF16_MATMUL") == NULL) {
+    if (g_cublas_ready && n_tok > 1) {
         const uint64_t xb_count = n_tok * in_dim;
         uint16_t *xb = (uint16_t *)cuda_tmp_alloc(xb_count * sizeof(uint16_t), "bf16 gemm activations");
         if (!xb) return 0;
@@ -1485,47 +1244,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
         return 0;
     }
-    /* Default: two separate coalesced matmuls (each fast via matmul_f16_kernel). The
-     * fused pair_ordered_chunks kernel is opt-in with the exact old order. */
-    static const int env_no_pair = getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL;
-    static const int env_serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
-    static const int env_serial_router = getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
-    static const int env_ordered_f16 = getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
-    if (n_tok != 1 ||
-        env_no_pair ||
-        env_serial_f16 ||
-        env_serial_router ||
-        !env_ordered_f16) {
-        return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
-                                           in_dim, out_dim, x, n_tok) &&
-               ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
-                                           in_dim, out_dim, x, n_tok);
-    }
-    if (weight0_offset > model_size || weight1_offset > model_size ||
-        out_dim > UINT64_MAX / in_dim) {
-        return 0;
-    }
-    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
-    if (weight_bytes > model_size - weight0_offset ||
-        weight_bytes > model_size - weight1_offset ||
-        x->bytes < in_dim * sizeof(float) ||
-        out0->bytes < out_dim * sizeof(float) ||
-        out1->bytes < out_dim * sizeof(float)) {
-        return 0;
-    }
-    const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
-    const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
-    if (!w0 || !w1) return 0;
-    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
-        (float *)out0->ptr,
-        (float *)out1->ptr,
-        w0,
-        w1,
-        (const float *)x->ptr,
-        in_dim,
-        out_dim,
-        out_dim);
-    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+    /* Two separate coalesced matmuls (each fast via matmul_f16_kernel). */
+    return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
+                                       in_dim, out_dim, x, n_tok) &&
+           ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
+                                       in_dim, out_dim, x, n_tok);
 }
 
 
