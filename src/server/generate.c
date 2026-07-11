@@ -449,6 +449,40 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
     free(visible);
 }
 
+/* Tool-call finish WITH thinking on: the model emitted <think>reasoning</think>
+ * before the DSML tool call, so the reasoning tokens sit in the live KV. The
+ * client replays this turn with the reasoning stripped (<think></think>), so the
+ * exact-DSML-replay shortcut no longer aligns and every follow-up re-prefills the
+ * whole conversation. Fix it like the toolless thinking path: remember the
+ * thinking-STRIPPED bytes the next request will render as a key, but keep the
+ * live tokens (reasoning included) as the sampled frontier. The next request then
+ * byte-matches the key and continues from live KV — no rewrite, no rebuild. */
+static void remember_tool_thinking_checkpoint(server *s, const job *j, const char *ctx,
+                                              uint64_t trace_id, const char *content,
+                                              const tool_calls *calls) {
+    if (!calls || calls->len == 0 || !j->req.prompt_text) return;
+    if (!ds4_think_mode_enabled(j->req.think_mode)) return;
+
+    /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + empty-reasoning
+     * suffix "</think>{content}{DSML}<EOS>" — exactly what render_chat_prompt_text
+     * emits for this tool turn on the next request (reasoning dropped). */
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix);
+    if (visible.ptr) {
+        thinking_live_remember(s, visible.ptr);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
+                   ctx, ds4_session_pos(s->session), visible.len);
+        trace_event(s, trace_id,
+                    "tool thinking checkpoint remembered: live=%d visible=%zu",
+                    ds4_session_pos(s->session), visible.len);
+    }
+    free(suffix);
+    buf_free(&visible);
+}
+
 
 
 /* After a successful tool-call finish, make the live checkpoint match what the
@@ -1551,6 +1585,18 @@ decode_again:
     }
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+        j->req.api != API_RESPONSES &&
+        ds4_think_mode_enabled(j->req.think_mode))
+    {
+        /* Tool call with thinking on: the reasoning is in the live KV but the
+         * client replays the turn stripped, so exact-DSML replay and
+         * canonicalization both fail (the latter can only re-prefill). Remember
+         * the stripped bytes as a key and keep the live tokens — the next
+         * request continues from live KV with no rebuild. */
+        remember_tool_thinking_checkpoint(s, j, ctx_span, trace_id,
+                                          parsed_content ? parsed_content : "",
+                                          &parsed_calls);
+    } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
