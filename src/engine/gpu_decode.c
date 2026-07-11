@@ -41,9 +41,7 @@ static bool gpu_graph_use_reference_hc_norm_decode(void) {
 
 
 bool gpu_graph_enable_batch_hc_norm_fusion(void) {
-    static int cache = -1;
-    return !gpu_graph_use_reference_hc_norm_decode() &&
-           gpu_graph_env_flag("DS4_CUDA_ENABLE_BATCH_HC_NORM_FUSION", &cache);
+    return !gpu_graph_use_reference_hc_norm_decode();
 }
 
 
