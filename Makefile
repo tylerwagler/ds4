@@ -30,7 +30,7 @@ SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 CUTLASS_CUDA_OBJS = src/cuda/ds4_mxfp4_cutlass.o
 CUDA_SRCS = $(filter-out src/cuda/ds4_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
-LIB_HDRS = src/lib/ds4_help.h src/lib/ds4_kvstore.h src/lib/ds4_web.h
+LIB_HDRS = src/lib/ds4_help.h src/lib/ds4_kvstore.h
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
@@ -73,7 +73,7 @@ ds4-bench: src/cli/ds4_bench.o src/lib/ds4_help.o $(CORE_OBJS)
 ds4-eval: src/cli/ds4_eval.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_web.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
+ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
@@ -120,8 +120,8 @@ tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CU
 ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
-ds4_agent_test: tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_web.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_web.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
+ds4_agent_test: tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
 test: ds4_test ds4_agent_test ds4-eval
 	./ds4-eval --self-test-extractors

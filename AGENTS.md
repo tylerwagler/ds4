@@ -52,7 +52,7 @@ Public headers: `src/ds4.h` (engine API) and `src/ds4_gpu.h` (GPU graph API).
 - `src/agent/` — 20 TUs + `ds4_agent_internal.h`: native coding agent (tools,
   terminal UI, sessions, compaction).
 - `src/cli/` — `ds4_cli.c`, `ds4_bench.c`, `ds4_eval.c` entry points.
-- `src/lib/` — shared pieces: help text, kvstore, web fetch.
+- `src/lib/` — shared pieces: help text, kvstore.
 - `src/vendor/` — linenoise, rax.
 - `tests/` — C runners; `ds4_test.c` and `ds4_agent_test.c` are unity builds
   that `#include` the server/agent source lists.
@@ -69,7 +69,7 @@ Everything else stays `static`. The cross-module surface is `src/ds4.h`,
 
 ```sh
 git submodule update --init cutlass   # once
-make cuda-spark          # DGX Spark / GB10 (no explicit -arch; fastest on GB10)
+make cuda-spark          # DGX Spark / GB10 (CUDA_ARCH=sm_120f)
 make cuda-generic        # other local CUDA GPUs (CUDA_ARCH=native)
 make cuda CUDA_ARCH=sm_N # explicit -arch, e.g. cross-builds
 ```
@@ -88,8 +88,6 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 - `./ds4_test --logprob-vectors` compares against official-API vectors and
   pins `DS4_CUDA_PREFILL_CHUNK=2048`.
 - imatrix collection (`--imatrix-dataset` / `--imatrix-out`) requires `--cuda`.
-- GPU/CPU cross-check diagnostics: `--gpu-graph-test`, `--gpu-graph-full-test`,
-  `--gpu-graph-prompt-test`.
 
 ## Validation Culture
 
@@ -136,4 +134,3 @@ Also: `DS4_FP8_NO_MXCORE`, `DS4_TEST_MODEL`, `DS4_LOCK_FILE`, `DS4_GGUF_DIR`
 
 - Real packed FP8 KV-cache storage (replace the fake-quant f32 path).
 - Move MoE decode off Q8_K activation quantization.
-- Eventually strip the CPU inference path entirely.

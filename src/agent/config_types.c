@@ -33,13 +33,6 @@ void agent_trace_text(agent_worker *w, const char *label,
 void agent_publish_system_status(agent_worker *w, const char *msg);
 
 
-int agent_web_confirm(void *privdata, const char *message,
-                             char *err, size_t err_len);
-
-
-void agent_web_log(void *privdata, const char *message);
-
-
 bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 

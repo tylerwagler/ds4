@@ -12,7 +12,6 @@
 #include "../src/agent/session_ui.c"
 #include "../src/agent/file_tools.c"
 #include "../src/agent/edit_tools.c"
-#include "../src/agent/web_tools.c"
 #include "../src/agent/bash_jobs.c"
 #include "../src/agent/tool_dispatch.c"
 #include "../src/agent/compaction.c"

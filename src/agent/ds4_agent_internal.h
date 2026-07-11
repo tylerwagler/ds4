@@ -7,7 +7,6 @@
 #include "ds4.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
-#include "ds4_web.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -81,17 +80,6 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 #define AGENT_COMPACT_SUMMARY_MAX_TOKENS 4096
 
 
-/* ============================================================================
- * Browser Web Tools
- * ============================================================================
- *
- * The browser subsystem lives in ds4_web.c: it owns visible Chrome and CDP.  The
- * agent side only asks for permission, dispatches tools, and caps visit_page
- * output using the same "head plus temp file" shape as bash.
- */
-
-#define AGENT_WEB_HEAD_BYTES (8*1024)
-#define AGENT_WEB_HEAD_LINES 100
 
 
 /* ============================================================================
@@ -214,12 +202,6 @@ typedef struct {
     char *out;
     size_t out_len;
     size_t out_cap;
-    ds4_web *web;
-    bool web_approval_pending;
-    bool web_approval_answered;
-    bool web_approval_result;
-    char web_approval_message[256];
-    char web_approval_error[160];
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -669,14 +651,6 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
 void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out);
 void agent_publish_system_status(agent_worker *w, const char *msg);
 void agent_publishf_system_status(agent_worker *w, const char *fmt, ...);
-int agent_web_confirm(void *privdata, const char *message,
-                             char *err, size_t err_len);
-void agent_web_log(void *privdata, const char *message);
-bool agent_web_cancel(void *privdata);
-bool worker_take_web_approval_request(agent_worker *w,
-                                             char *message, size_t message_len);
-void worker_answer_web_approval(agent_worker *w, bool allow,
-                                       const char *deny_error);
 char *worker_request_queued_user_drain(agent_worker *w);
 bool worker_take_queued_user_drain_request(agent_worker *w);
 void worker_answer_queued_user_drain(agent_worker *w, char *text);
@@ -745,8 +719,6 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
 char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
-char *agent_tool_google_search(agent_worker *w, const agent_tool_call *call);
-char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call);
 void agent_bash_jobs_free(agent_worker *w);
 agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid);
 void agent_bash_remove_job(agent_worker *w, agent_bash_job *target);

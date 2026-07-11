@@ -322,33 +322,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             continue;
         }
 
-        char web_approval_msg[256];
-        if (worker_take_web_approval_request(&worker, web_approval_msg,
-                                             sizeof(web_approval_msg)))
-        {
-            char *saved_input = NULL;
-            if (editor.active && editor.edit.buf && editor.edit.len)
-                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
-            editor_stop(&editor);
-            editor_restore_terminal_layout(&editor);
-            agent_yes_no_options approval_opts = {
-                .timeout_sec = 30,
-                .timeout_answer = AGENT_YES_NO_AUTO_NO,
-            };
-            bool approval_timed_out = false;
-            bool allow = agent_prompt_yes_no_ex(web_approval_msg,
-                                                &approval_opts,
-                                                &approval_timed_out);
-            worker_answer_web_approval(&worker, allow,
-                approval_timed_out ? "Chrome browser start approval timed out" : NULL);
-            worker_get_status(&worker, &st);
-            build_prompt_text(&st, prompt, sizeof(prompt));
-            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
-            editor_start(&editor, prompt, statusline, saved_input);
-            free(saved_input);
-            continue;
-        }
 
         if (initial_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {

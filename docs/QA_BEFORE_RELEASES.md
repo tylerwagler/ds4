@@ -107,10 +107,6 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Bash tools:
   test short output, large output truncation, non-zero exit output, long-running
   jobs, `bash_status`, and `bash_stop`.
-- Web tools:
-  `google_search` and `visit_page` should ask for visible Chrome approval with
-  timeout, open pages without stealing focus when possible, extract Markdown,
-  close tabs, and handle consent/privacy walls as tool errors the model can see.
 - TUI:
   test multiline prompt editing, history navigation, queued prompt display,
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,

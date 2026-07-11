@@ -1233,17 +1233,6 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
                 w->cache_dir, strerror(errno));
         return -1;
     }
-    ds4_web_config web_cfg = {
-        .home_dir = getenv("HOME"),
-        .port = 9333,
-        .confirm = agent_web_confirm,
-        .confirm_privdata = w,
-        .log = agent_web_log,
-        .log_privdata = w,
-        .cancel = agent_web_cancel,
-        .cancel_privdata = w,
-    };
-    w->web = ds4_web_create(&web_cfg);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -1265,7 +1254,6 @@ void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
-    ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     free(w->cache_dir);

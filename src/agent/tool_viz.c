@@ -106,8 +106,6 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "write")) return "write ";
     if (!strcmp(name, "edit")) return "edit ";
     if (!strcmp(name, "search")) return "search ";
-    if (!strcmp(name, "google_search")) return "google ";
-    if (!strcmp(name, "visit_page")) return "visit ";
     return NULL;
 }
 
