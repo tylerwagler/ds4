@@ -409,6 +409,45 @@ __global__ static void pack_fp8_kv_kernel(const float *x, uint8_t *packed, float
     }
 }
 
+/* Fused decode KV store: fake-quant the nope dims of the single kv row IN
+ * PLACE (same 64-thread block, same reduction and scale math as
+ * fp8_kv_quantize_kernel -> bit-identical values land in x), and write the
+ * whole row into the raw cache with store_raw_kv_batch_kernel's exact
+ * __float2half roundtrip semantics. One launch instead of two per layer per
+ * decode token. */
+__global__ static void fp8_kv_quantize_store_kernel(
+        float *x, float *raw, uint32_t raw_cap, uint32_t pos,
+        uint32_t head_dim, uint32_t n_rot, int raw_f16) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t row = pos % raw_cap;
+    __shared__ float scratch[64];
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + tid < n_nope) v = x[off + tid];
+        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        if (off + tid < n_nope) {
+            float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
+            x[off + tid] = q;
+            const __half h = __float2half(q);
+            if (raw_f16) ((__half *)raw)[(uint64_t)row * head_dim + off + tid] = h;
+            else         raw[(uint64_t)row * head_dim + off + tid] = __half2float(h);
+        }
+        __syncthreads();
+    }
+    for (uint32_t d = n_nope + tid; d < head_dim; d += 64) {
+        const __half h = __float2half(x[d]);
+        if (raw_f16) ((__half *)raw)[(uint64_t)row * head_dim + d] = h;
+        else         raw[(uint64_t)row * head_dim + d] = __half2float(h);
+    }
+}
+
 __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
@@ -1242,8 +1281,12 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot,
         uint32_t          raw_f16) {
-    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
-           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim, raw_f16);
+    if (!kv || !raw_cache || raw_cap == 0 || head_dim == 0 || n_rot > head_dim ||
+        raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
+        kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    fp8_kv_quantize_store_kernel<<<1, 64>>>((float *)kv->ptr, (float *)raw_cache->ptr,
+                                            raw_cap, raw_row, head_dim, n_rot, (int)raw_f16);
+    return cuda_ok(cudaGetLastError(), "fp8_kv_quantize_store launch");
 }
 
 
