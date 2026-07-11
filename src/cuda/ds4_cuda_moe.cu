@@ -2662,6 +2662,46 @@ static int routed_moe_launch(
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
     if (gate_type == 40u && down_type == 40u) {
+        /* Decode (n=1) takes the same direct fp4 GEMV as small verify batches:
+         * 4 launches with no host round-trip, vs the grouped path's BLOCKING
+         * per-layer offsets readback -- required for CUDA graph capture of the
+         * decode tape, and computes the exact same function (see the batch
+         * path's comment; bit-exact oracle in temp/fp4gemv_test.cu covers
+         * n_tokens>=1). DS4_MOE_FP4_GEMV=0 restores the grouped dispatch. */
+        static int fp4_gemv = -1;
+        if (fp4_gemv < 0) {
+            const char *e = getenv("DS4_MOE_FP4_GEMV");
+            fp4_gemv = !(e && e[0] == '0');
+        }
+        if (fp4_gemv &&
+            mid && mid->ptr && down && down->ptr && out && out->ptr &&
+            selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
+            mid->bytes >= (uint64_t)n_expert * expert_mid_dim * sizeof(float) &&
+            down->bytes >= (uint64_t)n_expert * out_dim * sizeof(float) &&
+            out->bytes >= (uint64_t)out_dim * sizeof(float) &&
+            selected->bytes >= (uint64_t)n_expert * sizeof(int32_t) &&
+            weights->bytes >= (uint64_t)n_expert * sizeof(float) &&
+            x->bytes >= (uint64_t)expert_in_dim * sizeof(float)) {
+            const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
+            const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
+            const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
+            const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
+            const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
+            if (gate_w && up_w && down_w &&
+                ds4_cutlass_expert_ffn_gemv_small(
+                        (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
+                        (const int32_t *)selected->ptr, (const float *)weights->ptr,
+                        (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
+                        gate_expert_bytes, gate_row_bytes,
+                        down_expert_bytes, down_row_bytes,
+                        clamp, 1, (int)n_expert, n_total_expert,
+                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim) == 0) {
+                moe_sum_kernel<<<(uint32_t)((out_dim + 255u) / 256u), 256>>>(
+                        (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, 1u);
+                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 1;
+            }
+            /* any failure: fall through to the grouped CUTLASS path */
+        }
         return routed_moe_launch_cutlass(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,

@@ -715,7 +715,8 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
     if (ws) {
         float al = 1.f, be = 0.f;
         cublasStatus_t st = cublasLtMatmul(g_cublaslt, e->op, &al, w->data, e->la, xq, e->lb, &be,
-                                           out->ptr, e->ld, out->ptr, e->ld, &e->h.algo, ws, wz, 0);
+                                           out->ptr, e->ld, out->ptr, e->ld, &e->h.algo, ws, wz,
+                                           cudaStreamPerThread);
         ok = (st == CUBLAS_STATUS_SUCCESS);
         if (!ok) fprintf(stderr, "ds4: cuBLASLt MXFP8 matmul failed: status %d\n", (int)st);
     }
@@ -808,7 +809,8 @@ static int cuda_attention_output_a_mx_gemm(
             cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &bs, sizeof(bs));
             float al = 1.f, be = 0.f;
             cublasStatus_t st = cublasLtMatmul(g_cublaslt, op, &al, ag, la, bg, lb, &be,
-                                               dg, ld, dg, ld, &h.algo, ws, wz, 0);
+                                               dg, ld, dg, ld, &h.algo, ws, wz,
+                                               cudaStreamPerThread);
             ok = (st == CUBLAS_STATUS_SUCCESS);
             if (!ok) fprintf(stderr, "ds4: cuBLASLt attn_out_a MXFP8 matmul failed: status %d\n", (int)st);
         }

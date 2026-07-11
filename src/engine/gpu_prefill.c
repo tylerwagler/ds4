@@ -2341,10 +2341,15 @@ bool gpu_graph_eval_token_raw_swa(
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = gpu_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    const int captured = ds4_gpu_decode_graph_begin();
+    bool ok = captured != 0 || ds4_gpu_begin_commands() != 0;
+    /* The split-flush prefix overlap is a direct-submission latency trick; a
+     * mid-tape device sync is illegal during graph capture (and unnecessary:
+     * the graph replays the whole tape in one launch). */
+    if (ok) ok = gpu_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL,
+                                                !captured);
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) ok = (captured ? ds4_gpu_decode_graph_end() : ds4_gpu_end_commands()) != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits) {
