@@ -21,21 +21,35 @@ static ssize_t header_end(const char *p, size_t n) {
 
 
 
+/* Body length from the request headers. Returns -1 (reject) on a duplicate
+ * Content-Length, a non-numeric value, or any Transfer-Encoding header: each
+ * connection is Connection: close today so smuggling is only latent, but the
+ * framing must stay unambiguous if keep-alive is ever added. */
 static long content_length(const char *h, size_t n) {
     const char *p = h, *end = h + n;
+    long clen = 0;
+    int seen = 0;
     while (p < end) {
         const char *line = p;
         while (p < end && *p != '\n') p++;
         size_t len = (size_t)(p - line);
         if (len && line[len - 1] == '\r') len--;
+        if (len >= 18 && strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+            return -1;
+        }
         if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
             const char *v = line + 15;
             while (v < line + len && isspace((unsigned char)*v)) v++;
-            return strtol(v, NULL, 10);
+            char *vend = NULL;
+            long parsed = strtol(v, &vend, 10);
+            if (vend == v || parsed < 0) return -1;
+            if (seen && parsed != clen) return -1;
+            seen = 1;
+            clen = parsed;
         }
         if (p < end) p++;
     }
-    return 0;
+    return clen;
 }
 
 

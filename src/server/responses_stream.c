@@ -9,12 +9,9 @@ static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
     unsigned char bytes[12];
     size_t pos = snprintf(dst, dstlen, "%s", prefix);
     if (pos >= dstlen) return;
-    static uint64_t fallback_ctr;
     if (!random_bytes(bytes, sizeof(bytes))) {
-        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
-        uint64_t b = ++fallback_ctr ^ (uint64_t)(uintptr_t)dst;
-        memcpy(bytes, &a, sizeof(a));
-        memcpy(bytes + sizeof(a), &b, sizeof(uint32_t));
+        /* Fail closed like random_tool_id: ids must not be predictable. */
+        ds4_die("random_bytes failed; cannot generate response ids");
     }
     static const char hex[] = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {

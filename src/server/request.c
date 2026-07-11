@@ -3,17 +3,16 @@
 
 
 void random_tool_id(char *dst, size_t dstlen, api_style api) {
-    static uint64_t fallback_ctr;
     unsigned char bytes[16];
     const char *prefix = api == API_ANTHROPIC ? "toolu_" : "call_";
     size_t pos = snprintf(dst, dstlen, "%s", prefix);
     if (pos >= dstlen) return;
 
     if (!random_bytes(bytes, sizeof(bytes))) {
-        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
-        uint64_t b = ++fallback_ctr ^ (uint64_t)(uintptr_t)dst;
-        memcpy(bytes, &a, sizeof(a));
-        memcpy(bytes + sizeof(a), &b, sizeof(b));
+        /* Fail closed: tool-call IDs must not be predictable, and with
+         * getrandom() + /dev/urandom both unavailable something is deeply
+         * wrong with the host. */
+        ds4_die("random_bytes failed; cannot generate tool-call ids");
     }
 
     static const char hex[] = "0123456789abcdef";

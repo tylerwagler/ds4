@@ -457,6 +457,13 @@ void model_open(ds4_model *m, const char *path, bool gpu_mapping,
 
     if (m->version != 3) ds4_die("only GGUF v3 is supported");
 
+    /* Sanity-cap the 64-bit header counts before they size calloc()s: every
+     * metadata entry and tensor record needs well over 24 bytes of file, so
+     * counts beyond size/24 can only come from a corrupt or hostile header. */
+    if (m->n_kv > m->size / 24 || m->n_tensors > m->size / 24) {
+        ds4_die("GGUF header kv/tensor counts exceed what the file could hold");
+    }
+
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 

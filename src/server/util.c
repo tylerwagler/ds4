@@ -1,5 +1,7 @@
 #include "ds4_server_internal.h"
 
+#include <sys/random.h>
+
 
 volatile sig_atomic_t g_stop_requested = 0;
 
@@ -54,6 +56,16 @@ char *xstrdup(const char *s) {
 
 bool random_bytes(void *dst, size_t len) {
     unsigned char *p = dst;
+    /* getrandom() has no fd/chroot failure modes; /dev/urandom stays as the
+     * fallback for kernels without the syscall. */
+    while (len) {
+        ssize_t n = getrandom(p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) break;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    if (len == 0) return true;
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return false;
     while (len) {

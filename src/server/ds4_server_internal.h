@@ -695,6 +695,7 @@ void *server_xmalloc(size_t n);
 void *server_xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
+void ds4_die(const char *msg); /* engine util.c; aborts the process */
 char *xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
