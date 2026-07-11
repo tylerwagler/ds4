@@ -773,31 +773,68 @@ static int cuda_attention_output_a_mx_gemm(
     __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)scratch;
     unsigned char *sx = (unsigned char *)(scratch + off_sx);
     void *ws = scratch + off_ws;
-    cudaMemset(sx, 0, scale_bytes);
+    cudaMemsetAsync(sx, 0, scale_bytes, 0);
     int warps = (int)n_tokens * (int)n_groups * (int)KB;
     mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
             (const float *)heads->ptr, (int)n_tokens, (int)n_groups,
             (int)group_dim, KBp, xq, sx, x_scale_slab);
     if (!cuda_ok(cudaGetLastError(), "attn_out_a act quant")) return 0;
-    cublasLtMatmulDesc_t op; if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
-    cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
-    cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
-    cublasLtMatrixLayout_t la, lb, ld;
-    cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, group_dim, rank, group_dim);
-    cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
-    cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, rank, n_tokens, low_dim);
-    cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
-    cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
-    cublasLtMatmulHeuristicResult_t h; int got = 0;
-    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, op, la, lb, ld, ld, pf, 1, &h, &got);
+    /* Same shape-keyed handle/algo cache as the main MXFP8 GEMM above (and
+     * the same gotcha: the heuristic must see scale pointers on the desc or
+     * it picks a non-MX algo). The per-group loop swaps only scale pointers,
+     * which is already cache-shaped. */
+    struct lt_group_cache {
+        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int valid;
+        cublasLtMatmulDesc_t op;
+        cublasLtMatrixLayout_t la, lb, ld;
+        cublasLtMatmulHeuristicResult_t h;
+    };
+    static lt_group_cache cache[8];
+    static int cache_next;
+    lt_group_cache *e = NULL;
+    for (int i = 0; i < 8; i++) {
+        if (cache[i].valid && cache[i].group_dim == group_dim && cache[i].rank == rank &&
+            cache[i].n_groups == n_groups && cache[i].ntok == (int)n_tokens) { e = &cache[i]; break; }
+    }
+    if (!e) {
+        lt_group_cache ne = {};
+        ne.group_dim = group_dim; ne.rank = rank; ne.n_groups = n_groups; ne.ntok = (int)n_tokens;
+        if (cublasLtMatmulDescCreate(&ne.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
+        cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+        cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
+        cublasLtMatrixLayoutCreate(&ne.la, CUDA_R_8F_E4M3, group_dim, rank, group_dim);
+        cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
+        cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
+        cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
+        cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        int got = 0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &ne.h, &got);
+        cublasLtMatmulPreferenceDestroy(pf);
+        if (hs != CUBLAS_STATUS_SUCCESS || !got) {
+            cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb);
+            cublasLtMatrixLayoutDestroy(ne.ld); cublasLtMatmulDescDestroy(ne.op);
+            return 0;
+        }
+        ne.valid = 1;
+        e = &cache[cache_next];
+        cache_next = (cache_next + 1) & 7;
+        if (e->valid) {
+            cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb);
+            cublasLtMatrixLayoutDestroy(e->ld); cublasLtMatmulDescDestroy(e->op);
+        }
+        *e = ne;
+    }
+    cublasLtMatmulDesc_t op = e->op;
+    cublasLtMatrixLayout_t la = e->la, lb = e->lb, ld = e->ld;
+    cublasLtMatmulHeuristicResult_t h = e->h;
     int ok = 0;
-    if (hs == CUBLAS_STATUS_SUCCESS && got && ws) {
+    if (ws) {
         ok = 1;
         for (uint32_t g = 0; g < n_groups && ok; g++) {
             const __nv_fp8_e4m3 *ag = w->data + (size_t)g * rank * group_dim;
@@ -815,9 +852,6 @@ static int cuda_attention_output_a_mx_gemm(
             if (!ok) fprintf(stderr, "ds4: cuBLASLt attn_out_a MXFP8 matmul failed: status %d\n", (int)st);
         }
     }
-    cublasLtMatmulPreferenceDestroy(pf);
-    cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(ld);
-    cublasLtMatmulDescDestroy(op);
     return ok;
 }
 
