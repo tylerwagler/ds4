@@ -83,6 +83,12 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 - `make test` runs `./ds4-eval --self-test-extractors`, `./ds4_agent_test`,
   and `./ds4_test`. The eval self-test and agent test need no model;
   `ds4_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`).
+- `ds4_test` distinguishes **gating** internal-correctness tests (any failure
+  fails the suite) from **informational** ones: `logprob-vectors` compares
+  the 2-bit production model against full-precision official-API logprobs (a
+  drift dashboard, expected mismatches), and `think-tool-recovery` is
+  run-to-run flaky from the nondeterministic batched-prefill float-atomic
+  down-sum. Informational mismatches are reported but exit 0.
 - `make cuda-regression` runs `tests/cuda_long_context_smoke`: GPU kernel
   smoke tests, no model required.
 - `./ds4_test --logprob-vectors` compares against official-API vectors and
