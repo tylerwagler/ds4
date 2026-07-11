@@ -12,7 +12,9 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -465,6 +467,17 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     return true;
 }
 
+/* "<name>.tmp.<pid>" left by a store that never reached rename().  Reclaim it
+ * once the writing process is gone; a live pid means a save is in flight. */
+static bool kv_cache_tmp_is_orphan(const char *name) {
+    const char *tag = strstr(name, ".tmp.");
+    if (!tag || !tag[5]) return false;
+    char *end = NULL;
+    long pid = strtol(tag + 5, &end, 10);
+    if (end == tag + 5 || *end != '\0' || pid <= 0) return true;
+    return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+}
+
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
     ds4_kvstore_clear(kc);
@@ -473,7 +486,18 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
-        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) {
+            if (kv_cache_tmp_is_orphan(de->d_name)) {
+                char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
+                if (unlink(path) == 0) {
+                    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                            "%s: kv cache removed orphaned temp file %s",
+                            kv_log_name(kc), de->d_name);
+                }
+                free(path);
+            }
+            continue;
+        }
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
         ds4_kvstore_entry e = {0};
         if (ds4_kvstore_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
@@ -1088,7 +1112,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
               ds4_session_write_staged_payload(&staged, fp,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
-              fflush(fp) == 0;
+              fflush(fp) == 0 &&
+              /* fsync before the atomic rename: without it a crash can leave
+               * a zero/partial .kv visible under the final name. */
+              fsync(fileno(fp)) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -1107,6 +1134,21 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     if (ok && rename(tmp, path) != 0) {
         saved_errno = errno;
         ok = false;
+    }
+    if (ok) {
+        /* Persist the rename itself: fsync the containing directory so the
+         * new entry survives a crash. Best-effort (some filesystems reject
+         * directory fsync); the file contents are already durable above. */
+        char *slash = strrchr(path, '/');
+        if (slash && slash != path) {
+            *slash = '\0';
+            int dfd = open(path, O_RDONLY | O_DIRECTORY);
+            *slash = '/';
+            if (dfd >= 0) {
+                (void)fsync(dfd);
+                close(dfd);
+            }
+        }
     }
     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
     if (!ok) {

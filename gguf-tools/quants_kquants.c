@@ -160,7 +160,10 @@ static int ds4q_iq2_compare_func(const void *left, const void *right) {
  *
  * The grid is tiny, but not every possible 2-bit 8-tuple is allowed.  During
  * initialization we build the direct map for allowed tuples and a nearest-grid
- * list for the missing ones, matching the GGML search exactly.
+ * list for the missing ones; the tables match GGML's exactly.  The per-group
+ * scale sweep below is NOT byte-identical to llama.cpp's IQ2_XXS search, so
+ * quantized output differs from llama.cpp (fine for this fork's private
+ * format, but do not expect byte parity).
  */
 void ds4q_iq2_xxs_init(void) {
     if (ds4q_iq2_xxs_data.grid) return;

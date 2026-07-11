@@ -4,9 +4,13 @@
 /*
  * Narrow quantization API used by the DS4 GGUF writer.
  *
- * The enum values intentionally match GGUF/GGML type IDs so template metadata
- * can be copied without translation.  Only the formats used by the DS4 Flash
- * quantization recipes are implemented as output targets.
+ * The enum values reuse the GGUF/GGML type-ID numbering so template metadata
+ * can be copied without translation, but this is a PRIVATE fork namespace:
+ * most IDs (MXFP8, MXFP4, CUTLASS_MXFP4, ...) do not exist upstream, and even
+ * the shared ones are written with DS4-specific layouts.  Files produced by
+ * these tools load ONLY in the DwarfStar engine, not in llama.cpp/GGML.
+ * Only the formats used by the DS4 Flash quantization recipes are implemented
+ * as output targets.
  */
 
 #include <stdbool.h>

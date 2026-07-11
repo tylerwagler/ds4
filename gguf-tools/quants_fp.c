@@ -1,5 +1,20 @@
 #include "quants_internal.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
+/* A NaN weight means the source tensor is corrupt; encoding it (E4M3 NaN or
+ * a garbage E2M1 pick) would poison inference far from the cause. Die loudly
+ * at quantization time instead. */
+static void ds4q_reject_nan(const float *x, int n, const char *what) {
+    for (int j = 0; j < n; j++) {
+        if (x[j] != x[j]) {
+            fprintf(stderr, "ds4-quantize: NaN weight in %s input block; source tensor is corrupt\n", what);
+            exit(1);
+        }
+    }
+}
+
 /* ---- MXFP8: E4M3 values + per-32 E8M0 block scale; block = 33 B / 32 elems
  * (8.25 bpw). byte[0] = E8M0 scale (value = 2^(b-127)); byte[1..32] = E4M3.
  * Hardware-native on Blackwell MX tensor cores (cuBLASLt VEC32_UE8M0). For the
@@ -45,10 +60,13 @@ size_t ds4q_quantize_fp8_e4m3(const float *src, void *dst, int64_t start,
     const int64_t nblocks = nrows * (ncols / qk);
     for (int64_t b = 0; b < nblocks; b++) {
         const float *x = src + start + (size_t)b * qk;
+        ds4q_reject_nan(x, (int)qk, "MXFP8");
         float amax = 0.0f;
         for (int j = 0; j < qk; j++) { float av = fabsf(x[j]); if (av > amax) amax = av; }
         int scale_exp = -127;
         if (amax > 0.0f) { int e; frexpf(amax, &e); scale_exp = (e - 1) - 7; } /* max elem -> [128,256) */
+        /* Clamp keeps the E8M0 byte <= 254: 255 would bitcast to +Inf in the
+         * engine's ldexp/bit-shift scale decode. */
         if (scale_exp < -127) scale_exp = -127;
         if (scale_exp >  127) scale_exp =  127;
         out[0] = (uint8_t)(scale_exp + 127);            /* E8M0 */
@@ -99,10 +117,12 @@ size_t ds4q_quantize_mxfp4(const float *src, void *dst, int64_t start,
     const int64_t nblocks = nrows * (ncols / qk);
     for (int64_t b = 0; b < nblocks; b++) {
         const float *x = src + start + (size_t)b * qk;
+        ds4q_reject_nan(x, (int)qk, "MXFP4");
         float amax = 0.0f;
         for (int j = 0; j < qk; j++) { float av = fabsf(x[j]); if (av > amax) amax = av; }
         int scale_exp = -127;
         if (amax > 0.0f) scale_exp = (int)ceilf(log2f(amax / 6.0f));
+        /* Same E8M0 <= 254 invariant as the MXFP8 writer above. */
         if (scale_exp < -127) scale_exp = -127;
         if (scale_exp >  127) scale_exp =  127;
         out[0] = (uint8_t)(scale_exp + 127);

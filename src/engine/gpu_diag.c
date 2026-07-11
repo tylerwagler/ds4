@@ -374,6 +374,7 @@ bool gpu_graph_alloc_raw_cap(
             fprintf(stderr,
                     "ds4: DS4_IDX_FP4 requires indexer head_dim 128 (model has %u)\n",
                     DS4_N_INDEXER_HEAD_DIM);
+            gpu_graph_free(g);
             return false;
         }
         /* f32 emit/repack staging for the packed indexer cache: comp-cap rows so

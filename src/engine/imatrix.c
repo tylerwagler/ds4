@@ -243,6 +243,15 @@ static void gpu_graph_report_prefill_display_progress(
  * f32 h0[n*4096], f32 h1[...], f32 h2[...]} -- and clear the arm flag. Records
  * with start==0 mark request boundaries for the trainer. Failure paths clear
  * the arm without writing so the verify batch path never sees a stale arm. */
+static FILE *g_dspark_bulk_dump;
+
+static void dspark_bulk_dump_close(void) {
+    if (g_dspark_bulk_dump) {
+        fclose(g_dspark_bulk_dump);
+        g_dspark_bulk_dump = NULL;
+    }
+}
+
 static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
                               uint32_t start, uint32_t n, bool ok) {
     if (!g->dspark_bulk_n) return;
@@ -286,8 +295,14 @@ static void dspark_bulk_drain(ds4_gpu_graph *g, const token_vec *prompt,
     if (!path || !path[0] || !g->dspark_bulk_h[0]) return;
     static FILE *f = NULL;
     static float *host = NULL;
-    if (!f) f = fopen(path, "wb");
+    if (!f) {
+        f = fopen(path, "wb");
+        /* Process-lifetime debug stream: close it at exit so the final
+         * buffered record is not lost if a caller skips the fflush below. */
+        if (f) atexit(dspark_bulk_dump_close);
+    }
     if (!f) return;
+    g_dspark_bulk_dump = f;
     if (!host) host = xmalloc((size_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
     uint32_t hdr[2] = { cap_n, start };
     fwrite(hdr, sizeof(uint32_t), 2, f);
