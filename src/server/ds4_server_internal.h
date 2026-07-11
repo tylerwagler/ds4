@@ -271,6 +271,10 @@ typedef struct {
     int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
+    /* tool_choice="required": force a tool call. The prompt is prefilled into an
+     * open DSML tool_calls block (thinking skipped) and generate_job seeds the
+     * output with the opener so the model must complete an invoke. */
+    bool force_tool_call;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the

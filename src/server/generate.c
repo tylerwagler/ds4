@@ -1069,6 +1069,21 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
+    /* tool_choice="required": the prompt was prefilled into an open DSML
+     * tool_calls block (thinking skipped: prompt ends "</think>\n\n<tool_calls>").
+     * Seed the output with that exact prefix — including the closing </think> so
+     * the (thinking-mode) parser sees reasoning end and a complete tool block —
+     * and prime the trackers to "inside tool call"; the model now generates only
+     * the invoke body. */
+    if (j->req.kind == REQ_CHAT && j->req.force_tool_call) {
+        buf_puts(&text, "</think>\n\n" DS4_TOOL_CALLS_START "\n");
+        saw_tool_start = true;
+        tool_scan_waiting_for_think_close = false;
+        dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
+        tool_scan_from = text.len;
+        plain_stream_pos = text.len;
+    }
+
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
@@ -1586,7 +1601,8 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        ds4_think_mode_enabled(j->req.think_mode))
+        ds4_think_mode_enabled(j->req.think_mode) &&
+        !j->req.force_tool_call)
     {
         /* Tool call with thinking on: the reasoning is in the live KV but the
          * client replays the turn stripped, so exact-DSML replay and

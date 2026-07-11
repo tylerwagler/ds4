@@ -12,6 +12,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
+    bool tool_choice_required = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
@@ -54,6 +55,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                     goto bad;
                 }
                 tool_choice_none = !strcmp(choice, "none");
+                tool_choice_required = !strcmp(choice, "required");
                 free(choice);
             } else if (!json_skip_value(&p)) {
                 free(key);
@@ -165,6 +167,24 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
+    /* tool_choice="required": force a tool call by prefilling the assistant turn
+     * into an open DSML tool_calls block. render_chat_prompt_text ends the turn
+     * with "<｜Assistant｜><think>" (or "</think>"); rewrite it to skip thinking
+     * and open the block so generation must complete an invoke. generate_job
+     * seeds the output with the same opener so the parser sees a full block. */
+    if (tool_choice_required && r->has_tools && r->prompt_text) {
+        r->force_tool_call = true;
+        buf pt = {0};
+        const char *base = r->prompt_text;
+        size_t blen = strlen(base);
+        if (blen >= 7 && !memcmp(base + blen - 7, "<think>", 7)) blen -= 7;
+        buf_append(&pt, base, blen);
+        if (!(pt.len >= 8 && !memcmp(pt.ptr + pt.len - 8, "</think>", 8)))
+            buf_puts(&pt, "</think>");
+        buf_puts(&pt, "\n\n" DS4_TOOL_CALLS_START "\n");
+        free(r->prompt_text);
+        r->prompt_text = buf_take(&pt);
+    }
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
