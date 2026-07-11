@@ -39,11 +39,11 @@ no longer supported, unless there is some kind of overlap of abilities.
 
 That said, a few important things about this project:
 
-* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 96/128GB of memory.
-* This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
-* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM the the model size is still preferred, SSD streaming allows to turn the available amount of RAM from a hard cutoff (can I run this model or not?) to continuous spectrum of speed levels.
-* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since recently we introduced large new features: distributed inference, SSD streaming, and other minor improvements.
-* The optimized graph path targets **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics: it is selected at runtime with `--cpu`, there is no separate CPU-only build target in this fork, and it is slated for eventual removal.
+* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on a high-end single-GPU machine like the DGX Spark, starting from ~96/128 GB of unified memory.
+* This software is developed with **strong assistance from AI coding agents** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand, nor without the upstream `ds4` project this fork is based on.
+* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and fast modern NVMe SSDs should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSDs also changed the inference game from the point of view of "model needs to fit RAM": while more RAM than the model size is still preferred, SSD streaming turns the available RAM from a hard cutoff (can I run this model or not?) into a continuous spectrum of speed levels.
+* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. This is beta quality code, so we are probably not fully there yet.
+* This fork targets **CUDA on Linux only**, with special care for the **NVIDIA DGX Spark (GB10)** and its ~128 GB of unified memory. The whole model runs as a single CUDA-graph inference path; there is no CPU inference backend and no multi-node/distributed mode.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -54,9 +54,19 @@ We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.
 and its contributors. Their implementation, kernels, tests, and design choices were
 an essential reference while building this DeepSeek V4 specific inference path.
 Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
+quant layouts and tables, host-side quant/dot logic, and certain kernels. For this
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
 notice in our `LICENSE` file.
+
+This fork also stands on:
+
+- **[antirez/ds4](https://github.com/antirez/ds4)** — the upstream DeepSeek V4
+  inference engine this project is forked from.
+- **DeepSeek** — for the DeepSeek V4 Flash / PRO open-weight models and their
+  compressed-KV architecture.
+- **[PrismaQuant](https://github.com/RobTand/prismaquant)** (Rob Tand) — the
+  measured-KL mixed-precision quant allocation approach used to build this
+  fork's GGUFs (see `gguf-tools/prisma/`).
 
 ## Status
 
@@ -125,18 +135,9 @@ here. **Prefer the imatrix versions.**
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
 
-For the full PRO Q4 distributed run, download one half on each machine:
-
-```sh
-./download_model.sh pro-q4-layers00-30      # first half of PRO Q4 split
-./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
-```
-
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
 updates `./ds4flash.gguf` to point at the selected main model.
-The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
-download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
@@ -169,36 +170,15 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 
 ## Speed
 
-On this fork's target hardware — a DGX Spark GB10 running the 97 GB
-MXFP8/IQ2 Flash build — current single-run numbers are about **162 t/s**
-long-prompt prefill and **12.35 t/s** greedy decode
-(`--ctx 32768`, `--nothink`, `-n 256`).
+Performance is measured on this fork's target hardware — a **DGX Spark GB10**
+running the ~97 GB MXFP8/IQ2 Flash build — with `tool-eval-bench` performance
+runs. Decode is bandwidth-bound and stays roughly flat as context grows;
+prefill tapers slowly as the long-context indexer scan grows; the DSpark
+speculative drafter lifts greedy decode well above the single-stream baseline.
 
-The table below keeps the **upstream, pre-fork** single-run CLI numbers for
-reference. They were measured on Apple hardware (Metal backend) and on the
-upstream GGUFs, neither of which this fork supports; only the last row is a
-CUDA run. Same settings: `--ctx 32768`, `--nothink`, greedy decoding,
-`-n 256`. The short prompt is a normal small Italian story prompt. The long
-prompts exercise chunked prefill plus long-context decode. Q4 requires the
-larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+<!-- TODO(release): populate with numbers from tool-eval-bench performance runs before announce. -->
 
-| Machine | Quant | Prompt | Prefill | Generation |
-| --- | ---: | ---: | ---: | ---: |
-| MacBook Pro M3 Max, 128 GB | q2 | short | 58.52 t/s | 26.68 t/s |
-| MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
-| MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
-| MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
-| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
-| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
-| Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
-| Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
-| Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
-| Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
-| Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
-| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
-
-![M3 Max t/s](speed-bench/m3_max_ts.svg)
-![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
+_Throughput table pending current `tool-eval-bench` runs._
 
 ## Running models larger than RAM
 
@@ -294,229 +274,6 @@ is stable, re-enable thinking with a conservative generation limit:
 
 The important startup line is the cache report. Start conservative, then
 increase the cache if the machine has headroom.
-
-## Distributed Inference
-
-Distributed inference lets DwarfStar **run a model that is too large for one machine** by
-splitting transformer layers across multiple machines. The main example is the
-full 4-bit Flash quant across two 128 GB MacBooks: each process maps only its
-own layer slice, activations are sent over TCP, and the coordinator keeps normal
-CLI/API behavior.
-
-**Fork note:** the distributed path is retained and builds, but the examples
-and measurements in this section are upstream's, taken on Apple hardware with
-Q4/PRO GGUFs that this fork's loader rejects. Treat this section as upstream
-reference material until it is re-validated on CUDA hosts with fork-format
-GGUFs.
-
-Distributed inference also allows to **speed up prefill** by
-using multiple GPUs at the same time to process different micro-batches at
-different layers, like in an assembly line. Only prefill can be accelerated this
-way. Generation is purely autoregressive: each token must finish across the
-route before the next token can start. The model work is the same as a single
-process, plus coordination latency, so distributed generation is slower.
-
-To build an initial mental model, here are the high level concepts:
-
-1. You put the GGUF on every machine, but each one loads just a subset. `--layers` controls which tensors are mapped, so a worker with `--layers 20:output` does not load the earlier layers.
-2. Layer ranges are inclusive: `10:20` means layers 10, 11, ..., 20. `N:output` means layer `N` through the final layer plus the output head.
-3. You assign one of the machines the role of `coordinator`, the others the roles of `workers`. Workers will connect to the coordinator and will tell they are there and which layers they are able to process.
-4. Each worker keeps its slice of the KV cache.
-5. Communication is worker-to-worker, there is no need to use the coordinator as relay, so if your coordinator is `A`, and you make a request, activations will flow in `A -> B -> C -> back to A`.
-
-### How it works and how to configure it
-
-The prefill path is pipelined (this is why it can go faster than in a single machine).
-For large prompts the coordinator can run its
-slice on chunk N+1 while the worker is running its slice on chunk N. The
-distributed rows below were measured with two M5 Max 128 GB MacBooks connected
-by Thunderbolt 5, using the Q4 Flash GGUF and the default 4096-token
-distributed prefill chunk. The single-process column is a reference run with
-the Q2 GGUF on a single machine, so it actually is a bit faster since
-the routed MoEs are smaller.
-
-| Prompt | Single-process reference | Two MacBooks | Speedup |
-| ---: | ---: | ---: | ---: |
-| 9421 tokens | 421.70 t/s | 582.22 t/s | 1.38x |
-| 28684 tokens | 405.30 t/s | 674.16 t/s | 1.66x |
-| 63819 tokens | 353.62 t/s | 654.79 t/s | 1.85x |
-
-Generation is different. **It is strictly autoregressive**: token N+1 cannot start
-until token N has produced logits and sampling has selected the next token. That
-means distributed generation cannot use the long prefill pipeline. It pays at
-least one cross-machine activation hop per generated token, so generation is
-slower than a single local process. On the same two-Mac Thunderbolt setup, a
-12k-context control run with the 91 GB Flash quant went from 30.59 t/s
-single-process to 24.67 t/s distributed, a 19.4% loss. Distributed inference is
-therefore mainly for fitting larger models and speeding up long prefills, not
-for making decode faster.
-
-### Full DeepSeek V4 PRO Q4 on two Mac Studios
-
-The full-size PRO Q4 GGUF can be run across two 512 GB Mac Studio M3 Ultra
-machines by giving the coordinator layers `0:30` and the worker
-`31:output`. Use the split GGUF files so each side maps only the tensors it
-needs:
-
-```sh
-# Coordinator machine.
-./download_model.sh pro-q4-layers00-30
-
-# Worker machine.
-./download_model.sh pro-q4-layers31-output
-```
-
-The two files are:
-
-```text
-gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf
-gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf
-```
-
-This is a capacity use case: each process maps only its own half of the model,
-while the worker owns the output head and returns logits.
-
-The upstream PRO Q4 path used queue-resident exact expert tables for the
-large routed experts. This avoids the broad multi-GiB routed-tensor bindings
-that made early distributed PRO Q4 attempts either run very slowly or hit GPU
-memory accounting limits. In a short greedy smoke test over the direct
-`192.168.0.182` / `192.168.0.183` link, the model generated coherent text and
-measured 11.47 t/s generation after startup. Per-token telemetry was balanced:
-local layers were around 39-43 ms, remote layers around 44-49 ms, for total
-token times around 84-92 ms. Expect a slow startup while each side maps and
-makes its half of the model resident. Long-context PRO Q4 prefill and decode
-performance still needs separate benchmarking.
-
-The measurements above use a Thunderbolt 5 cable. The implementation is plain
-TCP and also works over slower links, including WiFi, but fast Ethernet or
-Thunderbolt networking is strongly recommended. Slow links mostly hurt
-generation latency and short prefills; large prefills can still benefit when
-the layer split is balanced. In the normal performance path, the last worker
-owns the output head and returns logits directly.
-
-Minimal two-host configuration:
-
-```sh
-# Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..30.
-./ds4 \
-  -m gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf \
-  --role coordinator \
-  --layers 0:30 \
-  --listen 169.254.43.68 1234
-
-# Machine B: worker, connects to A and owns layers 31..output.
-./ds4 \
-  -m gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf \
-  --role worker \
-  --layers 31:output \
-  --coordinator 169.254.43.68 1234
-```
-
-Normally the final worker should own the output head too, for example
-`--layers 20:output`. This avoids returning a full final hidden-state batch
-after prefill and lets the final worker produce the logits directly. On very
-slow or metered links, `--layers 20:42` is also supported: the coordinator will
-load the output head and compute logits locally, trading extra coordinator work
-for smaller per-token replies.
-
-### Network Link Comparison
-
-The table below shows the same two M5 Max hosts, the same 91 GB Flash quant,
-coordinator `--layers 0:19`, worker `--layers 20:output`, an 8192-token prompt
-from `speed-bench/promessi_sposi.txt`, and 128 generated tokens. WiFi and
-Internet numbers vary with local conditions, but the shape is the important
-part: high latency hurts generation directly, while lower bandwidth also pulls
-down long-prefill speed.
-
-| Link | Addresses | Ping avg | Prefill | Generation |
-| --- | --- | ---: | ---: | ---: |
-| Thunderbolt 5 | `169.254.43.68` -> `169.254.12.245` | 0.45 ms | 582.99 t/s | 25.09 t/s |
-| WiFi | `192.168.1.57` -> `192.168.1.95` | 77.20 ms | 250.70 t/s | 10.70 t/s |
-| Internet / VPN | `10.77.0.4` -> `10.77.0.3` | 152.10 ms | 114.88 t/s | 3.63 t/s |
-
-The Internet/VPN case is not meant to be a good interactive experience. It is
-still useful for collective testing: multiple people can temporarily combine
-machines to run a larger model that would not fit on any single host, accepting
-slow decode in exchange for being able to inspect the model at all.
-
-Use the coordinator exactly like normal `./ds4`: interactive chat, `/read`,
-and ordinary generation go through the same high-level session API. The same
-distributed options are also wired into `ds4-agent`, `ds4-eval`, and
-`ds4-bench`. For benchmarks, workers should already be running; `ds4-bench`
-waits until a complete route is available.
-
-Useful tuning and diagnostics:
-
-```sh
-./ds4-bench \
-  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 32768 \
-  --ctx-max 65536 \
-  --step-incr 32768 \
-  --gen-tokens 0 \
-  --role coordinator \
-  --layers 0:19 \
-  --listen 169.254.43.68 1234 \
-  --debug
-```
-
-`--debug` on the coordinator prints route formation and per-hop telemetry:
-layer range, token span, local evaluation time, downstream wait time, socket
-send time, and input/output byte counts. This is the current profiling tool for
-deciding whether a split is balanced. `--dist-prefill-window N` controls how
-many prefill chunks may be in flight end-to-end; the default is conservative
-and bounded. `--dist-prefill-chunk N` exists for experiments, but the default
-4096-token chunk is the canonical setting and should be used unless you are
-explicitly validating a different chunk size.
-
-By default DwarfStar sends hidden-state activations as 32-bit floats. To reduce
-traffic, pass `--dist-activation-bits 16` or `--dist-activation-bits 8` on the
-coordinator. This changes only the transport format between machines, not the
-model weights or KV cache. 16-bit transport halves activation traffic and is the
-first option to try on Ethernet or WiFi. 8-bit transport is more aggressive and
-should be treated as an approximate/experimental mode unless you have validated
-the output for your use case. However experimentally reduction activation
-size didn't provide a significant improvement, so this option may be removed
-in the future.
-
-**If a worker disconnects, the coordinator removes that worker from the active
-route**. The request already in flight can fail, and later calls report an
-incomplete route until a compatible worker reconnects and sends a new
-registration. For live sessions, the coordinator keeps the token history and can
-rebuild worker KV state by replaying the prefix when the route is available
-again. Workers also validate a rolling 64-bit token-prefix hash on every work
-item, so a restarted worker at position 0 cannot silently accept work for
-position N; it reports the mismatch and the coordinator replays the current
-transcript. Ctrl+C in the CLI and agent is cooperative: DwarfStar waits for the
-current distributed token or prefill chunk to drain before returning control,
-which avoids coordinator-caused KV splits. Saved agent/server sessions use the
-same KV file format as single-machine sessions: during save the coordinator
-fetches worker-owned layer tensors and serializes one normal payload; during
-load it splits that payload over the currently registered route.
-
-### Distributed protocol overview
-
-At the protocol level there are two kinds of connections. Workers keep a
-control TCP connection open to the coordinator and send a `HELLO` with their
-model ID, model family, quant profile, layer slice, context capacity, and data
-port. The coordinator uses these registrations to build a route that covers all
-layers. Work then moves over low-latency TCP data connections: the coordinator
-computes the first slice, sends a `WORK` frame with session ID, token positions,
-rolling token-prefix hashes before and after the span, route information, and
-hidden-state payload, and each worker computes its slice. Middle workers can
-forward directly to the next worker. The final worker returns logits to the
-coordinator, or ACKs for non-final prefill chunks so the prefill pipeline can
-stay full. `RESULT` frames echo the request ID and the post-span hash. A worker
-status error is handled differently from a socket failure: KV/hash mismatch can
-be recovered by replaying the token history on the same route, while transport
-failure drops the route and waits for a replacement worker. For persistent KV,
-the coordinator opens worker data connections and sends snapshot save/load
-messages for each worker-owned layer range; the disk payload remains a single
-agent/server cache file. The protocol has no
-encryption or authentication, and is not release-stable yet; coordinator and
-workers should be built from the same commit and used on trusted machines and
-trusted networks.
 
 ## Reducing heat, power usage and fan noise
 
@@ -803,8 +560,15 @@ events.
 
 For browser JavaScript clients served from another origin, start the server with
 `--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
-headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
-explicitly when remote machines should be able to connect.
+headers; it is independent of which interfaces the server binds.
+
+> **Network exposure.** `ds4-server` binds **`0.0.0.0` (all interfaces) by
+> default** and has **no authentication** — any host that can reach the port can
+> use the model, the agent tools, and `/metrics`. This is a deliberate
+> single-node, trusted-LAN design: run it only on a network you control. To
+> restrict it to the local machine, pass `--host 127.0.0.1`. Do not expose the
+> port directly to the public internet; put it behind your own authenticating
+> reverse proxy if you need remote access.
 
 ### Tool call handling and canonicalization
 
@@ -1161,12 +925,6 @@ running one extra decode step. MTP draft logits/state are not persisted; after
 loading a disk checkpoint the draft state is invalidated and rebuilt by normal
 generation.
 
-Distributed coordinator sessions use the same `DSV4` payload. Worker-owned
-layer tensors are pulled during save and merged into the normal layer-ordered
-tensor stream; during load the coordinator splits that stream into the current
-route and pushes the relevant layer tensors back to the workers. The saved file
-does not retain the distributed topology.
-
 The tensor payload is DS4-specific KV/session state, not a generic inference
 graph dump. It is expected to be portable only across compatible DwarfStar
 builds for this model layout.
@@ -1206,32 +964,26 @@ The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as
 the kv cache files include the verbatim prompt cached.
 
-## Backends
+## Building
 
-CUDA is the default graph backend; the backends are `cuda` and `cpu`:
+DwarfStar is **CUDA-only**; the whole model runs as a single CUDA-graph
+inference path. Plain `make` prints the available build targets instead of
+selecting one implicitly. For the DGX Spark / GB10 (the validated production
+target) build with:
 
 ```sh
-./ds4 -p "Hello" --cuda
-./ds4 -p "Hello" --cpu
-./ds4 -p "Hello" --backend cuda
+make cuda-spark
 ```
 
-Plain `make` prints the available build targets instead of selecting a
-CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
-explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
-`make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
-when cross-building or when you need a known target:
+The CUTLASS MXFP4 expert path requires the **`sm_120f`** family arch for its
+block-scaled tensor-core MMA, so `cuda-spark` builds with `CUDA_ARCH=sm_120f`.
+For a generic local CUDA GPU use `make cuda-generic`, or set the arch
+explicitly when cross-building:
 
 ```sh
-make cuda CUDA_ARCH=sm_120
+make cuda CUDA_ARCH=sm_120f
 make cuda CUDA_ARCH=native
 ```
-
-Do not treat the CPU path as the production target. The CLI and `ds4-server`
-support the CPU backend for reference/debug use and share the same KV session
-and snapshot format as CUDA, but normal inference should use CUDA. There is no
-CPU-only build target: the CPU path is compiled into the CUDA binaries,
-selected at runtime with `--cpu`, and slated for eventual removal.
 
 ## Steering
 

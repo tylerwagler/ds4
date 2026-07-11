@@ -445,7 +445,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         if (last_hc) ds4_gpu_tensor_free(last_hc);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after whole-prefill graph failure also failed\n");
+                fprintf(stderr, "ds4: GPU synchronize after whole-prefill graph failure also failed\n");
             }
             return false;
         }
@@ -534,7 +534,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         execute_s += t_embed_done - t_embed_encoded;
         if (split_profile) {
             fprintf(stderr,
-                    "ds4: metal layer-major prefill embed encode=%.3f ms execute=%.3f ms\n",
+                    "ds4: GPU layer-major prefill embed encode=%.3f ms execute=%.3f ms\n",
                     (t_embed_encoded - t_layer0) * 1000.0,
                     (t_embed_done - t_embed_encoded) * 1000.0);
         }
@@ -545,7 +545,7 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                       layer_prepare_ahead);
         }
         if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after layer-major prefill embed failure also failed\n");
+            fprintf(stderr, "ds4: GPU synchronize after layer-major prefill embed failure also failed\n");
         }
         return false;
     }
@@ -664,7 +664,7 @@ static bool gpu_graph_prefill_layer_major_inner(
             encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
             execute_s += (t_attn_done - t_attn_encoded) + (t_ffn_done - t_ffn_encoded);
             fprintf(stderr,
-                    "ds4: metal layer-major prefill layer %u attn encode=%.3f execute=%.3f ms ffn encode=%.3f execute=%.3f ms\n",
+                    "ds4: GPU layer-major prefill layer %u attn encode=%.3f execute=%.3f ms ffn encode=%.3f execute=%.3f ms\n",
                     il,
                     (t_attn_encoded - t_attn0) * 1000.0,
                     (t_attn_done - t_attn_encoded) * 1000.0,
@@ -735,7 +735,7 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                           layer_prepare_ahead);
             }
             if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
+                fprintf(stderr, "ds4: GPU synchronize after layer-major prefill failure also failed\n");
             }
             return false;
         }
@@ -757,7 +757,7 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                       layer_prepare_ahead);
         }
         if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
+            fprintf(stderr, "ds4: GPU synchronize after layer-major prefill failure also failed\n");
         }
         return false;
     }
@@ -877,7 +877,7 @@ bool gpu_graph_prefill_raw_swa(
                                                           cancelled);
     }
     /* The layer-major fallback below may submit the whole short prefill as one
-     * Metal command buffer.  Once that command is in flight there is no useful
+     * GPU command buffer.  Once that command is in flight there is no useful
      * safe prefix to expose: by the time cancellation can be observed again,
      * the prompt has already been fully read and the KV is valid.  Let the
      * caller observe the pending interrupt at generation time instead. */
@@ -999,7 +999,7 @@ bool gpu_graph_prefill_chunked_range(
                                                   display_progress_ud);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
+                fprintf(stderr, "ds4: GPU synchronize after chunked prefill failure also failed\n");
             }
             return false;
         }
@@ -1357,7 +1357,7 @@ bool gpu_graph_verify_decode2_exact(
 
 
 
-/* Pick a raw SWA cache size for Metal.  During batched prefill it must cover
+/* Pick a raw SWA cache size for GPU.  During batched prefill it must cover
  * the previous window plus the current ubatch. */
 uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
     uint32_t raw_window = DS4_N_SWA;
@@ -1514,211 +1514,6 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend,
 
 
 
-int gpu_graph_prompt_logits_test(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        const token_vec   *prompt,
-        int                ctx_size) {
-    int n_test = prompt->len;
-    const char *n_test_env = getenv("DS4_CUDA_GRAPH_PROMPT_TOKENS");
-    if (n_test_env && n_test_env[0]) {
-        char *endp = NULL;
-        const long v = strtol(n_test_env, &endp, 10);
-        if (endp != n_test_env && v > 0 && v <= prompt->len) n_test = (int)v;
-    }
-
-    if (n_test <= 0 || n_test > ctx_size) {
-        fprintf(stderr, "ds4: Metal graph prompt test needs 1..%d prompt tokens\n", ctx_size);
-        return 1;
-    }
-
-    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, (uint32_t)n_test);
-
-    ds4_gpu_graph g;
-    bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
-    if (!ok) {
-        gpu_graph_free(&g);
-        fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
-        return 1;
-    }
-    const bool memory_report = getenv("DS4_CUDA_MEMORY_REPORT") != NULL;
-    if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
-
-    ds4_kv_cache cpu_cache;
-    kv_cache_init(&cpu_cache, (uint32_t)ctx_size, raw_cap);
-    float *cpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-    float *gpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-    float *oracle_logits = NULL;
-
-    const char *oracle_path = getenv("DS4_ORACLE_LOGITS");
-    if (oracle_path && oracle_path[0]) {
-        oracle_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-        if (!read_f32_binary_file(oracle_path, oracle_logits, DS4_N_VOCAB)) {
-            free(oracle_logits);
-            oracle_logits = NULL;
-        }
-    }
-
-    for (int t = 0; t < n_test; t++) {
-        const bool last = t == n_test - 1;
-        forward_token_raw_swa_cpu(last ? cpu_logits : NULL,
-                                  model,
-                                  weights,
-                                  &cpu_cache,
-                                  prompt->v[t],
-                                  (uint32_t)t);
-    }
-    ok = gpu_graph_prefill_raw_swa(&g, model, weights, prompt, n_test,
-                                     gpu_logits, true, NULL, NULL,
-                                     NULL, NULL, NULL);
-    if (memory_report) ds4_gpu_print_memory_report("after prompt graph");
-
-    if (ok) {
-        const char *dump_gpu = getenv("DS4_CUDA_GRAPH_DUMP_LOGITS");
-        if (dump_gpu && dump_gpu[0]) {
-            if (write_f32_binary_file(dump_gpu, gpu_logits, DS4_N_VOCAB)) {
-                fprintf(stderr, "ds4: wrote Metal graph logits to %s\n", dump_gpu);
-            }
-        }
-        const char *dump_cpu = getenv("DS4_CPU_DUMP_LOGITS");
-        if (dump_cpu && dump_cpu[0]) {
-            if (write_f32_binary_file(dump_cpu, cpu_logits, DS4_N_VOCAB)) {
-                fprintf(stderr, "ds4: wrote CPU logits to %s\n", dump_cpu);
-            }
-        }
-        if (getenv("DS4_CUDA_GRAPH_TRACE_CACHE") != NULL ||
-            getenv("DS4_CUDA_GRAPH_TRACE_COMP") != NULL) {
-            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                const uint32_t n_raw = cpu_cache.layer[il].n_raw;
-                if (n_raw != 0) {
-                    const uint64_t raw_phys_n = (uint64_t)raw_cap * DS4_N_HEAD_DIM;
-                    const uint64_t raw_logical_n = (uint64_t)n_raw * DS4_N_HEAD_DIM;
-                    const uint32_t raw_start = n_raw < raw_cap ? 0u : ((uint32_t)n_test % raw_cap);
-                    float *gpu_raw_phys = xmalloc((size_t)raw_phys_n * sizeof(float));
-                    float *gpu_raw_logical = xmalloc((size_t)raw_logical_n * sizeof(float));
-                    int raw_read_ok;
-                    if (gpu_graph_raw_f16_enabled()) {
-                        uint16_t *raw_h = xmalloc((size_t)raw_phys_n * sizeof(uint16_t));
-                        raw_read_ok = ds4_gpu_tensor_read(g.layer_raw_cache[il], 0, raw_h,
-                                                          raw_phys_n * sizeof(uint16_t));
-                        if (raw_read_ok != 0) {
-                            for (uint64_t i2 = 0; i2 < raw_phys_n; i2++) {
-                                gpu_raw_phys[i2] = f16_to_f32(raw_h[i2]);
-                            }
-                        }
-                        free(raw_h);
-                    } else {
-                        raw_read_ok = ds4_gpu_tensor_read(g.layer_raw_cache[il], 0, gpu_raw_phys,
-                                                          raw_phys_n * sizeof(float));
-                    }
-                    if (raw_read_ok != 0) {
-                        for (uint32_t r = 0; r < n_raw; r++) {
-                            const uint32_t phys = (raw_start + r) % raw_cap;
-                            memcpy(gpu_raw_logical + (uint64_t)r * DS4_N_HEAD_DIM,
-                                   gpu_raw_phys + (uint64_t)phys * DS4_N_HEAD_DIM,
-                                   (size_t)DS4_N_HEAD_DIM * sizeof(float));
-                        }
-                        fprintf(stderr,
-                                "ds4: cache trace layer %u raw_n=%u raw_start=%u raw_max=%g raw_rms=%g\n",
-                                il, n_raw, raw_start,
-                                max_abs_diff(cpu_cache.layer[il].raw_kv, gpu_raw_logical, raw_logical_n),
-                                rms_abs_diff(cpu_cache.layer[il].raw_kv, gpu_raw_logical, raw_logical_n));
-                    }
-                    free(gpu_raw_logical);
-                    free(gpu_raw_phys);
-                }
-
-                const uint32_t n_comp = cpu_cache.layer[il].n_comp;
-                if (n_comp == 0) continue;
-                const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
-                float *gpu_comp = xmalloc((size_t)n * sizeof(float));
-                bool comp_read = false;
-                if (gpu_graph_attn_pack_enabled()) {
-                    /* Packed cache: read through the bit-exact f32 dequant
-                     * shadow (mirrors the prefill readers). */
-                    ds4_gpu_tensor *shadow = gpu_graph_attn_comp_read_cache(&g, il, n_comp);
-                    comp_read = shadow &&
-                                ds4_gpu_tensor_read(shadow, 0, gpu_comp, n * sizeof(float)) != 0;
-                } else {
-                    comp_read = ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
-                                                    gpu_comp, n * sizeof(float)) != 0;
-                }
-                if (comp_read) {
-                    fprintf(stderr,
-                            "ds4: comp trace layer %u n=%u attn_max=%g attn_rms=%g\n",
-                            il, n_comp,
-                            max_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n),
-                            rms_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n));
-                }
-                free(gpu_comp);
-
-                const uint32_t n_index = cpu_cache.layer[il].n_index_comp;
-                if (n_index != 0 && g.layer_index_comp_cache[il]) {
-                    const uint64_t ni = (uint64_t)n_index * DS4_N_INDEXER_HEAD_DIM;
-                    float *gpu_index = xmalloc((size_t)ni * sizeof(float));
-                    ds4_gpu_tensor *index_src = g.layer_index_comp_cache[il];
-                    if (gpu_graph_idx_fp4_enabled()) {
-                        /* Packed cache: dequant into the f32 staging or skip the
-                         * trace — reading packed bytes as f32 would print garbage. */
-                        index_src = (g.idx_comp_stage &&
-                                     ds4_gpu_mxkv_dequant_tensor(g.layer_index_comp_cache[il],
-                                                                 g.idx_comp_stage,
-                                                                 DS4_ENGINE_MXKV_FMT_FP4,
-                                                                 n_index,
-                                                                 DS4_N_INDEXER_HEAD_DIM) != 0)
-                            ? g.idx_comp_stage
-                            : NULL;
-                    }
-                    if (index_src &&
-                        ds4_gpu_tensor_read(index_src, 0, gpu_index, ni * sizeof(float)) != 0) {
-                        fprintf(stderr,
-                                "ds4: comp trace layer %u n=%u index_max=%g index_rms=%g\n",
-                                il, n_index,
-                                max_abs_diff(cpu_cache.layer[il].index_comp_kv, gpu_index, ni),
-                                rms_abs_diff(cpu_cache.layer[il].index_comp_kv, gpu_index, ni));
-                    }
-                    free(gpu_index);
-                }
-            }
-        }
-        const uint64_t cpu_top = argmax_f32(cpu_logits, DS4_N_VOCAB);
-        const uint64_t gpu_top = argmax_f32(gpu_logits, DS4_N_VOCAB);
-        fprintf(stderr,
-                "ds4: Metal prompt graph logits: tokens=%d logits_max=%g logits_rms=%g cpu_top=%llu gpu_top=%llu cpu_top_logit=%g gpu_top_logit=%g\n",
-                n_test,
-                max_abs_diff(cpu_logits, gpu_logits, DS4_N_VOCAB),
-                rms_abs_diff(cpu_logits, gpu_logits, DS4_N_VOCAB),
-                (unsigned long long)cpu_top,
-                (unsigned long long)gpu_top,
-                cpu_logits[cpu_top],
-                gpu_logits[gpu_top]);
-        if (oracle_logits) {
-            const uint64_t oracle_top = argmax_f32(oracle_logits, DS4_N_VOCAB);
-            fprintf(stderr,
-                    "ds4: oracle logits: tokens=%d oracle_top=%llu oracle_top_logit=%g cpu_max=%g cpu_rms=%g gpu_max=%g gpu_rms=%g\n",
-                    n_test,
-                    (unsigned long long)oracle_top,
-                    oracle_logits[oracle_top],
-                    max_abs_diff(cpu_logits, oracle_logits, DS4_N_VOCAB),
-                    rms_abs_diff(cpu_logits, oracle_logits, DS4_N_VOCAB),
-                    max_abs_diff(gpu_logits, oracle_logits, DS4_N_VOCAB),
-                    rms_abs_diff(gpu_logits, oracle_logits, DS4_N_VOCAB));
-        }
-    } else {
-        fprintf(stderr, "ds4: Metal prompt graph logits test failed\n");
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after prompt graph failure also failed\n");
-        }
-    }
-
-    free(gpu_logits);
-    free(cpu_logits);
-    free(oracle_logits);
-    kv_cache_free(&cpu_cache);
-    gpu_graph_free(&g);
-    return ok ? 0 : 1;
-}
 
 
 

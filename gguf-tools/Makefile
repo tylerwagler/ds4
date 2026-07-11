@@ -30,9 +30,15 @@ QUANTIZE_OBJS := $(QUANTIZE_SRCS:.c=.o)
 QUANTS_SRCS := quants_common.c quants_fp.c quants_kquants.c
 QUANTS_OBJS := $(QUANTS_SRCS:.c=.o)
 
-.PHONY: all clean quality-score
+.PHONY: all clean quality-score test
 
 all: deepseek4-quantize
+
+test_quants: test_quants.c $(QUANTS_OBJS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -o $@ test_quants.c $(QUANTS_OBJS) -lm -pthread
+
+test: test_quants
+	./test_quants
 
 quantize/%.o: quantize/%.c quantize/dsq_internal.h quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -Iquantize -c -o $@ $<
@@ -48,4 +54,4 @@ quality-score:
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize quality-testing/score_official quantize/*.o *.o
+	rm -f deepseek4-quantize test_quants quality-testing/score_official quantize/*.o *.o

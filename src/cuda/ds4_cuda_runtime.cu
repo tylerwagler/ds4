@@ -784,9 +784,8 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     }
     /* One Spark can run the IQ2 model (~81 GiB) and larger mixed models
      * (~91 GiB) via the old startup tensor cache.  Keep enough headroom for
-     * scratch and KV, and make anything bigger
-     * use distributed layer loading unless the operator opts into a larger
-     * cache budget explicitly. */
+     * scratch and KV, and make anything bigger fall back to SSD streaming
+     * unless the operator opts into a larger cache budget explicitly. */
     return 96ull * 1073741824ull;
 }
 
@@ -2442,8 +2441,8 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         if (!cuda_model_cache_limit_explicit() && model_size > limit) {
             fprintf(stderr,
                     "ds4: CUDA model %.2f GiB exceeds the default single-GPU "
-                    "startup cache budget %.2f GiB; use distributed layer "
-                    "loading or set DS4_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly\n",
+                    "startup cache budget %.2f GiB; rely on SSD streaming "
+                    "or set DS4_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly\n",
                     (double)model_size / 1073741824.0,
                     (double)limit / 1073741824.0);
             return 0;

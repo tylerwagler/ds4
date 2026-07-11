@@ -22,7 +22,9 @@ void hc_weighted_sum_one(
 
 
 /* HC pre step for one token.  It normalizes the HC state, projects the control
- * vector, runs the Sinkhorn split, and emits the sublayer input plus post data. */
+ * vector, runs the Sinkhorn split, and emits the sublayer input plus post data.
+ * The caller supplies scratch buffers (out/post/comb/flat); shared by the GPU
+ * decode path via hc_pre_from_state_one. */
 void hc_pre_from_state_one_scratch(
         const ds4_model   * model,
         const ds4_tensor  * fn,

@@ -771,7 +771,7 @@ void generate_job(server *s, job *j) {
     }
     if (cached == 0) s->kv.continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a disk snapshot replaces the live Metal session.  Persist the
+        /* Loading a disk snapshot replaces the live GPU session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, "evict");
@@ -1066,6 +1066,8 @@ decode_again:
     size_t think_recovery_scan_from = 0;
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
+    const bool dspark_spec_enabled = getenv("DS4_DSPARK_DISABLE") == NULL;
+    const bool mtp_spec_enabled = getenv("DS4_MTP_SPEC_DISABLE") == NULL;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
@@ -1118,7 +1120,7 @@ decode_again:
         int ntok = 0;
         if (temperature <= 0.0f &&
             ds4_engine_has_dspark(s->engine) &&
-            getenv("DS4_DSPARK_DISABLE") == NULL)
+            dspark_spec_enabled)
         {
             ntok = ds4_session_eval_speculative_block(s->session,
                                                       token,
@@ -1134,7 +1136,7 @@ decode_again:
             }
         } else if (temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            mtp_spec_enabled)
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,

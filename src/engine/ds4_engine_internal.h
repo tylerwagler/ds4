@@ -9,14 +9,14 @@
  * =========================================================================
  *
  * This file is deliberately vertical: it owns GGUF loading, the fixed
- * DeepSeek V4 tensor layouts, CPU reference kernels, the whole-model Metal
+ * DeepSeek V4 tensor layouts, CPU reference kernels, the whole-model GPU
  * graph driver, and tokenizer wiring.  Model shape selection is intentionally
  * narrow: validation accepts the known Flash and Pro layouts and fails early
  * for anything else.
  *
  * Loading is mmap based.  The loader parses only the GGUF header, metadata
  * table, and tensor directory.  Tensor data stays in the kernel page cache
- * until inference touches it, or until Metal wraps slices of the mapping as
+ * until inference touches it, or until GPU wraps slices of the mapping as
  * no-copy MTLBuffers.
  */
 
@@ -43,7 +43,6 @@
 #include <unistd.h>
 
 #include "ds4.h"
-#include "ds4_distributed.h"
 
 #include "ds4_gpu.h"
 #if defined(__ARM_NEON)
@@ -183,7 +182,7 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * The server disk cache stores a high-level file header, then delegates the
  * graph-specific payload below to the engine.  This payload is intentionally
  * not mmaped: restoring a checkpoint copies bytes back into the already
- * allocated Metal tensors, preserving the same live graph buffers used by
+ * allocated GPU tensors, preserving the same live graph buffers used by
  * normal prefill/decode.  The raw SWA cache is serialized as the last logical
  * window only; suffix prefill writes its own raw rows before attention.  The
  * compressed caches are serialized up to their live row counts because sparse
@@ -297,63 +296,6 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
-typedef struct {
-    uint32_t ctx_size;
-    uint32_t comp_cap;
-    uint32_t attn_score_cap;
-    uint32_t q8_cap;
-
-    float *plain;
-    float *cur;
-    float *next;
-
-    float *attn_cur;
-    float *attn_norm;
-    float *attn_residual;
-    float *q;
-    float *qr;
-    float *qr_norm;
-    float *kv_raw;
-    float *kv;
-    float *heads;
-    float *attn_low;
-    float *attn_out;
-    float *after_attn_hc;
-    float *attn_score;
-
-    float *comp;
-    float *index_comp;
-    float *comp_kv_cur;
-    float *comp_sc_cur;
-    float *comp_pooled;
-
-    bool *index_allowed;
-    float *index_q;
-    float *index_weights;
-    float *index_scores;
-
-    float *ffn_cur;
-    float *ffn_norm;
-    float *ffn_moe;
-    float *ffn_shared;
-    float *ffn_out;
-    float *shared_gate;
-    float *shared_up;
-    float *shared_mid;
-    float *routed_mid_all;
-    block_q8_K *routed_xq;
-    block_q8_K *routed_midq;
-
-    int8_t *q8_xq;
-    float *q8_xscale;
-
-    float *hc_flat;
-    float *output_flat;
-    float *output_pre;
-    float *output_weights;
-    float *output_embd;
-    float *output_norm;
-} ds4_cpu_decode_scratch;
 
 typedef struct {
     const char *ptr;
@@ -887,26 +829,12 @@ typedef struct {
     uint32_t head_dim;
 } ds4_kv_cache;
 
-typedef struct {
-    float             * out_heads;
-    const ds4_model   * model;
-    const ds4_layer_weights * layer;
-    const float       * q;
-    const float       * raw_kv;
-    const float       * comp_kv;
-    const uint32_t    * comp_counts;
-    const uint8_t     * allowed_mask;
-    const uint8_t     * allowed_bits;
-    uint64_t            allowed_stride;
-    uint32_t            n_tok;
-    uint32_t            raw_cap;
-} layer_attention_prefix_batch_ctx;
 
 /* =========================================================================
- * Metal Release Graph State.
+ * GPU Release Graph State.
  * =========================================================================
  *
- * The release Metal executor owns one fixed set of tensors for single-token
+ * The release GPU executor owns one fixed set of tensors for single-token
  * decode and another for batched prefill.  The structure is DS4-specific:
  * tensor names follow the model stages rather than generic graph nodes.
  */
@@ -1238,7 +1166,7 @@ typedef struct gpu_graph_selected_async_load {
  * The 2-bit DS4 quants care most about routed MoE experts.  For expert gate
  * and up matrices the matmul input is the FFN-normalized activation row.  For
  * expert down matrices the matmul input is the routed SwiGLU row after route
- * weighting.  During Metal prefill those tensors are already materialized as
+ * weighting.  During GPU prefill those tensors are already materialized as
  * `batch_ffn_norm`, `batch_router_selected`, and `batch_routed_mid`, so the
  * collector observes the exact release graph without changing inference math.
  *
@@ -1328,7 +1256,6 @@ struct ds4_engine {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
-    ds4_distributed_options distributed;
     bool gpu_ready;
     bool mtp_ready;
     bool dspark_ready;
@@ -1358,10 +1285,7 @@ typedef struct {
 
 struct ds4_session {
     ds4_engine *engine;
-    ds4_dist_session *distributed;
     ds4_gpu_graph graph;
-    ds4_kv_cache cpu_cache;
-    ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
     float *logits;
     float *mtp_logits;
@@ -1541,17 +1465,9 @@ ds4_gpu_stream_expert_table graph_stream_expert_table_make(
         uint64_t                 down_expert_bytes);
 uint64_t ds4_streaming_manual_cache_safe_bytes(void);
 bool weights_have_output_head(const ds4_weights *w);
-bool weights_layers_bound(const ds4_weights *w, uint32_t layer_start, uint32_t layer_end);
 const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w);
 void config_validate_model(const ds4_model *m);
-void weights_bind(
-        ds4_weights     *w,
-        const ds4_model *m,
-        bool             load_slice,
-        uint32_t         load_layer_start,
-        uint32_t         load_layer_end,
-        bool             require_output,
-        bool             optional_output);
+void weights_bind(ds4_weights *w, const ds4_model *m);
 DS4_MAYBE_UNUSED bool weights_model_map_spans(
         const ds4_weights *w,
         uint32_t layer_start,
@@ -1564,13 +1480,6 @@ DS4_MAYBE_UNUSED bool weights_model_map_decode_layer_spans(
         ds4_model_map_span_vec *spans);
 DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
         const ds4_weights *w,
-        bool include_token,
-        bool include_output,
-        ds4_model_map_span_vec *spans);
-DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
-        const ds4_weights *w,
-        uint32_t layer_start,
-        uint32_t layer_end,
         bool include_token,
         bool include_output,
         ds4_model_map_span_vec *spans);
@@ -1616,26 +1525,6 @@ void matmul_q8_0_pair_batch(
         const float     * x,
         uint64_t          n_tok);
 void matvec_q8_0(float *out, const ds4_model *m, const ds4_tensor *w, const float *x);
-void matvec_q8_0_decode_scratch(
-        float                  * out,
-        const ds4_model        * m,
-        const ds4_tensor       * w,
-        const float            * x,
-        ds4_cpu_decode_scratch * scratch);
-void matvec_q8_0_pair_decode_scratch(
-        float                  * out0,
-        float                  * out1,
-        const ds4_model        * m,
-        const ds4_tensor       * w0,
-        const ds4_tensor       * w1,
-        const float            * x,
-        ds4_cpu_decode_scratch * scratch);
-void matvec_any_decode_scratch(
-        float                  * out,
-        const ds4_model        * m,
-        const ds4_tensor       * w,
-        const float            * x,
-        ds4_cpu_decode_scratch * scratch);
 void matvec_q8_0_grouped_rows(
         float           * out,
         const ds4_model * m,
@@ -1644,15 +1533,6 @@ void matvec_q8_0_grouped_rows(
         uint32_t          n_groups,
         uint64_t          group_dim,
         uint64_t          rank);
-void matvec_q8_0_grouped_rows_decode_scratch(
-        float                  * out,
-        const ds4_model        * m,
-        const ds4_tensor       * w,
-        const float            * x,
-        uint32_t                 n_groups,
-        uint64_t                 group_dim,
-        uint64_t                 rank,
-        ds4_cpu_decode_scratch * scratch);
 void matmul_q8_0_grouped_batch(
         float           * out,
         const ds4_model * m,
@@ -1841,19 +1721,6 @@ void layer_kv_projection_normed_one(
         const ds4_layer_weights * layer,
         const float       * normed,
         float             * kv);
-void layer_q_projection_with_lora_one_decode_scratch(
-        const ds4_model         * model,
-        const ds4_layer_weights * layer,
-        const float             * norm,
-        float                   * q,
-        float                   * qr_norm,
-        ds4_cpu_decode_scratch  * scratch);
-void layer_kv_projection_normed_one_decode_scratch(
-        const ds4_model         * model,
-        const ds4_layer_weights * layer,
-        const float             * normed,
-        float                   * kv,
-        ds4_cpu_decode_scratch  * scratch);
 float layer_rope_freq_base(uint32_t il);
 float layer_rope_freq_scale(uint32_t il);
 void rope_tail_layer_inplace(
@@ -1893,12 +1760,6 @@ void layer_grouped_out_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * heads);
-void layer_grouped_out_one_decode_scratch(
-        float                  * out,
-        const ds4_model        * model,
-        const ds4_layer_weights * layer,
-        const float            * heads,
-        ds4_cpu_decode_scratch * scratch);
 void layer_grouped_out_batch(
         float             * out,
         const ds4_model   * model,
@@ -1961,16 +1822,6 @@ void layer_ffn_one(
         const float       * steering_dirs,
         float               steering_scale,
         bool                trace);
-void layer_ffn_one_decode_scratch(
-        float                  * out_hc,
-        const ds4_model        * model,
-        const ds4_layer_weights * layer,
-        const float            * inp_hc,
-        uint32_t                 il,
-        int                      token,
-        const float            * steering_dirs,
-        float                    steering_scale,
-        ds4_cpu_decode_scratch * scratch);
 void layer_ffn_batch(
         float             * out_hc,
         const ds4_model   * model,
@@ -2004,37 +1855,8 @@ void layer_ffn_tokens_parallel(
 uint32_t ds4_default_raw_cap(uint32_t ctx_size);
 uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
-void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size);
-void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch);
 void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap);
 void kv_cache_free(ds4_kv_cache *cache);
-void forward_token_raw_swa_cpu_decode_scratch(
-        float             * logits,
-        const ds4_model   * model,
-        const ds4_weights * weights,
-        ds4_kv_cache      * cache,
-        int                 token,
-        uint32_t            pos,
-        const float       * steering_dirs,
-        float               steering_attn_scale,
-        float               steering_ffn_scale,
-        ds4_cpu_decode_scratch * scratch);
-void forward_token_raw_swa_cpu(
-        float             * logits,
-        const ds4_model   * model,
-        const ds4_weights * weights,
-        ds4_kv_cache      * cache,
-        int                 token,
-        uint32_t            pos);
-void prefill_layer_major_cpu(
-        float             * logits,
-        const ds4_model   * model,
-        const ds4_weights * weights,
-        ds4_kv_cache      * cache,
-        const token_vec   * prompt,
-        const float       * steering_dirs,
-        float               steering_attn_scale,
-        float               steering_ffn_scale);
 void layer_forward_self_one(
         float                   * out_hc,
         const ds4_model         * model,
@@ -2043,11 +1865,6 @@ void layer_forward_self_one(
         uint32_t                  il,
         uint32_t                  pos,
         int                       token);
-void forward_first_token_cpu(
-        float             * out_hc,
-        const ds4_model   * model,
-        const ds4_weights * weights,
-        int                 token);
 void output_logits_one(
         float             * logits,
         const ds4_model   * model,
@@ -2411,11 +2228,6 @@ int gpu_graph_decode_test(
         const ds4_weights *weights,
         const token_vec   *prompt,
         bool               quality);
-int gpu_graph_first_token_full_test(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        const token_vec   *prompt,
-        bool               quality);
 uint32_t gpu_graph_token_split_after_layers(void);
 ds4_gpu_tensor *gpu_graph_tensor_row_view(
         ds4_gpu_tensor *base,
@@ -2640,11 +2452,6 @@ uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap);
 uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk);
 uint32_t gpu_graph_resume_prefill_min_tokens(void);
-int gpu_graph_prompt_logits_test(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        const token_vec   *prompt,
-        int                ctx_size);
 void embed_prompt(
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -2662,7 +2469,6 @@ void cpu_directional_steering_project_rows(
         uint32_t     il,
         uint32_t     rows,
         float        scale);
-bool cpu_load_directional_steering(ds4_engine *e);
 void vocab_load(ds4_vocab *vocab, const ds4_model *model);
 void vocab_free(ds4_vocab *vocab);
 void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
@@ -2681,21 +2487,6 @@ int sample_top_p_min_p(
         float        top_p,
         float        min_p,
         uint64_t    *rng);
-int generate_raw_swa_cpu(
-        const ds4_model   * model,
-        const ds4_vocab   * vocab,
-        const ds4_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        const float       * directional_steering_dirs,
-        float               directional_steering_attn,
-        float               directional_steering_ffn,
-        ds4_token_emit_fn   emit,
-        ds4_generation_done_fn done,
-        void              * emit_ud,
-        ds4_session_progress_fn progress,
-        void              * progress_ud);
 int generate_gpu_graph_raw_swa(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
@@ -2779,7 +2570,7 @@ static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t
  * =========================================================================
  *
  * These functions are the CPU reference math used by the C backend and by
- * Metal diagnostics.  They implement only the tensor formats present in the
+ * GPU diagnostics.  They implement only the tensor formats present in the
  * DeepSeek V4 Flash GGUF: F16, F32, Q2_K, IQ2_XXS, and Q8_K activation
  * blocks used for expert dot products.
  */

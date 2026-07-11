@@ -5,7 +5,6 @@
 #define DS4_SERVER_INTERNAL_H
 
 #include "ds4.h"
-#include "ds4_distributed.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
@@ -14,7 +13,7 @@
  *
  * HTTP is intentionally simple: each client connection is handled by a small
  * blocking thread that parses one request, then queues a job to the single
- * Metal worker.  The worker owns the ds4_session and therefore owns all live KV
+ * GPU worker.  The worker owns the ds4_session and therefore owns all live KV
  * cache state.  That keeps session reuse, disk checkpointing, and future
  * batching decisions in one place instead of spreading graph mutations across
  * client threads. */
@@ -98,7 +97,7 @@
  * KV Cache.
  * =========================================================================
  *
- * The server has one live Metal session.  We persist reusable DS4 session
+ * The server has one live GPU session.  We persist reusable DS4 session
  * snapshots when a cold prompt reaches a useful prefix, when a long continued
  * conversation has grown far enough, and when a request evicts the live session.
  * The cache key is the SHA1 of the rendered byte prefix.  The payload still

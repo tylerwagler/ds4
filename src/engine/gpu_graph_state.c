@@ -49,7 +49,7 @@ void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
 
 
 
-/* Release every Metal tensor owned by the whole-model graph runtime. */
+/* Release every GPU tensor owned by the whole-model graph runtime. */
 void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
@@ -106,7 +106,23 @@ void gpu_graph_free(ds4_gpu_graph *g) {
     for (int i = 0; i < 3; i++) {
         ds4_gpu_tensor_free(g->dspark_target_h[i]);
         ds4_gpu_tensor_free(g->dspark_raw_cache[i]);
+        ds4_gpu_tensor_free(g->dspark_bulk_h[i]);
+        ds4_gpu_tensor_free(g->dspark_prompt_h[i]);
+        ds4_gpu_tensor_free(g->dspark_target_h_batch[i]);
     }
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->spec_comp_kv_save[il]);
+        ds4_gpu_tensor_free(g->spec_comp_sc_save[il]);
+        ds4_gpu_tensor_free(g->spec_icomp_kv_save[il]);
+        ds4_gpu_tensor_free(g->spec_icomp_sc_save[il]);
+    }
+    ds4_gpu_tensor_free(g->spec_comp_scratch_row);
+    ds4_gpu_tensor_free(g->dspark_concat);
+    ds4_gpu_tensor_free(g->dspark_proj_out);
+    ds4_gpu_tensor_free(g->dspark_seed_kv);
+    ds4_gpu_tensor_free(g->dspark_seed_norm);
+    ds4_gpu_tensor_free(g->dspark_seed_rot);
+    ds4_gpu_tensor_free(g->dspark_markov_logits);
     ds4_gpu_tensor_free(g->output_norm);
     ds4_gpu_tensor_free(g->output_embd);
     ds4_gpu_tensor_free(g->output_weights);
@@ -212,7 +228,7 @@ bool gpu_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
  * =========================================================================
  *
  * A steering file contains one normalized 4096-wide direction per layer.  When
- * enabled, the Metal graph edits selected block outputs in-place:
+ * enabled, the GPU graph edits selected block outputs in-place:
  *
  *     y = y - scale * v * dot(v, y)
  *

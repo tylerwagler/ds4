@@ -133,10 +133,6 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
                  used, total_ctx, st->generated, st->gen_tps, power);
         break;
-    case AGENT_WORKER_DRAINING:
-        snprintf(buf, len, "ctx %s/%s | stopping after distributed cluster drains%s",
-                 used, total_ctx, power);
-        break;
     case AGENT_WORKER_SAVING:
         snprintf(buf, len, "ctx %s/%s | saving session%s", used, total_ctx, power);
         break;
@@ -1381,7 +1377,7 @@ bool agent_maybe_save_before_leaving_session(agent_worker *w) {
 
 /* Process exit is different from /new or /switch: once the terminal is already
  * restored, declining the save can terminate immediately and let the OS reclaim
- * model/Metal resources instead of waiting for orderly teardown. */
+ * model/GPU resources instead of waiting for orderly teardown. */
 agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w) {
     if (!agent_worker_needs_save(w)) return AGENT_EXIT_CLEAN;
     if (!agent_prompt_yes_no("Save current session? (y/n) ")) return AGENT_EXIT_NOW;

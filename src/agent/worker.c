@@ -527,8 +527,7 @@ void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    if (!agent_worker_wait_distributed_route(w, init_err, sizeof(init_err)) ||
-        !agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
+    if (!agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
     agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);

@@ -5,7 +5,6 @@
 #define DS4_AGENT_INTERNAL_H
 
 #include "ds4.h"
-#include "ds4_distributed.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
@@ -159,7 +158,6 @@ typedef enum {
     AGENT_WORKER_PREFILL,
     AGENT_WORKER_GENERATING,
     AGENT_WORKER_COMPACTING,
-    AGENT_WORKER_DRAINING,
     AGENT_WORKER_SAVING,
     AGENT_WORKER_ERROR,
     AGENT_WORKER_STOPPED,
@@ -686,7 +684,6 @@ int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
 bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len);
-bool agent_worker_wait_distributed_route(agent_worker *w, char *err, size_t err_len);
 bool agent_worker_has_user_session(agent_worker *w);
 bool agent_worker_needs_save(agent_worker *w);
 bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],

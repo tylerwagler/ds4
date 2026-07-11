@@ -142,33 +142,6 @@ void cpu_directional_steering_project_rows(
 
 
 
-bool cpu_load_directional_steering(ds4_engine *e) {
-    if (!e ||
-        (e->directional_steering_attn_scale == 0.0f &&
-         e->directional_steering_ffn_scale == 0.0f)) {
-        return true;
-    }
-
-    const char *path = e->directional_steering_file;
-    if (!path || !path[0]) {
-        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
-        return false;
-    }
-
-    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
-    e->directional_steering_dirs = xmalloc((size_t)n * sizeof(e->directional_steering_dirs[0]));
-    if (!read_f32_binary_file(path, e->directional_steering_dirs, n)) {
-        free(e->directional_steering_dirs);
-        e->directional_steering_dirs = NULL;
-        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
-        return false;
-    }
-    fprintf(stderr, "ds4: CPU directional steering enabled: %s attn=%g ffn=%g\n",
-            path,
-            (double)e->directional_steering_attn_scale,
-            (double)e->directional_steering_ffn_scale);
-    return true;
-}
 
 
 
@@ -1172,125 +1145,10 @@ static void print_top_logits(
 
 
 
-/* CPU generation entry point.  It runs layer-major prefill once, then decodes
- * one token at a time using the persistent KV cache and scratch arena. */
-int generate_raw_swa_cpu(
-        const ds4_model   * model,
-        const ds4_vocab   * vocab,
-        const ds4_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        const float       * directional_steering_dirs,
-        float               directional_steering_attn,
-        float               directional_steering_ffn,
-        ds4_token_emit_fn   emit,
-        ds4_generation_done_fn done,
-        void              * emit_ud,
-        ds4_session_progress_fn progress,
-        void              * progress_ud) {
-    (void)progress;
-    (void)progress_ud;
-    fprintf(stderr, "ds4: using CPU generation with layer-major prefill\n");
-
-    ds4_kv_cache cache;
-    kv_cache_init(&cache, (uint32_t)ctx_size, 0);
-    ds4_cpu_decode_scratch decode_scratch;
-    cpu_decode_scratch_init(&decode_scratch, (uint32_t)ctx_size);
-
-    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    int pos = prompt->len;
-    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
-    const double t_prefill0 = now_sec();
-
-    if (prompt->len <= 0 || prompt->len > ctx_size) {
-        fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
-        free(logits);
-        cpu_decode_scratch_free(&decode_scratch);
-        kv_cache_free(&cache);
-        return 1;
-    }
-
-    prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
-                            directional_steering_dirs,
-                            directional_steering_attn,
-                            directional_steering_ffn);
-
-    const double t_prefill1 = now_sec();
-    fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
-    const char *dump_prefill_logits = getenv("DS4_CPU_DUMP_PREFILL_LOGITS");
-    if (dump_prefill_logits && dump_prefill_logits[0]) {
-        if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
-            free(logits);
-            cpu_decode_scratch_free(&decode_scratch);
-            kv_cache_free(&cache);
-            return 1;
-        }
-        fprintf(stderr, "ds4: wrote CPU prefill logits to %s\n", dump_prefill_logits);
-    }
-
-    int n_generated = 0;
-    int n_decode_eval = 0;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
-    const double t_decode0 = now_sec();
-    for (int i = 0; i < n_predict && pos < ctx_size; i++) {
-        if (trace_top) {
-            char label[64];
-            snprintf(label, sizeof(label), "step %d", i);
-            print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
-        }
-
-        int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
-
-        if (emit) emit(emit_ud, token);
-        n_generated++;
-
-        if (i == n_predict - 1 || pos + 1 >= ctx_size) {
-            pos++;
-            break;
-        }
-
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
-        /* The CPU decode step is expected to reuse buffers from
-         * cpu_decode_scratch.  Keep the allocation guard tightly scoped to the
-         * decode math itself; sampling, token emission, tracing, and callbacks
-         * may allocate small temporary strings without invalidating that
-         * guarantee. */
-        ds4_alloc_guard_begin("CPU token decode");
-        forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, &cache, token, (uint32_t)pos,
-                                                 directional_steering_dirs,
-                                                 directional_steering_attn,
-                                                 directional_steering_ffn,
-                                                 &decode_scratch);
-        ds4_alloc_guard_end();
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr, "ds4: decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-        }
-        n_decode_eval++;
-        pos++;
-    }
-    const double t_decode1 = now_sec();
-    if (done) done(emit_ud);
-
-    const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
-    ds4_log(stderr,
-            DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
-
-    free(logits);
-    cpu_decode_scratch_free(&decode_scratch);
-    kv_cache_free(&cache);
-    return 0;
-}
 
 
 
-/* Metal generation entry point.  The model runs as one local whole-graph
+/* GPU generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
 int generate_gpu_graph_raw_swa(
@@ -1456,7 +1314,6 @@ int generate_gpu_graph_raw_swa(
 const char *ds4_backend_name(ds4_backend backend) {
     switch (backend) {
     case DS4_BACKEND_CUDA:  return "cuda";
-    case DS4_BACKEND_CPU:   return "cpu";
     }
     return "unknown";
 }

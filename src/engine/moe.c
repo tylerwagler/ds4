@@ -62,30 +62,6 @@ void layer_shared_ffn_one(
 
 
 
-static void layer_shared_ffn_one_decode_scratch(
-        float                  * out,
-        const ds4_model        * model,
-        const ds4_layer_weights * layer,
-        const float            * x,
-        ds4_cpu_decode_scratch * scratch) {
-    const uint64_t in_dim = layer->ffn_gate_shexp->dim[0];
-    if (layer->ffn_up_shexp->type != 8 ||
-        layer->ffn_gate_shexp->type != 8 ||
-        layer->ffn_up_shexp->dim[0] != in_dim) {
-        ds4_die("shared expert gate/up tensors do not share a Q8_0 input layout");
-    }
-
-    matvec_q8_0_pair_decode_scratch(scratch->shared_gate,
-                                    scratch->shared_up,
-                                    model,
-                                    layer->ffn_gate_shexp,
-                                    layer->ffn_up_shexp,
-                                    x,
-                                    scratch);
-    swiglu(scratch->shared_mid, scratch->shared_gate, scratch->shared_up, DS4_N_FF_EXP,
-           DS4_SWIGLU_CLAMP_EXP);
-    matvec_q8_0_decode_scratch(out, model, layer->ffn_down_shexp, scratch->shared_mid, scratch);
-}
 
 
 
@@ -724,79 +700,6 @@ void layer_ffn_one(
 
 
 /* Allocation-free decode FFN using the persistent CPU scratch buffers. */
-void layer_ffn_one_decode_scratch(
-        float                  * out_hc,
-        const ds4_model        * model,
-        const ds4_layer_weights * layer,
-        const float            * inp_hc,
-        uint32_t                 il,
-        int                      token,
-        const float            * steering_dirs,
-        float                    steering_scale,
-        ds4_cpu_decode_scratch * scratch) {
-    const uint32_t n_hc = DS4_N_HC;
-    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
-    const double t_start = profile ? now_sec() : 0.0;
-    double t_hc = 0.0;
-    double t_norm = 0.0;
-    double t_routed = 0.0;
-    double t_shared = 0.0;
-    double t_post = 0.0;
-    float post[4];
-    float comb[16];
-
-    double t0 = profile ? now_sec() : 0.0;
-    hc_pre_from_state_one_scratch(model,
-                                  layer->hc_ffn_fn,
-                                  layer->hc_ffn_scale,
-                                  layer->hc_ffn_base,
-                                  inp_hc, scratch->ffn_cur, post, comb,
-                                  scratch->hc_flat,
-                                  false);
-    if (profile) t_hc = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
-    rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
-    if (profile) t_norm = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    layer_routed_moe_one_prealloc(scratch->ffn_moe,
-                                  model,
-                                  layer,
-                                  scratch->ffn_norm,
-                                  il,
-                                  token,
-                                  DS4_SWIGLU_CLAMP_EXP,
-                                  scratch->routed_mid_all,
-                                  scratch->routed_xq,
-                                  scratch->routed_midq);
-    if (profile) t_routed = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, model, layer, scratch->ffn_norm, scratch);
-    if (profile) t_shared = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-        scratch->ffn_out[i] = scratch->ffn_moe[i] + scratch->ffn_shared[i];
-    }
-    cpu_directional_steering_project_rows(scratch->ffn_out, steering_dirs, il, 1, steering_scale);
-    hc_post_one(out_hc, scratch->ffn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
-    if (profile) t_post = now_sec() - t0;
-
-    if (profile) {
-        fprintf(stderr,
-                "ds4: decode detail layer %u ffn hc=%.3f norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f ms\n",
-                il,
-                t_hc * 1000.0,
-                t_norm * 1000.0,
-                t_routed * 1000.0,
-                t_shared * 1000.0,
-                t_post * 1000.0,
-                (now_sec() - t_start) * 1000.0);
-    }
-}
 
 
 

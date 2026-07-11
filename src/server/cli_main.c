@@ -97,9 +97,8 @@ void usage(FILE *fp, const char *topic) {
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-    if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: cuda, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: cuda");
     exit(2);
 }
 
@@ -165,23 +164,6 @@ static server_config parse_options(int argc, char **argv) {
             usage(stdout, topic);
             exit(0);
         }
-        char dist_parse_err[256] = {0};
-        ds4_dist_cli_parse_result dist_parse =
-            ds4_dist_parse_cli_arg(arg,
-                                   &i,
-                                   argc,
-                                   argv,
-                                   &c.engine.distributed,
-                                   dist_parse_err,
-                                   sizeof(dist_parse_err));
-        if (dist_parse == DS4_DIST_CLI_ERROR) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s",
-                       dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
-            exit(2);
-        }
-        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
-
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -292,8 +274,6 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--cpu")) {
-            c.engine.backend = DS4_BACKEND_CPU;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr, NULL);
@@ -309,14 +289,6 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
-    }
-    char dist_err[256];
-    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
-                                        &c.engine,
-                                        dist_err,
-                                        sizeof(dist_err)) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
-        exit(2);
     }
     /* Production defaults: when -m/--dspark are not given, resolve the
      * canonical ggufs (cwd first, then the model store) so a bare
@@ -369,14 +341,6 @@ int main(int argc, char **argv) {
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
                        cfg.engine.prefill_chunk);
-    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        ds4_dist_generation_options gen = {
-            .ctx_size = cfg.ctx_size,
-        };
-        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
-        ds4_engine_close(engine);
-        return rc;
-    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {

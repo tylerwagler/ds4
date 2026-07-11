@@ -2,7 +2,7 @@
 
 
 
-/* Encode a full single-token decode step on Metal.  This is the generation
+/* Encode a full single-token decode step on GPU.  This is the generation
  * hot path: update caches, run all layers, then produce logits. */
 static bool gpu_graph_encode_token_raw_swa(
         ds4_gpu_graph *g,
@@ -13,7 +13,7 @@ static bool gpu_graph_encode_token_raw_swa(
         bool                   need_logits,
         bool                   allow_split_flush) {
     if (g->raw_cap == 0) {
-        fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
+        fprintf(stderr, "ds4: GPU graph raw KV cache is not allocated\n");
         return false;
     }
     const uint32_t raw_row = pos % g->raw_cap;
@@ -203,7 +203,7 @@ static bool gpu_graph_upload_prompt_embeddings_hc_cpu(
 
 
 /* Seed the batched HC state from token ids: every HC stream starts as the same
- * 4096-wide embedding.  Long prefill chunks use the Metal get-rows/repeat
+ * 4096-wide embedding.  Long prefill chunks use the GPU get-rows/repeat
  * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
 bool gpu_graph_upload_prompt_embeddings_hc(
         ds4_gpu_tensor   *out_hc,
@@ -256,7 +256,7 @@ bool gpu_graph_warmup_prefill_kernels(
     if (getenv("DS4_CUDA_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
 
     /*
-     * The first batched F16 matmul can pay Metal's one-time pipeline execution
+     * The first batched F16 matmul can pay GPU's one-time pipeline execution
      * cost. Run the same HC attention projection on scratch storage before the
      * measured prefill. The output is overwritten by the real graph.
      */
@@ -277,7 +277,7 @@ bool gpu_graph_warmup_prefill_kernels(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (!ok) {
-        fprintf(stderr, "ds4: Metal prefill kernel warmup failed\n");
+        fprintf(stderr, "ds4: GPU prefill kernel warmup failed\n");
         return false;
     }
 
@@ -300,7 +300,7 @@ bool gpu_graph_indexer_stage_profile_boundary(
     const double now = now_sec();
     if (stage != NULL) {
         fprintf(stderr,
-                "ds4: metal indexer stage layer=%u pos=%u tokens=%u comp=%u %s=%.3f ms\n",
+                "ds4: GPU indexer stage layer=%u pos=%u tokens=%u comp=%u %s=%.3f ms\n",
                 il,
                 pos0,
                 n_tokens,
@@ -342,7 +342,7 @@ bool gpu_graph_decode_stage_profile_enabled(uint32_t il) {
 
 
 
-/* Optional prefill stage profiler. It intentionally ends the current Metal
+/* Optional prefill stage profiler. It intentionally ends the current GPU
  * command buffer and waits, so the printed number includes encoding plus GPU
  * execution for the stage just emitted. This is disabled by default because it
  * adds synchronization points and changes scheduling. */
@@ -356,7 +356,7 @@ bool gpu_graph_layer_stage_profile_boundary(
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
     fprintf(stderr,
-            "ds4: metal layer stage part=%s layer=%u pos=%u tokens=%u %s=%.3f ms\n",
+            "ds4: GPU layer stage part=%s layer=%u pos=%u tokens=%u %s=%.3f ms\n",
             part,
             il,
             pos0,
@@ -378,7 +378,7 @@ static bool gpu_graph_q_stage_profile_boundary(
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
     fprintf(stderr,
-            "ds4: metal Q path stage layer=%u pos=%u tokens=%u %s=%.3f ms\n",
+            "ds4: GPU Q path stage layer=%u pos=%u tokens=%u %s=%.3f ms\n",
             il,
             pos0,
             n_tokens,
@@ -798,7 +798,7 @@ bool gpu_graph_encode_layer_attention_batch(
         const bool have_attn_comp = layer->attn_compressor_kv && layer->attn_compressor_gate &&
                                     layer->attn_compressor_ape && layer->attn_compressor_norm;
         if (!have_attn_comp) {
-            fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
+            fprintf(stderr, "ds4: GPU layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
         if (ok) {
@@ -843,12 +843,12 @@ bool gpu_graph_encode_layer_attention_batch(
         if (zero_prefix) {
             n_comp = n_tokens / ratio;
             if (ok && n_comp > g->layer_comp_cap[il]) {
-                fprintf(stderr, "ds4: Metal layer-major compressed KV cache capacity exceeded at layer %u\n", il);
+                fprintf(stderr, "ds4: GPU layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
             if (ok && gpu_graph_attn_pack_enabled() &&
                 n_comp > g->attn_comp_stage_cap) {
-                fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
+                fprintf(stderr, "ds4: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
             }
             ds4_gpu_tensor *attn_comp_target = NULL;
@@ -931,12 +931,12 @@ bool gpu_graph_encode_layer_attention_batch(
                 const uint32_t comp_before = g->layer_n_comp[il];
                 const uint32_t comp_chunk = n_tokens / ratio;
                 if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
-                    fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+                    fprintf(stderr, "ds4: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
                 if (ok && gpu_graph_attn_pack_enabled() &&
                     comp_chunk > g->attn_comp_stage_cap) {
-                    fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
+                    fprintf(stderr, "ds4: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
                 ds4_gpu_tensor *attn_comp_target =
@@ -1043,7 +1043,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     const uint32_t pos = pos0 + t;
                     const bool emit = ((pos + 1u) % ratio) == 0u;
                     if (emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
-                        fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+                        fprintf(stderr, "ds4: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                         break;
                     }
@@ -1122,7 +1122,7 @@ bool gpu_graph_encode_layer_attention_batch(
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
                 !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
                 !layer->indexer_attn_q_b || !layer->indexer_proj) {
-                fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
+                fprintf(stderr, "ds4: GPU layer-major prefill needs indexer weights\n");
                 ok = false;
             }
             if (ok) {
@@ -1193,7 +1193,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      n_tokens) != 0;
             if (zero_prefix) {
                 if (ok && n_comp > g->layer_comp_cap[il]) {
-                    fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
+                    fprintf(stderr, "ds4: GPU layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
                 const int idx_fp4 = gpu_graph_idx_fp4_enabled();
@@ -1279,7 +1279,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     const uint32_t index_before = g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
                     if (index_before + index_chunk > g->layer_comp_cap[il]) {
-                        fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+                        fprintf(stderr, "ds4: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                     }
                     const int idx_fp4 = gpu_graph_idx_fp4_enabled();
@@ -1371,7 +1371,7 @@ bool gpu_graph_encode_layer_attention_batch(
                         const uint32_t pos = pos0 + t;
                         const bool emit = ((pos + 1u) % ratio) == 0u;
                         if (emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
-                            fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+                            fprintf(stderr, "ds4: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                             ok = false;
                             break;
                         }
@@ -2437,7 +2437,7 @@ static bool gpu_graph_eval_token_raw_swa_streaming(
         uint32_t               pos,
         float                 *logits) {
     if (g->raw_cap == 0) {
-        fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
+        fprintf(stderr, "ds4: GPU graph raw KV cache is not allocated\n");
         return false;
     }
 
@@ -2506,7 +2506,7 @@ static bool gpu_graph_eval_token_raw_swa_streaming(
         const double t_read = (profile || throttle) ? now_sec() : 0.0;
         if (profile) {
             fprintf(stderr,
-                    "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                    "ds4: GPU SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
                     pos,
                     (t_encoded - t0) * 1000.0,
                     (t_done - t_encoded) * 1000.0,
@@ -2519,7 +2519,7 @@ static bool gpu_graph_eval_token_raw_swa_streaming(
         }
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after batched SSD streaming graph eval failure also failed\n");
+                fprintf(stderr, "ds4: GPU synchronize after batched SSD streaming graph eval failure also failed\n");
             }
         }
         return ok;
@@ -2586,7 +2586,7 @@ static bool gpu_graph_eval_token_raw_swa_streaming(
             execute_s += t_done - t_head_encoded;
         }
         fprintf(stderr,
-                "ds4: metal SSD streaming token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                "ds4: GPU SSD streaming token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
                 pos,
                 encode_s * 1000.0,
                 execute_s * 1000.0,
@@ -2597,7 +2597,7 @@ static bool gpu_graph_eval_token_raw_swa_streaming(
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after SSD streaming graph eval failure also failed\n");
+            fprintf(stderr, "ds4: GPU synchronize after SSD streaming graph eval failure also failed\n");
         }
     }
     return ok;
@@ -2605,7 +2605,7 @@ static bool gpu_graph_eval_token_raw_swa_streaming(
 
 
 
-/* Execute one Metal decode token and read back logits. */
+/* Execute one GPU decode token and read back logits. */
 bool gpu_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -2633,7 +2633,7 @@ bool gpu_graph_eval_token_raw_swa(
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
         fprintf(stderr,
-                "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                "ds4: GPU graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
                 pos,
                 (t_encoded - t0) * 1000.0,
                 (t_done - t_encoded) * 1000.0,
@@ -2644,7 +2644,7 @@ bool gpu_graph_eval_token_raw_swa(
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
+            fprintf(stderr, "ds4: GPU synchronize after graph eval failure also failed\n");
         }
     }
     return ok;
@@ -2774,7 +2774,7 @@ bool gpu_graph_prefill_decode_streaming_range(
                                             pos,
                                             token_logits)) {
             if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after decode-style streaming prefill failure also failed\n");
+                fprintf(stderr, "ds4: GPU synchronize after decode-style streaming prefill failure also failed\n");
             }
             return false;
         }
@@ -2875,7 +2875,7 @@ bool gpu_graph_seed_streaming_expert_cache_from_prefill(
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
         if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
             layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            fprintf(stderr, "ds4: Metal prefill expert-cache seed byte size overflow at layer %u\n", il);
+            fprintf(stderr, "ds4: GPU prefill expert-cache seed byte size overflow at layer %u\n", il);
             return false;
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
@@ -2902,7 +2902,7 @@ bool gpu_graph_seed_streaming_expert_cache_from_prefill(
     }
     if (profile) {
         fprintf(stderr,
-                "ds4: Metal streaming prefill expert-cache seed k=%u layers=%u rows=%u time=%.3f ms\n",
+                "ds4: GPU streaming prefill expert-cache seed k=%u layers=%u rows=%u time=%.3f ms\n",
                 seed_tokens,
                 seeded_layers,
                 seeded_rows,
@@ -2929,7 +2929,7 @@ bool gpu_graph_seed_streaming_expert_cache_from_hotlist(
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
         if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
             layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            fprintf(stderr, "ds4: Metal expert hotlist budget byte size overflow at layer %u\n", il);
+            fprintf(stderr, "ds4: GPU expert hotlist budget byte size overflow at layer %u\n", il);
             return false;
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
@@ -2950,7 +2950,7 @@ bool gpu_graph_seed_streaming_expert_cache_from_hotlist(
     if (current_count >= preload_count) {
         if (profile) {
             fprintf(stderr,
-                    "ds4: Metal streaming expert hotlist seed skipped preload=%u current=%u\n",
+                    "ds4: GPU streaming expert hotlist seed skipped preload=%u current=%u\n",
                     preload_count,
                     current_count);
         }
@@ -3002,7 +3002,7 @@ bool gpu_graph_seed_streaming_expert_cache_from_hotlist(
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
         if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
             layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            fprintf(stderr, "ds4: Metal expert hotlist seed byte size overflow at layer %u\n", il);
+            fprintf(stderr, "ds4: GPU expert hotlist seed byte size overflow at layer %u\n", il);
             return false;
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
@@ -3035,7 +3035,7 @@ bool gpu_graph_seed_streaming_expert_cache_from_hotlist(
             source_name = "built-in";
         }
         fprintf(stderr,
-                "ds4: Metal streaming expert hotlist seed source=%s preload=%u loaded=%u layers=%u experts=%u time=%.3f ms\n",
+                "ds4: GPU streaming expert hotlist seed source=%s preload=%u loaded=%u layers=%u experts=%u time=%.3f ms\n",
                 source_name,
                 preload_count,
                 loaded,
@@ -3078,7 +3078,7 @@ bool gpu_graph_eval_token_raw_swa_top(
     }
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after top-only graph eval failure also failed\n");
+            fprintf(stderr, "ds4: GPU synchronize after top-only graph eval failure also failed\n");
         }
     }
     return ok;

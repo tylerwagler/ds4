@@ -56,7 +56,7 @@ static float dsv4_e4m3fn_dequant_cpu(float x) {
 
 /* DeepSeek V4 stores the non-RoPE part of compressed KV through an E4M3-style
  * round trip.  Keeping this in the CPU reference makes cache values comparable
- * to the Metal graph's compressed-cache behavior. */
+ * to the GPU graph's compressed-cache behavior. */
 void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t off = 0; off < n_nope; off += 64) {

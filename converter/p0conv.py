@@ -125,11 +125,9 @@ def repack_mxfp4_row(w_i8_row, scale_row):       # w_i8_row [in/2], scale_row [i
 
 # ---------- CUTLASS MXFP4 codec (source E2M1+E8M0 -> ColumnMajor data + swizzled SF) ----------
 # The GB10 tensor-core path stores rich experts in CUTLASS B layout. The SF swizzle is CUTLASS's
-# tile-atom layout, so we shell out to the validated sm_120f packer (needs a GB10 box w/ CUTLASS —
-# run this on Sparky). NOTE(cleanup): once the fork is GB10-only, THIS + repack_mxfp8 + BF16 are the
-# only codecs we keep; q8_0_encode / Q4_K / Q2_K / IQ2 readers+codecs are dead code to strip.
+# tile-atom layout, so we shell out to the validated sm_120f packer (needs a GB10 box with CUTLASS).
 import subprocess as _sp, tempfile as _tf, os as _os
-_PACK_CLI = _os.environ.get("DS4_MXFP4_PACK_CLI", _os.path.expanduser("~/Projects/AI/temp/p0/mxfp4_pack_source_cli"))
+_PACK_CLI = _os.environ.get("DS4_MXFP4_PACK_CLI")
 def pack_mxfp4_cutlass(e2m1_i8, scale_e8m0, N, K):
     """One expert: E2M1 [N,K/2] + E8M0 [N,K/32] -> (data_bytes, sf_bytes) in CUTLASS B layout (ColumnMajor data + swizzled SF)."""
     assert e2m1_i8.shape == (N, K//2) and scale_e8m0.shape == (N, K//32), (e2m1_i8.shape, scale_e8m0.shape)

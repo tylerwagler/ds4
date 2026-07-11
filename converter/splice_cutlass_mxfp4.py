@@ -1,19 +1,25 @@
 """Sparky-side assembly: build the CUTLASS-MXFP4 GGUF from SOURCE. Stream oracle-zeroq8 verbatim,
 but rewrite the 18 rich-layer expert tensors (layers 30,34,37,39,41,42 x gate/up/down) into CUTLASS
-B layout (new type 40) packed FROM SOURCE E2M1+E8M0 (pve_extract_source.py output in SRCDIR).
+B layout (new type 40) packed FROM SOURCE E2M1+E8M0 arrays in SRCDIR.
 Uses p0conv.pack_mxfp4_cutlass -> mxfp4_pack_source_cli. Per rich tensor: expert-major (data||sf) per
 expert; per-expert stride = data(N*K/2) + sf(sf_count). Everything else copied byte-verbatim.
 
-NOTE(cleanup): GB10-only fork drops the non-CUTLASS tiers; kept verbatim here for now.
-  env: MXFP4_SRCDIR (source arrays), DS4_MXFP4_PACK_CLI (packer). Two-pass: gen blob files, then splice."""
+Usage: splice_cutlass_mxfp4.py SRC.gguf OUT.gguf
+  env: MXFP4_SRCDIR (source E2M1+E8M0 arrays), MXFP4_BLOBDIR (scratch for CUTLASS blobs),
+       DS4_MXFP4_PACK_CLI (path to the mxfp4_pack_source_cli packer binary).
+  Two-pass: generate blob files, then splice."""
 import struct, os, sys, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-PACK_CLI = os.environ.get("DS4_MXFP4_PACK_CLI", os.path.expanduser("~/Projects/AI/temp/p0/mxfp4_pack_source_cli"))
-
-SRC = "/home/tyler/Projects/AI/ds4-gguf/oracle-zeroq8-99gb.gguf"
-OUT = "/home/tyler/Projects/AI/ds4-gguf/oracle-cutlass-mxfp4-99gb.gguf"
-SRCDIR = os.environ.get("MXFP4_SRCDIR", "/home/tyler/Projects/AI/temp/p0/mxfp4_src")
-BLOBDIR = os.environ.get("MXFP4_BLOBDIR", "/home/tyler/Projects/AI/temp/p0/cutlass_blobs")
+PACK_CLI = os.environ.get("DS4_MXFP4_PACK_CLI")
+if not PACK_CLI:
+    sys.exit("set DS4_MXFP4_PACK_CLI to the mxfp4_pack_source_cli binary")
+if len(sys.argv) != 3:
+    sys.exit(__doc__)
+SRC, OUT = sys.argv[1], sys.argv[2]
+SRCDIR = os.environ.get("MXFP4_SRCDIR")
+BLOBDIR = os.environ.get("MXFP4_BLOBDIR")
+if not SRCDIR or not BLOBDIR:
+    sys.exit("set MXFP4_SRCDIR and MXFP4_BLOBDIR")
 ALIGN = 32; T_CUTLASS = 40; RICH = [30,34,37,39,41,42]
 BLK = {0:(1,4),1:(1,2),8:(32,34),10:(256,84),12:(256,144),16:(256,66),26:(1,4),30:(1,2),38:(32,33),39:(32,17)}
 TGT = {"ffn_gate_exps":"gate","ffn_up_exps":"up","ffn_down_exps":"down"}

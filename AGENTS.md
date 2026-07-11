@@ -51,7 +51,7 @@ Public headers: `src/ds4.h` (engine API) and `src/ds4_gpu.h` (GPU graph API).
 - `src/agent/` — 20 TUs + `ds4_agent_internal.h`: native coding agent (tools,
   terminal UI, sessions, compaction).
 - `src/cli/` — `ds4_cli.c`, `ds4_bench.c`, `ds4_eval.c` entry points.
-- `src/lib/` — shared pieces: distributed inference, help text, kvstore, SSD
+- `src/lib/` — shared pieces: help text, kvstore, SSD
   streaming, web fetch.
 - `src/vendor/` — linenoise, rax.
 - `tests/` — C runners; `ds4_test.c` and `ds4_agent_test.c` are unity builds

@@ -67,7 +67,7 @@ void gpu_graph_debug_dump_tensor(
     free(buf);
 
     if (ds4_gpu_begin_commands() == 0) {
-        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+        fprintf(stderr, "ds4: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
 
@@ -101,7 +101,7 @@ void gpu_graph_debug_dump_f16_tensor(
     free(hbuf);
 
     if (ds4_gpu_begin_commands() == 0) {
-        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+        fprintf(stderr, "ds4: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
 
@@ -136,7 +136,7 @@ void gpu_graph_debug_dump_i32_tensor(
     free(buf);
 
     if (ds4_gpu_begin_commands() == 0) {
-        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+        fprintf(stderr, "ds4: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
 
@@ -169,10 +169,10 @@ bool gpu_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 
 
 /* =========================================================================
- * Metal Release Graph Allocation.
+ * GPU Release Graph Allocation.
  * ========================================================================= */
 
-/* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
+/* Allocate the GPU graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
 bool gpu_graph_alloc_raw_cap(
         ds4_gpu_graph *g,

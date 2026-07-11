@@ -102,12 +102,22 @@ static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
                                         uint32_t grid_dim,
                                         int32_t *refined_id_dst,
                                         int32_t *refined_id2_dst) {
-    int32_t *ids = (int32_t *)malloc((size_t)grid_dim * sizeof(int32_t));
-    float *vals = (float *)malloc((size_t)grid_dim * sizeof(float));
-    int32_t *ids2 = (int32_t *)malloc((size_t)grid_dim * sizeof(int32_t));
-    float *vals2 = (float *)malloc((size_t)grid_dim * sizeof(float));
+    /* Persistent host merge scratch: grid_dim is fixed for a given vocab and this
+     * runs 5x per decode step at production draft depth, so grow-once instead of
+     * malloc/free per call. Decode is single-threaded (no re-entrancy). */
+    static int32_t *ids = NULL, *ids2 = NULL;
+    static float *vals = NULL, *vals2 = NULL;
+    static uint32_t cap = 0;
+    if (grid_dim > cap) {
+        free(ids); free(vals); free(ids2); free(vals2);
+        ids  = (int32_t *)malloc((size_t)grid_dim * sizeof(int32_t));
+        vals = (float *)  malloc((size_t)grid_dim * sizeof(float));
+        ids2 = (int32_t *)malloc((size_t)grid_dim * sizeof(int32_t));
+        vals2= (float *)  malloc((size_t)grid_dim * sizeof(float));
+        cap = (ids && vals && ids2 && vals2) ? grid_dim : 0;
+    }
     int rc = 0;
-    if (ids && vals && ids2 && vals2 &&
+    if (cap >= grid_dim && ids && vals && ids2 && vals2 &&
         ds4_gpu_tensor_read(id_dev, 0, ids, (uint64_t)grid_dim * sizeof(int32_t)) &&
         ds4_gpu_tensor_read(val_dev, 0, vals, (uint64_t)grid_dim * sizeof(float)) &&
         ds4_gpu_tensor_read(id2_dev, 0, ids2, (uint64_t)grid_dim * sizeof(int32_t)) &&
@@ -131,10 +141,6 @@ static int dspark_markov_reduce_blocks(const ds4_gpu_tensor *id_dev,
         if (refined_id2_dst) *refined_id2_dst = sec_id;
         rc = 1;
     }
-    free(ids);
-    free(vals);
-    free(ids2);
-    free(vals2);
     return rc;
 }
 

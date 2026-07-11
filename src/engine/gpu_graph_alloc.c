@@ -32,7 +32,7 @@ static bool gpu_graph_install_model_spans(
                                                 spans->max_tensor_bytes) != 0;
     if (!ok) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming failed to map %s model spans\n",
+                "ds4: GPU SSD streaming failed to map %s model spans\n",
                 label ? label : "requested");
     }
     free(offsets);
@@ -441,7 +441,7 @@ bool gpu_graph_stream_prefill_selected_profile_layer(
         const int32_t expert = selected[i];
         if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) {
             fprintf(stderr,
-                    "ds4: Metal streaming prefill selected profile expert id %d is outside 0..%u at layer %u\n",
+                    "ds4: GPU streaming prefill selected profile expert id %d is outside 0..%u at layer %u\n",
                     expert,
                     (uint32_t)DS4_N_EXPERT,
                     il);
@@ -459,14 +459,14 @@ bool gpu_graph_stream_prefill_selected_profile_layer(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
         layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-        fprintf(stderr, "ds4: Metal streaming prefill selected profile byte size overflow at layer %u\n", il);
+        fprintf(stderr, "ds4: GPU streaming prefill selected profile byte size overflow at layer %u\n", il);
         return false;
     }
     const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
     const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
     if (gate_expert_bytes > UINT64_MAX - gate_expert_bytes ||
         gate_expert_bytes + gate_expert_bytes > UINT64_MAX - down_expert_bytes) {
-        fprintf(stderr, "ds4: Metal streaming prefill selected profile byte size overflow at layer %u\n", il);
+        fprintf(stderr, "ds4: GPU streaming prefill selected profile byte size overflow at layer %u\n", il);
         return false;
     }
     const uint64_t per_expert_bytes = gate_expert_bytes + gate_expert_bytes +
@@ -505,7 +505,7 @@ bool gpu_graph_stream_prefill_selected_profile_layer(
     }
 
     fprintf(stderr,
-            "ds4: Metal streaming prefill selected profile layer=%u "
+            "ds4: GPU streaming prefill selected profile layer=%u "
             "tokens=%u unique=%u/%u selected=%.2f GiB full=%.2f GiB ratio=%.3f\n",
             il,
             n_tokens,
@@ -531,7 +531,7 @@ void gpu_graph_stream_prefill_selected_profile_summary(
         (double)g->prefill_selected_profile_selected_bytes /
         (double)g->prefill_selected_profile_full_bytes;
     fprintf(stderr,
-            "ds4: Metal streaming prefill selected profile summary "
+            "ds4: GPU streaming prefill selected profile summary "
             "layers=%u avg_unique=%.1f min_unique=%u max_unique=%u "
             "selected=%.2f GiB full=%.2f GiB ratio=%.3f rows=%" PRIu64 "\n",
             g->prefill_selected_profile_layers,
@@ -850,7 +850,7 @@ bool gpu_graph_stream_prefill_selected_pagein_start(
             const int32_t expert = selected[i];
             if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) {
                 fprintf(stderr,
-                        "ds4: Metal streaming prefill selected page-in expert id %d is outside 0..%u at layer %u\n",
+                        "ds4: GPU streaming prefill selected page-in expert id %d is outside 0..%u at layer %u\n",
                         expert,
                         (uint32_t)DS4_N_EXPERT,
                         il);
@@ -896,7 +896,7 @@ bool gpu_graph_stream_prefill_selected_pagein_start(
                 first_id > UINT64_MAX / down_expert_bytes ||
                 n_experts > UINT64_MAX / gate_expert_bytes ||
                 n_experts > UINT64_MAX / down_expert_bytes) {
-                fprintf(stderr, "ds4: Metal streaming prefill selected page-in offset overflow\n");
+                fprintf(stderr, "ds4: GPU streaming prefill selected page-in offset overflow\n");
                 ok = false;
                 break;
             }
@@ -907,7 +907,7 @@ bool gpu_graph_stream_prefill_selected_pagein_start(
             if (gate_rel > UINT64_MAX - layer->ffn_gate_exps->abs_offset ||
                 gate_rel > UINT64_MAX - layer->ffn_up_exps->abs_offset ||
                 down_rel > UINT64_MAX - layer->ffn_down_exps->abs_offset) {
-                fprintf(stderr, "ds4: Metal streaming prefill selected page-in offset overflow\n");
+                fprintf(stderr, "ds4: GPU streaming prefill selected page-in offset overflow\n");
                 ok = false;
                 break;
             }
@@ -952,7 +952,7 @@ bool gpu_graph_stream_prefill_selected_pagein_start(
                                       job);
         if (rc != 0) {
             fprintf(stderr,
-                    "ds4: Metal streaming prefill selected page-in thread failed: %s\n",
+                    "ds4: GPU streaming prefill selected page-in thread failed: %s\n",
                     strerror(rc));
             free(ranges);
             memset(job, 0, sizeof(*job));
@@ -971,7 +971,7 @@ bool gpu_graph_stream_prefill_selected_pagein_start(
                                           &job->workers[t]);
             if (rc != 0) {
                 fprintf(stderr,
-                        "ds4: Metal streaming prefill selected page-in worker failed: %s\n",
+                        "ds4: GPU streaming prefill selected page-in worker failed: %s\n",
                         strerror(rc));
                 for (uint32_t j = 0; j < t; j++) {
                     (void)pthread_join(job->threads[j], NULL);
@@ -1023,7 +1023,7 @@ bool gpu_graph_stream_prefill_selected_pagein_join(
         const char *kind = job->madvise_only ? "madvise" : "page-in";
         const char *bytes_label = job->madvise_only ? "advised" : "touched";
         fprintf(stderr,
-                "ds4: Metal streaming prefill selected %s layer=%u "
+                "ds4: GPU streaming prefill selected %s layer=%u "
                 "tokens=%u unique=%u ranges=%u bytes=%.2f GiB "
                 "read=%.3f ms wait=%.3f ms thread=%.3f ms %s=%.2f GiB ok=%d\n",
                 kind,
@@ -1041,7 +1041,7 @@ bool gpu_graph_stream_prefill_selected_pagein_join(
     }
     if (rc != 0) {
         fprintf(stderr,
-                "ds4: Metal streaming prefill selected page-in join failed: %s\n",
+                "ds4: GPU streaming prefill selected page-in join failed: %s\n",
                 strerror(rc));
     }
     free(job->workers);
@@ -1136,7 +1136,7 @@ static bool gpu_graph_stream_prefill_layer_pagein_start(
                                       job);
         if (rc != 0) {
             fprintf(stderr,
-                    "ds4: Metal streaming prefill layer page-in thread failed: %s\n",
+                    "ds4: GPU streaming prefill layer page-in thread failed: %s\n",
                     strerror(rc));
             free(ranges);
             memset(job, 0, sizeof(*job));
@@ -1155,7 +1155,7 @@ static bool gpu_graph_stream_prefill_layer_pagein_start(
                                           &job->workers[t]);
             if (rc != 0) {
                 fprintf(stderr,
-                        "ds4: Metal streaming prefill layer page-in worker failed: %s\n",
+                        "ds4: GPU streaming prefill layer page-in worker failed: %s\n",
                         strerror(rc));
                 for (uint32_t j = 0; j < t; j++) {
                     (void)pthread_join(job->threads[j], NULL);
@@ -1211,7 +1211,7 @@ static bool gpu_graph_stream_prefill_layer_pagein_join(
                                   job->readahead_only ? "requested" :
                                   job->madvise_only ? "advised" : "touched";
         fprintf(stderr,
-                "ds4: Metal streaming prefill layer %s layer=%u "
+                "ds4: GPU streaming prefill layer %s layer=%u "
                 "tokens=%u threads=%u ranges=%u bytes=%.2f GiB wait=%.3f ms "
                 "thread=%.3f ms %s=%.2f GiB ok=%d\n",
                 kind,
@@ -1228,7 +1228,7 @@ static bool gpu_graph_stream_prefill_layer_pagein_join(
     }
     if (rc != 0) {
         fprintf(stderr,
-                "ds4: Metal streaming prefill layer page-in join failed: %s\n",
+                "ds4: GPU streaming prefill layer page-in join failed: %s\n",
                 strerror(rc));
     }
     free(job->workers);
@@ -1283,7 +1283,7 @@ bool gpu_graph_stream_prepare_start_if_needed(
         gpu_graph_stream_prepare_slot_free(slots, n_slots);
     if (!slot) {
         fprintf(stderr,
-                "ds4: Metal streaming prefill prepare queue is full before layer %u\n",
+                "ds4: GPU streaming prefill prepare queue is full before layer %u\n",
                 layer);
         return false;
     }
@@ -1446,7 +1446,7 @@ static bool gpu_graph_stream_readahead_selected_run(
         first_id > UINT64_MAX / down_expert_bytes ||
         n_experts > UINT64_MAX / gate_expert_bytes ||
         n_experts > UINT64_MAX / down_expert_bytes) {
-        fprintf(stderr, "ds4: Metal streaming prefill selected expert readahead overflow\n");
+        fprintf(stderr, "ds4: GPU streaming prefill selected expert readahead overflow\n");
         return false;
     }
 
@@ -1457,7 +1457,7 @@ static bool gpu_graph_stream_readahead_selected_run(
     if (gate_rel > UINT64_MAX - layer->ffn_gate_exps->abs_offset ||
         gate_rel > UINT64_MAX - layer->ffn_up_exps->abs_offset ||
         down_rel > UINT64_MAX - layer->ffn_down_exps->abs_offset) {
-        fprintf(stderr, "ds4: Metal streaming prefill selected expert readahead overflow\n");
+        fprintf(stderr, "ds4: GPU streaming prefill selected expert readahead overflow\n");
         return false;
     }
 
@@ -1524,7 +1524,7 @@ bool gpu_graph_stream_readahead_selected_experts_from_gpu(
             const int32_t expert = selected[i];
             if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) {
                 fprintf(stderr,
-                        "ds4: Metal streaming prefill selected expert id %d is outside 0..%u at layer %u\n",
+                        "ds4: GPU streaming prefill selected expert id %d is outside 0..%u at layer %u\n",
                         expert,
                         (uint32_t)DS4_N_EXPERT,
                         il);
@@ -1573,7 +1573,7 @@ bool gpu_graph_stream_readahead_selected_experts_from_gpu(
     }
     if (profile) {
         fprintf(stderr,
-                "ds4: Metal streaming prefill selected readahead layer=%u "
+                "ds4: GPU streaming prefill selected readahead layer=%u "
                 "tokens=%u unique=%u ranges=%u gap=%u hint=%.2f GiB time=%.3f ms\n",
                 il,
                 n_tokens,
@@ -1594,7 +1594,7 @@ bool gpu_graph_stream_map_token(
         const ds4_weights *weights) {
     ds4_model_map_span_vec spans;
     if (!weights_model_map_token_spans(weights, &spans)) {
-        fprintf(stderr, "ds4: Metal SSD streaming could not build token embedding span\n");
+        fprintf(stderr, "ds4: GPU SSD streaming could not build token embedding span\n");
         return false;
     }
     const bool ok = gpu_graph_install_model_spans(model, &spans, "token embedding");
@@ -1609,7 +1609,7 @@ bool gpu_graph_stream_map_decode_static_all(
         const ds4_weights *weights) {
     ds4_model_map_span_vec spans;
     if (!weights_model_map_decode_static_spans(weights, true, true, &spans)) {
-        fprintf(stderr, "ds4: Metal SSD streaming could not build static decode spans\n");
+        fprintf(stderr, "ds4: GPU SSD streaming could not build static decode spans\n");
         return false;
     }
     const bool ok = gpu_graph_install_model_spans(model, &spans, "static decode");
@@ -1625,7 +1625,7 @@ bool gpu_graph_stream_map_layer(
         uint32_t           il) {
     ds4_model_map_span_vec spans;
     if (!weights_model_map_spans(weights, il, il, false, &spans)) {
-        fprintf(stderr, "ds4: Metal SSD streaming could not build layer %u spans\n", il);
+        fprintf(stderr, "ds4: GPU SSD streaming could not build layer %u spans\n", il);
         return false;
     }
     const bool ok = gpu_graph_install_model_spans(model, &spans, "layer");
@@ -1641,7 +1641,7 @@ bool gpu_graph_stream_map_layer_decode(
         uint32_t           il) {
     ds4_model_map_span_vec spans;
     if (!weights_model_map_decode_layer_spans(weights, il, &spans)) {
-        fprintf(stderr, "ds4: Metal SSD streaming could not build decode layer %u spans\n", il);
+        fprintf(stderr, "ds4: GPU SSD streaming could not build decode layer %u spans\n", il);
         return false;
     }
     const bool ok = gpu_graph_install_model_spans(model, &spans, "decode layer");
@@ -1656,7 +1656,7 @@ bool gpu_graph_stream_map_output(
         const ds4_weights *weights) {
     ds4_model_map_span_vec spans;
     if (!weights_model_map_output_spans(weights, &spans)) {
-        fprintf(stderr, "ds4: Metal SSD streaming could not build output head spans\n");
+        fprintf(stderr, "ds4: GPU SSD streaming could not build output head spans\n");
         return false;
     }
     const bool ok = gpu_graph_install_model_spans(model, &spans, "output head");
@@ -1773,7 +1773,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
 
 
 /* =========================================================================
- * Metal Decode Release Helpers and Reference Fallbacks.
+ * GPU Decode Release Helpers and Reference Fallbacks.
  * =========================================================================
  *
  * The normal generation path uses the fused helpers below.  The older unfused

@@ -27,7 +27,10 @@ __pycache__/
 /ds4_agent_test
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
+/gguf-tools/test_quants
 .claude/
+/data/
+/runs/
 
 # --- working files (see CLAUDE.md: all temp/scratch files live here) ---
 /temp/

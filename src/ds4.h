@@ -18,7 +18,6 @@
 
 typedef enum {
     DS4_BACKEND_CUDA,
-    DS4_BACKEND_CPU,
 } ds4_backend;
 
 typedef enum {
@@ -63,33 +62,6 @@ typedef bool (*ds4_session_cancel_fn)(void *ud);
 
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 
-typedef enum {
-    DS4_DISTRIBUTED_NONE = 0,
-    DS4_DISTRIBUTED_COORDINATOR,
-    DS4_DISTRIBUTED_WORKER,
-} ds4_distributed_role;
-
-typedef struct {
-    uint32_t start;
-    uint32_t end;
-    bool has_output;
-    bool set;
-} ds4_distributed_layers;
-
-typedef struct {
-    ds4_distributed_role role;
-    ds4_distributed_layers layers;
-    const char *listen_host;
-    int listen_port;
-    const char *coordinator_host;
-    int coordinator_port;
-    uint32_t prefill_chunk;
-    uint32_t prefill_window;
-    uint32_t activation_bits;
-    bool replay_check;
-    bool debug;
-} ds4_distributed_options;
-
 typedef struct {
     const char *model_path;
     const char *mtp_path;
@@ -118,11 +90,6 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool inspect_only;
-    bool load_slice;
-    uint32_t load_layer_start;
-    uint32_t load_layer_end;
-    bool load_output;
-    ds4_distributed_options distributed;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -208,10 +175,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_gpu_graph_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_gpu_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_gpu_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
 
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
@@ -240,7 +204,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
-bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
@@ -250,9 +213,6 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
-/* Distributed coordinator sessions return 1 when the full layer route is
- * available, 0 when it is still incomplete, and -1 for a local API error. */
-int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
@@ -302,36 +262,11 @@ bool ds4_engine_has_dspark(ds4_engine *e);
 int ds4_engine_dspark_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
-/* Low-level graph slice entry points used by distributed inference.  The
- * transport/session routing logic lives in ds4_distributed.c. */
-int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen);
-int ds4_session_eval_layer_slice(ds4_session *s,
-                                 const int *tokens,
-                                 uint32_t n_tokens,
-                                 uint32_t pos0,
-                                 uint32_t layer_start,
-                                 uint32_t layer_end,
-                                 const float *input_hc,
-                                 float *output_hc,
-                                 bool output_logits,
-                                 float *logits,
-                                 char *err,
-                                 size_t errlen);
-int ds4_session_eval_output_head_from_hc(ds4_session *s,
-                                         const float *hidden_hc,
-                                         uint32_t n_tokens,
-                                         float *logits,
-                                         char *err,
-                                         size_t errlen);
-
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
 #define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
-#define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
-#define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
-#define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
@@ -344,17 +279,5 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
-
-uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
-                                         uint32_t layer_start,
-                                         uint32_t layer_end);
-int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
-                                   uint32_t layer_start, uint32_t layer_end,
-                                   char *err, size_t errlen);
-int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
-                                   uint64_t payload_bytes,
-                                   const int *tokens, uint32_t n_tokens,
-                                   uint32_t layer_start, uint32_t layer_end,
-                                   char *err, size_t errlen);
 
 #endif

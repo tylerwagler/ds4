@@ -385,7 +385,7 @@ uint64_t ds4_streaming_manual_cache_safe_bytes(void) {
 
     /*
      * Explicit NGB budgets name only the routed expert cache.  Keep that cache
-     * below the full Metal working-set recommendation so non-routed weights,
+     * below the full GPU working-set recommendation so non-routed weights,
      * scratch buffers, KV, and macOS wired-memory overhead do not force expert
      * slots out of mlock during decode.
      */
@@ -550,18 +550,6 @@ static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) 
 
 
 
-bool weights_layers_bound(const ds4_weights *w, uint32_t layer_start, uint32_t layer_end) {
-    if (!w || layer_start >= DS4_N_LAYER) return false;
-    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
-    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
-        if (!weights_layer_has_required(&w->layer[il], il)) return false;
-    }
-    return true;
-}
-
-
-
 const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w) {
     if (!w) return NULL;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -573,8 +561,7 @@ const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w) {
 
 
 /* Verify every tensor type and dimension used by the specialized pipeline.
- * For distributed sliced GGUFs, only the advertised local layer range is
- * required; token embedding and output head are validated when present. */
+ * Token embedding and output head are validated when present. */
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -1229,43 +1216,18 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
-void weights_bind(
-        ds4_weights     *w,
-        const ds4_model *m,
-        bool             load_slice,
-        uint32_t         load_layer_start,
-        uint32_t         load_layer_end,
-        bool             require_output,
-        bool             optional_output) {
+void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
 
-    uint32_t start = 0;
-    uint32_t end = DS4_N_LAYER - 1u;
-    bool require_token_embd = true;
-    if (load_slice) {
-        if (load_layer_start >= DS4_N_LAYER) ds4_die("invalid model load layer slice");
-        start = load_layer_start;
-        end = load_layer_end == UINT32_MAX ? DS4_N_LAYER - 1u : load_layer_end;
-        if (end >= DS4_N_LAYER || end < start) ds4_die("invalid model load layer slice");
-        require_token_embd = start == 0;
-    } else {
-        require_output = true;
-        optional_output = false;
-    }
+    w->token_embd = required_tensor(m, "token_embd.weight");
+    weights_bind_output(w, m, true, false);
 
-    if (require_token_embd) {
-        w->token_embd = required_tensor(m, "token_embd.weight");
-    } else {
-        w->token_embd = model_find_tensor(m, "token_embd.weight");
-    }
-    weights_bind_output(w, m, require_output, optional_output);
-
-    for (uint32_t il = start; il <= end; il++) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         weights_bind_layer(&w->layer[il], m, il);
     }
 
-    weights_validate_layout(w, start, end, require_token_embd, require_output);
+    weights_validate_layout(w, 0, DS4_N_LAYER - 1u, true, true);
 }
 
 
@@ -1496,29 +1458,6 @@ DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        model_map_span_vec_include_layer_decode(spans, w, il);
-    }
-    if (include_output) model_map_span_vec_include_output(spans, w);
-    return model_map_span_vec_finish(spans);
-}
-
-
-
-DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
-        const ds4_weights *w,
-        uint32_t layer_start,
-        uint32_t layer_end,
-        bool include_token,
-        bool include_output,
-        ds4_model_map_span_vec *spans) {
-    if (!w || !spans) return false;
-    if (layer_start >= DS4_N_LAYER) return false;
-    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
-    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
-
-    memset(spans, 0, sizeof(*spans));
-    if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
         model_map_span_vec_include_layer_decode(spans, w, il);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
@@ -2563,54 +2502,15 @@ void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float
 
 /* Decode scratch owns this temporary activation quantization so generation
  * can assert that the hot path performs no malloc. */
-static void cpu_decode_quantize_q8_0(
-        ds4_cpu_decode_scratch * scratch,
-        const float            * x,
-        uint64_t                 in_dim) {
-    if (in_dim > scratch->q8_cap) ds4_die("CPU decode Q8_0 scratch buffer is too small");
-    quantize_q8_0_activation(x, scratch->q8_xq, scratch->q8_xscale, in_dim);
-}
 
 
 
-void matvec_q8_0_decode_scratch(
-        float                  * out,
-        const ds4_model        * m,
-        const ds4_tensor       * w,
-        const float            * x,
-        ds4_cpu_decode_scratch * scratch) {
-    cpu_decode_quantize_q8_0(scratch, x, w->dim[0]);
-    matvec_q8_0_prequant(out, m, w, scratch->q8_xq, scratch->q8_xscale);
-}
 
 
 
-void matvec_q8_0_pair_decode_scratch(
-        float                  * out0,
-        float                  * out1,
-        const ds4_model        * m,
-        const ds4_tensor       * w0,
-        const ds4_tensor       * w1,
-        const float            * x,
-        ds4_cpu_decode_scratch * scratch) {
-    cpu_decode_quantize_q8_0(scratch, x, w0->dim[0]);
-    matvec_q8_0_pair_prequant(out0, out1, m, w0, w1, scratch->q8_xq, scratch->q8_xscale);
-}
 
 
 
-void matvec_any_decode_scratch(
-        float                  * out,
-        const ds4_model        * m,
-        const ds4_tensor       * w,
-        const float            * x,
-        ds4_cpu_decode_scratch * scratch) {
-    if (w->type == 8) {
-        matvec_q8_0_decode_scratch(out, m, w, x, scratch);
-    } else {
-        matvec_any(out, m, w, x);
-    }
-}
 
 
 
@@ -2655,42 +2555,6 @@ void matvec_q8_0_grouped_rows(
 
 
 
-void matvec_q8_0_grouped_rows_decode_scratch(
-        float                  * out,
-        const ds4_model        * m,
-        const ds4_tensor       * w,
-        const float            * x,
-        uint32_t                 n_groups,
-        uint64_t                 group_dim,
-        uint64_t                 rank,
-        ds4_cpu_decode_scratch * scratch) {
-    if (w->type != 8 || w->ndim != 2) ds4_die("expected a 2D Q8_0 tensor");
-    if (w->dim[0] != group_dim || w->dim[1] < (uint64_t)n_groups * rank) {
-        ds4_die("grouped Q8_0 tensor has an unexpected layout");
-    }
-    if ((uint64_t)n_groups * group_dim > scratch->q8_cap) {
-        ds4_die("CPU decode grouped Q8_0 scratch buffer is too small");
-    }
-
-    const uint64_t blocks = (group_dim + 31) / 32;
-    for (uint32_t g = 0; g < n_groups; g++) {
-        quantize_q8_0_activation(x + (uint64_t)g * group_dim,
-                                 scratch->q8_xq + (uint64_t)g * blocks * 32,
-                                 scratch->q8_xscale + (uint64_t)g * blocks,
-                                 group_dim);
-    }
-
-    matvec_q8_0_grouped_ctx ctx = {
-        .out = out,
-        .data = tensor_data(m, w),
-        .xq = scratch->q8_xq,
-        .xscale = scratch->q8_xscale,
-        .in_dim = group_dim,
-        .blocks = blocks,
-        .rank = rank,
-    };
-    ds4_parallel_for((uint64_t)n_groups * rank, matvec_q8_0_grouped_worker, &ctx);
-}
 
 
 

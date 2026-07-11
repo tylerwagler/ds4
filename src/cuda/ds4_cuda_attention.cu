@@ -1062,9 +1062,14 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const uint32_t comp_idx = sr < raw_count
-                ? 0u
-                : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
+            /* Clamp the top-k index to visible_comp: the engine's invariant keeps
+             * padding sentinels (UINT32_MAX) out of this path, but a stray value
+             * would otherwise be a ~4 GB wild read. Substitute row 0 on violation. */
+            uint32_t comp_idx = 0u;
+            if (sr >= raw_count) {
+                int32_t c = topk[(uint64_t)t * top_k + (sr - raw_count)];
+                comp_idx = (c >= 0 && (uint32_t)c < visible_comp) ? (uint32_t)c : 0u;
+            }
             kv_shared[off] = sr < raw_count
                 ? raw_kv_ld4(raw_kv, raw_f16, (uint64_t)raw_rows[sr] * head_dim, c4)
                 : ((const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim))[c4];

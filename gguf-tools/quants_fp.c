@@ -77,7 +77,7 @@ void ds4q_dequantize_fp8_e4m3(const void *blocks, float *out, int64_t n) {
 static const float ds4q_e2m1_mag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
 
 static uint8_t ds4q_f32_to_e2m1(float x) {
-    uint8_t s = (x < 0.0f) ? 0x80 : 0x00;
+    uint8_t s = (x < 0.0f) ? 0x08 : 0x00; /* sign lives at bit 3 of the nibble */
     float a = fabsf(x);
     if (a == 0.0f) return s;
     if (a >= 6.0f) return (uint8_t)(s | 0x07);
@@ -117,14 +117,19 @@ size_t ds4q_quantize_mxfp4(const float *src, void *dst, int64_t start,
     return (size_t)nrows * row_size;
 }
 
+static inline float ds4q_e2m1_to_f32(uint8_t nib) {
+    const float mag = ds4q_e2m1_mag[nib & 0x07];
+    return (nib & 0x08) ? -mag : mag;
+}
+
 void ds4q_dequantize_mxfp4(const void *blocks, float *out, int64_t n) {
     const uint8_t *b = (const uint8_t *)blocks;
     const int64_t nblocks = n / 32;
     for (int64_t i = 0; i < nblocks; i++) {
         const float scale = ldexpf(1.0f, (int)b[0] - 127);
         for (int j = 0; j < 16; j++) {
-            out[i * 32 + 2*j]     = ds4q_e2m1_mag[b[1 + j] & 0x0f] * scale;
-            out[i * 32 + 2*j + 1] = ds4q_e2m1_mag[b[1 + j] >> 4]   * scale;
+            out[i * 32 + 2*j]     = ds4q_e2m1_to_f32(b[1 + j] & 0x0f) * scale;
+            out[i * 32 + 2*j + 1] = ds4q_e2m1_to_f32(b[1 + j] >> 4)   * scale;
         }
         b += 17;
     }

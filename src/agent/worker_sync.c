@@ -83,17 +83,6 @@ static int worker_status_power_locked(agent_worker *w) {
 void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
-    if (w->cfg &&
-        w->cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
-        (w->status.state == AGENT_WORKER_PREFILL ||
-         w->status.state == AGENT_WORKER_GENERATING ||
-         w->status.state == AGENT_WORKER_COMPACTING))
-    {
-        w->status.state = AGENT_WORKER_DRAINING;
-        w->status.prefill_tps = 0.0;
-        w->status.greedy_sampling = false;
-        agent_wake_locked(w);
-    }
     pthread_mutex_unlock(&w->mu);
 }
 

@@ -1112,6 +1112,33 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
+/* Configure indexer_topk_8192_cub_kernel's opt-in dynamic shared memory ONCE and
+ * cache the result. The device, its max-optin-smem, and the per-function attribute
+ * are process-invariant, so the cudaGetDevice + cudaDeviceGetAttribute +
+ * cudaFuncSetAttribute triple must not run per launch (it did, per layer per token
+ * at >=16k ctx — squarely on the decode launch floor). Returns the dynamic smem
+ * byte count if the cub path is usable on this device, or 0 if the caller must fall
+ * back to the pow2 kernel. Decode is single-threaded; a first-call race is benign
+ * (cudaFuncSetAttribute is idempotent). */
+static int indexer_topk_cub_smem(void) {
+    static int cached = -1; /* -1 uninit, 0 unavailable, >0 smem bytes */
+    if (cached >= 0) return cached;
+    using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
+    const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
+    int dev = 0, max_optin_smem = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&max_optin_smem,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+        max_optin_smem < smem ||
+        cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) {
+        cached = 0;
+        return 0;
+    }
+    cached = smem;
+    return smem;
+}
+
 
 
 static int indexer_scores_launch(
@@ -1282,26 +1309,12 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     if (top_k == 512u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         if (n_comp == 4096u) {
-            using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
-            const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
-            int dev = 0;
-            int max_optin_smem = 0;
-            cudaError_t attr_err = cudaGetDevice(&dev);
-            if (attr_err == cudaSuccess) {
-                attr_err = cudaDeviceGetAttribute(&max_optin_smem,
-                                                  cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                                                  dev);
-            }
-            if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                smem);
-                if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
-                    return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
-                }
+            const int smem = indexer_topk_cub_smem();
+            if (smem > 0) {
+                indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                                                                             (const float *)scores->ptr,
+                                                                             n_comp, n_tokens, top_k);
+                return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
             }
         }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
@@ -1313,26 +1326,12 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
         if (n_comp > 4096u) {
-            using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
-            const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
-            int dev = 0;
-            int max_optin_smem = 0;
-            cudaError_t attr_err = cudaGetDevice(&dev);
-            if (attr_err == cudaSuccess) {
-                attr_err = cudaDeviceGetAttribute(&max_optin_smem,
-                                                  cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                                                  dev);
-            }
-            if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                smem);
-                if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
-                    return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
-                }
+            const int smem = indexer_topk_cub_smem();
+            if (smem > 0) {
+                indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                                                                             (const float *)scores->ptr,
+                                                                             n_comp, n_tokens, top_k);
+                return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
             }
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,

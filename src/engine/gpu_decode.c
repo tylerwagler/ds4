@@ -210,7 +210,7 @@ static bool gpu_graph_check_hc_norm_fusion(
         const float norm_rms = rms_abs_diff(fused_norm_cpu, ref_norm_cpu, n_embd);
         const float tol = gpu_graph_hc_norm_fusion_check_tolerance();
         fprintf(stderr,
-                "ds4: Metal HC norm fusion check %s layer=%u pos=%u "
+                "ds4: GPU HC norm fusion check %s layer=%u pos=%u "
                 "out_max=%g out_rms=%g norm_max=%g norm_rms=%g tol=%g\n",
                 label ? label : "hc",
                 il,
@@ -222,7 +222,7 @@ static bool gpu_graph_check_hc_norm_fusion(
                 tol);
         if (out_max > tol || norm_max > tol) {
             fprintf(stderr,
-                    "ds4: Metal HC norm fusion check failed for %s layer=%u pos=%u\n",
+                    "ds4: GPU HC norm fusion check failed for %s layer=%u pos=%u\n",
                     label ? label : "hc",
                     il,
                     pos);
@@ -458,7 +458,7 @@ void gpu_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
 
 
 
-/* Encode one DS4 decode layer on Metal.  This is the release single-token
+/* Encode one DS4 decode layer on GPU.  This is the release single-token
  * layer path; diagnostics reuse it so they compare exactly what generation
  * runs. */
 bool gpu_graph_indexer_stage_profile_boundary(
@@ -803,7 +803,7 @@ uint32_t gpu_graph_streaming_expert_preload_count(
         preload = cache_budget;
         /* Auto mode is a hot seed, not a request to synchronously fill the
          * whole cache. Large Flash caches can otherwise spend startup doing
-         * thousands of preads into shared Metal buffers and trip the system
+         * thousands of preads into shared GPU buffers and trip the system
          * watchdog before decode begins. Explicit CLI preload counts bypass
          * this cap. */
         const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
@@ -939,7 +939,7 @@ static bool gpu_graph_decode_cpu_router(
 
     if (profile) {
         fprintf(stderr,
-                "ds4: Metal CPU router layer=%u gate=%s down=%s sync=%.3f ms read=%.3f ms cpu=%.3f ms write=%.3f ms total=%.3f ms\n",
+                "ds4: GPU CPU router layer=%u gate=%s down=%s sync=%.3f ms read=%.3f ms cpu=%.3f ms write=%.3f ms total=%.3f ms\n",
                 il,
                 tensor_type_name(layer->ffn_gate_exps->type),
                 tensor_type_name(layer->ffn_down_exps->type),
@@ -997,7 +997,7 @@ static bool gpu_graph_decode_selected_readahead_override(
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= DS4_N_EXPERT) {
             fprintf(stderr,
-                    "ds4: Metal streaming selected readahead expert id %d is outside 0..%u at layer %u\n",
+                    "ds4: GPU streaming selected readahead expert id %d is outside 0..%u at layer %u\n",
                     selected_ids[i],
                     DS4_N_EXPERT,
                     il);
@@ -1011,7 +1011,7 @@ static bool gpu_graph_decode_selected_readahead_override(
         const uint64_t expert_id = (uint64_t)expert;
         if (expert_id > UINT64_MAX / gate_expert_bytes ||
             expert_id > UINT64_MAX / down_expert_bytes) {
-            fprintf(stderr, "ds4: Metal streaming selected readahead offset overflow\n");
+            fprintf(stderr, "ds4: GPU streaming selected readahead offset overflow\n");
             return false;
         }
         const uint64_t gate_rel = expert_id * gate_expert_bytes;
@@ -1019,7 +1019,7 @@ static bool gpu_graph_decode_selected_readahead_override(
         if (gate_rel > UINT64_MAX - layer->ffn_gate_exps->abs_offset ||
             gate_rel > UINT64_MAX - layer->ffn_up_exps->abs_offset ||
             down_rel > UINT64_MAX - layer->ffn_down_exps->abs_offset) {
-            fprintf(stderr, "ds4: Metal streaming selected readahead offset overflow\n");
+            fprintf(stderr, "ds4: GPU streaming selected readahead offset overflow\n");
             return false;
         }
 
@@ -1059,7 +1059,7 @@ static bool gpu_graph_decode_selected_readahead_override(
 
     if (profile) {
         fprintf(stderr,
-                "ds4: Metal streaming selected readahead layer=%u unique=%u sync=%.3f ms read=%.3f ms hint=%.3f ms resume=%.3f ms total=%.3f ms\n",
+                "ds4: GPU streaming selected readahead layer=%u unique=%u sync=%.3f ms read=%.3f ms hint=%.3f ms resume=%.3f ms total=%.3f ms\n",
                 il,
                 unique,
                 (t_sync - t0) * 1000.0,
@@ -1267,7 +1267,7 @@ static void gpu_graph_selected_async_load_run(
         if (job->selected_ids[i] < 0 ||
             (uint32_t)job->selected_ids[i] >= DS4_N_EXPERT) {
             fprintf(stderr,
-                    "ds4: Metal streaming async selected expert id %d is outside 0..%u at layer %u\n",
+                    "ds4: GPU streaming async selected expert id %d is outside 0..%u at layer %u\n",
                     job->selected_ids[i],
                     DS4_N_EXPERT,
                     job->il);
@@ -1331,7 +1331,7 @@ static bool gpu_graph_selected_async_load_ensure_worker(void) {
     if (rc != 0) {
         pthread_mutex_unlock(&g_gpu_graph_selected_async_load_mutex);
         fprintf(stderr,
-                "ds4: failed to start Metal streaming async selected load worker: %s\n",
+                "ds4: failed to start GPU streaming async selected load worker: %s\n",
                 strerror(rc));
         return false;
     }
@@ -1660,11 +1660,11 @@ bool gpu_graph_encode_decode_layer(
             layer->attn_compressor_gate->dim[0] != DS4_N_EMBD ||
             layer->attn_compressor_kv->dim[1] != comp_width ||
             layer->attn_compressor_gate->dim[1] != comp_width) {
-            fprintf(stderr, "ds4: Metal graph compressor expects paired F16 compressor projections\n");
+            fprintf(stderr, "ds4: GPU graph compressor expects paired F16 compressor projections\n");
             ok = false;
         }
         if (ok && emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
-            fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+            fprintf(stderr, "ds4: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
             ok = false;
         }
         if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
@@ -1756,11 +1756,11 @@ bool gpu_graph_encode_decode_layer(
                 layer->indexer_compressor_gate->dim[0] != DS4_N_EMBD ||
                 layer->indexer_compressor_kv->dim[1] != index_width ||
                 layer->indexer_compressor_gate->dim[1] != index_width) {
-                fprintf(stderr, "ds4: Metal graph indexer compressor expects paired F16 projections\n");
+                fprintf(stderr, "ds4: GPU graph indexer compressor expects paired F16 projections\n");
                 ok = false;
             }
             if (ok && emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
-                fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+                fprintf(stderr, "ds4: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
             if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
@@ -1854,14 +1854,14 @@ bool gpu_graph_encode_decode_layer(
                     !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_attn_q_b) ||
                     layer->indexer_attn_q_b->dim[0] != q_rank ||
                     layer->indexer_attn_q_b->dim[1] != indexer_q_dim) {
-                    fprintf(stderr, "ds4: Metal graph indexer q projection expects F16 weights\n");
+                    fprintf(stderr, "ds4: GPU graph indexer q projection expects F16 weights\n");
                     ok = false;
                 }
                 if (ok && (!layer->indexer_proj ||
                            !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_proj) ||
                            layer->indexer_proj->dim[0] != DS4_N_EMBD ||
                            layer->indexer_proj->dim[1] != DS4_N_INDEXER_HEAD)) {
-                    fprintf(stderr, "ds4: Metal graph indexer weight projection expects F16 weights\n");
+                    fprintf(stderr, "ds4: GPU graph indexer weight projection expects F16 weights\n");
                     ok = false;
                 }
                 if (ok) ok = gpu_graph_matmul_plain_tensor(g->indexer_q,
@@ -3033,7 +3033,7 @@ bool gpu_graph_dspark_draft_forward(
     return ok;
 }
 
-/* Encode the final HC collapse, output norm, and vocab projection on Metal. */
+/* Encode the final HC collapse, output norm, and vocab projection on GPU. */
 bool gpu_graph_encode_output_head(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -3348,11 +3348,11 @@ bool gpu_graph_encode_output_head_mtp(
 
 
 /* =========================================================================
- * Metal Diagnostic Comparisons.
+ * GPU Diagnostic Comparisons.
  * =========================================================================
  *
  * These routines deliberately allocate CPU-side reference buffers and read
- * Metal tensors back.  They are not part of generation; command-line tests use
+ * GPU tensors back.  They are not part of generation; command-line tests use
  * them to localize drift against the C reference pipeline.
  */
 
@@ -3492,7 +3492,7 @@ static void gpu_graph_trace_layer_stages(
 
     if (ok) {
         fprintf(stderr,
-                "ds4: Metal stage layer %u attn_cur=%g/%g attn_norm=%g/%g q=%g/%g kv=%g/%g attn_out=%g/%g after_attn_hc=%g/%g ffn_cur=%g/%g ffn_norm=%g/%g shared=%g/%g router_w=%g routed=%g/%g ffn_out=%g/%g after_ffn_hc=%g/%g\n",
+                "ds4: GPU stage layer %u attn_cur=%g/%g attn_norm=%g/%g q=%g/%g kv=%g/%g attn_out=%g/%g after_attn_hc=%g/%g ffn_cur=%g/%g ffn_norm=%g/%g shared=%g/%g router_w=%g routed=%g/%g ffn_out=%g/%g after_ffn_hc=%g/%g\n",
                 il,
                 max_abs_diff(cpu_attn_cur, gpu_attn_cur, DS4_N_EMBD), rms_abs_diff(cpu_attn_cur, gpu_attn_cur, DS4_N_EMBD),
                 max_abs_diff(cpu_attn_norm, gpu_attn_norm, DS4_N_EMBD), rms_abs_diff(cpu_attn_norm, gpu_attn_norm, DS4_N_EMBD),
@@ -3508,14 +3508,14 @@ static void gpu_graph_trace_layer_stages(
                 max_abs_diff(cpu_ffn_out, gpu_ffn_out, DS4_N_EMBD), rms_abs_diff(cpu_ffn_out, gpu_ffn_out, DS4_N_EMBD),
                 max_abs_diff(cpu_after_ffn_hc, gpu_after_ffn_hc, hc_dim), rms_abs_diff(cpu_after_ffn_hc, gpu_after_ffn_hc, hc_dim));
         fprintf(stderr,
-                "ds4: Metal shared layer %u gate=%g/%g up=%g/%g mid=%g/%g down=%g/%g\n",
+                "ds4: GPU shared layer %u gate=%g/%g up=%g/%g mid=%g/%g down=%g/%g\n",
                 il,
                 max_abs_diff(cpu_shared_gate, gpu_shared_gate, shared_dim), rms_abs_diff(cpu_shared_gate, gpu_shared_gate, shared_dim),
                 max_abs_diff(cpu_shared_up, gpu_shared_up, shared_dim), rms_abs_diff(cpu_shared_up, gpu_shared_up, shared_dim),
                 max_abs_diff(cpu_shared_mid, gpu_shared_mid, shared_dim), rms_abs_diff(cpu_shared_mid, gpu_shared_mid, shared_dim),
                 max_abs_diff(cpu_shared, gpu_shared, DS4_N_EMBD), rms_abs_diff(cpu_shared, gpu_shared, DS4_N_EMBD));
         fprintf(stderr,
-                "ds4: Metal routed layer %u mid=%g/%g out=%g/%g\n",
+                "ds4: GPU routed layer %u mid=%g/%g out=%g/%g\n",
                 il,
                 max_abs_diff(routed_mid_all, gpu_routed_mid_all, DS4_N_EXPERT_USED * down_in_dim),
                 rms_abs_diff(routed_mid_all, gpu_routed_mid_all, DS4_N_EXPERT_USED * down_in_dim),
@@ -3523,7 +3523,7 @@ static void gpu_graph_trace_layer_stages(
                 rms_abs_diff(cpu_routed, gpu_routed, DS4_N_EMBD));
         if (memcmp(selected, gpu_selected, sizeof(selected)) != 0) {
             fprintf(stderr,
-                    "ds4: Metal stage layer %u router selected mismatch: cpu=[%d,%d,%d,%d,%d,%d] gpu=[%d,%d,%d,%d,%d,%d]\n",
+                    "ds4: GPU stage layer %u router selected mismatch: cpu=[%d,%d,%d,%d,%d,%d] gpu=[%d,%d,%d,%d,%d,%d]\n",
                     il,
                     selected[0], selected[1], selected[2], selected[3], selected[4], selected[5],
                     gpu_selected[0], gpu_selected[1], gpu_selected[2], gpu_selected[3], gpu_selected[4], gpu_selected[5]);
@@ -3578,7 +3578,7 @@ int gpu_graph_decode_test(
         const token_vec   *prompt,
         bool               quality) {
     if (prompt->len <= 0) {
-        fprintf(stderr, "ds4: Metal graph test needs a non-empty prompt\n");
+        fprintf(stderr, "ds4: GPU graph test needs a non-empty prompt\n");
         return 1;
     }
 
@@ -3739,7 +3739,7 @@ int gpu_graph_decode_test(
 
     if (ok) {
         fprintf(stderr,
-                "ds4: Metal graph test layer0 diffs: embed_hc=%g hc_pre=%g attn_norm=%g q_rope=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
+                "ds4: GPU graph test layer0 diffs: embed_hc=%g hc_pre=%g attn_norm=%g q_rope=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
                 max_abs_diff(cpu_hc, gpu_hc, hc_dim),
                 max_abs_diff(cpu_attn_cur, gpu_attn_cur, DS4_N_EMBD),
                 max_abs_diff(cpu_attn_norm, gpu_attn_norm, DS4_N_EMBD),
@@ -3758,17 +3758,17 @@ int gpu_graph_decode_test(
                 max_abs_diff(cpu_logits, gpu_logits, vocab_dim));
         if (memcmp(selected, gpu_selected, sizeof(selected)) != 0) {
             fprintf(stderr,
-                    "ds4: Metal graph router selected mismatch: cpu=[%d,%d,%d,%d,%d,%d] gpu=[%d,%d,%d,%d,%d,%d]\n",
+                    "ds4: GPU graph router selected mismatch: cpu=[%d,%d,%d,%d,%d,%d] gpu=[%d,%d,%d,%d,%d,%d]\n",
                     selected[0], selected[1], selected[2], selected[3], selected[4], selected[5],
                     gpu_selected[0], gpu_selected[1], gpu_selected[2], gpu_selected[3], gpu_selected[4], gpu_selected[5]);
         }
-        print_vec_stats("metal graph q", gpu_q, q_dim);
-        print_vec_stats("metal graph kv", gpu_kv, DS4_N_HEAD_DIM);
-        print_vec_stats("metal graph routed", gpu_routed, DS4_N_EMBD);
+        print_vec_stats("GPU graph q", gpu_q, q_dim);
+        print_vec_stats("GPU graph kv", gpu_kv, DS4_N_HEAD_DIM);
+        print_vec_stats("GPU graph routed", gpu_routed, DS4_N_EMBD);
     } else {
-        fprintf(stderr, "ds4: Metal graph test failed while encoding first decode stages\n");
+        fprintf(stderr, "ds4: GPU graph test failed while encoding first decode stages\n");
         if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after graph test failure also failed\n");
+            fprintf(stderr, "ds4: GPU synchronize after graph test failure also failed\n");
         }
     }
 
@@ -3817,154 +3817,14 @@ int gpu_graph_decode_test(
 
 
 
-int gpu_graph_first_token_full_test(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        const token_vec   *prompt,
-        bool               quality) {
-    if (prompt->len <= 0) {
-        fprintf(stderr, "ds4: full Metal graph test needs a non-empty prompt\n");
-        return 1;
-    }
-
-    const int token = prompt->v[0];
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t vocab_dim = weights->output->dim[1];
-    float *cpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *gpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    float *cpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
-    float *gpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
-
-    forward_first_token_cpu(cpu_hc, model, weights, token);
-    output_logits_one(cpu_logits, model, weights, cpu_hc);
-
-    ds4_gpu_graph g;
-    bool ok = gpu_graph_alloc(&g, weights, &weights->layer[0]);
-    g.quality = quality;
-    const bool trace_layers = getenv("DS4_CUDA_GRAPH_TRACE_LAYERS") != NULL;
-    if (trace_layers && ok) {
-        g.materialize_ffn_out = true;
-        const bool teacher_force = getenv("DS4_CUDA_GRAPH_TEACHER_FORCE") != NULL;
-        const char *stage_layer_env = getenv("DS4_CUDA_GRAPH_TRACE_STAGE_LAYER");
-        const long stage_layer = stage_layer_env ? strtol(stage_layer_env, NULL, 10) : -1;
-        float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-        float *cpu_cur = xmalloc((size_t)hc_dim * sizeof(float));
-        float *cpu_next = xmalloc((size_t)hc_dim * sizeof(float));
-
-        embed_token_f16(model, weights, token, plain);
-        hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            if (teacher_force) {
-                ok = ds4_gpu_tensor_write(g.cur_hc, 0, cpu_cur, hc_dim * sizeof(float)) != 0;
-            }
-            ok = ds4_gpu_begin_commands() != 0;
-            if (ok) ok = gpu_graph_encode_decode_layer(&g, model, &weights->layer[il],
-                                                       il, 0, g.layer_raw_cache[il], g.raw_cap, 0, 1, token);
-            ds4_gpu_tensor *tmp = g.cur_hc;
-            g.cur_hc = g.after_ffn_hc;
-            g.after_ffn_hc = tmp;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
-
-            layer_forward_self_one(cpu_next, model, &weights->layer[il], cpu_cur, il, 0, token);
-            if (ok) ok = ds4_gpu_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0;
-            if (ok) {
-                fprintf(stderr,
-                        "ds4: Metal full graph layer %u%s hc_max=%g hc_rms=%g\n",
-                        il,
-                        teacher_force ? " teacher" : "",
-                        max_abs_diff(cpu_next, gpu_hc, hc_dim),
-                        rms_abs_diff(cpu_next, gpu_hc, hc_dim));
-                if (stage_layer == (long)il) {
-                    gpu_graph_trace_layer_stages(&g, model, &weights->layer[il], cpu_cur, il, token);
-                }
-            }
-            float *ctmp = cpu_cur;
-            cpu_cur = cpu_next;
-            cpu_next = ctmp;
-        }
-
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = gpu_graph_encode_output_head(&g, model, weights, vocab_dim);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-
-        free(cpu_next);
-        free(cpu_cur);
-        free(plain);
-    } else {
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
-
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            ok = gpu_graph_encode_decode_layer(&g, model, &weights->layer[il],
-                                                 il, 0, g.layer_raw_cache[il],
-                                                 g.raw_cap, 0, 1, token);
-            ds4_gpu_tensor *tmp = g.cur_hc;
-            g.cur_hc = g.after_ffn_hc;
-            g.after_ffn_hc = tmp;
-        }
-
-        if (ok) ok = gpu_graph_encode_output_head(&g, model, weights, vocab_dim);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-    }
-
-    if (ok) {
-        ok = ds4_gpu_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(g.logits, 0, gpu_logits, vocab_dim * sizeof(float)) != 0;
-    }
-
-    if (ok) {
-        const uint64_t cpu_top = argmax_f32(cpu_logits, vocab_dim);
-        const uint64_t gpu_top = argmax_f32(gpu_logits, vocab_dim);
-        fprintf(stderr,
-                "ds4: Metal full first-token graph diffs: final_hc_max=%g final_hc_rms=%g logits_max=%g logits_rms=%g cpu_top=%llu gpu_top=%llu cpu_top_logit=%g gpu_top_logit=%g\n",
-                max_abs_diff(cpu_hc, gpu_hc, hc_dim),
-                rms_abs_diff(cpu_hc, gpu_hc, hc_dim),
-                max_abs_diff(cpu_logits, gpu_logits, vocab_dim),
-                rms_abs_diff(cpu_logits, gpu_logits, vocab_dim),
-                (unsigned long long)cpu_top,
-                (unsigned long long)gpu_top,
-                cpu_logits[cpu_top],
-                gpu_logits[gpu_top]);
-    } else {
-        fprintf(stderr, "ds4: Metal full first-token graph test failed\n");
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after full graph failure also failed\n");
-        }
-    }
-
-    gpu_graph_free(&g);
-    free(gpu_logits);
-    free(cpu_logits);
-    free(gpu_hc);
-    free(cpu_hc);
-    return ok ? 0 : 1;
-}
 
 
 
 /* =========================================================================
- * Metal Release Decode and Prefill.
+ * GPU Release Decode and Prefill.
  * =========================================================================
  *
- * Everything below is the user-facing Metal backend.  It uses the same layer
+ * Everything below is the user-facing GPU backend.  It uses the same layer
  * encoder as diagnostics, but diagnostics are not required for normal command
  * flow and their CPU reads stay outside these generation entry points.
  */

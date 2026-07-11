@@ -40,34 +40,9 @@ void layer_kv_projection_normed_one(
 
 
 
-void layer_q_projection_with_lora_one_decode_scratch(
-        const ds4_model         * model,
-        const ds4_layer_weights * layer,
-        const float             * norm,
-        float                   * q,
-        float                   * qr_norm,
-        ds4_cpu_decode_scratch  * scratch) {
-    const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
-
-    matvec_q8_0_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
-    rms_norm_weight(qr_norm, scratch->qr, q_a_norm, DS4_N_LORA_Q, DS4_RMS_EPS);
-    matvec_q8_0_decode_scratch(q, model, layer->attn_q_b, qr_norm, scratch);
-    head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
-}
 
 
 
-void layer_kv_projection_normed_one_decode_scratch(
-        const ds4_model         * model,
-        const ds4_layer_weights * layer,
-        const float             * normed,
-        float                   * kv,
-        ds4_cpu_decode_scratch  * scratch) {
-    const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
-
-    matvec_q8_0_decode_scratch(scratch->kv_raw, model, layer->attn_kv, normed, scratch);
-    rms_norm_weight(kv, scratch->kv_raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
-}
 
 
 
@@ -330,22 +305,6 @@ void layer_grouped_out_one(
 
 
 
-void layer_grouped_out_one_decode_scratch(
-        float                  * out,
-        const ds4_model        * model,
-        const ds4_layer_weights * layer,
-        const float            * heads,
-        ds4_cpu_decode_scratch * scratch) {
-    const uint32_t n_groups = 8;
-    const uint32_t group_heads = DS4_N_HEAD / n_groups;
-    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
-    const uint32_t rank = 1024;
-
-    memset(scratch->attn_low, 0, (size_t)n_groups * rank * sizeof(scratch->attn_low[0]));
-    matvec_q8_0_grouped_rows_decode_scratch(scratch->attn_low, model, layer->attn_output_a,
-                                            heads, n_groups, group_dim, rank, scratch);
-    matvec_q8_0_decode_scratch(out, model, layer->attn_output_b, scratch->attn_low, scratch);
-}
 
 
 

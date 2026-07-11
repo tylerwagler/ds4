@@ -324,19 +324,27 @@ __device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
 }
 
 /* E8M0 microscale: a power-of-two scale stored as a single byte = exponent+127
- * (byte 255 is reserved NaN).  Given a block amax and the format's max
- * representable magnitude, choose the smallest 2^k that maps amax into range. */
-__device__ static uint8_t dsv4_e8m0_encode_scale_dev(float amax, float max_repr) {
-    float ratio = fmaxf(amax, 1.0e-20f) / max_repr;
-    int k = (int)ceilf(log2f(ratio));
-    int e = k + 127;
+ * (byte 255 is reserved NaN). Encoding uses dsv4_e8m0_encode_scale_exact_dev
+ * below (bit-pattern ceil-log2, fast-math-safe). */
+__device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
+    return exp2f((float)((int)byte - 127));
+}
+
+/* Exact ceil-log2 E8M0 bucket computed from float bit patterns — no log2f/ceilf,
+ * so no --use_fast_math misrounding at bucket boundaries. For a max_repr equal to
+ * M_m*2^(E_m-127), the smallest 2^k with max_repr*2^k >= amax has exponent field
+ * (E_m+k) and mantissa M_m; comparing positive floats is comparing their bit
+ * patterns, so k = exp(amax) - E_m + (mant(amax) > M_m). Re-encoding rows that are
+ * already on the (grid * 2^m) lattice is then value-idempotent. */
+__device__ static inline uint8_t dsv4_e8m0_encode_scale_exact_dev(float amax, float max_repr, float floor_val) {
+    const float a = fmaxf(amax, floor_val);
+    const uint32_t u  = __float_as_uint(a);
+    const uint32_t um = __float_as_uint(max_repr);
+    int e = (int)(u >> 23) - (int)(um >> 23)
+          + (((u & 0x7fffffu) > (um & 0x7fffffu)) ? 1 : 0) + 127;
     if (e < 0) e = 0;
     if (e > 254) e = 254;
     return (uint8_t)e;
-}
-
-__device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
-    return exp2f((float)((int)byte - 127));
 }
 
 
@@ -527,21 +535,10 @@ __global__ static void attn_pack_dequant_kernel(const uint8_t *in, float *out, u
     }
 }
 
-/* EXACT ceil-log2 scale bucket for repacking already-roundtripped rows.
- * k = ceil(log2(max(amax,1e-4)/448)) computed from the float bit pattern:
- * 448*2^k has bits ((135+k)<<23)|0x600000, and comparing positive floats is
- * comparing their bit patterns as unsigned ints — no log2f/ceilf, so no
- * fast-math misrounding at bucket boundaries.  For inputs that are already
- * e4m3-grid multiples of a power-of-two scale (every session file row), this
- * makes the repack value-idempotent: elements y*2^m stay on the e4m3 grid up
- * to 448 and re-encode exactly. */
+/* Exact e4m3 (max_repr 448) scale bucket for repacking already-roundtripped
+ * attn KV rows; see dsv4_e8m0_encode_scale_exact_dev for the bit-pattern trick. */
 __device__ static inline uint8_t attn_pack_exact_e8_dev(float amax) {
-    const float a = fmaxf(amax, 1.0e-4f);
-    const uint32_t u = __float_as_uint(a);
-    int e = (int)(u >> 23) - 135 + (((u & 0x7fffffu) > 0x600000u) ? 1 : 0) + 127;
-    if (e < 0) e = 0;
-    if (e > 254) e = 254;
-    return (uint8_t)e;
+    return dsv4_e8m0_encode_scale_exact_dev(amax, 448.0f, 1.0e-4f);
 }
 
 __global__ static void attn_pack_repack_kernel(const float *x, uint8_t *out, uint32_t out_row0, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
@@ -1049,7 +1046,9 @@ __global__ static void mxkv_pack_kernel(const float *x, uint8_t *out,
         float a = fabsf(v);
         for (uint32_t s = 16u; s > 0u; s >>= 1) a = fmaxf(a, __shfl_down_sync(0xffffffffu, a, s));
         a = __shfl_sync(0xffffffffu, a, 0);      /* block amax on every lane */
-        const uint8_t e8 = dsv4_e8m0_encode_scale_dev(a, max_repr);
+        /* Exact bucket (not the fast-math ceil-log2 path) so save/load of the
+         * indexer/attn MX cache is value-idempotent — no boundary misround. */
+        const uint8_t e8 = dsv4_e8m0_encode_scale_exact_dev(a, max_repr, 1.0e-20f);
         const float scale = dsv4_e8m0_decode_scale_dev(e8);
         if (lane == 0) scales[b] = e8;
         if (fmt == DS4_MXKV_FMT_FP4) {

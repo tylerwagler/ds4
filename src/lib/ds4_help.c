@@ -130,7 +130,7 @@ static const char *tool_usage(ds4_help_tool tool) {
 static const char *tool_summary(ds4_help_tool tool) {
     switch (tool) {
     case DS4_HELP_DS4:
-        return "Chat with a local DwarfStar model, run one-shot prompts, inspect models, or coordinate distributed inference.";
+        return "Chat with a local DwarfStar model, run one-shot prompts, or inspect models.";
     case DS4_HELP_SERVER:
         return "Serve one loaded DwarfStar model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
     case DS4_HELP_AGENT:
@@ -147,8 +147,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-    opt(fp, c, "--cuda | --cpu", "Select the backend explicitly.");
-    opt(fp, c, "--backend NAME", "Backend name: cuda or cpu.");
     if (tool != DS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
@@ -204,23 +202,6 @@ static void print_steering(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
-static void print_distributed(FILE *fp, const help_colors *c) {
-    title(fp, c, "Distributed Inference");
-    fputc('\n', fp);
-    para(fp, c, "Distributed mode runs one logical session across several machines by assigning contiguous model layer ranges to workers. Workers own their layer slice and KV-cache shard; the coordinator owns the prompt, sampling loop, and client/API flow. Start workers first, then start the coordinator. The coordinator waits for a complete route and streams hidden states through the workers.");
-    fputc('\n', fp);
-    opt(fp, c, "--role ROLE", "Distributed role: coordinator or worker.");
-    opt(fp, c, "--layers A:B", "Inclusive layer slice, e.g. 0:20 or 21:output.");
-    opt(fp, c, "--listen HOST PORT", "Coordinator listen address; workers may use it for their data listener.");
-    opt(fp, c, "--coordinator HOST PORT", "Coordinator address for --role worker.");
-    opt(fp, c, "--dist-prefill-chunk N", "Coordinator prefill pipeline chunk size. Default: session cap.");
-    opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
-    opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
-    opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
-    opt(fp, c, "--debug", "Print coordinator route/debug logs.");
-    fputc('\n', fp);
-}
-
 static void print_cli_diagnostics(FILE *fp, const help_colors *c);
 
 static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
@@ -247,10 +228,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--imatrix-max-prompts N", "Stop imatrix collection after N prompts.");
     opt(fp, c, "--imatrix-max-tokens N", "Stop imatrix collection after N prompt tokens.");
     opt(fp, c, "--head-test", "Run the output HC/logits head after the native slice.");
-    opt(fp, c, "--first-token-test", "Run exact CPU whole-model pass for the first prompt token.");
-    opt(fp, c, "--gpu-graph-test", "Compare first GPU-resident graph stages with CPU.");
-    opt(fp, c, "--gpu-graph-full-test", "Run the GPU-resident self-token graph across all layers.");
-    opt(fp, c, "--gpu-graph-prompt-test", "Compare CPU and GPU graph logits for the full prompt.");
+    opt(fp, c, "--gpu-graph-test", "Run the GPU-resident graph self-token stage diagnostic.");
     fputc('\n', fp);
 }
 
@@ -364,7 +342,7 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
 static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
-    if (streq(topic, "runtime") || streq(topic, "distributed")) return true;
+    if (streq(topic, "runtime")) return true;
     if (streq(topic, "sampling"))
         return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
     if (streq(topic, "steering"))
@@ -401,7 +379,6 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
     more_line(fp, c, "Runtime full info:", "runtime");
     if (tool_has_topic(tool, "sampling"))
         more_line(fp, c, "Sampling full info:", "sampling");
-    more_line(fp, c, "Distributed inference:", "distributed");
     if (tool_has_topic(tool, "steering"))
         more_line(fp, c, "Steering full info:", "steering");
     if (tool == DS4_HELP_DS4) {
@@ -425,10 +402,7 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
 
 static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
     title(fp, c, "Examples");
-    if (topic_is(topic, "distributed")) {
-        opt(fp, c, "worker", "./ds4 --role worker --layers 21:output --coordinator 192.168.0.181 9000 -m ds4flash.gguf");
-        opt(fp, c, "coordinator", "./ds4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ds4flash.gguf");
-    } else if (topic_is(topic, "runtime")) {
+    if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "CUDA API", "./ds4-server -m ds4flash.gguf --cuda --ctx 100000");
             opt(fp, c, "quiet API", "./ds4-server --power 60 --host 127.0.0.1 --port 8000");
@@ -472,7 +446,6 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         print_model_runtime(fp, c, tool, true);
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
-        print_distributed(fp, c);
         if (tool == DS4_HELP_DS4) {
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
@@ -494,7 +467,6 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
     else if (streq(topic, "sampling")) print_sampling(fp, c, true);
     else if (streq(topic, "steering")) print_steering(fp, c);
-    else if (streq(topic, "distributed")) print_distributed(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);

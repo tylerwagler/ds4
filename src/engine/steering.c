@@ -113,7 +113,7 @@ ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
 
 
 /* =========================================================================
- * Metal Diagnostic Dump Hooks.
+ * GPU Diagnostic Dump Hooks.
  * =========================================================================
  *
  * The release path calls these after important stages, but they are no-ops

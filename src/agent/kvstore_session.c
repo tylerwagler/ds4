@@ -650,59 +650,6 @@ bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len)
 
 
 
-static bool agent_worker_should_stop(agent_worker *w) {
-    pthread_mutex_lock(&w->mu);
-    bool stop = w->stop;
-    pthread_mutex_unlock(&w->mu);
-    return stop;
-}
-
-
-
-bool agent_worker_wait_distributed_route(agent_worker *w, char *err, size_t err_len) {
-    if (!w || !w->cfg ||
-        w->cfg->engine.distributed.role != DS4_DISTRIBUTED_COORDINATOR)
-        return true;
-
-    char last[160] = {0};
-    unsigned ticks = 0;
-    const struct timespec delay = {0, 250000000L};
-    for (;;) {
-        int ready = ds4_session_distributed_route_ready(w->session, err, err_len);
-        if (ready > 0) {
-            if (ticks != 0) {
-                if (w->cfg->non_interactive)
-                    fprintf(stderr, "ds4-agent: distributed route ready\n");
-                else
-                    agent_publish_system_status(w, "Distributed route ready.");
-            }
-            if (err_len) err[0] = '\0';
-            return true;
-        }
-        if (ready < 0) return false;
-
-        const char *why = err && err[0] ? err : "route incomplete";
-        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
-            if (w->cfg->non_interactive) {
-                fprintf(stderr, "ds4-agent: waiting for distributed route: %s\n", why);
-            } else {
-                char msg[224];
-                snprintf(msg, sizeof(msg), "Waiting for distributed route: %s", why);
-                agent_publish_system_status(w, msg);
-            }
-            snprintf(last, sizeof(last), "%s", why);
-        }
-        if (agent_worker_should_stop(w)) {
-            snprintf(err, err_len, "agent stopped while waiting for distributed route");
-            return false;
-        }
-        nanosleep(&delay, NULL);
-        ticks++;
-    }
-}
-
-
-
 bool agent_worker_has_user_session(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool yes = w->user_activity;

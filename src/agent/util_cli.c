@@ -173,7 +173,6 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-    if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-agent: invalid backend: %s\n", s);
     exit(2);
 }
@@ -238,23 +237,6 @@ agent_config parse_options(int argc, char **argv) {
             usage(stdout, topic);
             exit(0);
         }
-        char dist_parse_err[256] = {0};
-        ds4_dist_cli_parse_result dist_parse =
-            ds4_dist_parse_cli_arg(arg,
-                                   &i,
-                                   argc,
-                                   argv,
-                                   &c.engine.distributed,
-                                   dist_parse_err,
-                                   sizeof(dist_parse_err));
-        if (dist_parse == DS4_DIST_CLI_ERROR) {
-            fprintf(stderr,
-                    "ds4-agent: %s\n",
-                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
-            exit(2);
-        }
-        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
-
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
@@ -293,8 +275,6 @@ agent_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
-        } else if (!strcmp(arg, "--cpu")) {
-            c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
@@ -362,18 +342,6 @@ agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
-    char dist_err[256];
-    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
-                                        &c.engine,
-                                        dist_err,
-                                        sizeof(dist_err)) != 0) {
-        fprintf(stderr, "ds4-agent: %s\n", dist_err);
-        exit(2);
-    }
-    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
-        exit(2);
-    }
     return c;
 }
 

@@ -20,8 +20,8 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [19] = {"iq1_s",  256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -411,7 +411,7 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 
 
 
-/* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
+/* Open and map the GGUF once.  GPU needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
@@ -428,9 +428,9 @@ void model_open(ds4_model *m, const char *path, bool gpu_mapping,
     if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
 
     /*
-     * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
+     * GPU wraps slices of this mapping as no-copy MTLBuffers, so the GPU
      * path keeps the file-backed shared mapping. The CPU path only reads the
-     * weights through normal pointers and should not inherit Metal's VM policy:
+     * weights through normal pointers and should not inherit GPU's VM policy:
      * use a private read-only mapping there.
      *
      * This is deliberately defensive against an OS-level Darwin VM bug observed

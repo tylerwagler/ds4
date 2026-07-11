@@ -2,12 +2,13 @@
 
 
 
-__global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+__global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
     if (i >= n) return;
     uint32_t e = i % n_embd;
-    out[i] = __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)token * n_embd + e]);
+    uint32_t tok = token < n_vocab ? token : n_vocab - 1; /* clamp: an OOB token id is a wild global read */
+    out[i] = __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)tok * n_embd + e]);
 }
 
 
@@ -568,14 +569,13 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
 
 
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
-    (void)n_vocab;
-    if (!out_hc || !model_map || weight_offset >= model_size) return 0;
+    if (!out_hc || !model_map || weight_offset >= model_size || n_vocab == 0) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_vocab, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 

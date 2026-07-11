@@ -20,13 +20,12 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from p0conv import SafeTensors, repack_mxfp8
 
-PACK_CLI = os.environ.get("DS4_MXFP4_PACK_CLI",
-                          os.path.expanduser("~/Projects/AI/temp/p0/mxfp4_pack_source_cli"))
+PACK_CLI = os.environ.get("DS4_MXFP4_PACK_CLI")
 ALIGN = 32
 WK = {"gate": "w1", "up": "w3", "down": "w2"}   # ds4 routed/shared slot -> HF expert matrix
 
-DEF_SNAP = ("/mnt/pve1-fast/hub/models--deepseek-ai--DeepSeek-V4-Flash-DSpark/"
-            "snapshots/913f0657a874f76844e2e91cbe706dbcaceeb6d7")
+# HF snapshot directory for deepseek-ai/DeepSeek-V4-Flash-DSpark; pass as argv[2].
+DEF_SNAP = os.environ.get("DSPARK_SNAPSHOT")
 
 # gguf type ids used by the ds4 fork (see splice_cutlass_mxfp4.py BLK / gguf.c)
 T_F32, T_F16, T_FP8, T_CUTLASS_MXFP4 = 0, 1, 38, 40
@@ -313,12 +312,17 @@ def cmd_emit(snap, out_path):
     print(f"  target_layer_ids={tids}  embedding_length={embd}")
 
 if __name__ == "__main__":
+    if not PACK_CLI:
+        sys.exit("set DS4_MXFP4_PACK_CLI to the mxfp4_pack_source_cli binary")
     cmd = sys.argv[1] if len(sys.argv) > 1 else "manifest"
     snap = sys.argv[2] if len(sys.argv) > 2 else DEF_SNAP
+    if not snap:
+        sys.exit("usage: dspark_convert.py {manifest|emit} SNAPSHOT_DIR [OUT.gguf]\n"
+                 "  (or set DSPARK_SNAPSHOT)")
     if cmd == "manifest":
         sys.exit(cmd_manifest(snap))
     if cmd == "emit":
-        out = sys.argv[3] if len(sys.argv) > 3 else \
-            "/home/tyler/Projects/AI/ds4-gguf/dspark-drafter.gguf"
-        sys.exit(cmd_emit(snap, out))
+        if len(sys.argv) <= 3:
+            sys.exit("emit requires an output path: dspark_convert.py emit SNAPSHOT_DIR OUT.gguf")
+        sys.exit(cmd_emit(snap, sys.argv[3]))
     print(f"unknown command: {cmd}"); sys.exit(2)

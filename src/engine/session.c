@@ -147,7 +147,7 @@ static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
 
 
 /* Only the last logical sliding-window rows are needed from the raw cache.
- * The physical Metal tensor is a ring sized for ubatches, but after restore
+ * The physical GPU tensor is a ring sized for ubatches, but after restore
  * the next suffix chunk will write its own raw rows before any attention read.
  * Compressed rows are different: sparse attention can select any row from the
  * prefix, so those are persisted up to their live row counts. */
@@ -376,7 +376,7 @@ static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const
             : (size_t)(count - done);
         if (ds4_gpu_tensor_read(tensor, offset_f16 + done * sizeof(uint16_t),
                                 h, n * sizeof(uint16_t)) == 0) {
-            payload_set_err(err, errlen, "failed to read Metal F16 session tensor");
+            payload_set_err(err, errlen, "failed to read GPU F16 session tensor");
             return 1;
         }
         for (size_t i = 0; i < n; i++) f[i] = f16_to_f32(h[i]);
@@ -420,7 +420,7 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
         for (size_t i = 0; i < n; i++) h[i] = f32_to_f16(f[i]);
         if (ds4_gpu_tensor_write(tensor, offset_f16 + done * sizeof(uint16_t),
                                  h, n * sizeof(uint16_t)) == 0) {
-            payload_set_err(err, errlen, "failed to restore Metal F16 session tensor");
+            payload_set_err(err, errlen, "failed to restore GPU F16 session tensor");
             return 1;
         }
         done += n;
@@ -459,436 +459,6 @@ static int payload_read_raw_row(FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_
 
 
 
-static bool ds4_session_is_cpu(const ds4_session *s) {
-    return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
-}
-
-
-
-static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
-    if (!s || !s->checkpoint_valid) return 0;
-    uint32_t rows = ds4_default_raw_cap((uint32_t)s->ctx_size);
-    if (rows > (uint32_t)s->checkpoint.len) rows = (uint32_t)s->checkpoint.len;
-    return rows;
-}
-
-
-
-static uint32_t session_cpu_comp_cap(const ds4_session *s) {
-    if (!s) return 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_cache *layer = &s->cpu_cache.layer[il];
-        if (layer->compress_ratio == 4) return layer->comp_cap;
-    }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_cache *layer = &s->cpu_cache.layer[il];
-        if (layer->compress_ratio != 0) return layer->comp_cap;
-    }
-    return (uint32_t)s->ctx_size;
-}
-
-
-
-static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
-    uint64_t bytes = 0;
-    const uint32_t raw_live = session_cpu_raw_live_rows(s);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_cache *layer = &s->cpu_cache.layer[il];
-        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
-        const uint32_t ratio = layer->compress_ratio;
-        if (ratio == 0) continue;
-        bytes += (uint64_t)layer->n_comp * DS4_N_HEAD_DIM * sizeof(float);
-        bytes += layer_attn_state_bytes(ratio);
-        bytes += layer_attn_state_bytes(ratio);
-        if (ratio == 4) {
-            bytes += (uint64_t)layer->n_index_comp * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-            bytes += layer_index_state_bytes(ratio);
-            bytes += layer_index_state_bytes(ratio);
-        }
-    }
-    return bytes;
-}
-
-
-
-static void session_cpu_reset_cache(ds4_session *s) {
-    kv_cache_free(&s->cpu_cache);
-    kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
-}
-
-
-
-static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_end) {
-    return layer_start <= layer_end && layer_end < (uint32_t)DS4_N_LAYER;
-}
-
-
-
-uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
-                                         uint32_t layer_start,
-                                         uint32_t layer_end) {
-    if (!s || !s->checkpoint_valid ||
-        !ds4_layer_payload_range_valid(layer_start, layer_end))
-        return 0;
-    if (ds4_session_is_cpu(s)) return 0;
-    const ds4_gpu_graph *g = &s->graph;
-    const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
-    uint64_t bytes = (uint64_t)DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
-    const uint32_t n_layers = layer_end - layer_start + 1u;
-    bytes += (uint64_t)n_layers * sizeof(uint32_t);
-    bytes += (uint64_t)n_layers * sizeof(uint32_t);
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
-        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
-        bytes += layer_attn_state_bytes(ratio);
-        bytes += layer_attn_state_bytes(ratio);
-        if (ratio == 4) {
-            bytes += (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-            bytes += layer_index_state_bytes(ratio);
-            bytes += layer_index_state_bytes(ratio);
-        }
-    }
-    return bytes;
-}
-
-
-
-int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
-                                   uint32_t layer_start, uint32_t layer_end,
-                                   char *err, size_t errlen) {
-    if (!s || !fp || !s->checkpoint_valid ||
-        !ds4_layer_payload_range_valid(layer_start, layer_end)) {
-        payload_set_err(err, errlen, "invalid session layer payload save");
-        return 1;
-    }
-    if (ds4_session_is_cpu(s)) {
-        payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
-        return 1;
-    }
-    if (ds4_gpu_synchronize() == 0) {
-        payload_set_err(err, errlen, "failed to synchronize accelerator before layer snapshot");
-        return 1;
-    }
-
-    ds4_gpu_graph *g = &s->graph;
-    const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
-    uint32_t header[DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS] = {
-        DS4_SESSION_LAYER_PAYLOAD_MAGIC,
-        DS4_SESSION_LAYER_PAYLOAD_VERSION,
-        (uint32_t)s->ctx_size,
-        s->prefill_cap,
-        g->raw_cap,
-        g->raw_window,
-        g->comp_cap,
-        (uint32_t)s->checkpoint.len,
-        DS4_N_LAYER,
-        DS4_N_HEAD_DIM,
-        DS4_N_INDEXER_HEAD_DIM,
-        layer_start,
-        layer_end,
-        raw_live,
-    };
-    for (uint32_t i = 0; i < DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS; i++) {
-        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
-    }
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
-        if (payload_write_u32(fp, g->layer_n_comp[il], err, errlen) != 0) return 1;
-    }
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
-        if (payload_write_u32(fp, g->layer_n_index_comp[il], err, errlen) != 0) return 1;
-    }
-
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = 0;
-    for (uint32_t il = layer_start; rc == 0 && il <= layer_end; il++) {
-        const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
-        for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
-            const uint32_t pos = raw_first + r;
-            const uint32_t phys = pos % g->raw_cap;
-            rc = payload_write_raw_row(fp, g, il, phys,
-                                       buf, DS4_SESSION_IO_CHUNK, err, errlen);
-        }
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (rc != 0 || ratio == 0) continue;
-        if (gpu_graph_attn_pack_enabled()) {
-            rc = payload_write_attn_comp_pack(fp, g, il,
-                                              g->layer_n_comp[il],
-                                              buf,
-                                              DS4_SESSION_IO_CHUNK,
-                                              err,
-                                              errlen);
-        } else {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_attn_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
-        }
-        if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                    g->layer_attn_state_kv[il],
-                                                    0,
-                                                    layer_attn_state_bytes(ratio),
-                                                    buf,
-                                                    DS4_SESSION_IO_CHUNK,
-                                                    err,
-                                                    errlen);
-        if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                    g->layer_attn_state_score[il],
-                                                    0,
-                                                    layer_attn_state_bytes(ratio),
-                                                    buf,
-                                                    DS4_SESSION_IO_CHUNK,
-                                                    err,
-                                                    errlen);
-        if (rc == 0 && ratio == 4) {
-            rc = payload_write_index_comp(fp, g, il,
-                                          g->layer_n_index_comp[il],
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          err,
-                                          errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                        g->layer_index_state_kv[il],
-                                                        0,
-                                                        layer_index_state_bytes(ratio),
-                                                        buf,
-                                                        DS4_SESSION_IO_CHUNK,
-                                                        err,
-                                                        errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                        g->layer_index_state_score[il],
-                                                        0,
-                                                        layer_index_state_bytes(ratio),
-                                                        buf,
-                                                        DS4_SESSION_IO_CHUNK,
-                                                        err,
-                                                        errlen);
-        }
-    }
-    free(buf);
-    return rc;
-}
-
-
-
-int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
-                                   uint64_t payload_bytes,
-                                   const int *tokens, uint32_t n_tokens,
-                                   uint32_t layer_start, uint32_t layer_end,
-                                   char *err, size_t errlen) {
-    if (!s || !fp || !tokens ||
-        !ds4_layer_payload_range_valid(layer_start, layer_end)) {
-        payload_set_err(err, errlen, "invalid session layer payload load");
-        return 1;
-    }
-    if (ds4_session_is_cpu(s)) {
-        payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
-        return 1;
-    }
-    uint64_t remaining = payload_bytes;
-    uint32_t h[DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS];
-    for (uint32_t i = 0; i < DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS; i++) {
-        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
-    }
-    if (h[0] != DS4_SESSION_LAYER_PAYLOAD_MAGIC ||
-        h[1] != DS4_SESSION_LAYER_PAYLOAD_VERSION) {
-        payload_set_err(err, errlen, "unsupported session layer payload version");
-        return 1;
-    }
-
-    ds4_gpu_graph *g = &s->graph;
-    const uint32_t saved_ctx = h[2];
-    const uint32_t saved_prefill_cap = h[3];
-    const uint32_t saved_raw_cap = h[4];
-    const uint32_t saved_raw_window = h[5];
-    const uint32_t saved_comp_cap = h[6];
-    const uint32_t saved_tokens = h[7];
-    const uint32_t saved_layer_start = h[11];
-    const uint32_t saved_layer_end = h[12];
-    const uint32_t saved_raw_live = h[13];
-    (void)saved_prefill_cap;
-    if (saved_layer_start != layer_start || saved_layer_end != layer_end) {
-        payload_set_err(err, errlen, "KV shard layer range does not match requested worker");
-        return 1;
-    }
-    if (saved_ctx > (uint32_t)s->ctx_size ||
-        saved_tokens != n_tokens ||
-        saved_tokens >= (uint32_t)s->ctx_size) {
-        payload_set_err(err, errlen, "KV shard does not fit current context");
-        return 1;
-    }
-    if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
-        h[10] != DS4_N_INDEXER_HEAD_DIM) {
-        payload_set_err(err, errlen, "KV shard was written for a different DS4 layout");
-        return 1;
-    }
-    if (saved_raw_window != g->raw_window) {
-        payload_set_err(err, errlen, "KV shard graph chunk layout does not match current runtime");
-        return 1;
-    }
-    const uint32_t expected_raw_live = saved_tokens < saved_raw_window ? saved_tokens : saved_raw_window;
-    if (saved_raw_cap == 0 || saved_raw_live != expected_raw_live ||
-        saved_raw_live > saved_raw_cap || saved_raw_live > g->raw_cap) {
-        payload_set_err(err, errlen, "KV shard raw ring layout does not match current context");
-        return 1;
-    }
-    if (saved_comp_cap > g->comp_cap) {
-        payload_set_err(err, errlen, "KV shard compressed cache is larger than current context");
-        return 1;
-    }
-
-    const uint32_t n_layers = layer_end - layer_start + 1u;
-    uint32_t *n_comp = xcalloc(n_layers, sizeof(n_comp[0]));
-    uint32_t *n_index_comp = xcalloc(n_layers, sizeof(n_index_comp[0]));
-    for (uint32_t i = 0; i < n_layers; i++) {
-        const uint32_t il = layer_start + i;
-        if (payload_read_u32(fp, &n_comp[i], &remaining, err, errlen) != 0) {
-            free(n_comp);
-            free(n_index_comp);
-            return 1;
-        }
-        if (n_comp[i] > saved_comp_cap || n_comp[i] > g->layer_comp_cap[il]) {
-            free(n_comp);
-            free(n_index_comp);
-            payload_set_err(err, errlen, "KV shard has invalid compressed row count");
-            return 1;
-        }
-    }
-    for (uint32_t i = 0; i < n_layers; i++) {
-        const uint32_t il = layer_start + i;
-        if (payload_read_u32(fp, &n_index_comp[i], &remaining, err, errlen) != 0) {
-            free(n_comp);
-            free(n_index_comp);
-            return 1;
-        }
-        if (n_index_comp[i] > saved_comp_cap || n_index_comp[i] > g->layer_comp_cap[il]) {
-            free(n_comp);
-            free(n_index_comp);
-            payload_set_err(err, errlen, "KV shard has invalid indexer row count");
-            return 1;
-        }
-    }
-
-    if (ds4_gpu_synchronize() == 0) {
-        free(n_comp);
-        free(n_index_comp);
-        payload_set_err(err, errlen, "failed to synchronize accelerator before KV shard restore");
-        return 1;
-    }
-    s->checkpoint_valid = false;
-    s->mtp_draft_valid = false;
-    g->mtp_n_raw = 0;
-
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = 0;
-    for (uint32_t i = 0; rc == 0 && i < n_layers; i++) {
-        const uint32_t il = layer_start + i;
-        const uint32_t raw_first = saved_tokens - saved_raw_live;
-        for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
-            const uint32_t pos = raw_first + r;
-            const uint32_t phys = pos % g->raw_cap;
-            rc = payload_read_raw_row(fp, g, il, phys,
-                                      buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
-        }
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (rc != 0 || ratio == 0) continue;
-        if (gpu_graph_attn_pack_enabled()) {
-            rc = payload_read_attn_comp_pack(fp, g, il,
-                                             n_comp[i],
-                                             buf,
-                                             DS4_SESSION_IO_CHUNK,
-                                             &remaining,
-                                             err,
-                                             errlen);
-        } else {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_attn_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_comp[i] * DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
-        }
-        if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                   g->layer_attn_state_kv[il],
-                                                   0,
-                                                   layer_attn_state_bytes(ratio),
-                                                   buf,
-                                                   DS4_SESSION_IO_CHUNK,
-                                                   &remaining,
-                                                   err,
-                                                   errlen);
-        if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                   g->layer_attn_state_score[il],
-                                                   0,
-                                                   layer_attn_state_bytes(ratio),
-                                                   buf,
-                                                   DS4_SESSION_IO_CHUNK,
-                                                   &remaining,
-                                                   err,
-                                                   errlen);
-        if (rc == 0 && ratio == 4) {
-            rc = payload_read_index_comp(fp, g, il,
-                                         n_index_comp[i],
-                                         buf,
-                                         DS4_SESSION_IO_CHUNK,
-                                         &remaining,
-                                         err,
-                                         errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                       g->layer_index_state_kv[il],
-                                                       0,
-                                                       layer_index_state_bytes(ratio),
-                                                       buf,
-                                                       DS4_SESSION_IO_CHUNK,
-                                                       &remaining,
-                                                       err,
-                                                       errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                       g->layer_index_state_score[il],
-                                                       0,
-                                                       layer_index_state_bytes(ratio),
-                                                       buf,
-                                                       DS4_SESSION_IO_CHUNK,
-                                                       &remaining,
-                                                       err,
-                                                       errlen);
-        }
-    }
-    free(buf);
-    if (rc == 0 && remaining != 0) {
-        payload_set_err(err, errlen, "KV shard has trailing payload bytes");
-        rc = 1;
-    }
-    if (rc == 0 && ds4_gpu_synchronize() == 0) {
-        payload_set_err(err, errlen, "failed to synchronize accelerator after KV shard restore");
-        rc = 1;
-    }
-    if (rc == 0) {
-        token_vec_free(&s->checkpoint);
-        memset(&s->checkpoint, 0, sizeof(s->checkpoint));
-        for (uint32_t i = 0; i < n_tokens; i++) token_vec_push(&s->checkpoint, tokens[i]);
-        for (uint32_t i = 0; i < n_layers; i++) {
-            const uint32_t il = layer_start + i;
-            g->layer_n_comp[il] = n_comp[i];
-            g->layer_n_index_comp[il] = n_index_comp[i];
-        }
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        g->mtp_n_raw = 0;
-    }
-    free(n_comp);
-    free(n_index_comp);
-    return rc;
-}
-
 
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
@@ -910,9 +480,7 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
 
 
 bool ds4_engine_has_mtp(ds4_engine *e) {
-    return e && e->backend != DS4_BACKEND_CPU &&
-           e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           e->mtp_ready;
+    return e && e->mtp_ready;
 }
 
 
@@ -922,9 +490,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
 }
 
 bool ds4_engine_has_dspark(ds4_engine *e) {
-    return e && e->backend != DS4_BACKEND_CPU &&
-           e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           e->dspark_ready;
+    return e && e->dspark_ready;
 }
 
 int ds4_engine_dspark_draft_tokens(ds4_engine *e) {
@@ -1101,16 +667,6 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
-    if (s->distributed) return 0;
-    if (ds4_session_is_cpu(s)) {
-        uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
-        bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
-        bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
-        bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
-        bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
-        bytes += session_cpu_payload_live_tensor_bytes(s);
-        return bytes;
-    }
     const ds4_gpu_graph *g = &s->graph;
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -1215,74 +771,6 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
-    }
-    if (s->distributed) {
-        return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
-    }
-    if (ds4_session_is_cpu(s)) {
-        const uint32_t raw_live = session_cpu_raw_live_rows(s);
-        const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
-        const uint32_t comp_cap = session_cpu_comp_cap(s);
-        uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
-            DS4_SESSION_PAYLOAD_MAGIC,
-            DS4_SESSION_PAYLOAD_VERSION,
-            (uint32_t)s->ctx_size,
-            s->prefill_cap,
-            raw_cap,
-            raw_cap,
-            comp_cap,
-            (uint32_t)s->checkpoint.len,
-            DS4_N_LAYER,
-            DS4_N_HEAD_DIM,
-            DS4_N_INDEXER_HEAD_DIM,
-            DS4_N_VOCAB,
-            raw_live,
-        };
-        for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
-            if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
-        }
-        for (int i = 0; i < s->checkpoint.len; i++) {
-            if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
-        }
-        if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (payload_write_u32(fp, s->cpu_cache.layer[il].n_comp, err, errlen) != 0) return 1;
-        }
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (payload_write_u32(fp, s->cpu_cache.layer[il].n_index_comp, err, errlen) != 0) return 1;
-        }
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            const ds4_layer_cache *layer = &s->cpu_cache.layer[il];
-            if (raw_live > layer->n_raw) {
-                payload_set_err(err, errlen, "CPU session raw cache has fewer live rows than checkpoint");
-                return 1;
-            }
-            const uint32_t raw_start = layer->n_raw - raw_live;
-            if (payload_write_bytes(fp,
-                                    layer->raw_kv + (uint64_t)raw_start * DS4_N_HEAD_DIM,
-                                    (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float),
-                                    err,
-                                    errlen) != 0) return 1;
-            const uint32_t ratio = layer->compress_ratio;
-            if (ratio == 0) continue;
-            if (payload_write_bytes(fp,
-                                    layer->attn_comp_kv,
-                                    (uint64_t)layer->n_comp * DS4_N_HEAD_DIM * sizeof(float),
-                                    err,
-                                    errlen) != 0) return 1;
-            if (payload_write_bytes(fp, layer->attn_state_kv, layer_attn_state_bytes(ratio), err, errlen) != 0) return 1;
-            if (payload_write_bytes(fp, layer->attn_state_score, layer_attn_state_bytes(ratio), err, errlen) != 0) return 1;
-            if (ratio == 4) {
-                if (payload_write_bytes(fp,
-                                        layer->index_comp_kv,
-                                        (uint64_t)layer->n_index_comp * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                        err,
-                                        errlen) != 0) return 1;
-                if (payload_write_bytes(fp, layer->index_state_kv, layer_index_state_bytes(ratio), err, errlen) != 0) return 1;
-                if (payload_write_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), err, errlen) != 0) return 1;
-            }
-        }
-        return 0;
     }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before snapshot");
@@ -1412,9 +900,6 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
-    if (s->distributed) {
-        return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
-    }
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -1423,143 +908,6 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
-    }
-    if (ds4_session_is_cpu(s)) {
-        const uint32_t saved_ctx = h[2];
-        const uint32_t saved_prefill_cap = h[3];
-        const uint32_t saved_raw_cap = h[4];
-        const uint32_t saved_raw_window = h[5];
-        const uint32_t saved_comp_cap = h[6];
-        const uint32_t saved_tokens = h[7];
-        const uint32_t saved_raw_live = h[12];
-        const uint32_t cpu_raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
-        const uint32_t cpu_comp_cap = session_cpu_comp_cap(s);
-        if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size) {
-            payload_set_err(err, errlen, "KV checkpoint does not fit current context");
-            return 1;
-        }
-        if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
-            h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB)
-        {
-            payload_set_err(err, errlen, "KV checkpoint was written for a different DS4 layout");
-            return 1;
-        }
-        /* prefill_cap is scratch scheduling capacity, not durable KV layout.
-         * Old checkpoints remain valid as long as the raw KV window matches. */
-        (void)saved_prefill_cap;
-        if (saved_raw_window != cpu_raw_cap) {
-            payload_set_err(err, errlen, "KV checkpoint graph chunk layout does not match current runtime");
-            return 1;
-        }
-        const uint32_t expected_raw_live = saved_tokens < saved_raw_window ? saved_tokens : saved_raw_window;
-        if (saved_raw_cap == 0 || saved_raw_live != expected_raw_live ||
-            saved_raw_live > saved_raw_cap || saved_raw_live > cpu_raw_cap)
-        {
-            payload_set_err(err, errlen, "KV checkpoint raw ring layout does not match current context");
-            return 1;
-        }
-        if (saved_comp_cap > cpu_comp_cap) {
-            payload_set_err(err, errlen, "KV checkpoint compressed cache is larger than current context");
-            return 1;
-        }
-
-        token_vec new_checkpoint = {0};
-        for (uint32_t i = 0; i < saved_tokens; i++) {
-            uint32_t tok = 0;
-            if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) {
-                token_vec_free(&new_checkpoint);
-                return 1;
-            }
-            token_vec_push(&new_checkpoint, (int)tok);
-        }
-        if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
-                               &remaining, err, errlen) != 0)
-        {
-            token_vec_free(&new_checkpoint);
-            return 1;
-        }
-        uint32_t n_comp[DS4_MAX_LAYER];
-        uint32_t n_index_comp[DS4_MAX_LAYER];
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (payload_read_u32(fp, &n_comp[il], &remaining, err, errlen) != 0) {
-                token_vec_free(&new_checkpoint);
-                return 1;
-            }
-            if (n_comp[il] > saved_comp_cap || n_comp[il] > cpu_comp_cap) {
-                token_vec_free(&new_checkpoint);
-                payload_set_err(err, errlen, "KV checkpoint has invalid compressed row count");
-                return 1;
-            }
-        }
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen) != 0) {
-                token_vec_free(&new_checkpoint);
-                return 1;
-            }
-            if (n_index_comp[il] > saved_comp_cap || n_index_comp[il] > cpu_comp_cap) {
-                token_vec_free(&new_checkpoint);
-                payload_set_err(err, errlen, "KV checkpoint has invalid indexer row count");
-                return 1;
-            }
-        }
-
-        s->checkpoint_valid = false;
-        s->mtp_draft_valid = false;
-        session_cpu_reset_cache(s);
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            ds4_layer_cache *layer = &s->cpu_cache.layer[il];
-            if (payload_read_bytes(fp,
-                                   layer->raw_kv,
-                                   (uint64_t)saved_raw_live * DS4_N_HEAD_DIM * sizeof(float),
-                                   &remaining,
-                                   err,
-                                   errlen) != 0)
-            {
-                token_vec_free(&new_checkpoint);
-                return 1;
-            }
-            layer->n_raw = saved_raw_live;
-            const uint32_t ratio = layer->compress_ratio;
-            if (ratio == 0) continue;
-            layer->n_comp = n_comp[il];
-            layer->n_index_comp = n_index_comp[il];
-            if (payload_read_bytes(fp,
-                                   layer->attn_comp_kv,
-                                   (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
-                                   &remaining,
-                                   err,
-                                   errlen) != 0 ||
-                payload_read_bytes(fp, layer->attn_state_kv, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0 ||
-                payload_read_bytes(fp, layer->attn_state_score, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0)
-            {
-                token_vec_free(&new_checkpoint);
-                return 1;
-            }
-            if (ratio == 4) {
-                if (payload_read_bytes(fp,
-                                       layer->index_comp_kv,
-                                       (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                       &remaining,
-                                       err,
-                                       errlen) != 0 ||
-                    payload_read_bytes(fp, layer->index_state_kv, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0 ||
-                    payload_read_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0)
-                {
-                    token_vec_free(&new_checkpoint);
-                    return 1;
-                }
-            }
-        }
-        if (remaining != 0) {
-            token_vec_free(&new_checkpoint);
-            payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
-            return 1;
-        }
-        token_vec_free(&s->checkpoint);
-        s->checkpoint = new_checkpoint;
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        return 0;
     }
     ds4_gpu_graph *g = &s->graph;
     const uint32_t saved_ctx = h[2];
@@ -1766,10 +1114,6 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
     }
-    if (s->distributed) {
-        payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
-        return 1;
-    }
     const uint64_t bytes = ds4_session_payload_bytes(s);
     if (bytes == 0) {
         payload_set_err(err, errlen, "session has no valid checkpoint to snapshot");
@@ -1809,10 +1153,6 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
-        return 1;
-    }
-    if (s->distributed) {
-        payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
         return 1;
     }
     if (snap->len > (uint64_t)SIZE_MAX) {
@@ -2091,13 +1431,7 @@ int ds4_engine_generate_argmax(
                                             emit, done, emit_ud,
                                             progress, progress_ud);
     }
-
-    return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
-                                ctx_size,
-                                e->directional_steering_dirs,
-                                e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale,
-                                emit, done, emit_ud, progress, progress_ud);
+    return 1;
 }
 
 
@@ -2109,28 +1443,6 @@ int ds4_engine_gpu_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
         return 1;
     }
     return gpu_graph_decode_test(&e->model, &e->weights, prompt, e->quality);
-}
-
-
-
-int ds4_engine_gpu_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!e->gpu_ready) {
-        fprintf(stderr, "ds4: %s full graph test requested but backend is unavailable\n",
-                ds4_backend_name(e->backend));
-        return 1;
-    }
-    return gpu_graph_first_token_full_test(&e->model, &e->weights, prompt, e->quality);
-}
-
-
-
-int ds4_engine_gpu_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size) {
-    if (!e->gpu_ready) {
-        fprintf(stderr, "ds4: %s prompt graph test requested but backend is unavailable\n",
-                ds4_backend_name(e->backend));
-        return 1;
-    }
-    return gpu_graph_prompt_logits_test(&e->model, &e->weights, prompt, ctx_size);
 }
 
 
@@ -2234,48 +1546,6 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 
 
-int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!prompt || prompt->len <= 0) {
-        fprintf(stderr, "ds4: first-token test requires a non-empty prompt\n");
-        return 1;
-    }
-
-    const ds4_model *model = &e->model;
-    const ds4_vocab *vocab = &e->vocab;
-    const ds4_weights *weights = &e->weights;
-
-    float *hc = xmalloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(hc[0]));
-    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    forward_first_token_cpu(hc, model, weights, prompt->v[0]);
-    print_vec_stats("first-token final_hc", hc, (uint64_t)DS4_N_HC * DS4_N_EMBD);
-    output_logits_one(logits, model, weights, hc);
-    print_vec_stats("first-token logits", logits, DS4_N_VOCAB);
-
-    int best[8];
-    for (int i = 0; i < 8; i++) best[i] = -1;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
-        for (int j = 0; j < 8; j++) {
-            if (best[j] < 0 || logits[i] > logits[best[j]]) {
-                for (int k = 7; k > j; k--) best[k] = best[k - 1];
-                best[j] = (int)i;
-                break;
-            }
-        }
-    }
-
-    printf("top logits after first-token whole-model CPU pass:\n");
-    for (int i = 0; i < 8; i++) {
-        printf("  %6d  %9.4f  %.*s\n",
-            best[i],
-            logits[best[i]],
-            (int)vocab->token[best[i]].len,
-            vocab->token[best[i]].ptr);
-    }
-
-    free(logits);
-    free(hc);
-    return 0;
-}
 
 
 
@@ -2363,7 +1633,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
-    e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->prefill_chunk = opt->prefill_chunk;
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
@@ -2403,22 +1672,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
-    }
-
-    bool load_slice = opt->load_slice;
-    uint32_t load_layer_start = opt->load_layer_start;
-    uint32_t load_layer_end = opt->load_layer_end;
-    bool load_output = opt->load_output;
-    bool load_output_optional = false;
-    if (opt->distributed.role != DS4_DISTRIBUTED_NONE &&
-        opt->distributed.layers.set)
-    {
-        load_slice = true;
-        load_layer_start = opt->distributed.layers.start;
-        load_layer_end = opt->distributed.layers.has_output ?
-                         UINT32_MAX : opt->distributed.layers.end;
-        load_output = opt->distributed.layers.has_output;
-        load_output_optional = opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
@@ -2486,13 +1739,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         fprintf(stderr, "ds4: expert overlay: %u tensors swapped in from %s (prefixes %s)\n",
                 swapped, overlay_path, sep + 1);
     }
-    weights_bind(&e->weights,
-                 &e->model,
-                 load_slice,
-                 load_layer_start,
-                 load_layer_end,
-                 load_output,
-                 load_output_optional);
+    weights_bind(&e->weights, &e->model);
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
         const uint64_t safe_cache_bytes =
@@ -2532,13 +1779,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = e;
         return 0;
     }
-    if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
-    if (opt->mtp_path && opt->mtp_path[0] &&
-        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+    if (opt->mtp_path && opt->mtp_path[0]) {
         if (e->ssd_streaming) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
             ds4_engine_close(e);
@@ -2553,8 +1794,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 e->mtp_draft_tokens);
     }
 
-    if (opt->dspark_path && opt->dspark_path[0] &&
-        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+    if (opt->dspark_path && opt->dspark_path[0]) {
         if (e->ssd_streaming) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --dspark\n");
             ds4_engine_close(e);
@@ -2632,24 +1872,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         uint64_t *load_sizes = NULL;
         uint32_t load_span_count = 0;
         if (e->ssd_streaming) {
-            const bool map_output = load_slice &&
-                                    (load_output ||
-                                     (load_output_optional &&
-                                      weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
-            bool spans_ok = false;
-            if (load_slice) {
-                spans_ok = weights_model_map_decode_static_slice_spans(
-                        &e->weights,
-                        load_layer_start,
-                        load_layer_end,
-                        true,
-                        map_output,
-                        &spans);
-            } else {
-                spans_ok = weights_model_map_token_spans(&e->weights, &spans);
-            }
-            if (!spans_ok) {
+            if (!weights_model_map_token_spans(&e->weights, &spans)) {
                 fprintf(stderr, "ds4: invalid SSD streaming initial token embedding map\n");
                 ds4_engine_close(e);
                 *out = NULL;
@@ -2666,79 +1890,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             load_offsets = offsets;
             load_sizes = sizes;
             load_span_count = spans.len;
-            if (load_slice) {
-                char load_end[32];
-                if (map_output && load_layer_end == UINT32_MAX) {
-                    snprintf(load_end, sizeof(load_end), "output");
-                } else if (map_output) {
-                    snprintf(load_end, sizeof(load_end), "%u+output", load_layer_end);
-                } else {
-                    snprintf(load_end, sizeof(load_end), "%u", load_layer_end);
-                }
-                fprintf(stderr,
-                        "ds4: SSD streaming initial %s model map restricted to token + non-routed layers %u:%s (%u spans, %.2f GiB tensor span)\n",
-                        ds4_backend_name(e->backend),
-                        load_layer_start,
-                        load_end,
-                        spans.len,
-                        (double)span_bytes / 1073741824.0);
-            } else {
-                fprintf(stderr,
-                        "ds4: SSD streaming initial %s model map restricted to token embedding (%u spans, %.2f GiB tensor span)\n",
-                        ds4_backend_name(e->backend),
-                        spans.len,
-                        (double)span_bytes / 1073741824.0);
-            }
-            model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
-                                                        e->model.size,
-                                                        load_offsets,
-                                                        load_sizes,
-                                                        load_span_count,
-                                                        spans.max_tensor_bytes);
-            free(spans.v);
-        } else if (load_slice) {
-            const bool map_output = load_output ||
-                                    (load_output_optional &&
-                                     weights_have_output_head(&e->weights));
-            char load_end[32];
-            if (map_output && load_layer_end == UINT32_MAX) {
-                snprintf(load_end, sizeof(load_end), "output");
-            } else if (map_output) {
-                snprintf(load_end, sizeof(load_end), "%u+output", load_layer_end);
-            } else {
-                snprintf(load_end, sizeof(load_end), "%u", load_layer_end);
-            }
-
-            ds4_model_map_span_vec spans;
-            if (!weights_model_map_spans(&e->weights,
-                                         load_layer_start,
-                                         load_layer_end,
-                                         map_output,
-                                         &spans))
-            {
-                fprintf(stderr, "ds4: invalid model load layer slice %u:%s\n",
-                        load_layer_start,
-                        load_end);
-                ds4_engine_close(e);
-                *out = NULL;
-                return 1;
-            }
-            uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
-            uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
-            uint64_t span_bytes = 0;
-            for (uint32_t i = 0; i < spans.len; i++) {
-                offsets[i] = spans.v[i].off;
-                sizes[i] = spans.v[i].end - spans.v[i].off;
-                span_bytes += sizes[i];
-            }
-            load_offsets = offsets;
-            load_sizes = sizes;
-            load_span_count = spans.len;
             fprintf(stderr,
-                    "ds4: restricting %s model map to layers %u:%s (%u spans, %.2f GiB tensor span)\n",
+                    "ds4: SSD streaming initial %s model map restricted to token embedding (%u spans, %.2f GiB tensor span)\n",
                     ds4_backend_name(e->backend),
-                    load_layer_start,
-                    load_end,
                     spans.len,
                     (double)span_bytes / 1073741824.0);
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
@@ -2939,11 +2093,13 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+    /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
+     * before munmap'ing the model — unmapping still-registered pages is UB. */
+    ds4_gpu_cleanup();
     if (e->mtp_ready) model_close(&e->mtp_model);
     if (e->dspark_ready) model_close(&e->dspark_model);
     if (e->overlay_ready) model_close(&e->overlay_model);
     model_close(&e->model);
-    ds4_gpu_cleanup();
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
@@ -2955,22 +2111,6 @@ void ds4_engine_close(ds4_engine *e) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
-    if (e->backend == DS4_BACKEND_CPU) {
-        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
-            fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
-            return 1;
-        }
-        ds4_session *s = xcalloc(1, sizeof(*s));
-        s->engine = e;
-        s->ctx_size = ctx_size;
-        s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
-                                                     e->prefill_chunk);
-        kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
-        cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
-        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        *out = s;
-        return 0;
-    }
     if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
@@ -3020,25 +2160,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
     }
-    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
-        char err[256];
-        if (ds4_dist_session_create(&s->distributed,
-                                    e,
-                                    &e->distributed,
-                                    s,
-                                    ctx_size,
-                                    err,
-                                    sizeof(err)) != 0) {
-            fprintf(stderr,
-                    "ds4: failed to create distributed coordinator session: %s\n",
-                    err[0] ? err : "unknown error");
-            gpu_graph_free(&s->graph);
-            free(s->logits);
-            free(s->mtp_logits);
-            free(s);
-            return 1;
-        }
-    }
     *out = s;
     return 0;
 }
@@ -3047,28 +2168,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
-    ds4_dist_session_free(s->distributed);
-    if (ds4_session_is_cpu(s)) {
-        kv_cache_free(&s->cpu_cache);
-        cpu_decode_scratch_free(&s->cpu_scratch);
-    }
-    else {
-        gpu_graph_free(&s->graph);
-    }
+    gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     free(s->logits);
     free(s->mtp_logits);
     free(s);
-}
-
-
-
-int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
-    if (!s || !s->distributed) {
-        if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");
-        return -1;
-    }
-    return ds4_dist_session_route_ready(s->distributed, err, errlen);
 }
 
 
@@ -3080,16 +2184,10 @@ int ds4_session_power(ds4_session *s) {
 
 
 
-bool ds4_session_is_distributed(ds4_session *s) {
-    return s && s->distributed != NULL;
-}
-
-
-
 int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
     s->engine->power_percent = power_percent;
-    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+    s->graph.power_percent = (uint32_t)power_percent;
     return 0;
 }
 
@@ -3137,465 +2235,6 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 }
 
 
-
-int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
-    if (!s) {
-        if (errlen) snprintf(err, errlen, "missing layer-slice session");
-        return 1;
-    }
-    ds4_session_invalidate(s);
-    if (ds4_session_is_cpu(s)) {
-        session_cpu_reset_cache(s);
-        return 0;
-    }
-    if (!gpu_graph_reset_prefill_state(&s->graph)) {
-        if (errlen) snprintf(err, errlen, "%s layer-slice state reset failed",
-                             ds4_backend_name(s->engine->backend));
-        return 1;
-    }
-    s->graph.mtp_n_raw = 0;
-    return 0;
-}
-
-
-
-int ds4_session_eval_output_head_from_hc(ds4_session *s,
-                                         const float *hidden_hc,
-                                         uint32_t n_tokens,
-                                         float *logits,
-                                         char *err,
-                                         size_t errlen) {
-    if (!s || !s->engine || !hidden_hc || n_tokens == 0 || !logits) {
-        if (errlen) snprintf(err, errlen, "invalid output-head hidden-state input");
-        return 1;
-    }
-
-    ds4_engine *e = s->engine;
-    if (!weights_have_output_head(&e->weights)) {
-        if (errlen) snprintf(err, errlen, "output head is not loaded");
-        return 1;
-    }
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const float *last_hc = hidden_hc + (uint64_t)(n_tokens - 1u) * hc_dim;
-
-    if (ds4_session_is_cpu(s)) {
-        output_logits_one(logits, &e->model, &e->weights, last_hc);
-        return 0;
-    }
-    ds4_gpu_graph *g = &s->graph;
-    bool ok = ds4_gpu_tensor_write(g->cur_hc,
-                                   0,
-                                   last_hc,
-                                   hc_dim * sizeof(float)) != 0;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = gpu_graph_encode_output_head(g,
-                                                &e->model,
-                                                &e->weights,
-                                                e->weights.output->dim[1]);
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (ok) ok = ds4_gpu_tensor_read(g->logits,
-                                     0,
-                                     logits,
-                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: synchronize after output-head hidden-state failure also failed\n");
-        }
-        if (errlen) snprintf(err, errlen, "%s output-head hidden-state evaluation failed",
-                             ds4_backend_name(e->backend));
-        return 1;
-    }
-    return 0;
-}
-
-
-
-static int ds4_session_slice_check_timeline(
-        ds4_session *s,
-        const int   *tokens,
-        uint32_t     n_tokens,
-        uint32_t     pos0,
-        char        *err,
-        size_t       errlen) {
-    if (!s || !tokens || n_tokens == 0) {
-        if (errlen) snprintf(err, errlen, "invalid layer-slice token span");
-        return 1;
-    }
-    const uint32_t ctx_size = (uint32_t)s->ctx_size;
-    if (pos0 > (uint32_t)INT_MAX || n_tokens > (uint32_t)INT_MAX ||
-        pos0 > ctx_size || n_tokens > ctx_size - pos0) {
-        if (errlen) snprintf(err, errlen, "layer-slice token span exceeds context");
-        return 1;
-    }
-    if (!s->checkpoint_valid) {
-        if (pos0 != 0) {
-            if (errlen) snprintf(err, errlen, "layer-slice session needs reset before pos %u", pos0);
-            return 1;
-        }
-        return 0;
-    }
-    if ((uint32_t)s->checkpoint.len != pos0) {
-        if (errlen) snprintf(err, errlen, "layer-slice KV position mismatch: have %d want %u",
-                             s->checkpoint.len, pos0);
-        return 1;
-    }
-    return 0;
-}
-
-
-
-static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, const int *tokens, uint32_t n_tokens) {
-    for (uint32_t i = 0; i < n_tokens; i++) token_vec_push(&s->checkpoint, tokens[i]);
-    s->checkpoint_valid = true;
-    s->mtp_draft_valid = false;
-}
-
-
-
-int ds4_session_eval_layer_slice(ds4_session *s,
-                                 const int *tokens,
-                                 uint32_t n_tokens,
-                                 uint32_t pos0,
-                                 uint32_t layer_start,
-                                 uint32_t layer_end,
-                                 const float *input_hc,
-                                 float *output_hc,
-                                 bool output_logits,
-                                 float *logits,
-                                 char *err,
-                                 size_t errlen) {
-    if (!s || !s->engine) {
-        if (errlen) snprintf(err, errlen, "missing layer-slice session");
-        return 1;
-    }
-    if (layer_start > layer_end || layer_end >= (uint32_t)DS4_N_LAYER) {
-        if (errlen) snprintf(err, errlen, "invalid layer-slice layer range %u:%u",
-                             layer_start, layer_end);
-        return 1;
-    }
-    if (layer_start != 0 && !input_hc) {
-        if (errlen) snprintf(err, errlen, "layer-slice layer %u requires input hidden-state",
-                             layer_start);
-        return 1;
-    }
-    if (output_logits && layer_end + 1u != (uint32_t)DS4_N_LAYER) {
-        if (errlen) snprintf(err, errlen, "layer-slice logits require final transformer layer");
-        return 1;
-    }
-    if (output_logits && !logits) {
-        if (errlen) snprintf(err, errlen, "layer-slice logits output is missing");
-        return 1;
-    }
-    if (!weights_layers_bound(&s->engine->weights, layer_start, layer_end)) {
-        if (errlen) snprintf(err, errlen, "requested layer slice %u:%u is not loaded",
-                             layer_start, layer_end);
-        return 1;
-    }
-    if (!input_hc && !s->engine->weights.token_embd) {
-        if (errlen) snprintf(err, errlen, "token embedding is not loaded");
-        return 1;
-    }
-    if (output_logits && !weights_have_output_head(&s->engine->weights)) {
-        if (errlen) snprintf(err, errlen, "output head is not loaded");
-        return 1;
-    }
-    /* A distributed prefill pipeline may need only the KV side effect for
-     * non-final chunks. In that case both output_hc and logits are NULL. */
-    if (ds4_session_slice_check_timeline(s, tokens, n_tokens, pos0, err, errlen) != 0) {
-        return 1;
-    }
-    if (ds4_session_is_cpu(s)) {
-        if (errlen) snprintf(err, errlen, "layer slices require the graph backend");
-        s->checkpoint_valid = false;
-        return 1;
-    }
-    if (n_tokens > s->prefill_cap) {
-        if (errlen) snprintf(err, errlen, "layer-slice chunk %u exceeds prefill cap %u",
-                             n_tokens, s->prefill_cap);
-        return 1;
-    }
-
-    ds4_engine *e = s->engine;
-    ds4_gpu_graph *g = &s->graph;
-    if (!input_hc && !output_hc && output_logits &&
-        layer_start == 0 && layer_end + 1u == (uint32_t)DS4_N_LAYER) {
-        bool ok = false;
-        ds4_tokens span = {0};
-        if (pos0 == 0) {
-            span.v = (int *)tokens;
-            span.len = (int)n_tokens;
-            span.cap = (int)n_tokens;
-            ok = gpu_graph_prefill_layer_major(g,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &span,
-                                                 0,
-                                                 n_tokens,
-                                                 logits,
-                                                 false,
-                                                 NULL,
-                                                 NULL,
-                                                 NULL);
-        } else if (n_tokens == 1) {
-            ok = gpu_graph_eval_token_raw_swa(g,
-                                                &e->model,
-                                                &e->weights,
-                                                tokens[0],
-                                                pos0,
-                                                logits);
-        } else {
-            if (pos0 > (uint32_t)INT_MAX - n_tokens) {
-                if (errlen) snprintf(err, errlen, "layer-slice full span is too large");
-                s->checkpoint_valid = false;
-                return 1;
-            }
-            span.len = (int)(pos0 + n_tokens);
-            span.cap = span.len;
-            span.v = calloc((size_t)span.len, sizeof(span.v[0]));
-            if (span.v) {
-                for (uint32_t i = 0; i < n_tokens; i++) span.v[pos0 + i] = tokens[i];
-                ok = gpu_graph_prefill_layer_major(g,
-                                                     &e->model,
-                                                     &e->weights,
-                                                     &span,
-                                                     pos0,
-                                                     n_tokens,
-                                                     logits,
-                                                     false,
-                                                     NULL,
-                                                     NULL,
-                                                     NULL);
-            }
-            free(span.v);
-        }
-        if (!ok) {
-            if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: synchronize after layer-slice full failure also failed\n");
-            }
-            if (errlen) snprintf(err, errlen, "%s layer-slice full evaluation failed",
-                                 ds4_backend_name(e->backend));
-            s->checkpoint_valid = false;
-            return 1;
-        }
-        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
-        return 0;
-    }
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
-    if (n_tokens == 1 && pos0 > 0) {
-        if (g->raw_cap == 0) {
-            if (errlen) snprintf(err, errlen, "%s layer-slice decode has no raw KV cache",
-                                 ds4_backend_name(e->backend));
-            s->checkpoint_valid = false;
-            return 1;
-        }
-
-        bool ok = true;
-        if (g->ssd_streaming && !input_hc) {
-            g->streaming_static_decode_map_current = false;
-            ok = gpu_graph_stream_map_token(&e->model, &e->weights);
-        }
-        if (input_hc) {
-            ok = ds4_gpu_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
-        }
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok && !input_hc) {
-            ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
-                                               e->model.map,
-                                               e->model.size,
-                                               e->weights.token_embd->abs_offset,
-                                               (uint32_t)e->weights.token_embd->dim[1],
-                                               (uint32_t)tokens[0],
-                                               DS4_N_EMBD,
-                                               DS4_N_HC) != 0;
-        }
-        const uint32_t raw_row = pos0 % g->raw_cap;
-        const uint32_t n_raw = gpu_graph_raw_span_for_batch(g, pos0, 1);
-        const uint32_t split_after_layers = gpu_graph_token_split_after_layers();
-        uint32_t encoded_layers = 0;
-        if (g->ssd_streaming) {
-            if (ok) ok = ds4_gpu_end_commands() != 0;
-            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-                g->streaming_static_decode_map_current = false;
-                ok = gpu_graph_stream_map_layer_decode(&e->model, &e->weights, il);
-                if (ok) ok = ds4_gpu_begin_commands() != 0;
-                if (ok) {
-                    ok = gpu_graph_encode_decode_layer(g,
-                                                         &e->model,
-                                                         &e->weights.layer[il],
-                                                         il,
-                                                         pos0,
-                                                         g->layer_raw_cache[il],
-                                                         g->raw_cap,
-                                                         raw_row,
-                                                         n_raw,
-                                                         tokens[0]);
-                    ds4_gpu_tensor *tmp = g->cur_hc;
-                    g->cur_hc = g->after_ffn_hc;
-                    g->after_ffn_hc = tmp;
-                }
-                if (ok) ok = ds4_gpu_end_commands() != 0;
-            }
-            if (ok && output_logits) {
-                g->streaming_static_decode_map_current = false;
-                ok = gpu_graph_stream_map_output(&e->model, &e->weights);
-                if (ok) ok = ds4_gpu_begin_commands() != 0;
-                if (ok) ok = gpu_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-                if (ok) ok = ds4_gpu_end_commands() != 0;
-            }
-        } else {
-            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-                ok = gpu_graph_encode_decode_layer(g,
-                                                     &e->model,
-                                                     &e->weights.layer[il],
-                                                     il,
-                                                     pos0,
-                                                     g->layer_raw_cache[il],
-                                                     g->raw_cap,
-                                                     raw_row,
-                                                     n_raw,
-                                                     tokens[0]);
-                ds4_gpu_tensor *tmp = g->cur_hc;
-                g->cur_hc = g->after_ffn_hc;
-                g->after_ffn_hc = tmp;
-                encoded_layers++;
-                if (ok &&
-                    split_after_layers != 0 &&
-                    encoded_layers == split_after_layers &&
-                    il < layer_end)
-                {
-                    ok = ds4_gpu_flush_commands() != 0;
-                }
-            }
-            if (ok && output_logits) {
-                ok = gpu_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-            }
-            if (ok) ok = ds4_gpu_end_commands() != 0;
-        }
-        if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
-        if (ok && output_hc) {
-            ok = ds4_gpu_tensor_read(g->cur_hc, 0, output_hc, hc_dim * sizeof(float)) != 0;
-        }
-        if (ok && output_logits) {
-            ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-        }
-        if (!ok) {
-            if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: synchronize after layer-slice decode failure also failed\n");
-            }
-            if (errlen) snprintf(err, errlen, "%s layer-slice decode failed",
-                                 ds4_backend_name(e->backend));
-            s->checkpoint_valid = false;
-            return 1;
-        }
-
-        ds4_session_slice_commit_timeline(s, tokens, n_tokens);
-        return 0;
-    }
-
-    ds4_tokens span = {
-        .v = (int *)tokens,
-        .len = (int)n_tokens,
-        .cap = (int)n_tokens,
-    };
-
-    bool ok = true;
-    if (g->ssd_streaming && !input_hc) {
-        g->streaming_static_decode_map_current = false;
-        ok = gpu_graph_stream_map_token(&e->model, &e->weights);
-    }
-    if (ok) ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
-    if (ok && input_hc) {
-        ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
-    } else if (ok) {
-        ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                     g->prefill_tokens,
-                                                     &e->model,
-                                                     &e->weights,
-                                                     &span,
-                                                     0,
-                                                     n_tokens);
-    }
-
-    ds4_gpu_tensor *last_hc = NULL;
-    ds4_gpu_tensor *saved_cur = NULL;
-    const bool batch_selected_addr =
-        g->ssd_streaming &&
-        layer_start == 0 &&
-        (gpu_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
-         gpu_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
-    if (g->ssd_streaming) {
-        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-            g->streaming_static_decode_map_current = false;
-            ok = batch_selected_addr ?
-                 gpu_graph_stream_map_layer_decode(&e->model, &e->weights, il) :
-                 gpu_graph_stream_map_layer(&e->model, &e->weights, il);
-            if (ok) ok = ds4_gpu_begin_commands() != 0;
-            if (ok) {
-                ok = gpu_graph_encode_layer_batch(g,
-                                                    &e->model,
-                                                    &e->weights.layer[il],
-                                                    il,
-                                                    pos0,
-                                                    n_tokens);
-            }
-            if (ok) ok = ds4_gpu_end_commands() != 0;
-        }
-    } else {
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-            ok = gpu_graph_encode_layer_batch(g,
-                                                &e->model,
-                                                &e->weights.layer[il],
-                                                il,
-                                                pos0,
-                                                n_tokens);
-        }
-    }
-    if (ok && output_logits) {
-        saved_cur = g->cur_hc;
-        last_hc = gpu_graph_tensor_row_view(g->batch_cur_hc, n_tokens - 1u, hc_dim);
-        ok = last_hc != NULL;
-        if (ok && g->ssd_streaming) {
-            g->streaming_static_decode_map_current = false;
-            ok = gpu_graph_stream_map_output(&e->model, &e->weights);
-        }
-        if (ok) {
-            g->cur_hc = last_hc;
-            if (g->ssd_streaming) ok = ds4_gpu_begin_commands() != 0;
-            if (ok) ok = gpu_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-            if (ok && g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
-            g->cur_hc = saved_cur;
-        }
-    }
-    if (ok && !g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
-    if (saved_cur) g->cur_hc = saved_cur;
-    if (last_hc) ds4_gpu_tensor_free(last_hc);
-
-    if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
-    if (ok && output_hc) {
-        ok = ds4_gpu_tensor_read(g->batch_cur_hc, 0, output_hc, hc_bytes) != 0;
-    }
-    if (ok && output_logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: synchronize after layer-slice failure also failed\n");
-        }
-        if (errlen) snprintf(err, errlen, "%s layer-slice failed",
-                             ds4_backend_name(e->backend));
-        s->checkpoint_valid = false;
-        return 1;
-    }
-
-    ds4_session_slice_commit_timeline(s, tokens, n_tokens);
-    return 0;
-}
-
-
-
 static void ds4_session_note_prefill_progress(void *ud, const char *event, int current, int total) {
     ds4_sync_progress *p = ud;
     if (!p || !p->session || !p->prompt) return;
@@ -3635,62 +2274,6 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
     s->cont_anchor_valid = false;
-    if (s->distributed) {
-        const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
-        return ds4_dist_session_sync(s->distributed,
-                                     s,
-                                     checkpoint,
-                                     prompt,
-                                     s->logits,
-                                     err,
-                                     errlen);
-    }
-    if (ds4_session_is_cpu(s)) {
-        ds4_engine *e = s->engine;
-        if (s->checkpoint_valid &&
-            prompt->len >= s->checkpoint.len &&
-            ds4_tokens_starts_with(prompt, &s->checkpoint))
-        {
-            s->mtp_draft_valid = false;
-            for (int i = s->checkpoint.len; i < prompt->len; i++) {
-                if (ds4_session_cancelled(s)) {
-                    snprintf(err, errlen, "interrupted");
-                    s->checkpoint_valid = true;
-                    s->mtp_draft_valid = false;
-                    return DS4_SESSION_SYNC_INTERRUPTED;
-                }
-                forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                         &e->model,
-                                                         &e->weights,
-                                                         &s->cpu_cache,
-                                                         prompt->v[i],
-                                                         (uint32_t)s->checkpoint.len,
-                                                         e->directional_steering_dirs,
-                                                         e->directional_steering_attn_scale,
-                                                         e->directional_steering_ffn_scale,
-                                                         &s->cpu_scratch);
-                token_vec_push(&s->checkpoint, prompt->v[i]);
-                if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
-            }
-            s->checkpoint_valid = true;
-            return 0;
-        }
-
-        session_cpu_reset_cache(s);
-        prefill_layer_major_cpu(s->logits,
-                                &e->model,
-                                &e->weights,
-                                &s->cpu_cache,
-                                prompt,
-                                e->directional_steering_dirs,
-                                e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
-        ds4_tokens_copy(&s->checkpoint, prompt);
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
-        return 0;
-    }
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
 
@@ -4013,38 +2596,6 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
-    if (s->distributed) {
-        if (!s->checkpoint_valid) {
-            if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
-            return 1;
-        }
-        (void)probe_mtp;
-        return ds4_dist_session_eval(s->distributed,
-                                     s,
-                                     &s->checkpoint,
-                                     token,
-                                     s->logits,
-                                     err,
-                                     errlen);
-    }
-    if (ds4_session_is_cpu(s)) {
-        ds4_engine *e = s->engine;
-        forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &s->cpu_cache,
-                                                 token,
-                                                 (uint32_t)s->checkpoint.len,
-                                                 e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
-        token_vec_push(&s->checkpoint, token);
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        (void)probe_mtp;
-        return 0;
-    }
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
@@ -4106,7 +2657,7 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
  * 1. commit the normal target token and use its logits to validate draft[0];
  * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
  * 3. verify the suffix with the target graph, committing only the accepted
- *    prefix and rolling back speculative Metal state on miss;
+ *    prefix and rolling back speculative GPU state on miss;
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
@@ -4114,20 +2665,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
-    if (s->distributed) {
-        if (!accepted) return 0;
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-        accepted[0] = first_token;
-        return 1;
-    }
-    if (ds4_session_is_cpu(s)) {
-        (void)max_tokens;
-        (void)eos_token;
-        if (!accepted || accepted_cap <= 0) return 0;
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-        accepted[0] = first_token;
-        return 1;
-    }
     ds4_engine *e = s->engine;
     int n_accept = 0;
     const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
@@ -4383,7 +2920,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     /*
      * The useful N=2 verifier is the tiny batch path: it verifies two target
      * positions in one layer-major pass and commits prefix-1 directly on a
-     * partial accept.  Like the rest of the non-quality Metal path, it may pick
+     * partial accept.  Like the rest of the non-quality GPU path, it may pick
      * a different greedy token when batched reductions perturb nearly-tied
      * logits.  --quality / DS4_MTP_STRICT selects the exact decode verifier,
      * which preserves the one-token target stream but is not a speed win.
@@ -4708,7 +3245,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (have_frontier) {
             (void)spec_frontier_restore(&frontier, s);
         } else if (!verifier_may_have_mutated) {
-            /* Snapshot setup failed before the verifier touched Metal state.
+            /* Snapshot setup failed before the verifier touched GPU state.
              * Fall through to the exact sequential verifier below. */
         } else {
             snprintf(err, errlen, "MTP verifier failed");
@@ -5329,7 +3866,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
-    if (!ds4_engine_has_dspark(s->engine) || s->distributed || ds4_session_is_cpu(s)) {
+    if (!ds4_engine_has_dspark(s->engine)) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
