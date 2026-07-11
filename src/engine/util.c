@@ -7,21 +7,6 @@ bool ds4_backend_uses_graph(ds4_backend backend) {
 
 
 
-bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
-    return backend == DS4_BACKEND_CUDA;
-}
-
-
-
-bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
-    /* CUDA uses the backend's fixed expert cache; there is no auto-sized
-     * streaming cache on this fork. */
-    (void)backend;
-    return false;
-}
-
-
-
 void ds4_die(const char *msg) {
     fprintf(stderr, "ds4: %s\n", msg);
     exit(1);

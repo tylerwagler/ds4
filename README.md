@@ -41,7 +41,7 @@ That said, a few important things about this project:
 
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on a high-end single-GPU machine like the DGX Spark, starting from ~96/128 GB of unified memory.
 * This software is developed with **strong assistance from AI coding agents** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand, nor without the upstream `ds4` project this fork is based on.
-* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and fast modern NVMe SSDs should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSDs also changed the inference game from the point of view of "model needs to fit RAM": while more RAM than the model size is still preferred, SSD streaming turns the available RAM from a hard cutoff (can I run this model or not?) into a continuous spectrum of speed levels.
+* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and fast modern NVMe SSDs should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**: sessions checkpoint to disk and resume instantly, so long agent histories survive restarts without re-prefilling. The model weights themselves, by contrast, are deliberately fully RAM-resident on this fork — the GB10's 128 GB fits the production model with room to spare, and a model that does not fit is rejected at load rather than degraded.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. This is beta quality code, so we are probably not fully there yet.
 * This fork targets **CUDA on Linux only**, with special care for the **NVIDIA DGX Spark (GB10)** and its ~128 GB of unified memory. The whole model runs as a single CUDA-graph inference path; there is no CPU inference backend and no multi-node/distributed mode.
 
@@ -180,100 +180,15 @@ speculative drafter lifts greedy decode well above the single-stream baseline.
 
 _Throughput table pending current `tool-eval-bench` runs._
 
-## Running models larger than RAM
+## Model residency
 
-The normal CUDA path tries to make the model resident in GPU-addressable
-memory. This is the fastest path and should remain your default when the model
-fits. When it does not fit, DwarfStar also has an **SSD streaming**
-capacity mode. In this mode the non-routed model weights stay resident, while
-routed MoE experts are kept in an in-memory cache and loaded from the GGUF file
-on cache misses.
-
-Streaming is not as fast as fitting the full model in RAM. It still needs memory
-for non-routed weights, KV cache, graph scratch, activations, and the routed
-expert cache. It is useful because routed experts dominate model size and modern
-NVMe SSDs are fast enough to make cache misses tolerable. Long prefills can still
-be fast; generation is more sensitive to cache misses because every new token
-routes through experts again.
-
-Start with the automatic cache budget:
-
-```sh
-./ds4 -m ./ds4flash.gguf --ssd-streaming
-```
-
-If startup reports that the expert cache is too large, or if you want to reserve
-more memory for context, set the routed expert cache explicitly:
-
-```sh
-./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
-```
-
-The `32GB` value is a memory budget for complete routed experts, not a generic
-byte cache. DwarfStar converts it to the number of full experts that fit for the
-current GGUF. Non-routed weights, KV cache, graph scratch, and activations need
-additional memory. Only the automatic cache budget does the subtraction for you:
-it takes 80% of the backend's recommended working set, subtracts non-routed weights,
-then uses the rest for routed experts. Leave the hot expert preload enabled for
-normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
-only for measurements.
-
-### Practical SSD streaming examples
-
-These examples are inherited from upstream (Apple hardware, upstream GGUFs)
-and are retained to illustrate the knobs. The mechanism is wired into the
-CUDA build, but the referenced GGUF files do not load in this fork without
-requantization.
-
-On 64GB machines, start with the 2-bit Flash GGUF and a moderate expert cache:
-
-```sh
-./download_model.sh q2-imatrix
-
-./ds4 \
-  -m ./ds4flash.gguf \
-  --ssd-streaming \
-  --ssd-streaming-cache-experts 32GB \
-  --ctx 32768 \
-  --nothink
-```
-
-On 128GB machines, PRO q2 streaming is experimental but usable for inspection
-and occasional work when you accept slow generation. Start with `--nothink`:
-
-```sh
-./download_model.sh pro-q2-imatrix
-
-./ds4 \
-  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
-  --ssd-streaming \
-  --ctx 32768 \
-  --nothink
-```
-
-On an M5 Max with 128GB of RAM, a short PRO q2 streaming decode benchmark found
-the automatic budget best: it selected about `59GB` of routed expert cache.
-Manual `64GB` to `75GB` caches were close on that machine. Larger explicit
-`NGB` requests are capped before inference so the expert buffers remain
-lockable instead of falling into OS paging. If the system is under extra
-memory pressure and `mlock` still fails, ds4 refuses to install pageable
-expert-cache entries and releases a locked-cache margin before continuing with
-the measured lockable cache size. Prefer the automatic budget; if setting the
-cache manually on this class of machine, start around `48GB` to `64GB`, then
-increase only while the startup log reports a lockable cache. Once the machine
-is stable, re-enable thinking with a conservative generation limit:
-
-```sh
-./ds4 \
-  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
-  --ssd-streaming \
-  --ctx 32768 \
-  --think \
-  --tokens 1500
-```
-
-The important startup line is the cache report. Start conservative, then
-increase the cache if the machine has headroom.
+DwarfStar is a fully resident engine: the CUDA path makes the whole model
+resident in GPU-addressable memory at load time, plus KV cache, graph scratch,
+and activations. On a 128 GB GB10, the production Flash GGUF (~76 GB), a 64k
+KV cache, and the DSpark drafter all fit together with a comfortable margin.
+A model that does not fit is rejected at startup with a clear error instead of
+silently degrading — there is no partial-residency or streaming fallback, so a
+successful load is also a residency guarantee for the whole run.
 
 ## Reducing heat, power usage and fan noise
 

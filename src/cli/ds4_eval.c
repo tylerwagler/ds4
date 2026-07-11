@@ -1207,10 +1207,6 @@ typedef struct {
     int pause_ms;
     int power_percent;
     uint32_t prefill_chunk;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_preload_experts;
-    uint64_t simulate_used_memory_bytes;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
@@ -1218,8 +1214,6 @@ typedef struct {
     bool plain;
     bool warm_weights;
     bool quality;
-    bool ssd_streaming;
-    bool ssd_streaming_cold;
     bool self_test_extractors;
 } eval_config;
 
@@ -4032,14 +4026,8 @@ int main(int argc, char **argv) {
         .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
         .prefill_chunk = cfg.prefill_chunk,
-        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
-        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
-        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
-        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        .ssd_streaming = cfg.ssd_streaming,
-        .ssd_streaming_cold = cfg.ssd_streaming_cold,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) {

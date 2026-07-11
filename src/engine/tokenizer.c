@@ -1159,9 +1159,6 @@ int generate_gpu_graph_raw_swa(
         int                 n_predict,
         int                 ctx_size,
         bool                quality,
-        bool                ssd_streaming,
-        bool                ssd_streaming_cold,
-        uint32_t            ssd_streaming_preload_experts,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
@@ -1196,9 +1193,6 @@ int generate_gpu_graph_raw_swa(
         return 1;
     }
     g.quality = quality;
-    g.ssd_streaming = ssd_streaming;
-    g.ssd_streaming_cold = ssd_streaming_cold;
-    g.streaming_preload_experts = ssd_streaming_preload_experts;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!gpu_graph_load_directional_steering(&g,
                                                directional_steering_file,

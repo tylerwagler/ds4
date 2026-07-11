@@ -379,8 +379,7 @@ static bool gpu_graph_prefill_layer_major_inner(
      * so per-layer progress drains the async launch pipeline 43x/chunk. Chunk-
      * level progress (gpu_graph_prefill_chunked_range) still fires; intra-chunk
      * progress is dropped in favor of throughput. */
-    const bool split_commands = g->ssd_streaming ||
-                                split_profile || throttle ||
+    const bool split_commands = split_profile || throttle ||
                                 n_tokens > 2048 || imatrix != NULL;
     const bool profile = getenv("DS4_CUDA_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
@@ -467,58 +466,6 @@ static bool gpu_graph_prefill_layer_major_inner(
         return ok;
     }
 
-    if (g->ssd_streaming) {
-        g->streaming_static_decode_map_current = false;
-        if (!gpu_graph_stream_map_token(model, weights)) return false;
-    }
-    gpu_graph_stream_prefill_selected_profile_reset(g);
-    gpu_graph_stream_prepare_slot layer_prepare_slots[DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD];
-    memset(layer_prepare_slots, 0, sizeof(layer_prepare_slots));
-    const bool layer_pagein =
-        gpu_graph_stream_prefill_layer_pagein_enabled(g);
-    const bool layer_readahead =
-        !layer_pagein &&
-        gpu_graph_stream_prefill_layer_readahead_enabled(g);
-    const bool layer_pread =
-        !layer_pagein && !layer_readahead &&
-        gpu_graph_stream_prefill_layer_pread_enabled(g);
-    const bool layer_madvise =
-        !layer_pagein && !layer_pread && !layer_readahead &&
-        gpu_graph_stream_prefill_layer_madvise_enabled(g);
-    const bool layer_prepare =
-        layer_pagein || layer_pread || layer_readahead || layer_madvise;
-    const bool layer_prepare_overlap =
-        layer_prepare && gpu_graph_stream_prefill_layer_pagein_overlap_enabled();
-    const uint32_t layer_prepare_ahead =
-        layer_prepare && layer_prepare_overlap ?
-        gpu_graph_stream_prefill_layer_prepare_ahead() : 1u;
-    const bool batch_selected_addr =
-        gpu_graph_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens) ||
-        gpu_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens);
-    if (g->ssd_streaming && DS4_N_LAYER > 0) {
-        if (layer_prepare) {
-            if (!gpu_graph_stream_prepare_start_if_needed(g,
-                                                            model,
-                                                            weights,
-                                                            0,
-                                                            n_tokens,
-                                                            layer_madvise,
-                                                            layer_pread,
-                                                            layer_readahead,
-                                                            batch_selected_addr,
-                                                            layer_prepare_slots,
-                                                            layer_prepare_ahead)) {
-                return false;
-            }
-        } else {
-            if (batch_selected_addr) {
-                gpu_graph_stream_readahead_layer_decode(model, weights, 0);
-            } else {
-                gpu_graph_stream_readahead_layer(model, weights, 0);
-            }
-        }
-    }
-
     double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
     ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                  g->prefill_tokens,
@@ -540,10 +487,6 @@ static bool gpu_graph_prefill_layer_major_inner(
         }
     }
     if (!ok) {
-        if (layer_prepare) {
-            (void)gpu_graph_stream_prepare_join_all(layer_prepare_slots,
-                                                      layer_prepare_ahead);
-        }
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: GPU synchronize after layer-major prefill embed failure also failed\n");
         }
@@ -552,67 +495,6 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         double layer_elapsed = 0.0;
-        if (layer_prepare &&
-            !gpu_graph_stream_prepare_join_layer(g,
-                                                   model,
-                                                   weights,
-                                                   il,
-                                                   n_tokens,
-                                                   layer_madvise,
-                                                   layer_pread,
-                                                   layer_readahead,
-                                                   batch_selected_addr,
-                                                   layer_prepare_slots,
-                                                   layer_prepare_ahead)) {
-            ok = false;
-            break;
-        }
-        if (g->ssd_streaming) {
-            g->streaming_static_decode_map_current = false;
-            bool decode_only_map = batch_selected_addr;
-            const bool map_ok = decode_only_map ?
-                gpu_graph_stream_map_layer_decode(model, weights, il) :
-                gpu_graph_stream_map_layer(model, weights, il);
-            if (!map_ok) {
-                ok = false;
-                break;
-            }
-        }
-        if (g->ssd_streaming) {
-            if (layer_prepare && layer_prepare_overlap) {
-                bool started_future = false;
-                for (uint32_t ahead = 1; ahead <= layer_prepare_ahead; ahead++) {
-                    if (il + ahead >= DS4_N_LAYER) break;
-                    started_future = true;
-                    if (!gpu_graph_stream_prepare_start_if_needed(g,
-                                                                    model,
-                                                                    weights,
-                                                                    il + ahead,
-                                                                    n_tokens,
-                                                                    layer_madvise,
-                                                                    layer_pread,
-                                                                    layer_readahead,
-                                                                    batch_selected_addr,
-                                                                    layer_prepare_slots,
-                                                                    layer_prepare_ahead)) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (!ok) break;
-                if (!started_future && logits) {
-                    gpu_graph_stream_readahead_output(model, weights);
-                }
-            } else if (!layer_prepare && il + 1 < DS4_N_LAYER) {
-                if (batch_selected_addr) {
-                    gpu_graph_stream_readahead_layer_decode(model, weights, il + 1);
-                } else {
-                    gpu_graph_stream_readahead_layer(model, weights, il + 1);
-                }
-            } else if (logits) {
-                gpu_graph_stream_readahead_output(model, weights);
-            }
-        }
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;
@@ -645,19 +527,9 @@ static bool gpu_graph_prefill_layer_major_inner(
                 g->batch_cur_hc = g->batch_next_hc;
                 g->batch_next_hc = tmp;
             }
-            if (ok) ok = gpu_graph_capture_prefill_seed_router_selected(g,
-                                                                          il,
-                                                                          n_tokens);
             const double t_ffn_encoded = now_sec();
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
-            if (ok) {
-                ok = gpu_graph_stream_prefill_selected_profile_layer(
-                        g,
-                        &weights->layer[il],
-                        il,
-                        n_tokens);
-            }
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
             layer_elapsed = (t_attn_done - t_attn0) + (t_ffn_done - t_ffn0);
 
@@ -682,19 +554,9 @@ static bool gpu_graph_prefill_layer_major_inner(
             if (!ok) {
                 fprintf(stderr, "ds4: gpu layer-major prefill layer %u encode failed\n", il);
             }
-            if (ok) ok = gpu_graph_capture_prefill_seed_router_selected(g,
-                                                                          il,
-                                                                          n_tokens);
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
-            if (ok) {
-                ok = gpu_graph_stream_prefill_selected_profile_layer(
-                        g,
-                        &weights->layer[il],
-                        il,
-                        n_tokens);
-            }
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
             layer_elapsed = t_done - t_chunk0;
             if (profile) {
@@ -707,33 +569,7 @@ static bool gpu_graph_prefill_layer_major_inner(
                         (t_done - t_encoded) * 1000.0);
             }
         }
-        if (ok &&
-            g->ssd_streaming &&
-            layer_prepare &&
-            !layer_prepare_overlap) {
-            if (il + 1 < DS4_N_LAYER) {
-                if (!gpu_graph_stream_prepare_start_if_needed(g,
-                                                                model,
-                                                                weights,
-                                                                il + 1,
-                                                                n_tokens,
-                                                                layer_madvise,
-                                                                layer_pread,
-                                                                layer_readahead,
-                                                                batch_selected_addr,
-                                                                layer_prepare_slots,
-                                                                layer_prepare_ahead)) {
-                    ok = false;
-                }
-            } else if (logits) {
-                gpu_graph_stream_readahead_output(model, weights);
-            }
-        }
         if (!ok) {
-            if (layer_prepare) {
-                (void)gpu_graph_stream_prepare_join_all(layer_prepare_slots,
-                                                          layer_prepare_ahead);
-            }
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: GPU synchronize after layer-major prefill failure also failed\n");
             }
@@ -752,23 +588,12 @@ static bool gpu_graph_prefill_layer_major_inner(
         }
     }
     if (!ok) {
-        if (layer_prepare) {
-            (void)gpu_graph_stream_prepare_join_all(layer_prepare_slots,
-                                                      layer_prepare_ahead);
-        }
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: GPU synchronize after layer-major prefill failure also failed\n");
         }
         return false;
     }
     if (show_progress) fputc('\n', stderr);
-    gpu_graph_stream_prefill_selected_profile_summary(g);
-    if (!gpu_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
-        return false;
-    }
-    if (!gpu_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
-        return false;
-    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
@@ -789,20 +614,6 @@ static bool gpu_graph_prefill_layer_major_inner(
                                               output_row,
                                               hc_dim);
         ok = last_hc != NULL;
-    }
-    if (ok && logits && g->ssd_streaming) {
-        const bool static_decode_map =
-            gpu_graph_stream_decode_static_map_enabled();
-        const bool static_map_state_cache =
-            static_decode_map &&
-            gpu_graph_stream_decode_static_map_state_cache_enabled();
-        g->streaming_static_decode_map_current = false;
-        if (static_map_state_cache) {
-            ok = gpu_graph_stream_map_decode_static_all(model, weights);
-            if (ok) g->streaming_static_decode_map_current = true;
-        } else {
-            ok = gpu_graph_stream_map_output(model, weights);
-        }
     }
     if (ok && logits) {
         g->cur_hc = last_hc;
@@ -858,24 +669,6 @@ bool gpu_graph_prefill_raw_swa(
         bool                  *cancelled) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
     if ((uint32_t)n_tokens > g->prefill_cap) return false;
-    if (gpu_graph_use_streaming_decode_prefill_range(g, weights, 0,
-                                                       (uint32_t)n_tokens)) {
-        return gpu_graph_prefill_decode_streaming_range(g,
-                                                          model,
-                                                          weights,
-                                                          prompt,
-                                                          0,
-                                                          (uint32_t)n_tokens,
-                                                          logits,
-                                                          show_progress,
-                                                          NULL,
-                                                          NULL,
-                                                          display_progress,
-                                                          display_progress_ud,
-                                                          cancel,
-                                                          cancel_ud,
-                                                          cancelled);
-    }
     /* The layer-major fallback below may submit the whole short prefill as one
      * GPU command buffer.  Once that command is in flight there is no useful
      * safe prefix to expose: by the time cancellation can be observed again,
@@ -927,28 +720,6 @@ bool gpu_graph_prefill_chunked_range(
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
-    if (g->ssd_streaming && start == 0) {
-        ds4_gpu_stream_expert_cache_reset_route_hotness();
-    }
-    if (!imatrix &&
-        gpu_graph_use_streaming_decode_prefill_range(g, weights,
-                                                       start, n_tokens)) {
-        return gpu_graph_prefill_decode_streaming_range(g,
-                                                          model,
-                                                          weights,
-                                                          prompt,
-                                                          start,
-                                                          n_tokens,
-                                                          logits,
-                                                          show_progress,
-                                                          progress,
-                                                          progress_ud,
-                                                          display_progress,
-                                                          display_progress_ud,
-                                                          cancel,
-                                                          cancel_ud,
-                                                          cancelled);
-    }
 
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;

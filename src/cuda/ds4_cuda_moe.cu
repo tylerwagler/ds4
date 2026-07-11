@@ -3175,37 +3175,10 @@ static int routed_moe_launch(
         down_bytes > model_size - down_offset) {
         return 0;
     }
-    const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
-    const int use_stream_selected_cache =
-        g_ssd_streaming_mode &&
-        g_stream_selected_cache.valid &&
-        g_stream_selected_cache.model_map == model_map &&
-        g_stream_selected_cache.layer == layer_index &&
-        g_stream_selected_cache.n_total_expert == n_total_expert &&
-        g_stream_selected_cache.slot_count >= required_slot_count &&
-        g_stream_selected_cache.gate_offset == gate_offset &&
-        g_stream_selected_cache.up_offset == up_offset &&
-        g_stream_selected_cache.down_offset == down_offset &&
-        g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
-        g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-        g_stream_selected_cache.gate_ptr &&
-        g_stream_selected_cache.up_ptr &&
-        g_stream_selected_cache.down_ptr &&
-        g_stream_selected_cache.slot_selected_tensor.ptr &&
-        g_stream_selected_cache.slot_selected_tensor.bytes >=
-            required_slot_count * sizeof(int32_t);
-    const ds4_gpu_tensor *selected_tensor =
-        use_stream_selected_cache ? &g_stream_selected_cache.slot_selected_tensor : selected;
-    const int32_t *selected_ptr = (const int32_t *)selected_tensor->ptr;
-    const char *gate_w = use_stream_selected_cache
-        ? g_stream_selected_cache.gate_ptr
-        : cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = use_stream_selected_cache
-        ? g_stream_selected_cache.up_ptr
-        : cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = use_stream_selected_cache
-        ? g_stream_selected_cache.down_ptr
-        : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    const int32_t *selected_ptr = (const int32_t *)selected->ptr;
+    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
     int ok = 1;
@@ -3289,9 +3262,7 @@ static int routed_moe_launch(
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
-            const uint32_t sort_expert_count =
-                use_stream_selected_cache ? g_stream_selected_cache.compact_count :
-                n_total_expert;
+            const uint32_t sort_expert_count = n_total_expert;
             if (sort_expert_count == 0) ok = 0;
             const uint64_t counts_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
             const uint64_t offsets_bytes = ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t);
@@ -3725,14 +3696,6 @@ static int routed_moe_launch(
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     return ok;
-}
-
-
-
-extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
-    (void)selected;
-    (void)n_selected;
-    return 1;
 }
 
 

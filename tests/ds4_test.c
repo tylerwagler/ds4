@@ -26,31 +26,6 @@ static const char *test_model_path(void) {
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
 }
 
-static bool test_env_bool(const char *name) {
-    const char *v = getenv(name);
-    return v && v[0] && strcmp(v, "0") != 0;
-}
-
-static uint32_t test_env_u32(const char *name) {
-    const char *v = getenv(name);
-    if (!v || !v[0]) return 0;
-    char *end = NULL;
-    unsigned long n = strtoul(v, &end, 10);
-    if (end == v) return 0;
-    return n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
-}
-
-static uint64_t test_env_gib(const char *name) {
-    const char *v = getenv(name);
-    if (!v || !v[0]) return 0;
-    char *end = NULL;
-    unsigned long long n = strtoull(v, &end, 10);
-    if (end == v || n == 0) return 0;
-    const uint64_t one_gib = 1024ull * 1024ull * 1024ull;
-    if (n > UINT64_MAX / one_gib) return UINT64_MAX;
-    return (uint64_t)n * one_gib;
-}
-
 static char *test_save_env(const char *name) {
     const char *value = getenv(name);
     if (!value) return NULL;
@@ -71,33 +46,6 @@ static void test_restore_env(const char *name, char *saved) {
     }
 }
 
-typedef struct {
-    char *cold_decode;
-    char *batch_selected_addr;
-} test_streaming_prefill_env;
-
-static test_streaming_prefill_env test_force_canonical_streaming_prefill(void) {
-    test_streaming_prefill_env saved = {
-        .cold_decode =
-            test_save_env("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL"),
-        .batch_selected_addr =
-            test_save_env("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR"),
-    };
-    if (test_env_bool("DS4_TEST_SSD_STREAMING")) {
-        setenv("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL", "1", 1);
-        setenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
-    }
-    return saved;
-}
-
-static void test_restore_canonical_streaming_prefill(
-        test_streaming_prefill_env saved) {
-    test_restore_env("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL",
-                     saved.cold_decode);
-    test_restore_env("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
-                     saved.batch_selected_addr);
-}
-
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
     /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
@@ -107,14 +55,6 @@ static ds4_engine *test_open_engine(bool quality) {
         .model_path = test_model_path(),
         .backend = DS4_BACKEND_CUDA,
         .quality = quality,
-        .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
-        .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
-        .ssd_streaming_cache_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
-        .ssd_streaming_cache_bytes =
-            test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
-        .ssd_streaming_preload_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
     };
@@ -809,12 +749,9 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     if (!fp) return;
 
     char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
-    test_streaming_prefill_env saved_canonical_streaming_prefill =
-        test_force_canonical_streaming_prefill();
     setenv("DS4_CUDA_PREFILL_CHUNK", "2048", 1);
     ds4_engine *engine = test_open_engine(false);
     if (!engine) {
-        test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
         test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
@@ -838,7 +775,6 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     }
     TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
     ds4_engine_close(engine);
-    test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
     test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
@@ -1030,14 +966,11 @@ static void test_local_golden_vectors(void) {
 
     char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
     char *saved_moe_tile_max = test_save_env("DS4_CUDA_MOE_TILE_MAX");
-    test_streaming_prefill_env saved_canonical_streaming_prefill =
-        test_force_canonical_streaming_prefill();
     setenv("DS4_CUDA_PREFILL_CHUNK", "4096", 1);
     unsetenv("DS4_CUDA_MOE_TILE_MAX");
 
     ds4_engine *engine = test_open_engine(false);
     if (!engine) {
-        test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
         test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
         test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
@@ -1051,7 +984,6 @@ static void test_local_golden_vectors(void) {
     }
 
     ds4_engine_close(engine);
-    test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
     test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
     test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
@@ -1475,121 +1407,6 @@ static void test_mpp_equivalence(void) {
 
     test_run_mpp_candidate("auto", cases, ncase);
 
-    for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
-}
-
-static void test_streaming_decode_prefill_correctness(void) {
-    test_close_engines();
-    if (!test_env_bool("DS4_TEST_SSD_STREAMING")) {
-        fprintf(stderr,
-                "ds4-test: streaming decode-prefill correctness skipped "
-                "(set DS4_TEST_SSD_STREAMING=1 to enable)\n");
-        return;
-    }
-
-    test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
-    memset(cases, 0, sizeof(cases));
-
-    test_streaming_prefill_env saved_canonical_streaming_prefill =
-        test_force_canonical_streaming_prefill();
-
-    ds4_engine *ref_engine = test_open_engine(false);
-    if (!ref_engine) {
-        test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-        return;
-    }
-
-    const int ncase = test_load_mpp_cases(ref_engine, cases, TEST_MPP_EQ_MAX_CASES);
-    TEST_ASSERT(ncase > 0);
-    for (int i = 0; i < ncase; i++) {
-        test_mpp_eq_case *tc = &cases[i];
-        tc->ref_logits = malloc((size_t)tc->vocab_size * sizeof(tc->ref_logits[0]));
-        TEST_ASSERT(tc->ref_logits != NULL);
-        if (!tc->ref_logits) continue;
-        TEST_ASSERT(test_mpp_capture(ref_engine, tc,
-                                     tc->ref_logits,
-                                     tc->ref_gen,
-                                     &tc->ref_gen_len));
-    }
-    ds4_engine_close(ref_engine);
-
-    unsetenv("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL");
-    unsetenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
-
-    ds4_engine *cand_engine = test_open_engine(false);
-    if (cand_engine) {
-        for (int i = 0; i < ncase; i++) {
-            test_mpp_eq_case *tc = &cases[i];
-            if (!tc->ref_logits) continue;
-
-            float *cand_cold = malloc((size_t)tc->vocab_size * sizeof(cand_cold[0]));
-            float *cand_warm_a = malloc((size_t)tc->vocab_size * sizeof(cand_warm_a[0]));
-            float *cand_warm_b = malloc((size_t)tc->vocab_size * sizeof(cand_warm_b[0]));
-            TEST_ASSERT(cand_cold != NULL);
-            TEST_ASSERT(cand_warm_a != NULL);
-            TEST_ASSERT(cand_warm_b != NULL);
-            if (!cand_cold || !cand_warm_a || !cand_warm_b) {
-                free(cand_cold);
-                free(cand_warm_a);
-                free(cand_warm_b);
-                continue;
-            }
-
-            TEST_ASSERT(test_mpp_capture_logits_only(cand_engine, tc, cand_cold));
-            TEST_ASSERT(test_mpp_capture_logits_only(cand_engine, tc, cand_warm_a));
-            TEST_ASSERT(test_mpp_capture_logits_only(cand_engine, tc, cand_warm_b));
-
-            test_mpp_eq_result result = test_compare_mpp_logits(tc, cand_cold, false);
-            TEST_ASSERT(result.nonfinite == 0);
-            TEST_ASSERT(result.top5_overlap >= 2);
-            TEST_ASSERT(result.overlap >= 10);
-            TEST_ASSERT(result.rms <= 4.0f);
-            TEST_ASSERT(result.top20_max_abs <= 12.0f);
-
-            int cold_warm_neq = 0;
-            int warm_repeat_neq = 0;
-            int repeat_nonfinite = 0;
-            float cold_warm_max_abs = 0.0f;
-            float warm_repeat_max_abs = 0.0f;
-            for (int j = 0; j < tc->vocab_size; j++) {
-                if (!isfinite(cand_cold[j]) ||
-                    !isfinite(cand_warm_a[j]) ||
-                    !isfinite(cand_warm_b[j])) {
-                    repeat_nonfinite++;
-                    continue;
-                }
-                const float cold_warm_d = fabsf(cand_cold[j] - cand_warm_a[j]);
-                if (cold_warm_d != 0.0f) cold_warm_neq++;
-                if (cold_warm_d > cold_warm_max_abs) cold_warm_max_abs = cold_warm_d;
-                const float warm_repeat_d = fabsf(cand_warm_a[j] - cand_warm_b[j]);
-                if (warm_repeat_d != 0.0f) warm_repeat_neq++;
-                if (warm_repeat_d > warm_repeat_max_abs) {
-                    warm_repeat_max_abs = warm_repeat_d;
-                }
-            }
-            TEST_ASSERT(repeat_nonfinite == 0);
-            TEST_ASSERT(cold_warm_neq == 0);
-            TEST_ASSERT(warm_repeat_neq == 0);
-            fprintf(stderr,
-                    "ds4-test: streaming decode-prefill %s cold_warm_neq=%d "
-                    "cold_warm_max_abs=%g warm_repeat_neq=%d "
-                    "warm_repeat_max_abs=%g top1 canonical=%d decode=%d\n",
-                    tc->id,
-                    cold_warm_neq,
-                    cold_warm_max_abs,
-                    warm_repeat_neq,
-                    warm_repeat_max_abs,
-                    result.ref_top1,
-                    result.cand_top1);
-
-            free(cand_cold);
-            free(cand_warm_a);
-            free(cand_warm_b);
-        }
-        ds4_engine_close(cand_engine);
-    }
-
-    test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
     for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
 }
 
@@ -2067,7 +1884,6 @@ static const ds4_test_entry test_entries[] = {
     {"--short-prefill-ratio4", "short-prefill-ratio4", "ratio-4 short prefill regression", test_short_prefill_ratio4},
     {"--f16-kernels", "f16-kernels", "isolated F16 matmul kernel numeric regressions", test_f16_kernel_group},
     {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
-    {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--cont-argmax-gap", "cont-argmax-gap", "DS4_MTP_CONTINUOUS commits autoregressive-identical tokens", test_cont_argmax_gap},
 #endif
@@ -2092,12 +1908,6 @@ static void test_print_help(const char *prog) {
     puts("      Show this help.");
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
-    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through SSD streaming.");
-    puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
-    puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
-    puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
-    puts("  DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
-    puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");

@@ -30,8 +30,8 @@ SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 CUTLASS_CUDA_OBJS = src/cuda/ds4_mxfp4_cutlass.o
 CUDA_SRCS = $(filter-out src/cuda/ds4_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
-LIB_HDRS = src/lib/ds4_help.h src/lib/ds4_kvstore.h src/lib/ds4_ssd.h src/lib/ds4_web.h
-CORE_OBJS = $(ENGINE_OBJS) src/lib/ds4_ssd.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
+LIB_HDRS = src/lib/ds4_help.h src/lib/ds4_kvstore.h src/lib/ds4_web.h
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
@@ -79,7 +79,7 @@ ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_web.o src/lib/ds4_kvstor
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
-src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/lib/ds4_ssd.h src/ds4_gpu.h
+src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
 src/agent/%.o: src/agent/%.c src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS) src/vendor/linenoise.h
@@ -88,7 +88,7 @@ src/agent/%.o: src/agent/%.c src/agent/ds4_agent_internal.h src/ds4.h $(LIB_HDRS
 src/server/%.o: src/server/%.c src/server/ds4_server_internal.h src/ds4.h $(LIB_HDRS) src/vendor/rax.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
-src/cli/%.o: src/cli/%.c src/ds4.h src/lib/ds4_ssd.h src/lib/ds4_help.h src/vendor/linenoise.h
+src/cli/%.o: src/cli/%.c src/ds4.h src/lib/ds4_help.h src/vendor/linenoise.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
 src/lib/%.o: src/lib/%.c src/ds4.h $(LIB_HDRS)

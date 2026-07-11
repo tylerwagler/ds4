@@ -36,16 +36,10 @@ typedef struct {
     int gen_tokens;
     int power_percent;
     uint32_t prefill_chunk;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_preload_experts;
-    uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
-    bool ssd_streaming;
-    bool ssd_streaming_cold;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -379,15 +373,9 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
-        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
-        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
-        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
-        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        .ssd_streaming = cfg.ssd_streaming,
-        .ssd_streaming_cold = cfg.ssd_streaming_cold,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

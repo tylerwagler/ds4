@@ -400,7 +400,6 @@ bool gpu_graph_alloc_raw_cap(
     g->after_attn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->ffn_cur = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->ffn_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->shared_gate = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
     g->shared_up = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
     g->shared_mid = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
@@ -474,11 +473,6 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_router_probs = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT * sizeof(float));
     g->batch_router_selected = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(int));
     g->batch_router_weights = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
-    g->prefill_seed_router_selected =
-        ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
-                             DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
-                             DS4_N_EXPERT_USED *
-                             sizeof(int32_t));
     g->batch_routed_gate = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_up = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
@@ -552,7 +546,6 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_shared_mid && g->batch_shared_out &&
                     g->batch_router_logits && g->batch_router_probs &&
                     g->batch_router_selected && g->batch_router_weights &&
-                    g->prefill_seed_router_selected &&
                     g->batch_routed_gate && g->batch_routed_up &&
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;

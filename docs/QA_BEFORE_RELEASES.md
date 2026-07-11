@@ -3,7 +3,7 @@
 This is the release gate for DwarfStar.  Run it before tagging or pushing a
 release build.  The goal is not to prove every code path exhaustively; it is to
 exercise the paths that have historically regressed: CUDA graph inference,
-SSD streaming, disk KV cache, server APIs, and the agent TUI/tool state
+disk KV cache, server APIs, and the agent TUI/tool state
 machine.
 
 This fork is CUDA-only and targets the DGX Spark (GB10, ~128 GB unified
@@ -57,26 +57,7 @@ Use the normal Flash GGUF that 128 GB users run.
   machine.
 - Run a longer prompt that exercises routed experts past a few thousand tokens.
 
-## 4. SSD Streaming
-
-SSD streaming is a capacity path, so test both correctness and user experience.
-
-- Flash q2/q2-q4 streaming:
-  `./ds4 -m ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
-- Regression test mixed-quant Flash SSD streaming. Use the mixed q2/q4 GGUF
-  with boosted Q4 routed-expert layers and a prompt long enough to exercise the
-  selected-address prefill path; it must not fail with "model range is not
-  covered by mapped model views":
-  `./ds4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ds4_600tok_prompt.txt`.
-- Cold streaming measurement:
-  run once with `--ssd-streaming-cold` and verify no deadlock, missing expert,
-  or impossible slowdown.
-- Confirm startup reports cache budget and that generation does not stall on
-  repeated expert misses for a small interactive prompt.
-- If streaming cache internals changed, test the same prompt twice and compare
-  first-token/logprob sanity between runs.
-
-## 5. Disk KV Cache
+## 4. Disk KV Cache
 
 Disk KV cache bugs are high impact for server users.
 
@@ -90,7 +71,7 @@ Disk KV cache bugs are high impact for server users.
 - Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
   by prefill and render sane history.
 
-## 6. Server APIs
+## 5. Server APIs
 
 The server must keep compatibility across OpenAI, Responses, and Anthropic
 clients.
@@ -103,7 +84,7 @@ clients.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
-## 7. ds4-agent
+## 6. ds4-agent
 
 The agent is the most stateful component.  Test it manually, not only by build.
 
@@ -135,7 +116,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
 
-## 8. Download Script And Model Files
+## 7. Download Script And Model Files
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
@@ -144,7 +125,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
 
-## 9. Performance And Power
+## 8. Performance And Power
 
 - Run `ds4-bench` on the release machine and compare with tracked CSV baselines.
 - Test `--power 100` is not throttled.
@@ -153,7 +134,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
-## 10. Release Sign-off
+## 9. Release Sign-off
 
 Do not sign off until:
 

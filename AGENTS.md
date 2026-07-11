@@ -3,16 +3,17 @@
 DwarfStar (`ds4`) is a DeepSeek V4 Flash specific inference engine, not a
 generic GGUF runner. This tree is the **CUDA-only fork** of antirez's upstream
 project, targeting the NVIDIA DGX Spark (GB10, `sm_121`, ~121 GB usable
-unified memory). The Metal and ROCm backends were fully removed. The two
-backends are `cuda` (default) and `cpu` (CPU inference retained only as
-reference/diagnostic code, slated for eventual removal).
+unified memory). The Metal, ROCm, and CPU inference backends were fully
+removed; `cuda` is the only backend. The engine still contains shared
+host-side C math (`attention.c`, `hc.c`, `layers.c`, `moe.c`, `experts.c`)
+that the live GPU path calls — it is not dead CPU-backend code.
 
 ## Goals
 
 - Keep the production path as whole-model CUDA graph inference on GB10.
-- Keep model loading mmap-backed; do not eagerly copy the full GGUF. Keep SSD
-  streaming of routed experts explicit and overlap loads with compute.
-- Keep the CPU backend CPU-only and use it only as reference/debug code.
+- Keep model loading mmap-backed; do not eagerly copy the full GGUF. The model
+  must be fully resident: a GGUF that does not fit is rejected at load, never
+  partially streamed.
 - Preserve correctness before speed. Do not keep a faster path with
   unexplained attention, KV cache, or logits drift.
 - Make long local agent sessions practical through live KV reuse and disk KV
@@ -39,7 +40,7 @@ Public headers: `src/ds4.h` (engine API) and `src/ds4_gpu.h` (GPU graph API).
   weight binder (`weights.c`), quant format/kernel tables, GPU graph
   orchestration (`gpu_graph_alloc.c`, `gpu_graph_state.c`, `gpu_prefill.c`,
   `gpu_decode.c`, `gpu_diag.c`), sessions + KV payload serialization, imatrix
-  collection, steering, and the CPU reference path (`cpu_*.c`).
+  collection, steering, and the shared host math TUs.
 - `src/cuda/` — 7 kernel TUs + `ds4_cuda_internal.h`: runtime/memory
   (`ds4_cuda_runtime.cu`), matmuls incl. the cuBLASLt MXFP8 path
   (`ds4_cuda_matmul.cu`), attention, MoE, indexer, norm/KV, HC router; plus
@@ -51,8 +52,7 @@ Public headers: `src/ds4.h` (engine API) and `src/ds4_gpu.h` (GPU graph API).
 - `src/agent/` — 20 TUs + `ds4_agent_internal.h`: native coding agent (tools,
   terminal UI, sessions, compaction).
 - `src/cli/` — `ds4_cli.c`, `ds4_bench.c`, `ds4_eval.c` entry points.
-- `src/lib/` — shared pieces: help text, kvstore, SSD
-  streaming, web fetch.
+- `src/lib/` — shared pieces: help text, kvstore, web fetch.
 - `src/vendor/` — linenoise, rax.
 - `tests/` — C runners; `ds4_test.c` and `ds4_agent_test.c` are unity builds
   that `#include` the server/agent source lists.

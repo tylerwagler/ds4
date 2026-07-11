@@ -59,7 +59,6 @@ void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_routed_up);
     ds4_gpu_tensor_free(g->batch_routed_gate);
     ds4_gpu_tensor_free(g->batch_router_weights);
-    ds4_gpu_tensor_free(g->prefill_seed_router_selected);
     ds4_gpu_tensor_free(g->batch_router_selected);
     ds4_gpu_tensor_free(g->batch_router_probs);
     ds4_gpu_tensor_free(g->batch_router_logits);
@@ -211,7 +210,6 @@ void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->hc_mix);
     ds4_gpu_tensor_free(g->flat_hc);
     ds4_gpu_tensor_free(g->cur_hc);
-    free(g->cpu_router_norm);
     memset(g, 0, sizeof(*g));
 }
 

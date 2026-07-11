@@ -1287,9 +1287,6 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         return 1;
     }
     g.quality = e->quality;
-    g.ssd_streaming = e->ssd_streaming;
-    g.ssd_streaming_cold = e->ssd_streaming_cold;
-    g.streaming_preload_experts = e->ssd_streaming_preload_experts;
     g.power_percent = (uint32_t)e->power_percent;
 
     ds4_imatrix_collector collector;
@@ -1420,9 +1417,6 @@ int ds4_engine_generate_argmax(
         }
         return generate_gpu_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
-                                            e->ssd_streaming,
-                                            e->ssd_streaming_cold,
-                                            e->ssd_streaming_preload_experts,
                                             e->power_percent,
                                             e->prefill_chunk,
                                             e->directional_steering_file,
@@ -1549,81 +1543,6 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 
 
-static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
-    if (!e ||
-        !e->ssd_streaming ||
-        !ds4_backend_supports_ssd_streaming(e->backend) ||
-        e->ssd_streaming_cache_experts != 0 ||
-        e->ssd_streaming_cache_bytes != 0) {
-        return true;
-    }
-    if (!ds4_backend_supports_streaming_auto_cache(e->backend)) {
-        return true;
-    }
-
-    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
-    if (recommended == 0) {
-        fprintf(stderr,
-                "ds4: SSD streaming auto cache: recommended working set unavailable; "
-                "set --ssd-streaming-cache-experts N or NGB explicitly\n");
-        return false;
-    }
-
-    uint64_t non_routed_bytes = 0;
-    if (!weights_streaming_non_routed_bytes(&e->weights, &non_routed_bytes)) {
-        fprintf(stderr,
-                "ds4: SSD streaming auto cache could not measure non-routed model weights\n");
-        return false;
-    }
-
-    uint64_t per_expert_bytes = 0;
-    if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
-        fprintf(stderr,
-                "ds4: SSD streaming auto cache could not measure routed expert size\n");
-        return false;
-    }
-
-    const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
-    ds4_ssd_cache_plan plan;
-    if (!ds4_ssd_auto_cache_plan(recommended,
-                                 non_routed_bytes,
-                                 per_expert_bytes,
-                                 max_model_experts,
-                                 &plan)) {
-        fprintf(stderr,
-                "ds4: SSD streaming auto cache could not compute a valid cache budget\n");
-        return false;
-    }
-
-    e->ssd_streaming_cache_experts = plan.cache_experts;
-    fprintf(stderr,
-            "ds4: SSD streaming auto cache budget\n");
-    fprintf(stderr,
-            "ds4:   %s recommends %.2f GiB working set\n",
-            ds4_backend_name(e->backend),
-            (double)recommended / 1073741824.0);
-    fprintf(stderr,
-            "ds4:   using 80%% total for model + cached experts: %.2f GiB\n",
-            (double)plan.model_target_bytes / 1073741824.0);
-    fprintf(stderr,
-            "ds4:   non-routed weights: %.2f GiB\n",
-            (double)non_routed_bytes / 1073741824.0);
-    fprintf(stderr,
-            "ds4:   routed expert size: %.2f MiB\n",
-            (double)per_expert_bytes / 1048576.0);
-    fprintf(stderr,
-            "ds4:   cached expert count: %u (%.2f GiB)\n",
-            e->ssd_streaming_cache_experts,
-            (double)plan.effective_cache_bytes / 1073741824.0);
-    if (plan.model_target_bytes <= non_routed_bytes) {
-        fprintf(stderr,
-                "ds4:   note: non-routed weights already fill the 80%% target; keeping a one-expert cache\n");
-    }
-    return true;
-}
-
-
-
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -1631,13 +1550,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
-    e->ssd_streaming = opt->ssd_streaming;
-    e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->prefill_chunk = opt->prefill_chunk;
-    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
-    e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
-    e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
@@ -1666,33 +1580,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    if (opt->simulate_used_memory_bytes != 0 &&
-        !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
-                                     opt->simulate_used_memory_bytes)) {
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
-
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --cuda\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
     if (opt->expert_overlay && opt->expert_overlay[0]) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --expert-overlay is not compatible with --ssd-streaming\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         const char *sep = strrchr(opt->expert_overlay, ':');
         if (!sep || sep == opt->expert_overlay || !sep[1]) {
             fprintf(stderr, "ds4: --expert-overlay expects FILE:PREFIX (e.g. donor.gguf:blk.17.)\n");
@@ -1740,52 +1634,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 swapped, overlay_path, sep + 1);
     }
     weights_bind(&e->weights, &e->model);
-    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
-        const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
-            ds4_streaming_manual_cache_safe_bytes();
-        if (safe_cache_bytes != 0 &&
-            e->ssd_streaming_cache_bytes > safe_cache_bytes) {
-            e->ssd_streaming_cache_bytes = safe_cache_bytes;
-            fprintf(stderr,
-                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
-                    "to keep expert buffers lockable\n",
-                    ds4_backend_name(e->backend),
-                    (double)requested_cache_bytes / 1073741824.0,
-                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
-        }
-        uint64_t per_expert_bytes = 0;
-        const uint32_t budget =
-            ds4_streaming_cache_experts_for_byte_budget(
-                    &e->weights,
-                    e->ssd_streaming_cache_bytes,
-                    &per_expert_bytes);
-        if (budget == 0 || per_expert_bytes == 0) {
-            fprintf(stderr,
-                    "ds4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        e->ssd_streaming_cache_experts = budget;
-        fprintf(stderr,
-                "ds4: %s SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
-                ds4_backend_name(e->backend),
-                (double)e->ssd_streaming_cache_bytes / 1073741824.0,
-                (double)per_expert_bytes / 1048576.0,
-                budget);
-    }
     if (opt->inspect_only) {
         *out = e;
         return 0;
     }
     if (opt->mtp_path && opt->mtp_path[0]) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
@@ -1795,12 +1648,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
     if (opt->dspark_path && opt->dspark_path[0]) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --dspark\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         if (e->mtp_ready) {
             fprintf(stderr, "ds4: --mtp and --dspark are mutually exclusive\n");
             ds4_engine_close(e);
@@ -1826,96 +1673,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_quality(e->quality);
-        ds4_gpu_set_ssd_streaming(e->ssd_streaming);
-        if (!ds4_engine_configure_streaming_auto_cache(e)) {
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
-        if (e->ssd_streaming) {
-            /*
-             * Pin the expert cache's slab size class to the model's uniform
-             * per-expert bytes, and count mixed-precision (boosted) layers:
-             * those are served through mapped model views instead of the
-             * cache (see weights_streaming_layer_experts_uniform).
-             */
-            uint64_t slab_expert_bytes = 0;
-            if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
-                ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
-                uint32_t routed = 0, boosted = 0;
-                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                    const ds4_layer_weights *l = &e->weights.layer[il];
-                    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
-                    routed++;
-                    if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
-                }
-                if (boosted > 0) {
-                    fprintf(stderr,
-                            "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
-                            "off the slab size class will bypass the expert cache and read "
-                            "experts via mapped model views\n",
-                            boosted, routed);
-                }
-                if (boosted * 2 > routed) {
-                    fprintf(stderr,
-                            "ds4: WARNING: the majority of routed layers (%u/%u) are off the "
-                            "slab size class (is the FIRST routed layer itself boosted?); "
-                            "expert-cache hit rate will be catastrophic\n",
-                            boosted, routed);
-                }
-            }
-        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
-        int model_map_ok = 0;
-        uint64_t *load_offsets = NULL;
-        uint64_t *load_sizes = NULL;
-        uint32_t load_span_count = 0;
-        if (e->ssd_streaming) {
-            ds4_model_map_span_vec spans;
-            if (!weights_model_map_token_spans(&e->weights, &spans)) {
-                fprintf(stderr, "ds4: invalid SSD streaming initial token embedding map\n");
-                ds4_engine_close(e);
-                *out = NULL;
-                return 1;
-            }
-            uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
-            uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
-            uint64_t span_bytes = 0;
-            for (uint32_t i = 0; i < spans.len; i++) {
-                offsets[i] = spans.v[i].off;
-                sizes[i] = spans.v[i].end - spans.v[i].off;
-                span_bytes += sizes[i];
-            }
-            load_offsets = offsets;
-            load_sizes = sizes;
-            load_span_count = spans.len;
-            fprintf(stderr,
-                    "ds4: SSD streaming initial %s model map restricted to token embedding (%u spans, %.2f GiB tensor span)\n",
-                    ds4_backend_name(e->backend),
-                    spans.len,
-                    (double)span_bytes / 1073741824.0);
-            model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
-                                                        e->model.size,
-                                                        load_offsets,
-                                                        load_sizes,
-                                                        load_span_count,
-                                                        spans.max_tensor_bytes);
-            free(spans.v);
-        } else {
-            model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
-                                                       e->model.size,
-                                                       e->model.tensor_data_pos,
-                                                       e->model.size - e->model.tensor_data_pos,
-                                                       e->model.max_tensor_bytes);
-        }
+        const int model_map_ok =
+            ds4_gpu_set_model_map_range(e->model.map,
+                                        e->model.size,
+                                        e->model.tensor_data_pos,
+                                        e->model.size - e->model.tensor_data_pos,
+                                        e->model.max_tensor_bytes);
         if (!model_map_ok) {
             fprintf(stderr,
                     "ds4: %s failed to map model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -1931,8 +1700,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: %s failed to map MTP model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -1948,26 +1715,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: %s failed to map DSpark model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
-                                             load_offsets, load_sizes,
-                                             load_span_count)) {
+                                             NULL, NULL, 0)) {
             fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        free(load_offsets);
-        free(load_sizes);
         /* Also apply explicit optional Q8 preload settings to the MTP support
          * model when loaded. */
         if (e->mtp_ready) {
@@ -2100,7 +1860,6 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->dspark_ready) model_close(&e->dspark_model);
     if (e->overlay_ready) model_close(&e->overlay_model);
     model_close(&e->model);
-    ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
@@ -2133,9 +1892,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->graph.quality = e->quality;
-    s->graph.ssd_streaming = e->ssd_streaming;
-    s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
-    s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!gpu_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,

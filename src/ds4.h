@@ -6,8 +6,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "ds4_ssd.h"
-
 /* Public engine boundary.
  *
  * The CLI and server should treat ds4_engine as the loaded model and
@@ -81,14 +79,8 @@ typedef struct {
     float directional_steering_attn;
     float directional_steering_ffn;
     int power_percent;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_preload_experts;
-    uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;
-    bool ssd_streaming;
-    bool ssd_streaming_cold;
     bool inspect_only;
 } ds4_engine_options;
 

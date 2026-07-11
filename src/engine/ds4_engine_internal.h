@@ -506,19 +506,6 @@ typedef struct {
 } ds4_dspark_weights;
 
 typedef struct {
-    uint64_t off;
-    uint64_t end;
-    bool isolate;
-} ds4_model_map_span;
-
-typedef struct {
-    ds4_model_map_span *v;
-    uint32_t len;
-    uint32_t cap;
-    uint64_t max_tensor_bytes;
-} ds4_model_map_span_vec;
-
-typedef struct {
     float *out;
     const uint16_t *data;
     const float *x;
@@ -839,8 +826,6 @@ typedef struct {
  * tensor names follow the model stages rather than generic graph nodes.
  */
 
-enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
-
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -1067,15 +1052,6 @@ typedef struct {
     ds4_gpu_tensor *batch_router_probs;
     ds4_gpu_tensor *batch_router_selected;
     ds4_gpu_tensor *batch_router_weights;
-    ds4_gpu_tensor *prefill_seed_router_selected;
-    uint32_t prefill_seed_tokens;
-    uint64_t prefill_selected_profile_rows;
-    uint64_t prefill_selected_profile_unique;
-    uint64_t prefill_selected_profile_selected_bytes;
-    uint64_t prefill_selected_profile_full_bytes;
-    uint32_t prefill_selected_profile_layers;
-    uint32_t prefill_selected_profile_min_unique;
-    uint32_t prefill_selected_profile_max_unique;
     ds4_gpu_tensor *batch_routed_gate;
     ds4_gpu_tensor *batch_routed_up;
     ds4_gpu_tensor *batch_routed_mid;
@@ -1090,74 +1066,9 @@ typedef struct {
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
     double decode_token_avg_sec;
-    uint32_t streaming_preload_experts;
     bool quality;
-    bool ssd_streaming;
-    bool ssd_streaming_cold;
-    bool streaming_static_decode_map_current;
     bool mtp_enabled;
-    float *cpu_router_norm;
 } ds4_gpu_graph;
-
-typedef struct {
-    uint64_t off;
-    uint64_t size;
-} gpu_graph_stream_pagein_range;
-
-typedef struct {
-    pthread_t thread;
-    const ds4_model *model;
-    gpu_graph_stream_pagein_range *ranges;
-    pthread_t *threads;
-    struct gpu_graph_stream_pagein_worker *workers;
-    uint32_t n_ranges;
-    uint32_t n_threads;
-    uint32_t layer;
-    uint32_t n_tokens;
-    uint32_t unique;
-    uint64_t bytes;
-    uint64_t touched;
-    double read_ms;
-    double thread_ms;
-    bool profile;
-    bool madvise_only;
-    bool pread_only;
-    bool readahead_only;
-    bool started;
-    bool ok;
-    uint8_t sink;
-} gpu_graph_stream_pagein_job;
-
-typedef struct gpu_graph_stream_pagein_worker {
-    gpu_graph_stream_pagein_job *job;
-    uint32_t first;
-    uint32_t stride;
-    uint64_t touched;
-    double thread_ms;
-    bool ok;
-    uint8_t sink;
-} gpu_graph_stream_pagein_worker;
-
-enum { DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD = 4 };
-
-typedef struct {
-    gpu_graph_stream_pagein_job job;
-    uint32_t layer;
-    bool active;
-} gpu_graph_stream_prepare_slot;
-
-typedef struct gpu_graph_selected_async_load {
-    bool                      active;
-    bool                      ok;
-    ds4_gpu_graph            *g;
-    const ds4_model          *model;
-    const ds4_layer_weights  *layer;
-    uint32_t                  il;
-    uint64_t                  event_value;
-    uint64_t                  gate_expert_bytes;
-    uint64_t                  down_expert_bytes;
-    int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
-} gpu_graph_selected_async_load;
 
 /* =========================================================================
  * Imatrix Collection.
@@ -1249,13 +1160,7 @@ struct ds4_engine {
     float directional_steering_ffn_scale;
     int power_percent;
     uint32_t prefill_chunk;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_preload_experts;
-    ds4_ssd_memory_lock simulated_memory;
     bool quality;
-    bool ssd_streaming;
-    bool ssd_streaming_cold;
     bool gpu_ready;
     bool mtp_ready;
     bool dspark_ready;
@@ -1356,8 +1261,6 @@ extern uint32_t g_requested_threads;
 /* ---- shared functions ---- */
 
 bool ds4_backend_uses_graph(ds4_backend backend);
-bool ds4_backend_supports_ssd_streaming(ds4_backend backend);
-bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend);
 void iq2xxs_signed_grid_init(void);
 void ds4_die(const char *msg);
 uint32_t ds4_layer_compress_ratio(uint32_t il);
@@ -1447,51 +1350,10 @@ bool routed_expert_gate_down_layout(
         uint64_t         *gate_row_bytes,
         uint64_t         *down_expert_bytes,
         uint64_t         *down_row_bytes);
-bool ds4_streaming_routed_expert_bytes(
-        const ds4_weights *weights,
-        uint64_t          *per_expert_bytes_out);
-DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
-        const ds4_weights *w,
-        uint32_t           il);
-uint32_t ds4_streaming_cache_experts_for_byte_budget(
-        const ds4_weights *weights,
-        uint64_t           bytes,
-        uint64_t          *per_expert_bytes_out);
-ds4_gpu_stream_expert_table graph_stream_expert_table_make(
-        const ds4_model         *model,
-        const ds4_layer_weights *layer,
-        uint32_t                 il,
-        uint64_t                 gate_expert_bytes,
-        uint64_t                 down_expert_bytes);
-uint64_t ds4_streaming_manual_cache_safe_bytes(void);
 bool weights_have_output_head(const ds4_weights *w);
 const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w);
 void config_validate_model(const ds4_model *m);
 void weights_bind(ds4_weights *w, const ds4_model *m);
-DS4_MAYBE_UNUSED bool weights_model_map_spans(
-        const ds4_weights *w,
-        uint32_t layer_start,
-        uint32_t layer_end,
-        bool include_output,
-        ds4_model_map_span_vec *spans);
-DS4_MAYBE_UNUSED bool weights_model_map_decode_layer_spans(
-        const ds4_weights *w,
-        uint32_t il,
-        ds4_model_map_span_vec *spans);
-DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
-        const ds4_weights *w,
-        bool include_token,
-        bool include_output,
-        ds4_model_map_span_vec *spans);
-DS4_MAYBE_UNUSED bool weights_streaming_non_routed_bytes(
-        const ds4_weights *w,
-        uint64_t          *bytes_out);
-DS4_MAYBE_UNUSED bool weights_model_map_token_spans(
-        const ds4_weights *w,
-        ds4_model_map_span_vec *spans);
-DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
-        const ds4_weights *w,
-        ds4_model_map_span_vec *spans);
 void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m);
 void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m);
 void weights_free(ds4_weights *w);
@@ -1939,124 +1801,6 @@ bool gpu_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer);
-bool gpu_graph_stream_decode_static_map_enabled(void);
-bool gpu_graph_stream_decode_static_map_state_cache_enabled(void);
-bool gpu_graph_stream_decode_layer_batch_enabled(
-        const ds4_gpu_graph *g);
-void gpu_graph_stream_readahead_range_impl(
-        const ds4_model *model,
-        uint64_t         offset,
-        uint64_t         size,
-        bool             enabled);
-bool gpu_graph_stream_prefill_selected_pagein_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_selected_madvise_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_layer_pagein_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_layer_readahead_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_layer_pread_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_layer_madvise_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_batch_selected_addr_enabled(
-        const ds4_gpu_graph *g,
-        const ds4_weights   *weights,
-        uint32_t             n_tokens);
-bool gpu_graph_cuda_stream_prefill_batch_selected_addr_enabled(
-        const ds4_gpu_graph *g,
-        const ds4_weights   *weights,
-        uint32_t             n_tokens);
-void gpu_graph_stream_prefill_selected_profile_reset(
-        ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_selected_profile_layer(
-        ds4_gpu_graph          *g,
-        const ds4_layer_weights *layer,
-        uint32_t                il,
-        uint32_t                n_tokens);
-void gpu_graph_stream_prefill_selected_profile_summary(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_layer_pagein_overlap_enabled(void);
-uint32_t gpu_graph_stream_prefill_layer_prepare_ahead(void);
-bool gpu_graph_stream_prefill_selected_pagein_start(
-        ds4_gpu_graph                 *g,
-        const ds4_model               *model,
-        const ds4_layer_weights       *layer,
-        uint32_t                       il,
-        uint32_t                       n_tokens,
-        uint64_t                       gate_expert_bytes,
-        uint64_t                       down_expert_bytes,
-        gpu_graph_stream_pagein_job *job);
-bool gpu_graph_stream_prefill_selected_pagein_join(
-        gpu_graph_stream_pagein_job *job);
-bool gpu_graph_stream_prepare_start_if_needed(
-        const ds4_gpu_graph          *g,
-        const ds4_model              *model,
-        const ds4_weights            *weights,
-        uint32_t                      layer,
-        uint32_t                      n_tokens,
-        bool                          madvise_only,
-        bool                          pread_only,
-        bool                          readahead_only,
-        bool                          decode_only,
-        gpu_graph_stream_prepare_slot *slots,
-        uint32_t                      n_slots);
-bool gpu_graph_stream_prepare_join_layer(
-        const ds4_gpu_graph          *g,
-        const ds4_model              *model,
-        const ds4_weights            *weights,
-        uint32_t                      layer,
-        uint32_t                      n_tokens,
-        bool                          madvise_only,
-        bool                          pread_only,
-        bool                          readahead_only,
-        bool                          decode_only,
-        gpu_graph_stream_prepare_slot *slots,
-        uint32_t                      n_slots);
-bool gpu_graph_stream_prepare_join_all(
-        gpu_graph_stream_prepare_slot *slots,
-        uint32_t                         n_slots);
-void gpu_graph_stream_readahead_layer(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           il);
-void gpu_graph_stream_readahead_layer_decode(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           il);
-void gpu_graph_stream_readahead_output(
-        const ds4_model   *model,
-        const ds4_weights *weights);
-bool gpu_graph_stream_prefill_selected_readahead_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_prefill_selected_readahead_shared_enabled(
-        const ds4_gpu_graph *g);
-bool gpu_graph_stream_readahead_selected_experts_from_gpu(
-        ds4_gpu_graph           *g,
-        const ds4_model         *model,
-        const ds4_layer_weights *layer,
-        uint32_t                 il,
-        uint32_t                 n_tokens,
-        uint64_t                 gate_expert_bytes,
-        uint64_t                 down_expert_bytes);
-bool gpu_graph_stream_map_token(
-        const ds4_model   *model,
-        const ds4_weights *weights);
-bool gpu_graph_stream_map_decode_static_all(
-        const ds4_model   *model,
-        const ds4_weights *weights);
-bool gpu_graph_stream_map_layer(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           il);
-bool gpu_graph_stream_map_layer_decode(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           il);
-bool gpu_graph_stream_map_output(
-        const ds4_model   *model,
-        const ds4_weights *weights);
 uint32_t gpu_graph_raw_span_for_batch(
         const ds4_gpu_graph *g,
         uint32_t               pos0,
@@ -2116,38 +1860,6 @@ ds4_gpu_tensor *gpu_graph_attn_comp_prefill_target(
         uint32_t       first_row,
         uint32_t       rows);
 void gpu_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t);
-bool gpu_graph_decode_iq2_selected_slots_expected(
-        const ds4_gpu_graph     *g,
-        const ds4_layer_weights *layer);
-uint32_t gpu_graph_streaming_prefill_cache_seed_k(const ds4_gpu_graph *g);
-bool gpu_graph_streaming_prefill_cache_seed_enabled(const ds4_gpu_graph *g);
-bool gpu_graph_streaming_expert_hotlist_enabled(const ds4_gpu_graph *g);
-bool gpu_graph_streaming_expert_hotlist_load_file(
-        const char *path,
-        uint32_t    max_entries,
-        int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t    priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t    counts[DS4_MAX_LAYER],
-        bool        seen[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t   *loaded_out);
-bool gpu_graph_streaming_expert_hotlist_load_default(
-        uint32_t    max_entries,
-        int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t    priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t    counts[DS4_MAX_LAYER],
-        bool        seen[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t   *loaded_out);
-uint32_t gpu_graph_streaming_expert_preload_count(
-        const ds4_gpu_graph *g,
-        uint32_t             cache_budget);
-bool gpu_graph_cuda_stream_prefill_batch_selected_load(
-        ds4_gpu_graph            *g,
-        const ds4_model          *model,
-        const ds4_layer_weights  *layer,
-        uint32_t                  il,
-        uint32_t                  n_tokens,
-        uint64_t                  gate_expert_bytes,
-        uint64_t                  down_expert_bytes);
 bool gpu_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -2294,39 +2006,6 @@ bool gpu_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits);
-bool gpu_graph_use_streaming_decode_prefill_range(
-        const ds4_gpu_graph *g,
-        const ds4_weights   *weights,
-        uint32_t             start,
-        uint32_t             n_tokens);
-bool gpu_graph_prefill_decode_streaming_range(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        const token_vec       *prompt,
-        uint32_t               start,
-        uint32_t               n_tokens,
-        float                 *logits,
-        bool                   show_progress,
-        ds4_session_progress_fn progress,
-        void                  *progress_ud,
-        ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud,
-        ds4_session_cancel_fn  cancel,
-        void                  *cancel_ud,
-        bool                  *cancelled);
-bool gpu_graph_capture_prefill_seed_router_selected(
-        ds4_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       n_tokens);
-bool gpu_graph_seed_streaming_expert_cache_from_prefill(
-        ds4_gpu_graph     *g,
-        const ds4_model   *model,
-        const ds4_weights *weights);
-bool gpu_graph_seed_streaming_expert_cache_from_hotlist(
-        ds4_gpu_graph     *g,
-        const ds4_model   *model,
-        const ds4_weights *weights);
 bool gpu_graph_eval_token_raw_swa_top(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -2495,9 +2174,6 @@ int generate_gpu_graph_raw_swa(
         int                 n_predict,
         int                 ctx_size,
         bool                quality,
-        bool                ssd_streaming,
-        bool                ssd_streaming_cold,
-        uint32_t            ssd_streaming_preload_experts,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,

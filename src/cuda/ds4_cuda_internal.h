@@ -48,9 +48,7 @@ enum {
      * GB10 48 KB shared-memory limit. */
     DS4_CUDA_ATTENTION_SCORE_CAP = 11712u,
     DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
-    DS4_CUDA_TOPK_MERGE_GROUP = 8u,
-    DS4_CUDA_STREAM_EXPERT_DEFAULT = 8u * 64u,
-    DS4_CUDA_STREAM_EXPERT_MAX = 61u * 384u
+    DS4_CUDA_TOPK_MERGE_GROUP = 8u
 };
 
 #define DS4_FP8_KV_BLOCK 64u
@@ -142,61 +140,6 @@ struct cuda_model_arena {
     uint64_t used;
 };
 
-struct cuda_stream_selected_cache {
-    int valid;
-    const void *model_map;
-    uint32_t layer;
-    uint32_t n_total_expert;
-    uint32_t n_selected;
-    uint32_t slot_count;
-    uint32_t compact_count;
-    uint64_t gate_offset;
-    uint64_t up_offset;
-    uint64_t down_offset;
-    uint64_t gate_expert_bytes;
-    uint64_t down_expert_bytes;
-    char *gate_ptr;
-    char *up_ptr;
-    char *down_ptr;
-    uint64_t gate_capacity;
-    uint64_t up_capacity;
-    uint64_t down_capacity;
-    int32_t *slot_selected_ptr;
-    uint64_t slot_selected_capacity;
-    ds4_gpu_tensor slot_selected_tensor;
-};
-
-struct cuda_stream_expert_cache_slot {
-    int valid;
-    const void *model_map;
-    uint64_t model_size;
-    uint32_t layer;
-    uint32_t n_total_expert;
-    uint32_t expert;
-    uint64_t gate_offset;
-    uint64_t up_offset;
-    uint64_t down_offset;
-    uint64_t gate_expert_bytes;
-    uint64_t down_expert_bytes;
-    uint64_t age;
-};
-
-struct cuda_stream_expert_cache {
-    int valid;
-    uint32_t capacity;
-    uint32_t count;
-    uint64_t tick;
-    uint64_t gate_expert_bytes;
-    uint64_t down_expert_bytes;
-    char *gate_ptr;
-    char *up_ptr;
-    char *down_ptr;
-    uint64_t gate_capacity;
-    uint64_t up_capacity;
-    uint64_t down_capacity;
-    std::vector<cuda_stream_expert_cache_slot> slots;
-};
-
 struct fp8_mx_weight { const void *host_base; uint64_t offset, in_dim, out_dim; __nv_fp8_e4m3 *data; unsigned char *scale; };
 
 /* ---- shared host globals ---- */
@@ -204,8 +147,6 @@ struct fp8_mx_weight { const void *host_base; uint64_t offset, in_dim, out_dim; 
 extern cublasHandle_t g_cublas;
 extern int g_cublas_ready;
 extern int g_quality_mode;
-extern int g_ssd_streaming_mode;
-extern cuda_stream_selected_cache g_stream_selected_cache;
 extern cublasLtHandle_t g_cublaslt;
 extern std::unordered_set<uint64_t> g_fp8_offsets;
 
