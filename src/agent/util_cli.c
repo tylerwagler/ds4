@@ -281,35 +281,6 @@ agent_config parse_options(int argc, char **argv) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
-        } else if (!strcmp(arg, "--ssd-streaming")) {
-            c.engine.ssd_streaming = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
-            c.engine.ssd_streaming_cold = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
-            uint32_t experts = 0;
-            uint64_t bytes = 0;
-            if (!ds4_parse_streaming_cache_experts_arg(
-                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
-                fprintf(stderr,
-                        "ds4-agent: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
-                exit(2);
-            }
-            c.engine.ssd_streaming_cache_experts = experts;
-            c.engine.ssd_streaming_cache_bytes = bytes;
-        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
-            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
-            if (v <= 0) {
-                fprintf(stderr, "ds4-agent: --ssd-streaming-preload-experts must be positive\n");
-                exit(2);
-            }
-            c.engine.ssd_streaming_preload_experts = (uint32_t)v;
-        } else if (!strcmp(arg, "--simulate-used-memory")) {
-            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
-                                   &c.engine.simulate_used_memory_bytes)) {
-                fprintf(stderr,
-                        "ds4-agent: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
-                exit(2);
-            }
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
