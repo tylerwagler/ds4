@@ -25,6 +25,42 @@ void random_tool_id(char *dst, size_t dstlen, api_style api) {
 
 
 
+/* The exact byte sequence a forced tool call is seeded with: close thinking,
+ * open the tool_calls block, and (when a specific tool was requested) open
+ * the named invoke. Used for BOTH the prompt suffix and the generate_job
+ * output seed - they must stay byte-identical or the DSML tracker and the
+ * prompt disagree about parser state. */
+void request_forced_tool_seed(const request *r, buf *out) {
+    buf_puts(out, "</think>\n\n" DS4_TOOL_CALLS_START "\n");
+    if (r->forced_tool_name && r->forced_tool_name[0]) {
+        buf_puts(out, DS4_INVOKE_START " name=\"");
+        buf_puts(out, r->forced_tool_name);
+        buf_puts(out, "\">\n");
+    }
+}
+
+/* Rewrite the rendered prompt tail for a forced tool call: drop a trailing
+ * "<think>" opener, then append the forced-tool seed (which begins with the
+ * "</think>" close; if the render already ended with one, skip the extra). */
+void request_apply_forced_tool_prefill(request *r) {
+    if (!r->force_tool_call || !r->prompt_text) return;
+    buf pt = {0};
+    const char *base = r->prompt_text;
+    size_t blen = strlen(base);
+    if (blen >= 7 && !memcmp(base + blen - 7, "<think>", 7)) blen -= 7;
+    buf_append(&pt, base, blen);
+    buf seed = {0};
+    request_forced_tool_seed(r, &seed);
+    if (pt.len >= 8 && !memcmp(pt.ptr + pt.len - 8, "</think>", 8)) {
+        buf_puts(&pt, seed.ptr + 8);   /* already closed: skip seed's close */
+    } else {
+        buf_puts(&pt, seed.ptr);
+    }
+    buf_free(&seed);
+    free(r->prompt_text);
+    r->prompt_text = buf_take(&pt);
+}
+
 void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
 
@@ -210,6 +246,7 @@ void request_init(request *r, req_kind kind, int max_tokens) {
 void request_free(request *r) {
     ds4_tokens_free(&r->prompt);
     free(r->model);
+    free(r->forced_tool_name);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
     free(r->raw_body);

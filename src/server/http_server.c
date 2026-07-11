@@ -59,12 +59,17 @@ static bool read_http_request(int fd, http_request *r) {
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
     const size_t max_body = 64 * 1024 * 1024;
+    /* Whole-request read deadline: SO_RCVTIMEO only bounds a single recv, so
+     * a client trickling one byte per interval could hold this thread
+     * forever. The deadline bounds total arrival time for headers + body. */
+    const time_t deadline = time(NULL) + DS4_SERVER_REQUEST_READ_DEADLINE_SEC;
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
+        if (time(NULL) > deadline) goto fail;
         buf_append(&b, tmp, (size_t)n);
         hend = header_end(b.ptr, b.len);
     }
@@ -88,6 +93,7 @@ static bool read_http_request(int fd, http_request *r) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
+        if (time(NULL) > deadline) goto fail;
         buf_append(&b, tmp, (size_t)n);
     }
 

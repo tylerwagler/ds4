@@ -174,16 +174,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
      * seeds the output with the same opener so the parser sees a full block. */
     if (tool_choice_required && r->has_tools && r->prompt_text) {
         r->force_tool_call = true;
-        buf pt = {0};
-        const char *base = r->prompt_text;
-        size_t blen = strlen(base);
-        if (blen >= 7 && !memcmp(base + blen - 7, "<think>", 7)) blen -= 7;
-        buf_append(&pt, base, blen);
-        if (!(pt.len >= 8 && !memcmp(pt.ptr + pt.len - 8, "</think>", 8)))
-            buf_puts(&pt, "</think>");
-        buf_puts(&pt, "\n\n" DS4_TOOL_CALLS_START "\n");
-        free(r->prompt_text);
-        r->prompt_text = buf_take(&pt);
+        request_apply_forced_tool_prefill(r);
     }
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
@@ -206,6 +197,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
+    bool tool_choice_forced = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
@@ -272,7 +264,20 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
                             goto bad;
                         }
                         tool_choice_none = !strcmp(choice, "none");
+                        /* {"type":"any"} and {"type":"tool","name":X} force a
+                         * tool call via the same DSML prefill as the OpenAI
+                         * "required" path (named invoke opener for "tool"). */
+                        tool_choice_forced = !strcmp(choice, "any") ||
+                                             !strcmp(choice, "tool");
                         free(choice);
+                    } else if (!strcmp(ckey, "name")) {
+                        free(r->forced_tool_name);
+                        r->forced_tool_name = NULL;
+                        if (!json_string(&p, &r->forced_tool_name)) {
+                            free(ckey);
+                            free(key);
+                            goto bad;
+                        }
                     } else if (!json_skip_value(&p)) {
                         free(ckey);
                         free(key);
@@ -397,6 +402,10 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
+    if (tool_choice_forced && r->has_tools && r->prompt_text) {
+        r->force_tool_call = true;
+        request_apply_forced_tool_prefill(r);
+    }
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);

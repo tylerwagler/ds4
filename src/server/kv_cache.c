@@ -297,6 +297,25 @@ void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs)
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
+    /* Only ids MISSING from the in-memory tool map justify touching disk: a
+     * live conversation's ids were remembered at generation time, so the
+     * common case skips the directory scan entirely (it used to open and
+     * parse every .kv file on every request that mentioned a tool call). */
+    {
+        int keep = 0;
+        for (int i = 0; i < wanted.len; i++) {
+            if (!tool_memory_has_id(s, wanted.v[i])) {
+                wanted.v[keep++] = wanted.v[i];
+            } else {
+                free(wanted.v[i]);
+            }
+        }
+        wanted.len = keep;
+    }
+    if (wanted.len == 0) {
+        id_list_free(&wanted);
+        return;
+    }
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
@@ -328,6 +347,13 @@ void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs)
             kv_tool_map_load_from_pos(s, fp, &wanted);
         }
         fclose(fp);
+        /* Cold restore satisfied: stop scanning once every missing id is in
+         * memory instead of walking the rest of the cache directory. */
+        bool all_found = true;
+        for (int i = 0; i < wanted.len; i++) {
+            if (!tool_memory_has_id(s, wanted.v[i])) { all_found = false; break; }
+        }
+        if (all_found) break;
     }
     closedir(d);
     id_list_free(&wanted);

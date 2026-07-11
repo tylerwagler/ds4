@@ -384,12 +384,18 @@ int main(int argc, char **argv) {
         }
 
         configure_client_socket(fd);
+        pthread_mutex_lock(&s.mu);
+        const int at_cap = s.clients >= DS4_SERVER_MAX_CLIENTS;
+        if (!at_cap) s.clients++;
+        pthread_mutex_unlock(&s.mu);
+        if (at_cap) {
+            http_error(fd, s.enable_cors, 503, "too many connections");
+            close(fd);
+            continue;
+        }
         client_arg *ca = server_xmalloc(sizeof(*ca));
         ca->srv = &s;
         ca->fd = fd;
-        pthread_mutex_lock(&s.mu);
-        s.clients++;
-        pthread_mutex_unlock(&s.mu);
         pthread_t th;
         if (pthread_create(&th, NULL, client_main, ca) != 0) {
             pthread_mutex_lock(&s.mu);

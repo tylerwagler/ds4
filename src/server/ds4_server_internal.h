@@ -50,6 +50,14 @@
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+/* Trusted-LAN posture, but a single stuck or hostile peer must not exhaust
+ * threads (one thread per connection) or hold a socket open forever while
+ * trickling bytes (slowloris). The cap bounds concurrent client threads;
+ * the read deadline bounds the total time a request may take to ARRIVE
+ * (generation time is not counted - streaming responses run as long as the
+ * model needs). */
+#define DS4_SERVER_MAX_CLIENTS 64
+#define DS4_SERVER_REQUEST_READ_DEADLINE_SEC 30
 
 
 /* The request parser only understands the API fields we use and skips the
@@ -270,10 +278,14 @@ typedef struct {
     int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
-    /* tool_choice="required": force a tool call. The prompt is prefilled into an
-     * open DSML tool_calls block (thinking skipped) and generate_job seeds the
-     * output with the opener so the model must complete an invoke. */
+    /* tool_choice="required" (OpenAI) / {"type":"any"|"tool"} (Anthropic):
+     * force a tool call. The prompt is prefilled into an open DSML tool_calls
+     * block (thinking skipped) and generate_job seeds the output with the
+     * SAME opener so the model must complete an invoke. forced_tool_name is
+     * set for Anthropic {"type":"tool","name":X}: the opener then includes
+     * the named invoke so the model can only fill in the parameters. */
     bool force_tool_call;
+    char *forced_tool_name;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
@@ -810,6 +822,8 @@ void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *i
                                          const tool_schema_orders *orders);
 bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body);
 bool http_error(int fd, bool enable_cors, int code, const char *msg);
+void request_forced_tool_seed(const request *r, buf *out);
+void request_apply_forced_tool_prefill(request *r);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool http_error_context_length_exceeded(int fd, bool enable_cors,
                                                const request *r,

@@ -1078,7 +1078,7 @@ decode_again:
      * and prime the trackers to "inside tool call"; the model now generates only
      * the invoke body. */
     if (j->req.kind == REQ_CHAT && j->req.force_tool_call) {
-        buf_puts(&text, "</think>\n\n" DS4_TOOL_CALLS_START "\n");
+        request_forced_tool_seed(&j->req, &text);
         saw_tool_start = true;
         tool_scan_waiting_for_think_close = false;
         dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
