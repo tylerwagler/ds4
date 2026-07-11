@@ -648,38 +648,77 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
     __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)(scratch + off_xq);
     unsigned char *sx = (unsigned char *)(scratch + off_sx);
     void *ws = scratch + off_ws;
-    cudaMemset(sx, 0, sx_bytes);
+    cudaMemsetAsync(sx, 0, sx_bytes, 0);
     int warps = ntok * (int)KB;
     mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, ntok, (int)in_dim, KBp, xq, sx);
     if (!cuda_ok(cudaGetLastError(), "fp8_mx act quant")) return 0;
-    cublasLtMatmulDesc_t op; if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
-    cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
-    cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
-    cublasLtMatrixLayout_t la, lb, ld;
-    cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, in_dim, out_dim, in_dim);
-    cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, in_dim, ntok, in_dim);
-    cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, out_dim, ntok, out_dim);
-    cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
-    cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
-    cublasLtMatmulHeuristicResult_t h; int got = 0;
-    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, op, la, lb, ld, ld, pf, 1, &h, &got);
+    /* Shape-keyed handle cache: the desc/layout/preference build plus the
+     * heuristic query cost ~100us of host time PER GEMM and only the two
+     * scale pointers change between calls of the same (in,out,ntok) shape.
+     * The workhorse prefill runs a handful of shapes x 43 layers per chunk,
+     * so cache the handles and the chosen algo, and update just the scale
+     * pointers per call. Round-robin eviction; entries live for the process
+     * (bounded by the slot count). */
+    struct lt_shape_cache {
+        uint64_t in_dim, out_dim; int ntok; int valid;
+        cublasLtMatmulDesc_t op;
+        cublasLtMatrixLayout_t la, lb, ld;
+        cublasLtMatmulHeuristicResult_t h;
+    };
+    static lt_shape_cache cache[16];
+    static int cache_next;
+    lt_shape_cache *e = NULL;
+    for (int i = 0; i < 16; i++) {
+        if (cache[i].valid && cache[i].in_dim == in_dim &&
+            cache[i].out_dim == out_dim && cache[i].ntok == ntok) { e = &cache[i]; break; }
+    }
+    if (!e) {
+        lt_shape_cache ne = {};
+        ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok;
+        if (cublasLtMatmulDescCreate(&ne.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
+        cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+        cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
+        /* The heuristic must see a fully-populated desc (including scale
+         * pointers) or it selects a non-MX algo an order of magnitude
+         * slower; the pointers are re-set per call below. */
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
+        cublasLtMatrixLayoutCreate(&ne.la, CUDA_R_8F_E4M3, in_dim, out_dim, in_dim);
+        cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, in_dim, ntok, in_dim);
+        cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, out_dim, ntok, out_dim);
+        cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
+        cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        int got = 0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &ne.h, &got);
+        cublasLtMatmulPreferenceDestroy(pf);
+        if (hs != CUBLAS_STATUS_SUCCESS || !got) {
+            cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb);
+            cublasLtMatrixLayoutDestroy(ne.ld); cublasLtMatmulDescDestroy(ne.op);
+            return 0;
+        }
+        ne.valid = 1;
+        e = &cache[cache_next];
+        cache_next = (cache_next + 1) & 15;
+        if (e->valid) {
+            cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb);
+            cublasLtMatrixLayoutDestroy(e->ld); cublasLtMatmulDescDestroy(e->op);
+        }
+        *e = ne;
+    }
+    cublasLtMatmulDescSetAttribute(e->op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
+    cublasLtMatmulDescSetAttribute(e->op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
     int ok = 0;
-    if (hs == CUBLAS_STATUS_SUCCESS && got && ws) {
+    if (ws) {
         float al = 1.f, be = 0.f;
-        cublasStatus_t st = cublasLtMatmul(g_cublaslt, op, &al, w->data, la, xq, lb, &be,
-                                           out->ptr, ld, out->ptr, ld, &h.algo, ws, wz, 0);
+        cublasStatus_t st = cublasLtMatmul(g_cublaslt, e->op, &al, w->data, e->la, xq, e->lb, &be,
+                                           out->ptr, e->ld, out->ptr, e->ld, &e->h.algo, ws, wz, 0);
         ok = (st == CUBLAS_STATUS_SUCCESS);
         if (!ok) fprintf(stderr, "ds4: cuBLASLt MXFP8 matmul failed: status %d\n", (int)st);
     }
-    cublasLtMatmulPreferenceDestroy(pf);
-    cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(ld);
-    cublasLtMatmulDescDestroy(op);
     return ok;
 }
 
