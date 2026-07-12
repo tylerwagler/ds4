@@ -734,7 +734,8 @@ bool gpu_graph_encode_decode_layer(
     ds4_gpu_tensor *comp_selected = NULL;
     uint32_t n_selected = 0;
     double decode_index_stage_t0 = 0.0;
-    const bool decode_index_stage_profile = getenv("DS4_CUDA_INDEXER_STAGE_PROFILE") != NULL;
+    static int decode_index_stage_env = -1;
+    const bool decode_index_stage_profile = gpu_graph_env_flag("DS4_CUDA_INDEXER_STAGE_PROFILE", &decode_index_stage_env);
     if (ok && compressed) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4 ? 2u : 1u;

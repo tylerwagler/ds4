@@ -215,13 +215,17 @@ bool gpu_graph_upload_prompt_embeddings_hc(
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
 
-    uint32_t gpu_min = 512;
-    const char *gpu_min_env = getenv("DS4_CUDA_GPU_BATCH_EMBED_MIN");
-    if (gpu_min_env && gpu_min_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(gpu_min_env, &end, 10);
-        if (end != gpu_min_env && v <= UINT32_MAX) gpu_min = (uint32_t)v;
+    static long gpu_min_cached = -1;
+    if (gpu_min_cached < 0) {
+        gpu_min_cached = 512;
+        const char *gpu_min_env = getenv("DS4_CUDA_GPU_BATCH_EMBED_MIN");
+        if (gpu_min_env && gpu_min_env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(gpu_min_env, &end, 10);
+            if (end != gpu_min_env && v <= UINT32_MAX) gpu_min_cached = (long)v;
+        }
     }
+    const uint32_t gpu_min = (uint32_t)gpu_min_cached;
 
     if (tokens && n_tokens >= gpu_min) {
         return ds4_gpu_embed_tokens_hc_tensor(out_hc,
@@ -328,14 +332,16 @@ static bool gpu_graph_profile_layer_env_match(const char *env_name, uint32_t il)
 
 
 static bool gpu_graph_layer_stage_profile_enabled(uint32_t il) {
-    return getenv("DS4_CUDA_LAYER_STAGE_PROFILE") != NULL &&
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_CUDA_LAYER_STAGE_PROFILE", &cache) &&
            gpu_graph_profile_layer_env_match("DS4_CUDA_LAYER_STAGE_PROFILE_LAYER", il);
 }
 
 
 
 bool gpu_graph_decode_stage_profile_enabled(uint32_t il) {
-    return getenv("DS4_CUDA_DECODE_STAGE_PROFILE") != NULL &&
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_CUDA_DECODE_STAGE_PROFILE", &cache) &&
            gpu_graph_profile_layer_env_match("DS4_CUDA_DECODE_STAGE_PROFILE_LAYER", il);
 }
 
@@ -409,9 +415,10 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
-    const bool index_stage_profile = getenv("DS4_CUDA_INDEXER_STAGE_PROFILE") != NULL;
+    static int index_stage_env = -1, q_stage_env = -1;
+    const bool index_stage_profile = gpu_graph_env_flag("DS4_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
     const bool layer_stage_profile = gpu_graph_layer_stage_profile_enabled(il);
-    const bool q_stage_profile = getenv("DS4_CUDA_Q_STAGE_PROFILE") != NULL;
+    const bool q_stage_profile = gpu_graph_env_flag("DS4_CUDA_Q_STAGE_PROFILE", &q_stage_env);
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
     double q_stage_t0 = q_stage_profile ? now_sec() : 0.0;
 #define DS4_CUDA_PROFILE_ATTN_STAGE(name) do { \

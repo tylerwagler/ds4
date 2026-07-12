@@ -395,6 +395,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool mtp_spec_enabled = getenv("DS4_MTP_SPEC_DISABLE") == NULL;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
@@ -404,7 +405,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         int toks[17];
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            mtp_spec_enabled) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -1227,6 +1228,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool mtp_spec_enabled = getenv("DS4_MTP_SPEC_DISABLE") == NULL;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(chat->session,
@@ -1240,7 +1242,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         int toks[17];
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            mtp_spec_enabled) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,

@@ -604,7 +604,8 @@ void layer_ffn_one(
         float               steering_scale,
         bool                trace) {
     const uint32_t n_hc = DS4_N_HC;
-    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
+    static int profile_env = -1;
+    const bool profile = gpu_graph_env_flag("DS4_DECODE_PROFILE_DETAIL", &profile_env);
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc = 0.0;
     double t_norm = 0.0;
@@ -841,7 +842,8 @@ void layer_ffn_shared_batch(
         uint32_t            il,
         const float       * steering_dirs,
         float               steering_scale) {
-    const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
+    static int profile_env = -1;
+    const bool profile = gpu_graph_env_flag("DS4_PREFILL_PROFILE_DETAIL", &profile_env);
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc_norm = 0.0;
     double t_routed = 0.0;
@@ -856,9 +858,10 @@ void layer_ffn_shared_batch(
     float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    static int no_routed_parallel_env = -1;
     const bool routed_token_parallel =
-        getenv("DS4_ROUTED_TOKEN_PARALLEL") != NULL ||
-        (getenv("DS4_NO_ROUTED_TOKEN_PARALLEL") == NULL && n_tok >= 64);
+        !gpu_graph_env_flag("DS4_NO_ROUTED_TOKEN_PARALLEL", &no_routed_parallel_env) &&
+        n_tok >= 64;
     float *routed_mid = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
     block_q8_K *routed_xq = routed_token_parallel ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
     block_q8_K *routed_midq = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));

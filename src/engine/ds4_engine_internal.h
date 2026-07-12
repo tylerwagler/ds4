@@ -1195,8 +1195,6 @@ struct ds4_session {
     float *logits;
     float *mtp_logits;
     int mtp_draft_token;
-    uint32_t cont_anchor_row;
-    bool cont_anchor_valid;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;

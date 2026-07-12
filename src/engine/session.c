@@ -22,6 +22,27 @@ static float dspark_conf_sched_tau(void) {
     return cached;
 }
 
+/* Cached MTP diagnostic gates (read per token / per spec cycle). */
+static bool mtp_spec_log(void) {
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_MTP_SPEC_LOG", &cache);
+}
+
+static bool mtp_probe_log_flag(void) {
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_MTP_PROBE", &cache);
+}
+
+static bool mtp_full_logits_flag(void) {
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_MTP_FULL_LOGITS", &cache);
+}
+
+static bool force_snapshot_debug(void) {
+    static int cache = -1;
+    return gpu_graph_env_flag("DS4_MTP_FORCE_SNAPSHOT", &cache);
+}
+
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
 }
@@ -1102,7 +1123,6 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
-    s->cont_anchor_valid = false;
     g->mtp_n_raw = 0;
     return 0;
 }
@@ -2029,7 +2049,6 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
-    s->cont_anchor_valid = false;
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
 
@@ -2353,7 +2372,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
     ds4_engine *e = s->engine;
-    const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+    const bool mtp_probe_log = mtp_probe_log_flag();
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
@@ -2380,7 +2399,6 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
-    s->cont_anchor_valid = false;
     if (mtp_should_draft) {
         int mtp_top = -1;
         if (gpu_graph_eval_mtp_draft(&s->graph,
@@ -2390,11 +2408,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                        &e->mtp_weights,
                                        token,
                                        (uint32_t)(s->checkpoint.len - 1),
-                                       getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
+                                       mtp_full_logits_flag() ? s->mtp_logits : NULL,
                                        &mtp_top)) {
             s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
             s->mtp_draft_valid = true;
-        } else if (getenv("DS4_MTP_PROBE")) {
+        } else if (mtp_probe_log) {
             fprintf(stderr, "ds4: mtp probe draft failed\n");
         }
     }
@@ -2423,112 +2441,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     ds4_engine *e = s->engine;
     int n_accept = 0;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
-
-    /* Continuous depth-1 speculation (DS4_MTP_CONTINUOUS).  The default path
-     * below decodes first_token on its own and then batch-verifies the MTP
-     * draft; that standalone decode is a full shared-weight pass the verify
-     * could have amortized.  Continuous mode folds the two together: forward
-     * [first_token, draft] in a single verify, drafting from the anchor row the
-     * previous verify left in batch_cur_hc.  It removes one shared-weight pass
-     * per accepted draft (about 0.50 versus 0.70 reads per token).  Same
-     * near-greedy class as the batched draft-2 verifier, not bit-exact to a
-     * strict decode: a wrong draft is rejected by the verify and never
-     * committed, so a stale anchor only lowers acceptance, never corrupts.
-     * --quality / DS4_MTP_STRICT ask for a strict decode, so defer to the
-     * exact verifier below in that case. */
-    if (!strict_mtp && e->mtp_ready && s->mtp_logits &&
-        e->mtp_draft_tokens > 1 && s->graph.prefill_cap >= 2 &&
-        getenv("DS4_MTP_CONTINUOUS"))
-    {
-        const uint32_t start = (uint32_t)s->checkpoint.len;
-
-        int draft = -1;
-        if (s->cont_anchor_valid) {
-            const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-            ds4_gpu_tensor *anchor = gpu_graph_tensor_row_view(s->graph.batch_cur_hc,
-                                                                 s->cont_anchor_row, hc_dim);
-            const bool drafted = gpu_graph_eval_mtp_draft_from_hc(&s->graph, &e->model, &e->weights,
-                                                                    &e->mtp_model, &e->mtp_weights,
-                                                                    anchor, s->graph.mtp_state_hc,
-                                                                    first_token, start,
-                                                                    NULL, &draft);
-            if (anchor) ds4_gpu_tensor_free(anchor);
-            if (!drafted) draft = -1;
-        }
-
-        /*
-         * No usable draft (first token of a generation, draft unavailable, EOS,
-         * or no room to store or report two tokens): forward first_token alone
-         * and seat the anchor on its row, like an ordinary depth-1 cycle.
-         */
-        if (draft < 0 || first_token == eos_token ||
-            max_tokens == 1 || accepted_cap < 2 ||
-            start + 2u > (uint32_t)s->ctx_size)
-        {
-            token_vec_push(&s->checkpoint, first_token);
-            bool ok = gpu_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
-                                                     &s->checkpoint, start, 1,
-                                                     false, NULL, NULL) &&
-                      gpu_graph_read_spec_logits_row(&s->graph, 0, s->logits);
-            if (!ok) {
-                s->checkpoint.len = start;
-                snprintf(err, errlen, "continuous decode failed");
-                s->checkpoint_valid = false;
-                s->cont_anchor_valid = false;
-                return -1;
-            }
-            accepted[n_accept++] = first_token;
-            s->checkpoint_valid = true;
-            s->mtp_draft_valid = false;
-            s->cont_anchor_row = 0;
-            s->cont_anchor_valid = true;
-            return n_accept;
-        }
-
-        /*
-         * Verify [first_token, draft] together with prefix-1 capture so a
-         * rejected draft rewinds cheaply.  first_token is always committed; the
-         * draft is committed only when the target agrees at row 0.
-         */
-        int row_tops[2] = { -1, -1 };
-        token_vec_push(&s->checkpoint, first_token);
-        token_vec_push(&s->checkpoint, draft);
-        bool ok = gpu_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
-                                                 &s->checkpoint, start, 2,
-                                                 true, row_tops, NULL);
-        if (ok && row_tops[0] == draft) {
-            ok = gpu_graph_read_spec_logits_row(&s->graph, 1, s->logits);
-            if (ok) {
-                accepted[n_accept++] = first_token;
-                if (n_accept < accepted_cap) accepted[n_accept++] = draft;
-                s->cont_anchor_row = 1;
-            }
-        } else if (ok) {
-            if (getenv("DS4_MTP_SPEC_LOG")) {
-                fprintf(stderr, "ds4: mtp cont miss draft=%d top=%d\n", draft, row_tops[0]);
-            }
-            s->checkpoint.len = start;
-            ok = spec_frontier_commit_prefix1(s) &&
-                 gpu_graph_read_spec_logits_row(&s->graph, 0, s->logits);
-            if (ok) {
-                accepted[n_accept++] = first_token;
-                token_vec_push(&s->checkpoint, first_token);
-                s->cont_anchor_row = 0;
-            }
-        }
-        if (!ok) {
-            s->checkpoint.len = start;
-            snprintf(err, errlen, "continuous verify failed");
-            s->checkpoint_valid = false;
-            s->cont_anchor_valid = false;
-            return -1;
-        }
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        s->cont_anchor_valid = true;
-        return n_accept;
-    }
+    static int strict_env = -1;
+    const bool strict_mtp = e->quality || gpu_graph_env_flag("DS4_MTP_STRICT", &strict_env);
 
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
@@ -2556,17 +2470,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
-    float mtp_margin_threshold = e->mtp_margin;
-    const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
-    if (mtp_margin_env && mtp_margin_env[0]) {
-        char *end = NULL;
-        float v = strtof(mtp_margin_env, &end);
-        if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
-    }
-    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
-    const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
+    const float mtp_margin_threshold = e->mtp_margin;
+    static int timing_env = -1, conf_log_env = -1;
+    const bool mtp_timing = gpu_graph_env_flag("DS4_MTP_TIMING", &timing_env);
+    const bool mtp_conf_log = gpu_graph_env_flag("DS4_MTP_CONF_LOG", &conf_log_env);
     const bool mtp_need_logits = mtp_conf_log ||
-        getenv("DS4_MTP_FULL_LOGITS") != NULL ||
+        mtp_full_logits_flag() ||
         (!strict_mtp && mtp_margin_threshold > 0.0f);
     const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
     double mtp_t_after_draft = mtp_t0;
@@ -2580,7 +2489,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * only first_token and skip all speculative work.
      */
     if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        if (mtp_spec_log()) {
             fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
         }
         return n_accept;
@@ -2681,8 +2590,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * logits.  --quality / DS4_MTP_STRICT selects the exact decode verifier,
      * which preserves the one-token target stream but is not a speed win.
      */
-    const bool use_decode2_exact =
-        draft_n == 2 && strict_mtp && getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+    const bool use_decode2_exact = draft_n == 2 && strict_mtp;
     if (use_decode2_exact) {
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
@@ -2762,7 +2670,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         spec_frontier_free(&frontier);
         free(row0_logits);
         free(row_logits);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        if (mtp_spec_log()) {
             fprintf(stderr, "ds4: mtp decode2 verifier failed, falling back to sequential\n");
         }
     }
@@ -2782,13 +2690,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
          * replay one token on partial accept.  DS4_MTP_CAPTURE_PREFIX1 restores
          * the older no-replay partial path for measurement.
          */
-        const bool capture_prefix1 =
-            draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
-        const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
+        const bool capture_prefix1 = draft_n == 2 && !strict_mtp;
+        static int exact_replay_env = -1;
+        const bool exact_replay_debug = gpu_graph_env_flag("DS4_MTP_EXACT_REPLAY", &exact_replay_env);
         const bool snapshot_required =
             draft_n > 2 ||
             (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
-            getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
+            force_snapshot_debug();
         bool have_frontier = false;
         bool ok = true;
         bool verifier_may_have_mutated = false;
@@ -3015,7 +2923,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         spec_frontier_free(&frontier);
         free(row_logits);
         free(row_tops);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        if (mtp_spec_log()) {
             fprintf(stderr, "ds4: mtp spec micro verifier failed, falling back to sequential\n");
         }
     }
@@ -3032,7 +2940,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     const double seq_t0 = mtp_timing ? now_sec() : 0.0;
     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
         if (target_top != drafts[i]) {
-            if (getenv("DS4_MTP_SPEC_LOG")) {
+            if (mtp_spec_log()) {
                 fprintf(stderr,
                         "ds4: mtp spec seq miss at=%d draft=%d base=%d drafted=%d accepted=%d\n",
                         i,
@@ -3085,7 +2993,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 (now_sec() - seq_t0) * 1000.0,
                 (now_sec() - mtp_t0) * 1000.0);
     }
-    if (getenv("DS4_MTP_SPEC_LOG")) {
+    if (mtp_spec_log()) {
         if (verified == draft_n) {
             fprintf(stderr,
                     "ds4: mtp spec seq accept drafted=%d accepted=%d\n",
@@ -3231,8 +3139,10 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
     const void *dmap = e->dspark_model.map;
     const uint64_t dsize = e->dspark_model.size;
-    const int dspark_stats = getenv("DS4_DSPARK_STATS") != NULL;
-    const int dtree_stats = getenv("DS4_DTREE_STATS") != NULL;
+    static int dspark_stats_env = -1;
+    const int dspark_stats = gpu_graph_env_flag("DS4_DSPARK_STATS", &dspark_stats_env);
+    static int dtree_stats_env = -1;
+    const int dtree_stats = gpu_graph_env_flag("DS4_DTREE_STATS", &dtree_stats_env);
     const double t0 = dspark_stats ? now_sec() : 0.0;
     int n_accept = 0;
 
@@ -3641,7 +3551,8 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     ds4_gpu_graph *g = &s->graph;
     const uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     int n_accept = 0;
-    const int dspark_stats = getenv("DS4_DSPARK_STATS") != NULL;
+    static int dspark_stats_env = -1;
+    const int dspark_stats = gpu_graph_env_flag("DS4_DSPARK_STATS", &dspark_stats_env);
     const double dspark_t0 = dspark_stats ? now_sec() : 0.0;
     double dspark_draft_ms = 0.0;
     int dspark_base0 = -1;   /* draft-forward's row-0 argmax (pre-markov) */
@@ -3677,8 +3588,12 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * the drafter KV, so its rolling context stays complete for later steps.
      * DS4_DSPARK_MIN_CONF=0 (default) preserves the old always-draft behavior. */
     {
-        const char *mc = getenv("DS4_DSPARK_MIN_CONF");
-        const float min_conf = mc ? (float)atof(mc) : 0.0f;
+        static float min_conf = -1.0f;
+        if (min_conf < 0.0f) {
+            const char *mc = getenv("DS4_DSPARK_MIN_CONF");
+            const float v = mc ? (float)atof(mc) : 0.0f;
+            min_conf = v > 0.0f ? v : 0.0f;
+        }
         if (min_conf > 0.0f) {
             const float p = dspark_base_top1_prob(s->logits, DS4_N_VOCAB);
             if (p < min_conf) {
@@ -3957,7 +3872,6 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
-    s->cont_anchor_valid = false;
     s->dspark_n_pending = 0;
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first
@@ -3976,7 +3890,6 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
-    s->cont_anchor_valid = false;
     s->dspark_n_pending = 0;
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
