@@ -37,7 +37,9 @@ all: deepseek4-quantize
 test_quants: test_quants.c $(QUANTS_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -o $@ test_quants.c $(QUANTS_OBJS) -lm -pthread
 
-test: test_quants
+# test also rebuilds the production binary: a stale deepseek4-quantize
+# once shipped sign-stripped MXFP4 donors while test_quants (rebuilt) passed.
+test: test_quants deepseek4-quantize
 	./test_quants
 
 quantize/%.o: quantize/%.c quantize/dsq_internal.h quants.h
