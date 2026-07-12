@@ -4016,6 +4016,8 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        /* keep KL/quality probes on plain decode with max memory headroom */
+        .dspark_disable = true,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .power_percent = cfg.power_percent,

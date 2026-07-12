@@ -403,7 +403,21 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        {
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_has_dspark(engine)) {
+            ntok = ds4_session_eval_speculative_block(session,
+                                                      token,
+                                                      max_tokens - generated,
+                                                      ds4_token_eos(engine),
+                                                      toks,
+                                                      (int)(sizeof(toks) / sizeof(toks[0])),
+                                                      err,
+                                                      sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+        } else {
             int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -995,7 +1009,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f) {
+    } else if (cfg->gen.temperature > 0.0f || ds4_engine_has_dspark(engine)) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1223,7 +1237,20 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        {
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_has_dspark(engine)) {
+            ntok = ds4_session_eval_speculative_block(chat->session,
+                                                      token,
+                                                      max_tokens - generated,
+                                                      ds4_token_eos(engine),
+                                                      toks,
+                                                      (int)(sizeof(toks) / sizeof(toks[0])),
+                                                      err,
+                                                      sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+        } else {
             int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1488,6 +1515,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--no-dspark")) {
+            c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--expert-overlay")) {
             c.engine.expert_overlay = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {

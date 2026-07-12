@@ -1582,9 +1582,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = e;
         return 0;
     }
-    if (opt->dspark_path && opt->dspark_path[0]) {
+    if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {
+        /* Drafter merged into the main GGUF: bind from the main model and
+         * alias dspark_model to it by value (same map/fd; every dspark call
+         * site reads e->dspark_model, and close is guarded on dspark_external
+         * so the shared mapping is only torn down once). */
+        dspark_weights_bind(&e->dspark_weights, &e->model);
+        e->dspark_model = e->model;
+        e->dspark_external = false;
+        e->dspark_ready = true;
+        fprintf(stderr, "ds4: DSpark drafter found in model (draft=%d, confidence=%.2f)\n",
+                e->dspark_draft_tokens,
+                (double)e->dspark_confidence);
+    } else if (!opt->dspark_disable && opt->dspark_path && opt->dspark_path[0]) {
         model_open(&e->dspark_model, opt->dspark_path, graph_backend, true);
         dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
+        e->dspark_external = true;
         e->dspark_ready = true;
         fprintf(stderr, "ds4: DSpark support model loaded: %s (draft=%d, confidence=%.2f)\n",
                 opt->dspark_path,
@@ -1618,7 +1631,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->dspark_ready &&
+        if (e->dspark_ready && e->dspark_external &&
             !ds4_gpu_set_model_map_range(e->dspark_model.map,
                                            e->dspark_model.size,
                                            e->dspark_model.tensor_data_pos,
@@ -1635,17 +1648,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
-                                             NULL, NULL, 0)) {
+                                             NULL, NULL, 0,
+                                             e->dspark_ready ? NULL : "dspark.")) {
             fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        if (e->dspark_ready) {
+        if (e->dspark_ready && e->dspark_external) {
             (void)ds4_gpu_set_model_fd_for_map(e->dspark_model.fd, e->dspark_model.map);
             if (!accelerator_cache_model_tensors(e->backend, &e->dspark_model,
-                                                 NULL, NULL, 0)) {
+                                                 NULL, NULL, 0, NULL)) {
                 fprintf(stderr, "ds4: %s failed to prepare optional DSpark model cache\n",
                         ds4_backend_name(e->backend));
                 ds4_engine_close(e);
@@ -1756,7 +1770,7 @@ void ds4_engine_close(ds4_engine *e) {
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */
     ds4_gpu_cleanup();
-    if (e->dspark_ready) model_close(&e->dspark_model);
+    if (e->dspark_ready && e->dspark_external) model_close(&e->dspark_model);
     if (e->overlay_ready) model_close(&e->overlay_model);
     model_close(&e->model);
     ds4_release_instance_lock();

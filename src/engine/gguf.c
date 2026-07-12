@@ -629,6 +629,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
                                                    uint32_t span_count,
+                                                   const char *skip_prefix,
                                                    uint64_t *prepared_out) {
     uint64_t cap = m->n_tensors;
     if (cap == 0) {
@@ -653,6 +654,9 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
          * (donor-relative offsets that can exceed this model's size); they are
          * prepared separately by accelerator_prepare_expert_overlay. */
         if (t->ext_map) continue;
+        if (skip_prefix &&
+            t->name.len > strlen(skip_prefix) &&
+            memcmp(t->name.ptr, skip_prefix, strlen(skip_prefix)) == 0) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
@@ -743,7 +747,8 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
-                                            uint32_t span_count) {
+                                            uint32_t span_count,
+                                     const char *skip_prefix) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
     /* Register each MXFP8 weight's offset so the workhorse matmul executes
@@ -767,7 +772,7 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
 
     const double t0 = now_sec();
     uint64_t prepared = 0;
-    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
+    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, skip_prefix, &prepared)) {
         return false;
     }
     const double t1 = now_sec();

@@ -63,6 +63,9 @@ typedef bool (*ds4_session_cancel_fn)(void *ud);
 typedef struct {
     const char *model_path;
     const char *dspark_path;
+    /* Drafter is auto-enabled when the main GGUF contains dspark.* tensors;
+     * this opts out (memory saving for sampled-only workloads). */
+    bool dspark_disable;
     /* "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
      * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */

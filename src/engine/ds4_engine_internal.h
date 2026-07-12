@@ -1123,6 +1123,7 @@ struct ds4_engine {
     bool quality;
     bool gpu_ready;
     bool dspark_ready;
+    bool dspark_external;   /* drafter opened from its own GGUF (own map/fd) */
     ds4_model overlay_model;
     bool overlay_ready;
     /* Prometheus /metrics spec-decode counters (server /metrics endpoint via
@@ -1262,7 +1263,8 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
-                                            uint32_t span_count);
+                                            uint32_t span_count,
+                                            const char *skip_prefix);
 const void *tensor_data(const ds4_model *m, const ds4_tensor *t);
 uint32_t model_apply_expert_overlay(ds4_model *base, const ds4_model *overlay,
                                     const char *prefix);

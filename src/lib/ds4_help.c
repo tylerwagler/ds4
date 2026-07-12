@@ -158,6 +158,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
+            opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the model GGUF.");
             opt(fp, c, "--expert-overlay FILE:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor GGUF FILE (quant-format measurement).");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");

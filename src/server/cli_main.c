@@ -164,6 +164,8 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--no-dspark")) {
+            c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--dspark")) {
             c.engine.dspark_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark-draft")) {

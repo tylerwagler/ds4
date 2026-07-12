@@ -376,6 +376,9 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        /* bench measures the plain decode baseline; never bind a merged
+         * drafter (spec-decode throughput has its own timed-server protocol) */
+        .dspark_disable = true,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
