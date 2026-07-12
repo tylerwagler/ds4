@@ -72,7 +72,6 @@ fi
 
 MODEL=$1
 shift
-MODEL_FILES=
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
@@ -214,13 +213,7 @@ download_one() {
     mv "$part" "$out"
 }
 
-if [ -n "$MODEL_FILES" ]; then
-    for file in $MODEL_FILES; do
-        download_one "$file"
-    done
-else
-    download_one "$MODEL_FILE"
-fi
+download_one "$MODEL_FILE"
 
 cd "$ROOT"
 ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf

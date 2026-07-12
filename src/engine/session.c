@@ -1957,7 +1957,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             if (cancelled) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
-                    return DS4_SESSION_SYNC_INTERRUPTED;
+                return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (!ok) {
                 snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
@@ -1973,7 +1973,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
-                    return DS4_SESSION_SYNC_INTERRUPTED;
+                return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (!gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                                 (uint32_t)prompt->v[i],
