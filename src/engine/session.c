@@ -2684,11 +2684,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         const int start = s->checkpoint.len;
         /*
          * The production MTP depth is two.  Prefix-1 capture makes partial
-         * accepts cheap, but it copies per-layer compressor frontiers even when
-         * both draft tokens are accepted.  Full accepts are the path that makes
-         * MTP worthwhile, so by default we snapshot before the verifier and
-         * replay one token on partial accept.  DS4_MTP_CAPTURE_PREFIX1 restores
-         * the older no-replay partial path for measurement.
+         * accepts cheap; strict mode instead snapshots before the verifier and
+         * replays one token on partial accept, preserving the exact stream.
          */
         const bool capture_prefix1 = draft_n == 2 && !strict_mtp;
         static int exact_replay_env = -1;

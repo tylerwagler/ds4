@@ -965,13 +965,10 @@ static void test_local_golden_vectors(void) {
     if (!fp) return;
 
     char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
-    char *saved_moe_tile_max = test_save_env("DS4_CUDA_MOE_TILE_MAX");
     setenv("DS4_CUDA_PREFILL_CHUNK", "4096", 1);
-    unsetenv("DS4_CUDA_MOE_TILE_MAX");
 
     ds4_engine *engine = test_open_engine(false);
     if (!engine) {
-        test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
         test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
@@ -984,7 +981,6 @@ static void test_local_golden_vectors(void) {
     }
 
     ds4_engine_close(engine);
-    test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
     test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
