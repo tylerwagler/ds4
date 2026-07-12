@@ -241,12 +241,15 @@ static void tensor_expect_routed_expert_combo(
     const bool cutlass_mxfp4_combo = gate->type == DS4_TENSOR_CUTLASS_MXFP4 &&
                                      up->type   == DS4_TENSOR_CUTLASS_MXFP4 &&
                                      down->type == DS4_TENSOR_CUTLASS_MXFP4;
-    if (iq2_combo || mxfp4_combo || cutlass_mxfp4_combo) return;
+    const bool q2k_combo = gate->type == DS4_TENSOR_Q2_K &&
+                           up->type   == DS4_TENSOR_Q2_K &&
+                           down->type == DS4_TENSOR_Q2_K;
+    if (iq2_combo || mxfp4_combo || cutlass_mxfp4_combo || q2k_combo) return;
     fprintf(stderr,
             "ds4: unsupported routed expert quant combo at tensor %.*s: "
             "gate=%s up=%s down=%s; supported combos are "
-            "gate/up=iq2_xxs with down=q2_k, gate/up/down=mxfp4, or "
-            "gate/up/down=cutlass_mxfp4\n",
+            "gate/up=iq2_xxs with down=q2_k, gate/up/down=q2_k, gate/up/down=mxfp4, "
+            "or gate/up/down=cutlass_mxfp4\n",
             (int)gate->name.len,
             gate->name.ptr,
             tensor_type_name(gate->type),

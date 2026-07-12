@@ -45,9 +45,10 @@ BLOCK = {
 # post-step; plain type-39 MXFP4 decodes fine but skips prefill batching.
 PRESETS = {
     "cheap": {"gate": "IQ2_XXS", "up": "IQ2_XXS", "down": "Q2_K"},   # ~2.06 / 2.6 bpw
+    "mid":   {"gate": "Q2_K",    "up": "Q2_K",    "down": "Q2_K"},   # 2.625 bpw everywhere
     "rich":  {"gate": "MXFP4",   "up": "MXFP4",   "down": "MXFP4"},  # 4.25 bpw, lossless
 }
-PRESET_ORDER = ["cheap", "rich"]               # ascending size; promote cheap->rich
+PRESET_ORDER = ["cheap", "mid", "rich"]        # ascending size
 ROUTED_CANDS = ["IQ2_XXS", "Q2_K", "MXFP4"]    # display only, bpw-ascending
 
 MIB = 1 << 20   # DP budget granularity
@@ -122,10 +123,11 @@ def solve_01_knapsack(weights_mib, values, budget_mib):
             c -= weights_mib[i]
     return chosen
 
-def allocate(tensors, sens, mse, kl, budget_bytes, ucb_z):
-    """Per-layer two-preset allocation. Unit = whole MoE layer (gate+up+down);
-    picks 'cheap' or 'rich'. Benefit of promotion comes from measured KL when
-    available (--kl), else the 0.5*sens*mse proxy. Solved exactly by DP."""
+def allocate(tensors, sens, mse, kl, kl_mid, budget_bytes, ucb_z):
+    """Per-layer preset allocation. Unit = whole MoE layer (gate+up+down);
+    picks 'cheap', 'mid' (only when --kl-mid measurements exist), or 'rich'.
+    Benefits come from measured KL when available (--kl / --kl-mid), else the
+    0.5*sens*mse proxy (rich only). Solved exactly by grouped DP."""
     import collections
     fixed_bytes = 0
     layers = collections.OrderedDict()
@@ -151,30 +153,64 @@ def allocate(tensors, sens, mse, kl, budget_bytes, ucb_z):
             dkl += 0.5 * sv * m
         return dkl
 
-    units = []   # [layer, ts, cheap_sz, rich_sz, promote_benefit]
-    for layer, ts in layers.items():
-        cheap_sz, rich_sz = preset_size(ts, "cheap"), preset_size(ts, "rich")
-        if kl is not None and layer in kl:
-            benefit = float(kl[layer]["dkl_promote"])
-            benefit -= ucb_z * float(kl[layer].get("stderr", 0.0))
-        else:
-            benefit = proxy_dkl(ts, "cheap") - proxy_dkl(ts, "rich")
-        units.append([layer, ts, cheap_sz, rich_sz, benefit])
+    def measured(store, layer):
+        if store is None or layer not in store:
+            return None
+        return float(store[layer]["dkl_promote"]) - \
+               ucb_z * float(store[layer].get("stderr", 0.0))
 
-    base_routed = sum(u[2] for u in units)
-    budget_left = budget_bytes - fixed_bytes - base_routed
-    weights_mib = [max(1, math.ceil((u[3] - u[2]) / MIB)) for u in units]
-    values = [u[4] for u in units]
-    chosen_idx = solve_01_knapsack(weights_mib, values, budget_left // MIB) \
-        if budget_left > 0 else set()
+    units = []   # [layer, ts, sizes{preset}, benefits{preset}]
+    for layer, ts in layers.items():
+        sizes = {p: preset_size(ts, p) for p in PRESET_ORDER}
+        b_rich = measured(kl, layer)
+        if b_rich is None:
+            b_rich = proxy_dkl(ts, "cheap") - proxy_dkl(ts, "rich")
+        benefits = {"cheap": 0.0, "rich": b_rich}
+        b_mid = measured(kl_mid, layer)
+        if b_mid is not None:
+            # mid is a strict subset of the rich improvement; cap noise
+            benefits["mid"] = min(b_mid, b_rich)
+        units.append([layer, ts, sizes, benefits])
+
+    base_routed = sum(u[2]["cheap"] for u in units)
+    budget_left = (budget_bytes - fixed_bytes - base_routed) // MIB
+    # grouped DP: each layer picks one preset (cheap weight 0, value 0)
+    NEG = float("-inf")
+    W = max(0, int(budget_left))
+    best = [0.0] + [NEG] * W
+    pick = []
+    for layer, ts, sizes, benefits in units:
+        opts = [("cheap", 0, 0.0)]
+        for p in ("mid", "rich"):
+            if p in benefits and benefits[p] > 0.0:
+                w = max(1, math.ceil((sizes[p] - sizes["cheap"]) / MIB))
+                opts.append((p, w, benefits[p]))
+        row = [None] * (W + 1)
+        nxt = [NEG] * (W + 1)
+        for c in range(W + 1):
+            for (pname, w, v) in opts:
+                if c >= w and best[c - w] > NEG:
+                    cand = best[c - w] + v
+                    if cand > nxt[c]:
+                        nxt[c] = cand
+                        row[c] = (pname, w)
+        best = nxt
+        pick.append(row)
+
+    c = max(range(W + 1), key=lambda x: best[x])
+    choice = {}
+    for i in range(len(units) - 1, -1, -1):
+        pname, w = pick[i][c] if pick[i][c] else ("cheap", 0)
+        choice[i] = pname
+        c -= w
 
     chosen = {}
     rsize = 0
     saved_kl = 0.0
-    for i, (layer, ts, cheap_sz, rich_sz, benefit) in enumerate(units):
-        preset = "rich" if i in chosen_idx else "cheap"
-        rsize += rich_sz if i in chosen_idx else cheap_sz
-        if i in chosen_idx: saved_kl += benefit
+    for i, (layer, ts, sizes, benefits) in enumerate(units):
+        preset = choice.get(i, "cheap")
+        rsize += sizes[preset]
+        saved_kl += benefits.get(preset, 0.0)
         for (nm, _, _, role) in ts:
             chosen[nm] = PRESETS[preset][role]
     return chosen, fixed_bytes, rsize, saved_kl
@@ -184,22 +220,24 @@ def main():
     ap.add_argument("--tensors", required=True)
     ap.add_argument("--sens"); ap.add_argument("--mse")
     ap.add_argument("--kl", help="measured per-layer KL costs from measure_layer_kl.py")
+    ap.add_argument("--kl-mid", help="measured per-layer KL for the mid (Q2_K gate/up) preset")
     ap.add_argument("--ucb-z", type=float, default=0.0,
                     help="charge Z*stderr against measured benefits (default 0)")
     ap.add_argument("--pareto", nargs="+", type=float, default=[90, 99, 105])
     ap.add_argument("--out-dir", default=".")
     a = ap.parse_args()
     tensors = json.load(open(a.tensors))
-    sens = load(a.sens); mse = load(a.mse); kl = load(a.kl)
+    sens = load(a.sens); mse = load(a.mse); kl = load(a.kl); kl_mid = load(a.kl_mid)
     if kl:
-        using = f"MEASURED KL ({len(kl)} layers, ucb_z={a.ucb_z})"
+        using = f"MEASURED KL ({len(kl)} layers" + \
+                (f" + mid {len(kl_mid)}" if kl_mid else "") + f", ucb_z={a.ucb_z})"
     else:
         using = ("imatrix sens" if sens else "SYNTHETIC sens") + " + " + \
                 ("real MSE" if mse else "SYNTHETIC MSE")
     print(f"# {len(tensors)} tensors; cost model: {using}")
     print(f"# routed-expert candidate menu: {ROUTED_CANDS}\n")
     for gb in a.pareto:
-        chosen, fixed, rtot, saved = allocate(tensors, sens, mse, kl, gb * 1e9, a.ucb_z)
+        chosen, fixed, rtot, saved = allocate(tensors, sens, mse, kl, kl_mid, gb * 1e9, a.ucb_z)
         total = (fixed + rtot) / 1e9
         man = {}
         for t in tensors:
