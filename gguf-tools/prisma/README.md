@@ -16,7 +16,10 @@ RobTand/PrismaQuant. Two cost models:
 # 0. one-time assets: all-cheap base + all-rich (lossless MXFP4) donor
 deepseek4-quantize --hf HF_DIR --template T.gguf \
     --routed-w1 iq2_xxs --routed-w2 q2_k --routed-w3 iq2_xxs \
+    --output fp8_e4m3 \
     --imatrix imatrix.dat --out allcheap-base.gguf
+# --output fp8_e4m3 emits the MXFP8 LM head directly (supersedes the old
+# temp/splice_mxfp8_head.py post-step)
 deepseek4-quantize --hf HF_DIR --template T.gguf --experts mxfp4 \
     --out allrich-donor.gguf
 
