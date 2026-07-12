@@ -62,7 +62,6 @@ typedef bool (*ds4_session_cancel_fn)(void *ud);
 
 typedef struct {
     const char *model_path;
-    const char *mtp_path;
     const char *dspark_path;
     /* "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
@@ -71,8 +70,6 @@ typedef struct {
     ds4_backend backend;
     int n_threads;
     uint32_t prefill_chunk;
-    int mtp_draft_tokens;
-    float mtp_margin;
     int dspark_draft_tokens;
     float dspark_confidence;
     const char *directional_steering_file;
@@ -233,10 +230,6 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
-int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
-                                        int max_tokens, int eos_token,
-                                        int *accepted, int accepted_cap,
-                                        char *err, size_t errlen);
 int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -248,8 +241,6 @@ int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
-bool ds4_engine_has_mtp(ds4_engine *e);
-int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 bool ds4_engine_has_dspark(ds4_engine *e);
 int ds4_engine_dspark_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);

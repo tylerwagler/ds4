@@ -6,7 +6,6 @@ Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-ima
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
 Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
 PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
-MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -25,7 +24,6 @@ Usage:
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
   ./download_model.sh q4-imatrix [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
-  ./download_model.sh mtp [--token TOKEN]
 
 Targets:
 
@@ -47,10 +45,6 @@ Targets:
        DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
        on disk; intended for 512 GB RAM machines.
 
-  mtp  Optional speculative decoding component, about 3.5 GB on disk.
-       It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but must be
-       enabled explicitly with --mtp when running ds4 or ds4-server.
-
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -66,9 +60,6 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
-After downloading mtp, enable it explicitly, for example:
-  ./ds4 --mtp <download directory>/$MTP_FILE --mtp-draft 2
-
 PRO files are downloaded with the official Hugging Face downloader because
 they are too large for the curl path used by the smaller GGUF files.
 EOF
@@ -82,14 +73,12 @@ fi
 MODEL=$1
 shift
 MODEL_FILES=
-LINK_MODEL=1
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
     q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
-    mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
     -h|--help|help)
         usage
         exit 0
@@ -233,16 +222,9 @@ else
     download_one "$MODEL_FILE"
 fi
 
-if [ "$MODEL" = "mtp" ]; then
-    echo
-    echo "MTP is an optional component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
-    echo "Enable it explicitly, for example:"
-    echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
-elif [ "$LINK_MODEL" -eq 1 ]; then
-    cd "$ROOT"
-    ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
-    echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
-fi
+cd "$ROOT"
+ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
+echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
 
 echo
 echo "Done."

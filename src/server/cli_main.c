@@ -144,8 +144,6 @@ static server_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_server_backend(),
-            .mtp_draft_tokens = 1,
-            .mtp_margin = 3.0f,
         },
         .host = "0.0.0.0",
         .port = 8000,
@@ -166,12 +164,6 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp-draft")) {
-            c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--mtp-margin")) {
-            c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "--dspark")) {
             c.engine.dspark_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark-draft")) {

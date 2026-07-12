@@ -1067,7 +1067,6 @@ decode_again:
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     const bool dspark_spec_enabled = getenv("DS4_DSPARK_DISABLE") == NULL;
-    const bool mtp_spec_enabled = getenv("DS4_MTP_SPEC_DISABLE") == NULL;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
@@ -1100,7 +1099,7 @@ decode_again:
         float min_p = j->req.min_p;
         /* Thinking mode normally forces sampling defaults for quality, but an
          * EXPLICIT temperature==0 (default is 1.0) means the caller wants greedy
-         * decode — honor it so MTP speculative decode (greedy-only) can engage. */
+         * decode — honor it so DSpark speculative decode (greedy-only) can engage. */
         if (ds4_think_mode_enabled(j->req.think_mode) && j->req.temperature > 0.0f) {
             temperature = DS4_DEFAULT_TEMPERATURE;
             top_k = 0;
@@ -1130,22 +1129,6 @@ decode_again:
                                                       (int)(sizeof(toks) / sizeof(toks[0])),
                                                       err,
                                                       sizeof(err));
-            if (ntok < 0) {
-                finish = "error";
-                break;
-            }
-        } else if (temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            mtp_spec_enabled)
-        {
-            ntok = ds4_session_eval_speculative_argmax(s->session,
-                                                       token,
-                                                       max_tokens - completion,
-                                                       ds4_token_eos(s->engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
             if (ntok < 0) {
                 finish = "error";
                 break;

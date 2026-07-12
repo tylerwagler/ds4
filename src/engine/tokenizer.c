@@ -907,28 +907,6 @@ int sample_argmax(const float *logits, uint32_t n_vocab) {
 
 
 
-DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
-                        int *top0, float *logit0,
-                        int *top1, float *logit1) {
-    int b0 = -1, b1 = -1;
-    float v0 = DS4_NEG_INF, v1 = DS4_NEG_INF;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (v > v0) {
-            b1 = b0; v1 = v0;
-            b0 = (int)i; v0 = v;
-        } else if (v > v1) {
-            b1 = (int)i; v1 = v;
-        }
-    }
-    if (top0) *top0 = b0;
-    if (logit0) *logit0 = v0;
-    if (top1) *top1 = b1;
-    if (logit1) *logit1 = v1;
-}
-
-
-
 static uint64_t sample_rng_next(uint64_t *state) {
     uint64_t x = *state;
     if (x == 0) x = 0x9e3779b97f4a7c15ULL;

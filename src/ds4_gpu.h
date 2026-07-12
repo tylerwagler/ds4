@@ -248,12 +248,6 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ds4_gpu_repeat_hc_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *row,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
-
 int ds4_gpu_rms_norm_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

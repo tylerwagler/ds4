@@ -45,44 +45,6 @@ uint32_t gpu_graph_raw_start_for_span(
 
 
 
-/* Capture the verifier prefix after the first speculative token.
- *
- * Exact MTP speculation is only profitable if partial accepts are cheap.  The
- * target verifier computes two draft tokens together; if only the first token
- * is accepted, replaying a one-token verifier throws away most of the gain.
- * For compressed-attention layers the mutable frontier is just the small
- * compressor state plus append counters, so we save that prefix-1 state while
- * the N=2 verifier is already stepping the compressor token by token.
- *
- * Raw SWA rows are not captured here.  This graph uses a raw ring larger than
- * the 128-token logical SWA window, so writing speculative future rows does
- * not evict visible raw rows.  If the raw cache is ever reduced to a strict
- * 128-row ring, speculative raw rows must become shadow rows and be copied
- * into the ring only on commit. */
-bool gpu_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_attn_state_kv[il]) return true;
-    const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-    g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_kv[il], 0,
-                                 g->layer_attn_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_score[il], 0,
-                                 g->layer_attn_state_score[il], 0, bytes) != 0;
-}
-
-
-
-bool gpu_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_index_state_kv[il]) return true;
-    const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-    g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_index_state_kv[il], 0,
-                                 g->layer_index_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
-                                 g->layer_index_state_score[il], 0, bytes) != 0;
-}
-
-
-
 uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
     (void)g;
     static int parsed = -1;

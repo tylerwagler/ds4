@@ -90,16 +90,6 @@ void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_cur_hc);
     ds4_gpu_tensor_free(g->prefill_tokens);
     ds4_gpu_tensor_free(g->logits);
-    ds4_gpu_tensor_free(g->mtp_raw_cache);
-    ds4_gpu_tensor_free(g->mtp_next_hc);
-    ds4_gpu_tensor_free(g->mtp_state_hc);
-    ds4_gpu_tensor_free(g->mtp_input_hc);
-    ds4_gpu_tensor_free(g->mtp_hproj_hc);
-    ds4_gpu_tensor_free(g->mtp_hnorm_hc);
-    ds4_gpu_tensor_free(g->mtp_eproj_hc);
-    ds4_gpu_tensor_free(g->mtp_eproj);
-    ds4_gpu_tensor_free(g->mtp_enorm);
-    ds4_gpu_tensor_free(g->mtp_embed);
     ds4_gpu_tensor_free(g->spec_logits);
     ds4_gpu_tensor_free(g->dspark_main_x);
     for (int i = 0; i < 3; i++) {
@@ -183,10 +173,6 @@ void gpu_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_attn_state_score[il]);
         ds4_gpu_tensor_free(g->spec_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_index_state_score[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
     }
     /* The batched-copy tables cache raw device pointers into the state tensors
      * freed above; drop them so a rebuilt graph re-prepares fresh tables. */

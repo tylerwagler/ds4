@@ -1191,7 +1191,6 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
-    const char *mtp_path;
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
@@ -1499,8 +1498,6 @@ static eval_config parse_options(int argc, char **argv) {
         }
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp")) {
-            c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -4019,11 +4016,8 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
-        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
-        .mtp_draft_tokens = 1,
-        .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
         .prefill_chunk = cfg.prefill_chunk,
         .warm_weights = cfg.warm_weights,

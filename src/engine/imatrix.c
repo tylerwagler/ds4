@@ -198,7 +198,6 @@ bool imatrix_collector_save(
 bool gpu_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
-    g->mtp_n_raw = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -878,7 +877,7 @@ bool gpu_graph_prefill_chunked(
 
 
 
-/* Layer-major speculative target verifier for tiny MTP suffixes.
+/* Layer-major speculative target verifier for tiny draft suffixes.
  *
  * This is the first production-shaped verifier attempt: unlike repeated decode
  * it runs the target model layer-by-layer for the whole speculative suffix, and
@@ -895,7 +894,6 @@ bool gpu_graph_verify_suffix_tops(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
-        bool                   capture_prefix1,
         int                   *row_tops,
         float                 *row_logits) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
@@ -903,7 +901,7 @@ bool gpu_graph_verify_suffix_tops(
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
 
-    const bool timing = getenv("DS4_MTP_VERIFY_TIMING") != NULL;
+    const bool timing = getenv("DS4_SPEC_VERIFY_TIMING") != NULL;
     const double t0 = timing ? now_sec() : 0.0;
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
@@ -915,9 +913,6 @@ bool gpu_graph_verify_suffix_tops(
                                                          n_tokens);
     const double t_uploaded = timing ? now_sec() : 0.0;
     if (!ok) return false;
-
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
 
     const double t_layers_encode0 = timing ? now_sec() : 0.0;
     ok = ds4_gpu_begin_commands() != 0;
@@ -936,7 +931,6 @@ bool gpu_graph_verify_suffix_tops(
         (void)ds4_gpu_synchronize();
     }
     const double t_layers_done = timing ? now_sec() : 0.0;
-    g->spec_capture_prefix1 = saved_capture;
     if (!ok) return false;
 
     const double t_head_encode0 = timing ? now_sec() : 0.0;
@@ -999,10 +993,9 @@ bool gpu_graph_verify_suffix_tops(
     if (timing) {
         const double t_done = now_sec();
         fprintf(stderr,
-                "ds4: mtp verify suffix tokens=%u start=%u capture_prefix1=%d upload=%.3f ms layers_encode=%.3f ms layers_execute=%.3f ms head_encode=%.3f ms head_execute=%.3f ms read=%.3f ms total=%.3f ms ok=%d\n",
+                "ds4: spec verify suffix tokens=%u start=%u upload=%.3f ms layers_encode=%.3f ms layers_execute=%.3f ms head_encode=%.3f ms head_execute=%.3f ms read=%.3f ms total=%.3f ms ok=%d\n",
                 n_tokens,
                 start,
-                capture_prefix1 ? 1 : 0,
                 (t_uploaded - t0) * 1000.0,
                 (t_layers_encoded - t_layers_encode0) * 1000.0,
                 (t_layers_done - t_layers_encoded) * 1000.0,
@@ -1024,145 +1017,6 @@ bool gpu_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *logit
                                  (uint64_t)row * row_bytes,
                                  logits,
                                  row_bytes) != 0;
-}
-
-
-
-/* Exact N=2 target verifier for MTP.
- *
- * The generic batch prefill path is fast, but it is not a safe substitute for
- * autoregressive decode: small row-wise differences in HC/MoE/output kernels
- * are enough to flip future greedy tokens.  This verifier keeps the exact
- * decode kernels and cache update order, but encodes the two proposed tokens
- * layer-by-layer in one command stream.  It returns the exact target top after
- * token0, and exact logits after token1. */
-bool gpu_graph_verify_decode2_exact(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        int                    token0,
-        int                    token1,
-        uint32_t               start,
-        int                   *top0,
-        float                 *logits0,
-        float                 *logits1) {
-    if (!g || !top0 || !logits1 || g->raw_cap == 0) return false;
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    ds4_gpu_tensor *cur0 = gpu_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim);
-    ds4_gpu_tensor *cur1 = gpu_graph_tensor_row_view(g->batch_cur_hc, 1, hc_dim);
-    ds4_gpu_tensor *next0 = gpu_graph_tensor_row_view(g->batch_next_hc, 0, hc_dim);
-    ds4_gpu_tensor *next1 = gpu_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
-    bool ok = cur0 && cur1 && next0 && next1;
-
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur0,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token0,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur1,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token1,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    ds4_gpu_tensor *saved_after = g->after_ffn_hc;
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = true;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        const uint32_t pos0 = start;
-        const uint32_t pos1 = start + 1u;
-
-        g->cur_hc = cur0;
-        g->after_ffn_hc = next0;
-        ok = gpu_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos0,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             pos0 % g->raw_cap,
-                                             gpu_graph_raw_span_for_batch(g, pos0, 1),
-                                             token0);
-        if (!ok) break;
-        ok = gpu_graph_capture_prefix1_attn_state(g, il) &&
-             gpu_graph_capture_prefix1_index_state(g, il);
-        if (!ok) break;
-
-        g->cur_hc = cur1;
-        g->after_ffn_hc = next1;
-        ok = gpu_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos1,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             pos1 % g->raw_cap,
-                                             gpu_graph_raw_span_for_batch(g, pos1, 1),
-                                             token1);
-        if (!ok) break;
-
-        ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
-        tmp = cur1; cur1 = next1; next1 = tmp;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-
-    if (ok) {
-        g->cur_hc = cur0;
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_argmax_tensor(g->comp_selected,
-                                           g->logits,
-                                           DS4_N_VOCAB) != 0;
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top0, sizeof(*top0)) != 0;
-        if (ok && logits0) {
-            ok = ds4_gpu_tensor_read(g->logits,
-                                       0,
-                                       logits0,
-                                       (uint64_t)DS4_N_VOCAB * sizeof(logits0[0])) != 0;
-        }
-    }
-
-    if (ok) {
-        g->cur_hc = cur1;
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        if (ok) {
-            ok = ds4_gpu_tensor_read(g->logits,
-                                       0,
-                                       logits1,
-                                       (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
-        }
-    }
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-    g->spec_capture_prefix1 = saved_capture;
-
-    ds4_gpu_tensor_free(next1);
-    ds4_gpu_tensor_free(next0);
-    ds4_gpu_tensor_free(cur1);
-    ds4_gpu_tensor_free(cur0);
-    return ok;
 }
 
 

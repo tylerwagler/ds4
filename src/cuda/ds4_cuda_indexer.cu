@@ -266,7 +266,7 @@ __global__ static void indexer_scores_wmma128_kernel(
  *
  * Tie-breaking: lower index wins, matching the host sample_argmax used by
  * the CPU reference path. Replaces the indexer-as-argmax workaround used
- * in the MTP top-id sites, which fell through to the legacy single-thread
+ * in the speculative top-id sites, which fell through to the legacy single-thread
  * indexer_topk_kernel at top_k=1, costing ~17.5 ms per call on n_vocab=129280. */
 __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
     enum { THREADS = 1024 };

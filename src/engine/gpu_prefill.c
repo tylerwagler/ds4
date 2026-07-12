@@ -1114,7 +1114,6 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
-                    if (ok && t == 0) ok = gpu_graph_capture_prefix1_attn_state(g, il);
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
                 }
@@ -1434,7 +1433,6 @@ bool gpu_graph_encode_layer_attention_batch(
                         }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
-                        if (ok && t == 0) ok = gpu_graph_capture_prefix1_index_state(g, il);
                         ds4_gpu_tensor_free(sc_view);
                         ds4_gpu_tensor_free(kv_view);
                     }
@@ -2419,149 +2417,6 @@ bool gpu_graph_eval_token_raw_swa_top(
     }
     return ok;
 }
-
-
-
-bool gpu_graph_eval_mtp_draft_from_hc(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        ds4_gpu_tensor      *prev_hc,
-        ds4_gpu_tensor      *out_hc,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits,
-        int                   *top_id) {
-    if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint32_t raw_row = pos % g->raw_cap;
-    uint32_t n_raw = g->mtp_n_raw + 1u;
-    if (n_raw > g->raw_window) n_raw = g->raw_window;
-    if (n_raw > g->raw_cap) n_raw = g->raw_cap;
-
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    ds4_gpu_tensor *saved_after = g->after_ffn_hc;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(g->mtp_embed,
-                                                  base_model->map,
-                                                  base_model->size,
-                                                  base_weights->token_embd->abs_offset,
-                                                  (uint32_t)base_weights->token_embd->dim[1],
-                                                  (uint32_t)token,
-                                                  DS4_N_EMBD,
-                                                  1) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
-                                                  g->mtp_embed,
-                                                  mtp_model->map,
-                                                  mtp_model->size,
-                                                  mtp->enorm->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->mtp_eproj,
-                                              mtp_model->map,
-                                              mtp_model->size,
-                                              mtp->e_proj->abs_offset,
-                                              DS4_N_EMBD,
-                                              DS4_N_EMBD,
-                                              g->mtp_enorm,
-                                              1) != 0;
-    if (ok) ok = ds4_gpu_repeat_hc_tensor(g->mtp_eproj_hc,
-                                            g->mtp_eproj,
-                                            DS4_N_EMBD,
-                                            DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mtp_hnorm_hc,
-                                                       prev_hc,
-                                                       mtp_model->map,
-                                                       mtp_model->size,
-                                                       mtp->hnorm->abs_offset,
-                                                       DS4_N_EMBD,
-                                                       DS4_N_HC,
-                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(g->mtp_hproj_hc,
-                                              mtp_model->map,
-                                              mtp_model->size,
-                                              mtp->h_proj->abs_offset,
-                                              DS4_N_EMBD,
-                                              DS4_N_EMBD,
-                                              g->mtp_hnorm_hc,
-                                              DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_add_tensor(g->mtp_input_hc,
-                                      g->mtp_eproj_hc,
-                                      g->mtp_hproj_hc,
-                                      (uint32_t)hc_dim) != 0;
-    if (ok) {
-        g->cur_hc = g->mtp_input_hc;
-        g->after_ffn_hc = out_hc;
-        ok = gpu_graph_encode_decode_layer(g,
-                                             mtp_model,
-                                             &mtp->block,
-                                             1,
-                                             pos,
-                                             g->mtp_raw_cache,
-                                             g->raw_cap,
-                                             raw_row,
-                                             n_raw,
-                                             token);
-    }
-    if (ok) g->cur_hc = out_hc;
-    if (ok) ok = gpu_graph_encode_output_head_mtp(g,
-                                                    base_model,
-                                                    base_weights,
-                                                    mtp_model,
-                                                    mtp,
-                                                    base_weights->output->dim[1]);
-    if (ok && top_id) {
-        ok = ds4_gpu_argmax_tensor(g->comp_selected,
-                                   g->logits,
-                                   DS4_N_VOCAB) != 0;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-
-    if (ok && logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (ok && top_id) {
-        ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
-    }
-    if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
-    if (!ok) {
-        (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        g->after_ffn_hc = saved_after;
-    }
-    return ok;
-}
-
-
-
-bool gpu_graph_eval_mtp_draft(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits,
-        int                   *top_id) {
-    return gpu_graph_eval_mtp_draft_from_hc(g,
-                                              base_model,
-                                              base_weights,
-                                              mtp_model,
-                                              mtp,
-                                              g->cur_hc,
-                                              g->mtp_state_hc,
-                                              token,
-                                              pos,
-                                              logits,
-                                              top_id);
-}
-
 
 
 

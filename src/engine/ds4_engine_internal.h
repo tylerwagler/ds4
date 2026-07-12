@@ -478,18 +478,6 @@ typedef struct {
 } ds4_weights;
 
 typedef struct {
-    ds4_tensor *e_proj;
-    ds4_tensor *h_proj;
-    ds4_tensor *enorm;
-    ds4_tensor *hnorm;
-    ds4_tensor *norm;
-    ds4_tensor *hc_head_base;
-    ds4_tensor *hc_head_fn;
-    ds4_tensor *hc_head_scale;
-    ds4_layer_weights block;
-} ds4_mtp_weights;
-
-typedef struct {
     ds4_tensor *main_proj;
     ds4_tensor *main_norm;
     ds4_layer_weights layer[3];
@@ -858,18 +846,13 @@ typedef struct {
     ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
 
-    /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
-     * if the target verifier can either commit it or restore the saved
-     * frontiers.  The prefix1 buffers are the cheap partial-accept state for the
-     * common N=2 case. */
+    /* Speculative decoding scratch.  The drafter is allowed to mutate graph
+     * state only if the target verifier can either commit it or restore the
+     * saved frontiers. */
     ds4_gpu_tensor *spec_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_index_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_attn_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_MAX_LAYER];
     /* Batched-copy descriptor tables for the frontier snapshot (layer->spec)
      * and restore (spec->layer) copy sets: one kernel launch instead of ~126
      * cudaMemcpy calls per direction. Built lazily on first snapshot; NULL
@@ -882,9 +865,6 @@ typedef struct {
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_MAX_LAYER];
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
-    bool spec_capture_prefix1;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -944,21 +924,6 @@ typedef struct {
     ds4_gpu_tensor *output_embd;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
-
-    /* Optional MTP model state.  It has its own raw cache because the drafter
-     * runs on speculative future tokens; target KV state is updated only after
-     * verification accepts draft tokens. */
-    ds4_gpu_tensor *mtp_embed;
-    ds4_gpu_tensor *mtp_enorm;
-    ds4_gpu_tensor *mtp_eproj;
-    ds4_gpu_tensor *mtp_eproj_hc;
-    ds4_gpu_tensor *mtp_hnorm_hc;
-    ds4_gpu_tensor *mtp_hproj_hc;
-    ds4_gpu_tensor *mtp_input_hc;
-    ds4_gpu_tensor *mtp_state_hc;
-    ds4_gpu_tensor *mtp_next_hc;
-    ds4_gpu_tensor *mtp_raw_cache;
-    uint32_t mtp_n_raw;
 
     /* DSpark target hidden capture buffers */
     ds4_gpu_tensor *dspark_target_h[3];
@@ -1067,7 +1032,6 @@ typedef struct {
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
     double decode_token_avg_sec;
     bool quality;
-    bool mtp_enabled;
 } ds4_gpu_graph;
 
 /* =========================================================================
@@ -1143,15 +1107,11 @@ struct ds4_vocab {
 
 struct ds4_engine {
     ds4_model model;
-    ds4_model mtp_model;
     ds4_model dspark_model;
     ds4_vocab vocab;
     ds4_weights weights;
-    ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
     ds4_backend backend;
-    int mtp_draft_tokens;
-    float mtp_margin;
     int dspark_draft_tokens;
     float dspark_confidence;
     char *directional_steering_file;
@@ -1162,7 +1122,6 @@ struct ds4_engine {
     uint32_t prefill_chunk;
     bool quality;
     bool gpu_ready;
-    bool mtp_ready;
     bool dspark_ready;
     ds4_model overlay_model;
     bool overlay_ready;
@@ -1193,10 +1152,6 @@ struct ds4_session {
     ds4_gpu_graph graph;
     token_vec checkpoint;
     float *logits;
-    float *mtp_logits;
-    int mtp_draft_token;
-    uint64_t mtp_probe_total;
-    uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -1206,11 +1161,10 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
-    bool mtp_draft_valid;
     /* Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
      * position's hidden, pending verification in THIS step's single batched
      * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
-     * n=1 forward. Invalidate on rewind/invalidate like mtp_draft_valid. */
+     * n=1 forward. Invalidated on rewind/invalidate. */
     int32_t dspark_pending[16];
     uint32_t dspark_n_pending;
     /* The base token the pending drafts continue from (predicted greedy next).
@@ -1228,7 +1182,6 @@ struct ds4_session {
 typedef struct {
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
-    uint32_t mtp_n_raw;
 } ds4_spec_frontier;
 
 typedef struct {
@@ -1352,7 +1305,6 @@ bool weights_have_output_head(const ds4_weights *w);
 const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w);
 void config_validate_model(const ds4_model *m);
 void weights_bind(ds4_weights *w, const ds4_model *m);
-void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m);
 void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m);
 void weights_free(ds4_weights *w);
 void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out);
@@ -1793,7 +1745,7 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp);
+        bool                    enable_spec);
 bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
 bool gpu_graph_alloc(
         ds4_gpu_graph *g,
@@ -1807,8 +1759,6 @@ uint32_t gpu_graph_raw_start_for_span(
         const ds4_gpu_graph *g,
         uint32_t               last_pos,
         uint32_t               n_raw);
-bool gpu_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il);
-bool gpu_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il);
 uint32_t gpu_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g);
 bool gpu_graph_env_flag(const char *name, int *cache);
 bool gpu_graph_use_reference_hc_decode(void);
@@ -1926,13 +1876,6 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-bool gpu_graph_encode_output_head_mtp(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        uint64_t               vocab_dim);
 int gpu_graph_decode_test(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -2012,34 +1955,12 @@ bool gpu_graph_eval_token_raw_swa_top(
         uint32_t               pos,
         int                   *top_id,
         float                 *logits);
-bool gpu_graph_eval_mtp_draft_from_hc(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        ds4_gpu_tensor      *prev_hc,
-        ds4_gpu_tensor      *out_hc,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits,
-        int                   *top_id);
 bool gpu_graph_dspark_compressor_rollforward(
         ds4_gpu_graph  *g,
         const ds4_model  *model,
         const ds4_weights *weights,
         uint32_t          pos0,
         uint32_t          n_positions);
-bool gpu_graph_eval_mtp_draft(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits,
-        int                   *top_id);
 bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path);
 void imatrix_collector_free(ds4_imatrix_collector *c);
 bool imatrix_collector_save(
@@ -2111,20 +2032,9 @@ bool gpu_graph_verify_suffix_tops(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
-        bool                   capture_prefix1,
         int                   *row_tops,
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *logits);
-bool gpu_graph_verify_decode2_exact(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        int                    token0,
-        int                    token1,
-        uint32_t               start,
-        int                   *top0,
-        float                 *logits0,
-        float                 *logits1);
 uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap);
 uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk);
@@ -2153,9 +2063,6 @@ void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
 void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens);
 void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens);
 int sample_argmax(const float *logits, uint32_t n_vocab);
-DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
-                        int *top0, float *logit0,
-                        int *top1, float *logit1);
 int sample_top_p_min_p(
         const float *logits,
         uint32_t     n_vocab,

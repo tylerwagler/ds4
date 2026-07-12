@@ -181,9 +181,8 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_spec) {
     memset(g, 0, sizeof(*g));
-    g->mtp_enabled = enable_mtp;
     g->comp_ratio_override = -1;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
@@ -311,11 +310,9 @@ bool gpu_graph_alloc_raw_cap(
                     (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            if (enable_mtp) {
+            if (enable_spec) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             }
             if (g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
@@ -337,11 +334,9 @@ bool gpu_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                if (enable_mtp) {
+                if (enable_spec) {
                     g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 }
                 if (g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
@@ -420,29 +415,6 @@ bool gpu_graph_alloc_raw_cap(
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
-    /*
-     * MTP is deliberately outside the normal graph footprint.  A session that
-     * does not opt in with --mtp must allocate and execute exactly the same
-     * buffers as the plain decoder: no support-model mapping, no draft logits,
-     * and no MTP scratch hidden behind otherwise unused tensors.
-     */
-    if (enable_mtp) {
-        g->mtp_embed = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_enorm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_eproj = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_eproj_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_hnorm_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_hproj_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_input_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_raw_cache = gpu_graph_alloc_kv_cache_tensor(
-                managed_kv_cache,
-                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
-        g->mtp_n_raw = 0;
-    }
-
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -488,22 +460,18 @@ bool gpu_graph_alloc_raw_cap(
             layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
-                             (!enable_mtp ||
+                             (!enable_spec ||
                               (g->spec_attn_state_kv[il] != NULL &&
-                               g->spec_attn_state_score[il] != NULL &&
-                               g->spec_prefix1_attn_state_kv[il] != NULL &&
-                               g->spec_prefix1_attn_state_score[il] != NULL));
+                               g->spec_attn_state_score[il] != NULL));
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
                              (!gpu_graph_idx_fp4_enabled() || g->idx_comp_stage != NULL) &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL &&
-                             (!enable_mtp ||
+                             (!enable_spec ||
                               (g->spec_index_state_kv[il] != NULL &&
-                               g->spec_index_state_score[il] != NULL &&
-                               g->spec_prefix1_index_state_kv[il] != NULL &&
-                               g->spec_prefix1_index_state_score[il] != NULL));
+                               g->spec_index_state_score[il] != NULL));
         }
     }
 
@@ -527,11 +495,6 @@ bool gpu_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
-                    (!enable_mtp ||
-                     (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
-                      g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
-                      g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
-                      g->mtp_raw_cache && g->spec_logits)) &&
                     g->prefill_tokens &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
@@ -623,14 +586,8 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits;
     }
-    /*
-     * DSpark reuses the MTP speculative-logits buffer for its N-token draft
-     * base logits and for the target verify pass.  --mtp and --dspark are
-     * mutually exclusive, so the enable_mtp branch in gpu_graph_alloc_raw_cap
-     * never allocated it for a DSpark session; allocate it here when MTP did
-     * not.  Without this the draft forward receives a NULL base_logits_out and
-     * every speculative block fails.
-     */
+    /* Speculative-logits buffer for the N-token draft base logits and the
+     * target verify pass. */
     if (!g->spec_logits) {
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
     }

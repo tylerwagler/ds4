@@ -110,7 +110,7 @@ binder is stricter than upstream's.** It accepts exactly:
 
 | Tensor group | Accepted formats |
 | --- | --- |
-| Attention projections, shared experts, MTP | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales) |
+| Attention projections, shared experts | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales) |
 | Routed experts gate/up/down | `IQ2_XXS`/`IQ2_XXS`/`Q2_K`, or all three `MXFP4` |
 | Output head | `BF16` or MXFP8 |
 | Norms, embeddings, indexer, HC | `F32`/`F16` |
@@ -147,13 +147,6 @@ model-building work and can take a long time on the full DeepSeek V4 Flash
 weights. Flash GGUF generation is supported by the local tools. PRO GGUF
 production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
-
-`./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF for Flash (upstream `Q4_K`/`Q8_0` artifact — this fork requires MTP
-tensors in MXFP8, so it too must be requantized before use). MTP must be
-enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
-still experimental: it is correctness-gated and currently provides at most a
-slight speedup, not a meaningful generation-speed win.
 
 Then build (the `cutlass/` submodule is required):
 
@@ -396,10 +389,7 @@ conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path; it is useful only for greedy decoding, currently uses a confidence gate
-(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
-experimental slight-speedup path.
+answers.
 
 ## Server
 
@@ -836,9 +826,8 @@ Then it stores:
 The logits are raw IEEE-754 `float32` values from the host `ds4_session`
 buffer. They are saved immediately after the checkpoint tokens so a loaded
 snapshot can sample or continue from the exact next-token distribution without
-running one extra decode step. MTP draft logits/state are not persisted; after
-loading a disk checkpoint the draft state is invalidated and rebuilt by normal
-generation.
+running one extra decode step. Speculative draft state is not persisted; after
+loading a disk checkpoint it is invalidated and rebuilt by normal generation.
 
 The tensor payload is DS4-specific KV/session state, not a generic inference
 graph dump. It is expected to be portable only across compatible DwarfStar

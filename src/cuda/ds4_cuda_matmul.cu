@@ -135,15 +135,6 @@ __global__ static void matmul_f32_kernel(
 
 
 
-__global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n_embd, uint32_t n_hc) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_embd * n_hc;
-    if (i >= n) return;
-    out[i] = row[i % n_embd];
-}
-
-
-
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(x[i]);
@@ -1364,18 +1355,6 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
 
-
-
-extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
-    if (!out || !row || n_embd == 0 || n_hc == 0 ||
-        row->bytes < (uint64_t)n_embd * sizeof(float) ||
-        out->bytes < (uint64_t)n_embd * n_hc * sizeof(float)) {
-        return 0;
-    }
-    uint64_t n = (uint64_t)n_embd * n_hc;
-    repeat_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
-    return cuda_ok(cudaGetLastError(), "repeat_hc launch");
-}
 
 
 /* Decode grouped "a" projection: prefer the de-interleaved cached weight (vectorized

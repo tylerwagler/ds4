@@ -499,11 +499,7 @@ bool gpu_graph_encode_decode_layer(
         int                     token) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-    /* Storage format of the raw cache PASSED to this call: only the persistent
-     * layer ring is __half under DS4_RAW_F16.  The MTP block's raw cache is
-     * always allocated f32 (gpu_diag.c), so key the flag off the tensor. */
-    const uint32_t raw_f16 = (raw_cache == g->mtp_raw_cache)
-        ? 0u : (uint32_t)gpu_graph_raw_f16_enabled();
+    const uint32_t raw_f16 = (uint32_t)gpu_graph_raw_f16_enabled();
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint32_t n_groups = DS4_N_OUT_GROUP;
@@ -1844,7 +1840,7 @@ bool gpu_graph_encode_output_head(
  * A target verifier only needs top-1 ids for intermediate draft rows and full
  * logits for the last accepted row.  Running the normal one-row output head in
  * a loop serializes the HC collapse, output norm, and MXFP8 vocab projection.  For
- * tiny MTP suffixes we instead process all rows together and let the GPU reduce
+ * tiny speculative suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
 bool gpu_graph_encode_output_head_batch(
@@ -2037,52 +2033,6 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
                                                  out_dim,
                                                  x,
                                                  n_tok) != 0;
-    return ok;
-}
-
-
-
-bool gpu_graph_encode_output_head_mtp(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        uint64_t               vocab_dim) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
-                                                 hc_dim, DS4_N_HC, g->flat_hc, 1);
-    if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
-                                                    g->output_pre,
-                                                    mtp_model->map,
-                                                    mtp_model->size,
-                                                    mtp->hc_head_scale->abs_offset,
-                                                    mtp->hc_head_base->abs_offset,
-                                                    DS4_N_HC,
-                                                    DS4_HC_EPS) != 0;
-    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->output_embd,
-                                                  g->cur_hc,
-                                                  g->output_weights,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
-                                                  g->output_embd,
-                                                  mtp_model->map,
-                                                  mtp_model->size,
-                                                  mtp->norm->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_RMS_EPS) != 0;
-    if (ok) {
-        if (base_weights->output->type == DS4_TENSOR_BF16)
-            ok = ds4_gpu_matmul_bf16_tensor(g->logits, base_model->map, base_model->size,
-                                            base_weights->output->abs_offset, DS4_N_EMBD,
-                                            vocab_dim, g->output_norm, 1) != 0;
-        else
-            ok = ds4_gpu_matmul_mxfp8_tensor(g->logits, base_model->map, base_model->size,
-                                            base_weights->output->abs_offset, DS4_N_EMBD,
-                                            vocab_dim, g->output_norm, 1) != 0;
-    }
     return ok;
 }
 

@@ -493,54 +493,6 @@ static void weights_validate_layout(
 
 
 
-static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
-    const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
-    const ds4_layer_weights *l = &w->block;
-
-    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
-    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_layout(w->e_proj,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->h_proj,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->enorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->hnorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-
-    tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
-    tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
-    tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-    tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
-    tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
-    tensor_expect_layout(l->attn_kv,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
-    tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
-    tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-    tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_FP8_E4M3, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-    tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_FP8_E4M3, 2, out_low_dim, DS4_N_EMBD, 0);
-
-    tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
-    tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
-    tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-    tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
-    tensor_expect_routed_expert_combo(l->ffn_gate_exps,
-                                      l->ffn_up_exps,
-                                      l->ffn_down_exps);
-    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
-}
-
-
-
 static bool ds4_shape_matches_metadata(
         const ds4_shape *s,
         uint32_t n_layer,
@@ -1056,50 +1008,6 @@ void weights_bind(ds4_weights *w, const ds4_model *m) {
 }
 
 
-
-
-
-void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
-    memset(w, 0, sizeof(*w));
-    weights_reject_unsupported_types(m);
-
-    w->hc_head_base  = required_tensor(m, "mtp.0.hc_head_base.weight");
-    w->hc_head_fn    = required_tensor(m, "mtp.0.hc_head_fn.weight");
-    w->hc_head_scale = required_tensor(m, "mtp.0.hc_head_scale.weight");
-    w->e_proj        = required_tensor(m, "mtp.0.e_proj.weight");
-    w->h_proj        = required_tensor(m, "mtp.0.h_proj.weight");
-    w->enorm         = required_tensor(m, "mtp.0.enorm.weight");
-    w->hnorm         = required_tensor(m, "mtp.0.hnorm.weight");
-    w->norm          = required_tensor(m, "mtp.0.norm.weight");
-
-    ds4_layer_weights *l = &w->block;
-    l->hc_attn_fn      = required_tensor(m, "mtp.0.hc_attn_fn.weight");
-    l->hc_attn_scale   = required_tensor(m, "mtp.0.hc_attn_scale.weight");
-    l->hc_attn_base    = required_tensor(m, "mtp.0.hc_attn_base.weight");
-    l->attn_norm       = required_tensor(m, "mtp.0.attn_norm.weight");
-    l->attn_q_a        = required_tensor(m, "mtp.0.attn_q_a.weight");
-    l->attn_q_a_norm   = required_tensor(m, "mtp.0.attn_q_a_norm.weight");
-    l->attn_q_b        = required_tensor(m, "mtp.0.attn_q_b.weight");
-    l->attn_kv         = required_tensor(m, "mtp.0.attn_kv.weight");
-    l->attn_kv_a_norm  = required_tensor(m, "mtp.0.attn_kv_a_norm.weight");
-    l->attn_sinks      = required_tensor(m, "mtp.0.attn_sinks.weight");
-    l->attn_output_a   = required_tensor(m, "mtp.0.attn_output_a.weight");
-    l->attn_output_b   = required_tensor(m, "mtp.0.attn_output_b.weight");
-    l->hc_ffn_fn       = required_tensor(m, "mtp.0.hc_ffn_fn.weight");
-    l->hc_ffn_scale    = required_tensor(m, "mtp.0.hc_ffn_scale.weight");
-    l->hc_ffn_base     = required_tensor(m, "mtp.0.hc_ffn_base.weight");
-    l->ffn_norm        = required_tensor(m, "mtp.0.ffn_norm.weight");
-    l->ffn_gate_inp    = required_tensor(m, "mtp.0.ffn_gate_inp.weight");
-    l->ffn_exp_probs_b = required_tensor(m, "mtp.0.exp_probs_b.bias");
-    l->ffn_gate_exps   = required_tensor(m, "mtp.0.ffn_gate_exps.weight");
-    l->ffn_up_exps     = required_tensor(m, "mtp.0.ffn_up_exps.weight");
-    l->ffn_down_exps   = required_tensor(m, "mtp.0.ffn_down_exps.weight");
-    l->ffn_gate_shexp  = required_tensor(m, "mtp.0.ffn_gate_shexp.weight");
-    l->ffn_up_shexp    = required_tensor(m, "mtp.0.ffn_up_shexp.weight");
-    l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
-
-    mtp_weights_validate_layout(w);
-}
 
 
 
