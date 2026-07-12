@@ -16,10 +16,12 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-QUALITY_TARGETS := ds4.o ds4_cuda.o
-QUALITY_OBJS := ../ds4.o ../ds4_cuda.o
-QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -o
+QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
+# post-restructure: link against the split engine/cuda TUs (built via the
+# ds4-bench target, which forces every core object)
+QUALITY_TARGETS := ds4-bench
+QUALITY_OBJS = ../src/engine/*.o ../src/cuda/*.o ../src/lib/ds4_help.o ../src/vendor/rax.o ../src/lib/ds4_kvstore.o
+QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I../src -o
 endif
 
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)

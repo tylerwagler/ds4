@@ -147,6 +147,9 @@ def request_one(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            # some gateways (Cloudflare error 1010) reject the default
+            # python-urllib User-Agent
+            "User-Agent": "ds4-quality-testing/1.0 (+curl-compatible)",
         },
         method="POST",
     )
