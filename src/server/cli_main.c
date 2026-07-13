@@ -4571,7 +4571,35 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 
 
 
+static void test_unterminated_think_stays_off_content(void) {
+    /* Generation that ends inside the think block (token cap / stop) must
+     * surface as reasoning_content, never as visible content — clients that
+     * score or display the answer channel would otherwise receive raw
+     * chain-of-thought (the tool-eval-bench MMLU/IFEval artifact). Covers
+     * both the generated "<think>" opener and the prompt-pre-opened form. */
+    const char *cases[] = {
+        "<think>We need to compute the index of the subgroup",
+        "We need to compute the index of the subgroup",
+    };
+    for (size_t i = 0; i < 2; i++) {
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_ex(cases[i], true, &content,
+                                               &reasoning, &calls));
+        TEST_ASSERT(content && content[0] == '\0');
+        TEST_ASSERT(reasoning &&
+                    !strcmp(reasoning, "We need to compute the index of the subgroup"));
+        TEST_ASSERT(calls.len == 0);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
+}
+
+
+
 static void ds4_server_unit_tests_run(void) {
+    test_unterminated_think_stays_off_content();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();

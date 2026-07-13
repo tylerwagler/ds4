@@ -318,13 +318,22 @@ static bool dsml_parse_nested_params_object(const char **p_in,
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
-    if (!strncmp(body, "<think>", 7)) body += 7;
+    const bool opened_think = !strncmp(body, "<think>", 7);
+    if (opened_think) body += 7;
 
     char *think_end = strstr(body, "</think>");
     if (think_end) {
         *think_end = '\0';
         *reasoning_out = xstrdup(body);
         *content_out = xstrdup(think_end + 8);
+    } else if (opened_think) {
+        /* Generation ended inside the think block (token cap / stop). The
+         * partial reasoning is still reasoning: surfacing it as content
+         * hands raw chain-of-thought to clients that score or display the
+         * answer channel (the streaming path already promises reasoning is
+         * never visible assistant text). */
+        *reasoning_out = xstrdup(body);
+        *content_out = xstrdup("");
     } else {
         *reasoning_out = NULL;
         *content_out = xstrdup(s);
@@ -350,9 +359,14 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
+            /* Model did not close thinking (truncation or stop inside the
+             * think block) — the whole text is reasoning, even when the
+             * <think> opener lives in the prompt rather than the generation.
+             * Ignore any DSML in it, and keep it off the content channel. */
             server_log(DS4_LOG_TOOL, "thinking not closed, ignoring DSML in reasoning");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
+            *reasoning_out = xstrdup(body);
+            *content_out = xstrdup("");
             return true;
         }
         tool_search = think_end + 8;
