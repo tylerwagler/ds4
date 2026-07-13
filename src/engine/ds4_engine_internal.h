@@ -1179,6 +1179,9 @@ struct ds4_session {
      * with the pendings on rewind/invalidate/sync. */
     int32_t spec_carry_token;
     bool spec_carry_valid;
+    /* checkpoint.len the carry was drawn at; any session advance outside the
+     * speculative path (sync, plain eval) moves it and voids the carry */
+    int32_t spec_carry_pos;
     /* sampling params the carry was drawn under; a param change between calls
      * drops the carry and redraws from s->logits (exact: the carry was never
      * emitted or forwarded) */

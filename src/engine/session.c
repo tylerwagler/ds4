@@ -853,6 +853,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+    /* drop speculative lookahead up front, not just on success: a restore
+     * that fails midway may already have overwritten GPU state the carry
+     * and pendings were conditioned on */
+    s->spec_carry_valid = false;
+    s->dspark_n_pending = 0;
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -1947,6 +1952,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
 
+    /* a sync begins a new request: any carry left by a max-tokens/stop-string
+     * truncated generation belongs to the previous request's distribution.
+     * (position stamping alone misses a same-length full rebuild.) */
+    s->spec_carry_valid = false;
+
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -2269,6 +2279,9 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    /* a token evaluated outside the speculative path (tool injection, plain
+     * fallback loops) advances the state past any in-flight carry */
+    s->spec_carry_valid = false;
     return 0;
 }
 
@@ -2661,6 +2674,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     const int next_base = carry_tok;
     s->spec_carry_token = (int32_t)carry_tok;
     s->spec_carry_valid = !hit_eos;
+    s->spec_carry_pos = (int32_t)s->checkpoint.len;
     s->spec_carry_temp = temperature;
     s->spec_carry_top_k = top_k;
     s->spec_carry_top_p = top_p;
@@ -2868,7 +2882,11 @@ int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_
     const bool carry_params_match =
         s->spec_carry_temp == temperature && s->spec_carry_top_k == top_k &&
         s->spec_carry_top_p == top_p && s->spec_carry_min_p == min_p;
-    if (s->spec_carry_valid && carry_params_match) {
+    /* the carry is only valid at the exact position it was drawn at; any
+     * session advance outside this path (sync, plain eval, tool injection)
+     * means s->logits no longer matches the carry's source distribution */
+    const bool carry_pos_match = s->spec_carry_pos == (int32_t)s->checkpoint.len;
+    if (s->spec_carry_valid && carry_params_match && carry_pos_match) {
         first = (int)s->spec_carry_token;
         s->spec_carry_valid = false;
     } else {
