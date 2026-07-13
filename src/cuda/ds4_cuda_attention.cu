@@ -681,17 +681,36 @@ __global__ static void attention_indexed_mixed_kernel(
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
     }
-    for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
-        int32_t c = topk[(uint64_t)t * top_k + i];
-        if (c >= 0 && (uint32_t)c < visible_comp) {
-            uint32_t slot = atomicAdd(&comp_count, 1u);
-            if (slot < 512u) comp_rows[slot] = (uint32_t)c;
-        }
+    /* Deterministic ordered compaction (was an atomicAdd slot race): the
+     * ORDER of comp_rows fixes the float accumulation order of the indexed
+     * attention that consumes it, so it must not depend on warp scheduling.
+     * Order-preserving parallel compaction: parallel load + Hillis-Steele
+     * scan over the validity flags in smem. top_k <= 512, and the add[2]
+     * double-buffer needs blockDim.x >= lim/2 (launch is <<<grid, 256>>>). */
+    __shared__ int32_t s_topk[512];
+    __shared__ uint16_t s_scan[512];
+    const uint32_t lim = top_k < 512u ? top_k : 512u;
+    for (uint32_t i = threadIdx.x; i < lim; i += blockDim.x) {
+        const int32_t c = topk[(uint64_t)t * top_k + i];
+        s_topk[i] = c;
+        s_scan[i] = (uint16_t)(c >= 0 && (uint32_t)c < visible_comp);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        if (comp_count > 512u) comp_count = 512u;
+    for (uint32_t stride = 1; stride < lim; stride <<= 1) {
+        uint16_t add[2] = {0, 0};
+        for (uint32_t i = threadIdx.x, k = 0; i < lim; i += blockDim.x, k++)
+            add[k & 1] = i >= stride ? s_scan[i - stride] : (uint16_t)0;
+        __syncthreads();
+        for (uint32_t i = threadIdx.x, k = 0; i < lim; i += blockDim.x, k++)
+            s_scan[i] = (uint16_t)(s_scan[i] + add[k & 1]);
+        __syncthreads();
     }
+    for (uint32_t i = threadIdx.x; i < lim; i += blockDim.x) {
+        const int32_t c = s_topk[i];
+        if (c >= 0 && (uint32_t)c < visible_comp)
+            comp_rows[s_scan[i] - 1u] = (uint32_t)c;   /* inclusive scan -> slot */
+    }
+    if (threadIdx.x == 0) comp_count = lim ? s_scan[lim - 1u] : 0u;
     __syncthreads();
     uint32_t n_score = raw_count + comp_count;
     float local_max = sinks[h];

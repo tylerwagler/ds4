@@ -4,13 +4,6 @@
 
 
 
-__global__ static void zero_kernel(float *out, uint64_t n) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = 0.0f;
-}
-
-
-
 __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
@@ -1253,8 +1246,11 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
         for (uint32_t p = 0; p < np; p++) {
             acc[p] = quarter_warp_sum_f32(acc[p], lane);
             if (lane == 0) {
-                uint32_t tok = pair[p] / n_expert;
-                atomicAdd(down_out + (uint64_t)tok * out_dim + row, acc[p]);
+                /* per-pair store; the fixed-order moe_sum pass accumulates.
+                 * (was atomicAdd per token: float order varied with tile
+                 * scheduling AND with the sorted-pair scatter order -- the
+                 * prefill nondeterminism behind the #17 flake) */
+                down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
             }
         }
     }
@@ -1964,17 +1960,13 @@ static int routed_moe_launch(
                         midq_blocks,
                         out_dim);
                 }
-            } else if (use_big_batch) {
-                uint64_t n = (uint64_t)n_tokens * out_dim;
-                zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
-                ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
             if (use_direct_down_sum6) {
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && use_big_batch) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
                 moe_down_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
-                    (float *)out->ptr,
+                    (float *)down->ptr,
                     down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                     tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
                     midq_blocks, out_dim, n_expert);
@@ -2013,7 +2005,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
         }
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
-        if (ok && !use_big_batch && !use_direct_down_sum6) {
+        if (ok && !use_direct_down_sum6) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");

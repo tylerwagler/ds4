@@ -683,6 +683,13 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
         cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, out_dim, ntok, out_dim);
         cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
         cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        /* determinism: forbid split-K reduction algos (atomic/parallel
+         * reduction order varies run-to-run and vs the decode GEMV path);
+         * NONE-scheme algos accumulate in a fixed order. */
+        {
+            uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
+        }
         int got = 0;
         cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &ne.h, &got);
         cublasLtMatmulPreferenceDestroy(pf);
@@ -804,6 +811,13 @@ static int cuda_attention_output_a_mx_gemm(
         cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
         cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
         cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        /* determinism: forbid split-K reduction algos (atomic/parallel
+         * reduction order varies run-to-run and vs the decode GEMV path);
+         * NONE-scheme algos accumulate in a fixed order. */
+        {
+            uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
+        }
         int got = 0;
         cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &ne.h, &got);
         cublasLtMatmulPreferenceDestroy(pf);
