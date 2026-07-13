@@ -397,27 +397,28 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     int generated = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(session, cfg->gen.temperature, 0,
-                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
-        if (token == ds4_token_eos(engine)) break;
-
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_has_dspark(engine)) {
-            ntok = ds4_session_eval_speculative_block(session,
-                                                      token,
-                                                      max_tokens - generated,
-                                                      ds4_token_eos(engine),
-                                                      toks,
-                                                      (int)(sizeof(toks) / sizeof(toks[0])),
-                                                      err,
-                                                      sizeof(err));
+        if (ds4_engine_has_dspark(engine)) {
+            ntok = ds4_session_generate_speculative(session,
+                                                    cfg->gen.temperature, 0,
+                                                    cfg->gen.top_p, cfg->gen.min_p, &rng,
+                                                    max_tokens - generated,
+                                                    ds4_token_eos(engine),
+                                                    toks,
+                                                    (int)(sizeof(toks) / sizeof(toks[0])),
+                                                    err,
+                                                    sizeof(err));
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
                 return 1;
             }
+            if (ntok == 1 && toks[0] == ds4_token_eos(engine)) break;
         } else {
+            int token = ds4_session_sample(session, cfg->gen.temperature, 0,
+                                           cfg->gen.top_p, cfg->gen.min_p, &rng);
+            if (token == ds4_token_eos(engine)) break;
             int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1227,30 +1228,31 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     int generated = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(chat->session,
-                                       cfg->gen.temperature,
-                                       0,
-                                       cfg->gen.top_p,
-                                       cfg->gen.min_p,
-                                       &rng);
-        if (token == ds4_token_eos(engine)) break;
-
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_has_dspark(engine)) {
-            ntok = ds4_session_eval_speculative_block(chat->session,
-                                                      token,
-                                                      max_tokens - generated,
-                                                      ds4_token_eos(engine),
-                                                      toks,
-                                                      (int)(sizeof(toks) / sizeof(toks[0])),
-                                                      err,
-                                                      sizeof(err));
+        if (ds4_engine_has_dspark(engine)) {
+            ntok = ds4_session_generate_speculative(chat->session,
+                                                    cfg->gen.temperature, 0,
+                                                    cfg->gen.top_p, cfg->gen.min_p, &rng,
+                                                    max_tokens - generated,
+                                                    ds4_token_eos(engine),
+                                                    toks,
+                                                    (int)(sizeof(toks) / sizeof(toks[0])),
+                                                    err,
+                                                    sizeof(err));
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
+            if (ntok == 1 && toks[0] == ds4_token_eos(engine)) break;
         } else {
+            int token = ds4_session_sample(chat->session,
+                                           cfg->gen.temperature,
+                                           0,
+                                           cfg->gen.top_p,
+                                           cfg->gen.min_p,
+                                           &rng);
+            if (token == ds4_token_eos(engine)) break;
             int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);

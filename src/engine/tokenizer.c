@@ -1025,6 +1025,154 @@ static int sample_full_vocab(
 
 
 
+/* =====
+ * Filtered-distribution object for speculative sampling.
+ *
+ * Builds the SAME final sampling distribution sample_top_p_min_p draws from
+ * (temperature scaling, top-k preselect, min-p relative floor, top-p nucleus
+ * with the crossing candidate included), but materialized so the speculative
+ * path can (a) query p(token), (b) draw, and (c) draw excluding a rejected
+ * token — the exact residual rule for deterministic-proposal speculative
+ * sampling. Mirrors the sampler branch-for-branch; the spec_sampling harness
+ * chi-square-checks the equivalence.
+ */
+int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
+                          float temperature, int top_k, float top_p, float min_p,
+                          ds4_sample_dist *out) {
+    memset(out, 0, sizeof(*out));
+    if (temperature <= 0.0f) {
+        out->ids = xmalloc(sizeof(int));
+        out->probs = xmalloc(sizeof(float));
+        out->ids[0] = sample_argmax(logits, n_vocab);
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        return 1;
+    }
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
+
+    /* collect candidates: full vocab, or top-k preselect like the sampler */
+    uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
+    sample_candidate *cand = xmalloc((size_t)cap * sizeof(cand[0]));
+    uint32_t n = 0;
+    if (top_k > 0) {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            if (n == (uint32_t)top_k && v <= cand[n - 1].logit) continue;
+            uint32_t j = n < (uint32_t)top_k ? n++ : n - 1;
+            while (j > 0 && cand[j - 1].logit < v) {
+                cand[j] = cand[j - 1];
+                j--;
+            }
+            cand[j].id = (int)i;
+            cand[j].logit = v;
+        }
+    } else {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = 0.0f};
+        }
+        if (n) qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
+    }
+    if (n == 0) {
+        free(cand);
+        out->ids = xmalloc(sizeof(int));
+        out->probs = xmalloc(sizeof(float));
+        out->ids[0] = sample_argmax(logits, n_vocab);
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        return 1;
+    }
+
+    const float max_logit = cand[0].logit;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        cand[i].prob = expf((cand[i].logit - max_logit) / temperature);
+        sum += cand[i].prob;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        out->ids = xmalloc(sizeof(int));
+        out->probs = xmalloc(sizeof(float));
+        out->ids[0] = cand[0].id;
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        free(cand);
+        return 1;
+    }
+    const float min_prob = (cand[0].prob / sum) * min_p;
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float pr = cand[i].prob / sum;
+        if (i > 0 && pr < min_prob) break;
+        filtered_sum += cand[i].prob;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered == 0) filtered = 1;
+    out->ids = xmalloc((size_t)filtered * sizeof(int));
+    out->probs = xmalloc((size_t)filtered * sizeof(float));
+    out->n = filtered;
+    for (uint32_t i = 0; i < filtered; i++) {
+        out->ids[i] = cand[i].id;
+        out->probs[i] = cand[i].prob / filtered_sum;   /* renormalized nucleus */
+    }
+    free(cand);
+    return 1;
+}
+
+void ds4_sample_dist_free(ds4_sample_dist *d) {
+    free(d->ids);
+    free(d->probs);
+    memset(d, 0, sizeof(*d));
+}
+
+float ds4_sample_dist_prob(const ds4_sample_dist *d, int token) {
+    for (uint32_t i = 0; i < d->n; i++)
+        if (d->ids[i] == token) return d->probs[i];
+    return 0.0f;
+}
+
+int ds4_sample_dist_accept(const ds4_sample_dist *d, int token, uint64_t *rng) {
+    const float pd = ds4_sample_dist_prob(d, token);
+    if (pd >= 1.0f) return 1;
+    if (pd <= 0.0f) return 0;
+    return sample_rng_f32(rng) < pd;
+}
+
+int ds4_sample_dist_draw(const ds4_sample_dist *d, uint64_t *rng) {
+    float r = sample_rng_f32(rng);
+    for (uint32_t i = 0; i < d->n; i++) {
+        r -= d->probs[i];
+        if (r <= 0.0f) return d->ids[i];
+    }
+    return d->ids[d->n - 1];
+}
+
+int ds4_sample_dist_draw_excluding(const ds4_sample_dist *d, int excluded, uint64_t *rng) {
+    /* residual of a rejected deterministic proposal: p with `excluded`
+     * removed, renormalized. If the nucleus is exactly {excluded}, there is
+     * no residual mass — the caller treats that as accept-forced. */
+    float mass = 0.0f;
+    for (uint32_t i = 0; i < d->n; i++)
+        if (d->ids[i] != excluded) mass += d->probs[i];
+    if (mass <= 0.0f) return excluded;
+    float r = sample_rng_f32(rng) * mass;
+    int last = excluded;
+    for (uint32_t i = 0; i < d->n; i++) {
+        if (d->ids[i] == excluded) continue;
+        last = d->ids[i];
+        r -= d->probs[i];
+        if (r <= 0.0f) return d->ids[i];
+    }
+    return last;
+}
+
+
+
 int sample_top_p_min_p(
         const float *logits,
         uint32_t     n_vocab,

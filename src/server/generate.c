@@ -1109,31 +1109,31 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
-        if (token == ds4_token_eos(s->engine)) {
-            finish = "stop";
-            break;
-        }
-
+        int token;
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
-            ds4_engine_has_dspark(s->engine) &&
-            dspark_spec_enabled)
-        {
-            ntok = ds4_session_eval_speculative_block(s->session,
-                                                      token,
-                                                      max_tokens - completion,
-                                                      ds4_token_eos(s->engine),
-                                                      toks,
-                                                      (int)(sizeof(toks) / sizeof(toks[0])),
-                                                      err,
-                                                      sizeof(err));
+        if (ds4_engine_has_dspark(s->engine) && dspark_spec_enabled) {
+            /* the speculative block owns sampling (exact sampled acceptance at
+             * any temperature; greedy degenerates to the argmax rule) */
+            ntok = ds4_session_generate_speculative(s->session,
+                                                    temperature, top_k, top_p, min_p,
+                                                    &rng,
+                                                    max_tokens - completion,
+                                                    ds4_token_eos(s->engine),
+                                                    toks,
+                                                    (int)(sizeof(toks) / sizeof(toks[0])),
+                                                    err,
+                                                    sizeof(err));
             if (ntok < 0) {
                 finish = "error";
                 break;
             }
         } else {
+            token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+            if (token == ds4_token_eos(s->engine)) {
+                finish = "stop";
+                break;
+            }
             if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;

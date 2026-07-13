@@ -1172,6 +1172,18 @@ struct ds4_session {
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
     int32_t dspark_pending_base;
+    /* Speculative-sampling carry: the next base token, already drawn from the
+     * request's filtered distribution (bonus draw on full accept, residual
+     * draw on rejection) but NOT yet forwarded through the target. The next
+     * generate_speculative call forwards it as batch position 0. Invalidated
+     * with the pendings on rewind/invalidate/sync. */
+    int32_t spec_carry_token;
+    bool spec_carry_valid;
+    /* sampling params the carry was drawn under; a param change between calls
+     * drops the carry and redraws from s->logits (exact: the carry was never
+     * emitted or forwarded) */
+    float spec_carry_temp, spec_carry_top_p, spec_carry_min_p;
+    int spec_carry_top_k;
     /* DTree Phase 0 (DS4_DTREE_STATS): the drafter #2 token and confidence
      * score for each pending draft, carried from the drafting step to the
      * verify step so a rejection can be scored p2 = P(target correction ==
@@ -2065,6 +2077,21 @@ void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
 void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens);
 void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens);
 int sample_argmax(const float *logits, uint32_t n_vocab);
+typedef struct {
+    int *ids;
+    float *probs;   /* renormalized over the filtered nucleus */
+    uint32_t n;
+} ds4_sample_dist;
+
+int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
+                          float temperature, int top_k, float top_p, float min_p,
+                          ds4_sample_dist *out);
+void ds4_sample_dist_free(ds4_sample_dist *d);
+float ds4_sample_dist_prob(const ds4_sample_dist *d, int token);
+int ds4_sample_dist_accept(const ds4_sample_dist *d, int token, uint64_t *rng);
+int ds4_sample_dist_draw(const ds4_sample_dist *d, uint64_t *rng);
+int ds4_sample_dist_draw_excluding(const ds4_sample_dist *d, int excluded, uint64_t *rng);
+
 int sample_top_p_min_p(
         const float *logits,
         uint32_t     n_vocab,

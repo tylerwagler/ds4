@@ -1052,6 +1052,15 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         g->layer_n_index_comp[il] = n_index_comp[il];
     }
     s->checkpoint_valid = true;
+    /* a restored state invalidates any in-flight speculative lookahead: the
+     * carry token, pre-drafted pendings, AND the drafter's context-KV ring
+     * were all conditioned on the replaced state. Leaving the ring makes the
+     * next drafts (and therefore the verify batch shapes) depend on whatever
+     * ran before the restore — the source of run-to-run tie flips. */
+    s->spec_carry_valid = false;
+    s->dspark_n_pending = 0;
+    for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = 0;
+    g->dspark_prompt_n = 0;
     return 0;
 }
 
@@ -2382,6 +2391,9 @@ static bool dspark_seed_from_batch_row(ds4_session *s, uint32_t row) {
  * (Stage A; the Stage-B transactional state removes the replay). */
 static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                               int max_tokens, int eos_token,
+                                              float temperature, int top_k,
+                                              float top_p, float min_p,
+                                              uint64_t *rng,
                                               int *accepted, int accepted_cap,
                                               char *err, size_t errlen) {
     ds4_engine *e = s->engine;
@@ -2418,6 +2430,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
             pend_conf[i] = s->dspark_pending_conf[i];
         }
     s->dspark_n_pending = 0;
+    s->spec_carry_valid = false;
     const uint32_t n_batch = 1u + K;
 
     /* Prompt-window seeding (one-time per prompt): fresh drafter state + a
@@ -2480,10 +2493,46 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         return -1;
     }
 
-    /* Accept the longest prefix the target agrees with: row i's argmax is the
-     * target's token AFTER batch token i, i.e. its prediction for pend[i]. */
+    /* Accept the longest prefix the target agrees with. Greedy: row i's
+     * argmax must equal pend[i]. Sampled: exact speculative sampling for a
+     * deterministic proposal — accept pend[i] with probability p_i(pend[i])
+     * under the request's FILTERED target distribution; on rejection draw the
+     * replacement from p_i excluding pend[i] (the residual), which becomes
+     * the carry token. Both yield the exact per-token target distribution. */
     int commit = 0;
-    while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
+    int carry_tok = -1;
+    if (temperature <= 0.0f || K == 0) {
+        while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
+    } else {
+        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        bool walk_ok = true;
+        while (commit < (int)K) {
+            if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, row_logits)) {
+                walk_ok = false;
+                break;
+            }
+            ds4_sample_dist dist;
+            ds4_sample_dist_build(row_logits, DS4_N_VOCAB, temperature, top_k,
+                                  top_p, min_p, &dist);
+            if (ds4_sample_dist_accept(&dist, (int)pend[commit], rng)) {
+                ds4_sample_dist_free(&dist);
+                commit++;
+                continue;
+            }
+            carry_tok = ds4_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
+            ds4_sample_dist_free(&dist);
+            break;
+        }
+        free(row_logits);
+        if (!walk_ok) {
+            s->checkpoint.len = saved_len;
+            (void)spec_frontier_restore(&frontier, s);
+            spec_frontier_free(&frontier);
+            snprintf(err, errlen, "DSpark sampled-accept logits readback failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+    }
 
     /* Prometheus /metrics spec-decode counters (server /metrics endpoint). The
      * base token is always emitted; K drafts were verified this step and the
@@ -2522,6 +2571,22 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         snprintf(err, errlen, "DSpark fused logits readback failed");
         s->checkpoint_valid = false;
         return -1;
+    }
+
+    /* Finalize the carry token — the next base, drawn from the refreshed
+     * s->logits (= row[commit]) when the walk did not already draw a residual:
+     * greedy -> argmax (the old next_base); sampled full-accept -> the bonus
+     * draw from the last accepted row's distribution. */
+    if (carry_tok < 0) {
+        if (temperature <= 0.0f) {
+            carry_tok = sample_argmax(s->logits, DS4_N_VOCAB);
+        } else {
+            ds4_sample_dist bonus;
+            ds4_sample_dist_build(s->logits, DS4_N_VOCAB, temperature, top_k,
+                                  top_p, min_p, &bonus);
+            carry_tok = ds4_sample_dist_draw(&bonus, rng);
+            ds4_sample_dist_free(&bonus);
+        }
     }
 
     bool ok_state = true;
@@ -2590,9 +2655,16 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         if (pend[i] == (int32_t)eos_token) hit_eos = true;
     }
 
-    /* Next greedy base; draft the NEXT block conditioned on the hidden that
-     * produced it (target_h already = last committed hidden on both paths). */
-    const int next_base = sample_argmax(s->logits, DS4_N_VOCAB);
+    /* The carry IS the next base (already correctly distributed). Persist it
+     * so the next generate_speculative call forwards it as batch position 0;
+     * pre-draft the NEXT block conditioned on it. */
+    const int next_base = carry_tok;
+    s->spec_carry_token = (int32_t)carry_tok;
+    s->spec_carry_valid = !hit_eos;
+    s->spec_carry_temp = temperature;
+    s->spec_carry_top_k = top_k;
+    s->spec_carry_top_p = top_p;
+    s->spec_carry_min_p = min_p;
     uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     if (n_draft > 16u) n_draft = 16u;
     if (hit_eos || next_base == eos_token || n_draft == 0) {
@@ -2780,6 +2852,50 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     return n_accept;
 }
 
+/* Speculative generation that OWNS sampling: draws the base token from the
+ * request's filtered distribution (or forwards the carry left by the previous
+ * call), runs the fused draft/verify step with exact sampled acceptance, and
+ * leaves the next correctly-distributed base as the carry. temperature <= 0
+ * degenerates to the greedy argmax-equality path (byte-identical to the old
+ * eval_speculative_block behavior). Returns the number of tokens emitted. */
+int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
+                                     float top_p, float min_p, uint64_t *rng,
+                                     int max_tokens, int eos_token,
+                                     int *accepted, int accepted_cap,
+                                     char *err, size_t errlen) {
+    if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
+    int first;
+    const bool carry_params_match =
+        s->spec_carry_temp == temperature && s->spec_carry_top_k == top_k &&
+        s->spec_carry_top_p == top_p && s->spec_carry_min_p == min_p;
+    if (s->spec_carry_valid && carry_params_match) {
+        first = (int)s->spec_carry_token;
+        s->spec_carry_valid = false;
+    } else {
+        /* no carry, or params changed mid-stream (e.g. tool-call payloads
+         * force greedy): redraw from the current distribution */
+        s->spec_carry_valid = false;
+        first = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+                                   top_p, min_p, rng);
+    }
+    if (first == eos_token) {
+        /* never forward EOS through the target (matches the old caller loops,
+         * which broke before eval) */
+        accepted[0] = first;
+        return 1;
+    }
+    if (!ds4_engine_has_dspark(s->engine)) {
+        if (ds4_session_eval(s, first, err, errlen) != 0) return -1;
+        accepted[0] = first;
+        return 1;
+    }
+    return ds4_session_eval_speculative_fused(s, first, max_tokens, eos_token,
+                                              temperature, top_k, top_p, min_p, rng,
+                                              accepted, accepted_cap, err, errlen);
+}
+
+
+
 int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -2796,8 +2912,11 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
      * the old Step1+verify loop as an operational fallback. */
     static int fused_cache = -1;
     if (fused_cache < 0) fused_cache = getenv("DS4_DSPARK_LEGACY_LOOP") == NULL;
+    /* an externally chosen first_token invalidates any pending carry */
+    s->spec_carry_valid = false;
     if (fused_cache)
         return ds4_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
+                                                  0.0f, 0, 1.0f, 0.0f, NULL,
                                                   accepted, accepted_cap, err, errlen);
 
     ds4_engine *e = s->engine;
@@ -3124,6 +3243,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->dspark_n_pending = 0;
+    s->spec_carry_valid = false;
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first
      * attended over the PREVIOUS request's window rows for its first ~128
@@ -3141,6 +3261,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->dspark_n_pending = 0;
+    s->spec_carry_valid = false;
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
