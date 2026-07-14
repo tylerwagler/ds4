@@ -46,23 +46,23 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench CUDA_ARCH=sm_120f
-
-ds4: src/cli/ds4_cli.o src/lib/ds4_help.o src/vendor/linenoise.o $(CORE_OBJS)
-	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+	$(MAKE) -B ds4-server CUDA_ARCH=sm_120f
 
 ds4-server: $(SERVER_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Development tools, not part of the shipped release. The release is just
+# ds4-server (the HTTP API). Source is kept; build these by name.
+ds4: src/cli/ds4_cli.o src/lib/ds4_help.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 ds4-bench: src/cli/ds4_bench.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
+ds4-eval: src/cli/ds4_eval.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-# ds4-eval and ds4-agent are not part of the shipped release (out of scope,
-# untested after the CUDA-only cleanup). Source is kept; build them by name.
-ds4-eval: src/cli/ds4_eval.o src/lib/ds4_help.o $(CORE_OBJS)
+ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
