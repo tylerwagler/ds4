@@ -387,13 +387,12 @@ static bool gpu_graph_prefill_layer_major_inner(
      * callbacks emitted while encoding one huge command buffer would only be
      * cosmetic.
      */
-    const bool throttle = graph_power_throttle_enabled(g);
     /* Do NOT split (per-layer cudaDeviceSynchronize) just to fire a display
      * progress callback: on this backend end_commands() is a full device sync,
      * so per-layer progress drains the async launch pipeline 43x/chunk. Chunk-
      * level progress (gpu_graph_prefill_chunked_range) still fires; intra-chunk
      * progress is dropped in favor of throughput. */
-    const bool split_commands = split_profile || throttle ||
+    const bool split_commands = split_profile ||
                                 n_tokens > 2048 || imatrix != NULL;
     const bool profile = getenv("DS4_CUDA_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
@@ -480,7 +479,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         return ok;
     }
 
-    double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
+    double t_layer0 = profile ? now_sec() : 0.0;
     ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                  g->prefill_tokens,
                                                  model,
@@ -488,8 +487,8 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                  prompt,
                                                  start,
                                                  n_tokens);
-    const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
-    const double t_embed_done = (profile || throttle) ? now_sec() : 0.0;
+    const double t_embed_encoded = profile ? now_sec() : 0.0;
+    const double t_embed_done = profile ? now_sec() : 0.0;
     if (profile) {
         encode_s += t_embed_encoded - t_layer0;
         execute_s += t_embed_done - t_embed_encoded;
@@ -508,7 +507,6 @@ static bool gpu_graph_prefill_layer_major_inner(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        double layer_elapsed = 0.0;
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;
@@ -545,7 +543,6 @@ static bool gpu_graph_prefill_layer_major_inner(
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
-            layer_elapsed = (t_attn_done - t_attn0) + (t_ffn_done - t_ffn0);
 
             encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
             execute_s += (t_attn_done - t_attn_encoded) + (t_ffn_done - t_ffn_encoded);
@@ -557,7 +554,7 @@ static bool gpu_graph_prefill_layer_major_inner(
                     (t_ffn_encoded - t_ffn0) * 1000.0,
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
-            const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
+            const double t_chunk0 = profile ? now_sec() : 0.0;
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = gpu_graph_encode_layer_batch(g,
                                                         model,
@@ -568,11 +565,10 @@ static bool gpu_graph_prefill_layer_major_inner(
             if (!ok) {
                 fprintf(stderr, "ds4: gpu layer-major prefill layer %u encode failed\n", il);
             }
-            const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
+            const double t_encoded = profile ? now_sec() : 0.0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
-            const double t_done = (profile || throttle) ? now_sec() : 0.0;
+            const double t_done = profile ? now_sec() : 0.0;
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
-            layer_elapsed = t_done - t_chunk0;
             if (profile) {
                 encode_s += t_encoded - t_chunk0;
                 execute_s += t_done - t_encoded;
@@ -589,7 +585,6 @@ static bool gpu_graph_prefill_layer_major_inner(
             }
             return false;
         }
-        graph_power_note_prefill_layer(g, il, layer_elapsed);
         gpu_graph_report_prefill_display_progress(display_progress,
                                                   display_progress_ud,
                                                   start,

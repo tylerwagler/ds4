@@ -154,7 +154,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
-    opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
     opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
@@ -228,7 +227,6 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/help", "Show interactive commands.");
     opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
-    opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
     opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
@@ -254,7 +252,6 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/del ID", "Delete a saved session.");
     opt(fp, c, "/strip ID", "Remove KV payload; the text history can be rebuilt later.");
     opt(fp, c, "/history [N]", "Show N recent user turns from the current session.");
-    opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
     fputc('\n', fp);
@@ -396,19 +393,15 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "CUDA API", "./ds4-server -m ds4flash.gguf --cuda --ctx 100000");
-            opt(fp, c, "quiet API", "./ds4-server --power 60 --host 127.0.0.1 --port 8000");
         } else if (tool == DS4_HELP_AGENT) {
             opt(fp, c, "agent", "./ds4-agent -m ds4flash.gguf --ctx 100000");
-            opt(fp, c, "quiet agent", "./ds4-agent --power 50");
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "bench", "./ds4-bench --prompt-file long.txt --ctx-max 32768");
-            opt(fp, c, "quiet bench", "./ds4-bench --prompt-file long.txt --power 70");
         } else if (tool == DS4_HELP_EVAL) {
             opt(fp, c, "eval", "./ds4-eval --questions 10 --ctx 100000");
             opt(fp, c, "CPU debug", "./ds4-eval --cpu --questions 1 --tokens 32");
         } else {
             opt(fp, c, "CUDA", "./ds4 -m ds4flash.gguf --cuda -c 100000");
-            opt(fp, c, "quiet thermals", "./ds4 -p \"Summarize README\" --power 50");
         }
     } else if (topic_is(topic, "steering")) {
         opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");

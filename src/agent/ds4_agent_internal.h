@@ -162,7 +162,6 @@ typedef struct {
     bool greedy_sampling;
     int ctx_used;
     int ctx_size;
-    int power_percent;
     char error[256];
 } agent_status;
 
@@ -192,8 +191,6 @@ typedef struct {
     bool initialized;
     bool save_requested;
     bool compact_requested;
-    bool power_requested;
-    int requested_power;
     int progress_base;
     double progress_started_at;
     int last_system_prompt_reminder_at;
@@ -558,7 +555,6 @@ void write_all(int fd, const char *p, size_t n);
 void agent_input_buf_append(agent_input_buf *b, const char *s, size_t n);
 char *agent_input_buf_take(agent_input_buf *b);
 void agent_input_buf_free(agent_input_buf *b);
-bool parse_power_percent(const char *arg, int *out);
 bool agent_slash_command_known(const char *cmd);
 double agent_now_sec(void);
 void usage(FILE *fp, const char *topic);
@@ -753,8 +749,6 @@ int worker_force_generated_text(agent_worker *w,
                                        size_t err_len);
 void worker_request_save(agent_worker *w);
 void worker_request_compact(agent_worker *w);
-void worker_request_power(agent_worker *w, int power);
-void worker_apply_pending_power(agent_worker *w);
 void *worker_main(void *arg);
 int set_nonblock(int fd, bool on, int *old_flags);
 bool worker_check_raw_mode_restore(agent_worker *w);

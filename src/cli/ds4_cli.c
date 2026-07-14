@@ -1054,18 +1054,9 @@ static void print_repl_help(void) {
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
-    puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
-}
-
-static bool parse_power_percent(const char *arg, int *out) {
-    char *end = NULL;
-    long v = strtol(arg, &end, 10);
-    if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
-    *out = (int)v;
-    return true;
 }
 
 static void history_file_path(char *buf, size_t len) {
@@ -1356,21 +1347,6 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             cfg->gen.think_mode = DS4_THINK_NONE;
             repl_chat_apply_max_prefix(engine, &chat, false);
             puts("Thinking mode: none.");
-        } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
-            char *arg = trim_inplace(cmd + 6);
-            if (!arg[0]) {
-                printf("Power: %d%%.\n", ds4_session_power(chat.session));
-            } else {
-                int power = 0;
-                if (!parse_power_percent(arg, &power)) {
-                    fprintf(stderr, "ds4: /power must be between 1 and 100\n");
-                } else if (ds4_session_set_power(chat.session, power) != 0) {
-                    fprintf(stderr, "ds4: failed to set /power\n");
-                } else {
-                    cfg->engine.power_percent = power;
-                    printf("Power: %d%%.\n", power);
-                }
-            }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
@@ -1542,12 +1518,6 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
-        } else if (!strcmp(arg, "--power")) {
-            c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
-            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
-                fprintf(stderr, "ds4: --power must be between 1 and 100\n");
-                exit(2);
-            }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {

@@ -34,7 +34,6 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
-    int power_percent;
     uint32_t prefill_chunk;
     double step_mul;
     const char *dump_frontier_logits_dir;
@@ -194,12 +193,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--power")) {
-            c.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
-            if (c.power_percent < 1 || c.power_percent > 100) {
-                fprintf(stderr, "ds4-bench: --power must be between 1 and 100\n");
-                exit(2);
-            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else {
@@ -373,7 +366,6 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
-        .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         /* bench measures the plain decode baseline; never bind a merged

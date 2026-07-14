@@ -416,20 +416,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
-                } else if (!strncmp(cmd, "/power", 6) &&
-                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
-                    char *arg = cmd + 6;
-                    while (*arg == ' ' || *arg == '\t') arg++;
-                    if (!arg[0]) {
-                        printf("usage: /power <1..100>\n");
-                    } else {
-                        int power = 0;
-                        if (!parse_power_percent(arg, &power)) {
-                            printf("usage: /power <1..100>\n");
-                        } else {
-                            worker_request_power(&worker, power);
-                        }
-                    }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;

@@ -12,7 +12,6 @@ void worker_progress_cb(void *ud, const char *event, int current, int total) {
     agent_worker *w = ud;
     if (!w || !event) return;
     if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display")) return;
-    worker_apply_pending_power(w);
     pthread_mutex_lock(&w->mu);
     int done = current - w->progress_base;
     if (done < 0) done = 0;

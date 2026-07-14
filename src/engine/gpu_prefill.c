@@ -2343,8 +2343,7 @@ bool gpu_graph_eval_token_raw_swa(
         float                 *logits) {
 
     const bool profile = getenv("DS4_CUDA_GRAPH_TOKEN_PROFILE") != NULL;
-    const bool throttle = graph_power_throttle_enabled(g);
-    const double t0 = (profile || throttle) ? now_sec() : 0.0;
+    const double t0 = profile ? now_sec() : 0.0;
 
     const int captured = ds4_gpu_decode_graph_begin();
     bool ok = captured != 0 || ds4_gpu_begin_commands() != 0;
@@ -2353,14 +2352,14 @@ bool gpu_graph_eval_token_raw_swa(
      * the graph replays the whole tape in one launch). */
     if (ok) ok = gpu_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL,
                                                 !captured);
-    const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
+    const double t_encoded = profile ? now_sec() : 0.0;
     if (ok) ok = (captured ? ds4_gpu_decode_graph_end() : ds4_gpu_end_commands()) != 0;
-    const double t_done = (profile || throttle) ? now_sec() : 0.0;
+    const double t_done = profile ? now_sec() : 0.0;
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
-    const double t_read = (profile || throttle) ? now_sec() : 0.0;
+    const double t_read = profile ? now_sec() : 0.0;
     if (profile) {
         fprintf(stderr,
                 "ds4: GPU graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
@@ -2371,7 +2370,6 @@ bool gpu_graph_eval_token_raw_swa(
                 (t_read - t0) * 1000.0,
                 logits != NULL);
     }
-    if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: GPU synchronize after graph eval failure also failed\n");

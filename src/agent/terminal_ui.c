@@ -66,17 +66,6 @@ static void agent_progress_bar(int done, int total, double tps,
 
 
 
-static void agent_power_status_suffix(const agent_status *st,
-                                      char *buf, size_t len) {
-    if (len == 0) return;
-    if (st->power_percent > 0 && st->power_percent < 100)
-        snprintf(buf, len, " | ⚡ %d%%", st->power_percent);
-    else
-        buf[0] = '\0';
-}
-
-
-
 unsigned agent_next_prefill_label(void) {
     static unsigned next;
     return next++;
@@ -105,10 +94,8 @@ static const char *agent_prefill_label(const agent_status *st) {
  * because linenoise redraws it on every progress update. */
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
     char used[32], total_ctx[32];
-    char power[32];
     agent_format_ctx_size(st->ctx_used, used, sizeof(used));
     agent_format_ctx_size(st->ctx_size, total_ctx, sizeof(total_ctx));
-    agent_power_status_suffix(st, power, sizeof(power));
 
     switch (st->state) {
     case AGENT_WORKER_PREFILL: {
@@ -119,32 +106,32 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         char bar[AGENT_PROGRESS_BAR_MAX_BYTES];
         agent_progress_bar(done, total, st->prefill_tps, bar, sizeof(bar),
                            stdout_is_tty());
-        snprintf(buf, len, "ctx %s/%s | %s %s %d/%d %.1f%%%s",
+        snprintf(buf, len, "ctx %s/%s | %s %s %d/%d %.1f%%",
                  used, total_ctx, agent_prefill_label(st), bar,
-                 done, total, pct, power);
+                 done, total, pct);
         break;
     }
     case AGENT_WORKER_GENERATING:
-        snprintf(buf, len, "ctx %s/%s | generation %d tokens%s %.1f t/s%s",
+        snprintf(buf, len, "ctx %s/%s | generation %d tokens%s %.1f t/s",
                  used, total_ctx, st->generated,
-                 st->greedy_sampling ? " ❄️" : "", st->gen_tps, power);
+                 st->greedy_sampling ? " ❄️" : "", st->gen_tps);
         break;
     case AGENT_WORKER_COMPACTING:
-        snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
-                 used, total_ctx, st->generated, st->gen_tps, power);
+        snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s",
+                 used, total_ctx, st->generated, st->gen_tps);
         break;
     case AGENT_WORKER_SAVING:
-        snprintf(buf, len, "ctx %s/%s | saving session%s", used, total_ctx, power);
+        snprintf(buf, len, "ctx %s/%s | saving session", used, total_ctx);
         break;
     case AGENT_WORKER_ERROR:
-        snprintf(buf, len, "ctx %s/%s | error: %s%s", used, total_ctx,
-                 st->error[0] ? st->error : "unknown error", power);
+        snprintf(buf, len, "ctx %s/%s | error: %s", used, total_ctx,
+                 st->error[0] ? st->error : "unknown error");
         break;
     case AGENT_WORKER_STOPPED:
-        snprintf(buf, len, "ctx %s/%s | interrupted%s", used, total_ctx, power);
+        snprintf(buf, len, "ctx %s/%s | interrupted", used, total_ctx);
         break;
     default:
-        snprintf(buf, len, "ctx %s/%s | idle%s", used, total_ctx, power);
+        snprintf(buf, len, "ctx %s/%s | idle", used, total_ctx);
         break;
     }
 }
@@ -1158,7 +1145,6 @@ void runtime_help(void) {
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
-    puts("  /power N     Set GPU duty cycle percentage, 1..100.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");

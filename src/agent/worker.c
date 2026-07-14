@@ -214,7 +214,6 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         bool status_greedy_sampling = false;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
-            worker_apply_pending_power(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
             if (greedy_sampling != status_greedy_sampling) {
                 worker_set_greedy_sampling(w, greedy_sampling);
@@ -410,18 +409,6 @@ void worker_request_compact(agent_worker *w) {
 
 
 
-void worker_request_power(agent_worker *w, int power) {
-    pthread_mutex_lock(&w->mu);
-    w->requested_power = power;
-    w->power_requested = true;
-    w->status.power_percent = power;
-    pthread_cond_signal(&w->cond);
-    agent_wake_locked(w);
-    pthread_mutex_unlock(&w->mu);
-}
-
-
-
 static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->save_requested;
@@ -438,35 +425,6 @@ static bool worker_take_compact_requested(agent_worker *w) {
     w->compact_requested = false;
     pthread_mutex_unlock(&w->mu);
     return requested;
-}
-
-
-
-static bool worker_take_power_requested(agent_worker *w, int *power) {
-    pthread_mutex_lock(&w->mu);
-    bool requested = w->power_requested;
-    if (requested) {
-        if (power) *power = w->requested_power;
-        w->power_requested = false;
-    }
-    pthread_mutex_unlock(&w->mu);
-    return requested;
-}
-
-
-
-void worker_apply_pending_power(agent_worker *w) {
-    int power = 0;
-    if (!worker_take_power_requested(w, &power)) return;
-    if (ds4_session_set_power(w->session, power) != 0) {
-        agent_publishf(w, "\npower change failed\n");
-        return;
-    }
-    pthread_mutex_lock(&w->mu);
-    w->cfg->engine.power_percent = power;
-    w->status.power_percent = power;
-    agent_wake_locked(w);
-    pthread_mutex_unlock(&w->mu);
 }
 
 
@@ -539,16 +497,11 @@ void *worker_main(void *arg) {
     while (true) {
         pthread_mutex_lock(&w->mu);
         while (!w->stop && !w->cmd_text && !w->save_requested &&
-               !w->compact_requested && !w->power_requested)
+               !w->compact_requested)
             pthread_cond_wait(&w->cond, &w->mu);
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;
-        }
-        if (w->power_requested) {
-            pthread_mutex_unlock(&w->mu);
-            worker_apply_pending_power(w);
-            continue;
         }
         if (!w->cmd_text && w->save_requested) {
             pthread_mutex_unlock(&w->mu);
@@ -566,7 +519,6 @@ void *worker_main(void *arg) {
 
         worker_run_turn(w, cmd);
         free(cmd);
-        worker_apply_pending_power(w);
         worker_run_deferred_compact(w);
         worker_run_deferred_save(w);
     }

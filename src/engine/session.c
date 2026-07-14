@@ -1249,7 +1249,6 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         return 1;
     }
     g.quality = e->quality;
-    g.power_percent = (uint32_t)e->power_percent;
 
     ds4_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {
@@ -1379,7 +1378,6 @@ int ds4_engine_generate_argmax(
         }
         return generate_gpu_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
-                                            e->power_percent,
                                             e->prefill_chunk,
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
@@ -1511,9 +1509,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
-    e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->prefill_chunk = opt->prefill_chunk;
-    if (e->power_percent > 100) e->power_percent = 100;
     /* Default draft depth 5: the measured optimum WITH confidence-scheduled
      * verification (2026-07-09 sweep, conf3 head, tau 0.35: 24.46 eff t/s vs
      * 23.18 at draft 3).  Without conf-sched (tau 0) the fixed-depth optimum
@@ -1713,20 +1709,6 @@ int ds4_engine_vocab_size(ds4_engine *e) {
 
 
 
-int ds4_engine_power(ds4_engine *e) {
-    return e ? e->power_percent : 100;
-}
-
-
-
-int ds4_engine_set_power(ds4_engine *e, int power_percent) {
-    if (!e || power_percent < 1 || power_percent > 100) return 1;
-    e->power_percent = power_percent;
-    return 0;
-}
-
-
-
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_SHAPE_NAME;
@@ -1819,7 +1801,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->graph.quality = e->quality;
-    s->graph.power_percent = (uint32_t)e->power_percent;
     if (!gpu_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
@@ -1850,22 +1831,6 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     free(s->logits);
     free(s);
-}
-
-
-
-int ds4_session_power(ds4_session *s) {
-    if (!s || !s->engine) return 100;
-    return s->engine->power_percent;
-}
-
-
-
-int ds4_session_set_power(ds4_session *s, int power_percent) {
-    if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
-    s->engine->power_percent = power_percent;
-    s->graph.power_percent = (uint32_t)power_percent;
-    return 0;
 }
 
 

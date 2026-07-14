@@ -1028,9 +1028,6 @@ typedef struct {
     ds4_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
-    uint32_t power_percent;
-    double prefill_layer_avg_sec[DS4_MAX_LAYER];
-    double decode_token_avg_sec;
     bool quality;
 } ds4_gpu_graph;
 
@@ -1118,7 +1115,6 @@ struct ds4_engine {
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
-    int power_percent;
     uint32_t prefill_chunk;
     bool quality;
     bool gpu_ready;
@@ -1703,11 +1699,6 @@ float max_abs_diff(const float *a, const float *b, uint64_t n);
 float rms_abs_diff(const float *a, const float *b, uint64_t n);
 uint64_t argmax_f32(const float *x, uint64_t n);
 void print_vec_stats(const char *name, const float *x, uint64_t n);
-bool graph_power_throttle_enabled(const ds4_gpu_graph *g);
-void graph_power_note_prefill_layer(ds4_gpu_graph *g,
-                                           uint32_t il,
-                                           double elapsed_sec);
-void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec);
 void gpu_graph_free(ds4_gpu_graph *g);
 bool gpu_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n);
 bool gpu_graph_load_directional_steering(
@@ -2111,7 +2102,6 @@ int generate_gpu_graph_raw_swa(
         int                 n_predict,
         int                 ctx_size,
         bool                quality,
-        int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
         float               directional_steering_attn,

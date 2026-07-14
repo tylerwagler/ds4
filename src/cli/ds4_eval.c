@@ -1204,7 +1204,6 @@ typedef struct {
     float min_p;
     uint64_t seed;
     int pause_ms;
-    int power_percent;
     uint32_t prefill_chunk;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
@@ -1541,12 +1540,6 @@ static eval_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.prefill_chunk = (uint32_t)v;
-        } else if (!strcmp(arg, "--power")) {
-            c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-            if (c.power_percent < 1 || c.power_percent > 100) {
-                fprintf(stderr, "ds4-eval: --power must be between 1 and 100\n");
-                exit(2);
-            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
@@ -4020,7 +4013,6 @@ int main(int argc, char **argv) {
         .dspark_disable = true,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
-        .power_percent = cfg.power_percent,
         .prefill_chunk = cfg.prefill_chunk,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,

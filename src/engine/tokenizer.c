@@ -1285,7 +1285,6 @@ int generate_gpu_graph_raw_swa(
         int                 n_predict,
         int                 ctx_size,
         bool                quality,
-        int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
         float               directional_steering_attn,
@@ -1319,7 +1318,6 @@ int generate_gpu_graph_raw_swa(
         return 1;
     }
     g.quality = quality;
-    g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!gpu_graph_load_directional_steering(&g,
                                                directional_steering_file,
                                                directional_steering_attn,

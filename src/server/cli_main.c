@@ -147,7 +147,7 @@ static server_config parse_options(int argc, char **argv) {
         },
         .host = "0.0.0.0",
         .port = 8000,
-        .ctx_size = 262144,
+        .ctx_size = 1048576,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
@@ -218,12 +218,6 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
-        } else if (!strcmp(arg, "--power")) {
-            c.engine.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
-                server_log(DS4_LOG_DEFAULT, "ds4-server: --power must be between 1 and 100");
-                exit(2);
-            }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {

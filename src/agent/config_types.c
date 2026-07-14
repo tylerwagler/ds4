@@ -20,9 +20,6 @@ agent_worker *agent_completion_worker;
 
 
 
-void worker_apply_pending_power(agent_worker *w);
-
-
 void agent_trace(agent_worker *w, const char *fmt, ...);
 
 

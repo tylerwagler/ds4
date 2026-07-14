@@ -71,14 +71,6 @@ bool worker_submit(agent_worker *w, const char *text) {
 
 
 
-static int worker_status_power_locked(agent_worker *w) {
-    if (w->power_requested) return w->requested_power;
-    int power = w->cfg->engine.power_percent;
-    return power > 0 ? power : 100;
-}
-
-
-
 /* Request interruption at the next model/tool polling point. */
 void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
@@ -111,7 +103,6 @@ void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_status *
     }
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
-    w->status.power_percent = worker_status_power_locked(w);
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -123,7 +114,6 @@ void worker_get_status(agent_worker *w, agent_status *status) {
     pthread_mutex_lock(&w->mu);
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
-    w->status.power_percent = worker_status_power_locked(w);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -145,7 +135,6 @@ bool worker_is_initialized(agent_worker *w, agent_status *status) {
     pthread_mutex_lock(&w->mu);
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
-    w->status.power_percent = worker_status_power_locked(w);
     if (status) *status = w->status;
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);

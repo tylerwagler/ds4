@@ -112,16 +112,6 @@ static int parse_int(const char *s, const char *opt) {
 
 
 
-bool parse_power_percent(const char *arg, int *out) {
-    char *end = NULL;
-    long v = strtol(arg, &end, 10);
-    if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
-    *out = (int)v;
-    return true;
-}
-
-
-
 static bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
@@ -138,7 +128,6 @@ bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
-           agent_slash_command_with_args(cmd, "/power") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -283,12 +272,6 @@ agent_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
-        } else if (!strcmp(arg, "--power")) {
-            c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
-            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
-                fprintf(stderr, "ds4-agent: --power must be between 1 and 100\n");
-                exit(2);
-            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--dir-steering-file")) {
