@@ -44,9 +44,8 @@ Environment:
 After download the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
 
-Then the default commands work:
-  ./ds4 -p "Hello"
-  ./ds4-server --ctx 100000
+Then start the server (the shipped binary reads ./ds4flash.gguf by default):
+  ./ds4-server -m ds4flash.gguf --ctx 100000
 EOF
 }
 

@@ -5,10 +5,12 @@ Flash** on a single **NVIDIA GB10 (DGX Spark, ~128 GB unified memory)**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DeepSeek specific loading,
-prompt rendering, tool calling, and KV state handling (RAM and on-disk) behind a
-server API, ready to work with local coding agents or the provided CLI
-interface. There are also tools for GGUF and imatrix generation, and for quality
-and speed testing.
+prompt rendering, tool calling, and KV state handling (RAM and on-disk) behind an
+OpenAI- and Anthropic-compatible server API, ready to work with local coding
+agents. The shipped release is a single binary — **`ds4-server`** — that serves
+that API; that is the product. There are also offline tools for GGUF and imatrix
+generation, plus development tools for quality and speed testing (see the
+Development tools note under Building).
 
 This tree is the **CUDA-only fork** of
 [antirez/ds4](https://github.com/antirez/ds4) targeting **NVIDIA CUDA on
@@ -54,12 +56,15 @@ This fork also stands on:
 
 ## Status
 
-The code and GGUF files are to be considered of **beta quality** because
-inference and model serving is a complicated matter and all this exists
-only for a few days. It will take months to reach a more stable form.
-However, we try to keep the project in a usable state, and we are making
-progress. If you have issues, make sure to use `--trace` to log the
-sessions, and open issues including the full trace.
+This is **beta quality**, but a first release has shipped: the
+measured-allocation DeepSeek-V4-Flash GGUF (the `v5mx` build) and the
+`ds4-server` engine that serves it. The inference path, the MXFP4/MXFP8/IQ2
+quantization, and speculative decoding are validated against the tests in this
+tree and the hardmode `tool-eval-bench` quality run (92/100). Model serving is
+a large surface, so rough edges remain; we keep the project usable and are
+actively hardening it. If you hit a problem, run `ds4-server --trace
+/tmp/ds4-trace.txt` to capture the session and open an issue with the full
+trace.
 
 
 ## More Documentation
@@ -128,7 +133,8 @@ A few things this fork's GGUFs do beyond upstream:
   release**: in a hardmode `tool-eval-bench` bake-off it scored 92/100 against
   84/100 for a uniform all-`Q2_K` build, so the measured build ships and the
   all-`Q2_K` build was dropped. Recommended sampling for the shipped build is
-  `--temp 0.95 --top-p 0.38`.
+  temperature 0.95, top-p 0.38 (send these as the `temperature`/`top_p` API
+  parameters).
 - **REAP expert pruning.** Production GGUFs are REAP expert-pruned: expert
   tensors are dense-trimmed to a per-layer survivor count while the router
   stays padded to the full expert count. This trades a small quality margin
@@ -168,9 +174,13 @@ git submodule update --init cutlass
 make cuda-spark            # Linux CUDA, DGX Spark / GB10 (sm_120f)
 ```
 
-`./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
-`./ds4-server --help` for the full flag list.
+`./ds4flash.gguf` is the default model path used by `ds4-server`. Pass `-m` to
+select another supported GGUF from `./gguf/`. Run `./ds4-server --help` for the
+full flag list, and start serving with:
+
+```sh
+./ds4-server -m ds4flash.gguf --ctx 100000
+```
 
 ## Speed
 
@@ -215,7 +225,8 @@ was removed rather than kept as a semi-supported variant. The drafter's
 tensors ship merged inside the main model GGUF and the engine auto-enables
 speculative decoding when it detects them at load — no extra file or flag
 needed. `--no-dspark` opts out, and `--dspark PATH` still loads a split
-drafter file. `ds4-bench` intentionally measures the plain-decode baseline.
+drafter file. The `ds4-bench` development tool intentionally measures the
+plain-decode baseline.
 
 Acceptance is **exact sampled acceptance at all temperatures**: a draft token
 is accepted with its filtered target probability, and on rejection the engine
@@ -224,7 +235,7 @@ exactly like the plain sampler (temperature scale, top-k, min-p, top-p), so
 the output distribution is provably identical to plain sampling — greedy
 decoding is just the point-mass special case of the same walk. Speculative
 decoding is purely a speedup, never a quality knob, and it now applies to the
-sampling recipes people actually use, not only `--temp 0`.
+sampling recipes people actually use, not only temperature 0.
 
 This guarantee is only meaningful because decode and prefill numerics are
 run-to-run deterministic: accumulation orders are fixed everywhere
@@ -232,67 +243,17 @@ run-to-run deterministic: accumulation orders are fixed everywhere
 sampling parameters, and seed reproduce the same output across runs, and the
 speculative verify pass sees exactly the numerics plain decode would.
 
-## Benchmarking
+## Prefill chunking
 
-`ds4-bench` measures instantaneous prefill and generation throughput at context
-frontiers instead of reporting one whole-run average. It loads the model once,
-walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
-incremental prefill so each row measures only the newly-added token interval.
-After each frontier it saves the live KV state to memory, generates a fixed
-greedy non-EOS probe, restores the memory snapshot, and continues prefill.
-
-```sh
-./ds4-bench \
-  -m ds4flash.gguf \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 2048 \
-  --ctx-max 65536 \
-  --step-incr 2048 \
-  --gen-tokens 128
-```
-
-The example file is a cleaned public-domain Project Gutenberg text of
-Alessandro Manzoni's *I Promessi Sposi* (ebook #45334), with the Gutenberg
-header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
-
-Use `--step-incr N` for different linear spacing, or `--step-mul F` for
-exponential sweeps. Output is CSV with one row per frontier: latest prefill
-interval tokens/sec, generation tokens/sec at that frontier, and
-`kvcache_bytes`.
-
-Sessions prefill long prompts in 4096-token chunks by default. Set
-`DS4_CUDA_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
-to match the strict official-vector checkpoint path, or
-`DS4_CUDA_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
-allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
-as an explicit run configuration.
-Chunked GPU prefill reuses the same range-capable layer-major graph for each
-chunk, preserving absolute compressor/indexer boundaries while avoiding the old
-per-layer chunk dispatch path.
-
-## CLI
-
-One-shot prompt:
-
-```sh
-./ds4 -p "Explain Redis streams in one paragraph."
-```
-
-No `-p` starts the interactive prompt:
-
-```sh
-./ds4
-ds4>
-```
-
-The interactive CLI is a real multi-turn chat. It keeps the rendered chat
-transcript and the live graph KV checkpoint, so each turn extends the previous
-conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
-`/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
-and returns to `ds4>`.
-
-The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers.
+Prefill chunking is configurable and affects the KV checkpoint/logit path.
+Sessions prefill long prompts in 4096-token chunks by default; use the server's
+`--prefill-chunk N` (or `DS4_CUDA_PREFILL_CHUNK=N`) to compare another chunk
+size, for example `2048` to match the strict official-vector checkpoint path,
+or `0` to prefill a prompt as one whole batch when memory allows. Changing the
+chunk changes the KV checkpoint/logit path, so compare it as an explicit run
+configuration. Chunked GPU prefill reuses the same range-capable layer-major
+graph for each chunk, preserving absolute compressor/indexer boundaries while
+avoiding the old per-layer chunk dispatch path.
 
 ## Server
 
@@ -793,7 +754,16 @@ make cuda-spark
 
 The CUTLASS MXFP4 expert path requires the **`sm_120f`** family arch for its
 block-scaled tensor-core MMA, so `cuda-spark` builds with `CUDA_ARCH=sm_120f`.
-This fork targets the GB10 only; there is a single build target.
+This fork targets the GB10 only; there is a single build target, and
+`make cuda-spark` builds only the shipped binary, `ds4-server`.
+
+### Development tools
+
+The tree also builds `ds4` (the CLI), `ds4-bench` (speed microbench), `ds4-eval`
+(embedded capability check), and `ds4-agent` (native coding agent) via
+`make <name>` — for example `make ds4-bench`. These are development tools for
+contributors; they are not part of the release and are not built by
+`make cuda-spark`. Some are untested after the pre-release cleanup.
 
 ## Steering
 
@@ -806,13 +776,27 @@ and so forth, much faster than fine-tuning.
 This is also useful for cybersecurity researchers who want to reduce a model's
 willingness to provide dual-use or offensive security guidance.
 
+`ds4-server` exposes steering directly: point it at a direction file and set the
+per-path scales (`--dir-steering-ffn` after FFN outputs, `--dir-steering-attn`
+after attention outputs):
+
+```sh
+./ds4-server -m ds4flash.gguf --ctx 100000 \
+  --dir-steering-file dir-steering/out/verbosity.f32 \
+  --dir-steering-ffn -4.0
+```
+
+With no steering file or zero scales the server follows the normal inference
+path.
+
 ## Test Vectors
 
 `tests/test-vectors` contains short and long-context continuation vectors
 captured from the official DeepSeek V4 Flash API. The requests use
 `deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
 `top_logprobs` slice exposed by the API. Local vectors are generated with
-`./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
+`./ds4 --dump-logprobs` (the `ds4` development CLI, built with `make ds4`) and
+compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
 C runner pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
 comparison.
@@ -831,14 +815,15 @@ cuda-regression` runs a GPU kernel smoke test that needs no model.
 
 ## Debugging Notes
 
-When a generation looks wrong, three small tools are usually enough to get a
-first answer:
+When a generation looks wrong, a few small tools are usually enough to get a
+first answer. `ds4-server --trace` is the one that works against the shipped
+binary; the `--dump-*` probes live on the `ds4` development CLI (`make ds4`):
 
 ```sh
+./ds4-server --trace /tmp/ds4-trace.txt ...
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 ./ds4 --dump-logits /tmp/logits.json --cuda --nothink --prompt-file prompt.txt
-./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
