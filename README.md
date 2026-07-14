@@ -1060,6 +1060,12 @@ dropped as measurements come in.
 - **MoE verify-microbatch routing audit.** Verify batches are only a few
   rows but currently pass through prefill-shaped routing machinery; audit
   it and skip what a small batch does not need.
+- **Grouped MXFP4 prefill GEMM.** Prefill dispatches the CUTLASS MXFP4
+  expert GEMM per expert behind a blocking per-layer offset readback. A
+  single ptr-array grouped launch (available in the SM120 blockscaled
+  builder without a CUTLASS bump) would remove that readback and the
+  per-expert launch overhead — a prefill-only win, worth profiling first
+  since prefill is already competitive.
 - **Retire the remaining CPU compute paths.** The engine is CUDA-only; the
   leftover host-side decode code inherited from upstream should go. In the
   same pass, revisit the Q8_K activation quantization used by the MoE
