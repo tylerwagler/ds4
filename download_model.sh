@@ -4,8 +4,7 @@ set -e
 # ds4 (DwarfStar) release GGUFs live in this repo. Each file is a single,
 # self-contained artifact: REAP-25-pruned DeepSeek-V4-Flash experts, MXFP8
 # attention/shared/head, and the DSpark drafter merged in-file (auto-enabled
-# on load). The repo is private during pre-release; downloads need a token
-# (--token, HF_TOKEN, or the local HF cache) until it is made public.
+# on load). The repo is public; no token is required for the download.
 REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
 V5MX_FILE="ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf"
 
@@ -34,8 +33,8 @@ Targets:
          token context. Requires a ds4 engine built with CUDA_ARCH=sm_120f.
 
 Options:
-  --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
-                 cache is used if present. Required while the repo is private.
+  --token TOKEN  Hugging Face token (optional; the repo is public). Otherwise
+                 HF_TOKEN or the local HF token cache is used if present.
 
 Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
