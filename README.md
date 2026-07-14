@@ -5,10 +5,10 @@ Flash** on a single **NVIDIA GB10 (DGX Spark, ~128 GB unified memory)**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DeepSeek specific loading,
-prompt rendering, tool calling, KV state handling (RAM and on-disk), server
-API and integrated coding agent, all ready to work with coding agents or with
-the provided CLI interface. There are also tools for GGUF and imatrix generation,
-and for quality and speed testing.
+prompt rendering, tool calling, and KV state handling (RAM and on-disk) behind a
+server API, ready to work with local coding agents or the provided CLI
+interface. There are also tools for GGUF and imatrix generation, and for quality
+and speed testing.
 
 This tree is the **CUDA-only fork** of
 [antirez/ds4](https://github.com/antirez/ds4) targeting **NVIDIA CUDA on
@@ -28,21 +28,6 @@ contexts practical. The bet is one model, one class of machine, done end to
 end rather than a generic runner. If a materially better open-weight model
 lands for this size class, the engine can follow it; the model is a target,
 not a permanent commitment.
-
-## Motivations
-
-* Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier, and its experts resist 2-bit quantization remarkably well.
-* Very capable computers like MacBooks, the DGX Spark now exist.
-* DeepSeek v4 kv cache design makes it pratical to run very big contexts. Other vendors are using this approach.
-* This few hundred billions models are strictly better than smaller (even if dense) models, regardless of what benchmarks say.
-
-That said, a few important things about this project:
-
-* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on a high-end single-GPU machine like the DGX Spark, starting from ~96/128 GB of unified memory.
-* This software is developed with **strong assistance from AI coding agents** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand, nor without the upstream `ds4` project this fork is based on.
-* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and fast modern NVMe SSDs should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**: sessions checkpoint to disk and resume instantly, so long agent histories survive restarts without re-prefilling. The model weights themselves, by contrast, are deliberately fully RAM-resident on this fork — the GB10's 128 GB fits the production model with room to spare, and a model that does not fit is rejected at load rather than degraded.
-* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. This is beta quality code, so we are probably not fully there yet.
-* This fork targets **CUDA on Linux only**, with special care for the **NVIDIA DGX Spark (GB10)** and its ~128 GB of unified memory. The whole model runs as a single CUDA-graph inference path; there is no CPU inference backend and no multi-node/distributed mode.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -180,9 +165,7 @@ Then build (the `cutlass/` submodule is required):
 
 ```sh
 git submodule update --init cutlass
-make cuda-spark            # Linux CUDA, DGX Spark / GB10
-make cuda-generic          # Linux CUDA, other local CUDA GPUs
-make cuda CUDA_ARCH=sm_N   # explicit nvcc -arch value
+make cuda-spark            # Linux CUDA, DGX Spark / GB10 (sm_120f)
 ```
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
@@ -286,97 +269,6 @@ as an explicit run configuration.
 Chunked GPU prefill reuses the same range-capable layer-major graph for each
 chunk, preserving absolute compressor/indexer boundaries while avoiding the old
 per-layer chunk dispatch path.
-
-## Capability Evaluation
-
-`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
-runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
-security benchmark score: the questions are an embedded 92-item subset chosen
-to make local regression testing useful and visually inspectable. The program
-loads the real GGUF, renders DeepSeek chat prompts, streams sampled tokens in a split-screen TUI, grades
-the final answer, and prints a per-question report with prompt tokens,
-generated tokens, pass/fail state, the model answer, and the correct answer.
-
-```sh
-./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
-```
-
-The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
-`</think>` budget cutoff so the model has room to produce a visible answer.
-`ds4-eval` sizes the context internally from the largest selected prompt plus
-the generation budget, and refuses runs that would need more than 1M context
-tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
-inspect or select another question, and Enter to run the selected question next.
-`--plain` disables the TUI.
-
-Use `--regrade-trace /path/to/trace.txt` to replay the current answer
-extractor and scorer against a prior `--trace` file without loading the model
-or regenerating tokens. This is useful when auditing evaluator changes: it
-shows which cases changed, the old picked answer, the new picked answer, and a
-pass/fail summary.
-
-For inference changes that can affect generation drift, keep this deterministic
-q1..q4 token-count gate in the test plan:
-
-```sh
-./ds4-eval \
-  -m ds4flash.gguf \
-  --plain \
-  --questions 4 \
-  --tokens 2048 \
-  --temp 0 \
-  --seed 1
-```
-
-The generated-token counts must stay aligned with the baseline:
-
-| Question | Expected state | Expected generated tokens | Expected given/correct |
-|---:|---|---:|---|
-| 1 | `PASSED` | 2048 | `B` / `B` |
-| 2 | `PASSED` | 438 | `C` / `C` |
-| 3 | `PASSED` | 666 | `70` / `70` |
-| 4 | `FAILED` | 2048 | `A` / `C` |
-
-The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
-SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
-subset of reduced single-function C/C++ vulnerability-localization questions.
-The model is asked for the single best source line, or the smallest exact line
-set only when the bug cannot be localized to one line; the scorer accepts small
-audited ranges only when adjacent lines are equivalent locations for the same
-bug. The order is
-intentionally progressive: early questions are useful smoke tests, while later
-questions are hard enough that a strong reasoning model should still miss some
-of them. The SuperGPQA slice is curated rather than blind: upstream rows with
-wrong keys, missing figures, or underspecified prompts are replaced with cleaner
-rows.
-
-The set should be treated as a hard capability regression suite rather than
-a pass/fail unit test.
-
-- **GPQA Diamond** contributes graduate-level science questions with
-  multiple-choice answers. DeepSeek's model card reports strong results
-  on full GPQA Diamond in thinking mode, but individual items still require
-  careful physics, chemistry, or biology reasoning and are easy to lose with a
-  small prompt/rendering or sampling regression.
-- **SuperGPQA** contributes broad specialist knowledge and domain-transfer
-  questions. The model-card SuperGPQA number is much lower than GPQA Diamond,
-  so these items are expected to be uneven: some look mundane, others require
-  niche professional knowledge or exact interpretation of a translated-style
-  exam question.
-- **AIME 2025** contributes exact-answer contest math. These are often the most
-  unforgiving items in the set: no multiple-choice prior, no partial credit, and
-  a single arithmetic or algebraic slip changes the grade.
-- **COMPSEC** contributes single-function C/C++ security reasoning items
-  reduced from public CVE writeups. These are not exploit prompts: the task is
-  to identify the best source line where the defensive code flaw is introduced,
-  or return `0` for a safe function.
-
-In practice this means `ds4-eval` should not be expected to produce a perfect
-92/92 run. It is meant to answer a more useful engineering question: after a
-kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
-DeepSeek V4 Flash still solve a representative mix of hard science, broad
-knowledge, exact math, and security-code problems while using the same inference
-path users run?
 
 ## CLI
 
@@ -901,13 +793,7 @@ make cuda-spark
 
 The CUTLASS MXFP4 expert path requires the **`sm_120f`** family arch for its
 block-scaled tensor-core MMA, so `cuda-spark` builds with `CUDA_ARCH=sm_120f`.
-For a generic local CUDA GPU use `make cuda-generic`, or set the arch
-explicitly when cross-building:
-
-```sh
-make cuda CUDA_ARCH=sm_120f
-make cuda CUDA_ARCH=native
-```
+This fork targets the GB10 only; there is a single build target.
 
 ## Steering
 
@@ -931,11 +817,10 @@ attention regressions show up before they become long generation failures. The
 C runner pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
 comparison.
 
-All project tests are driven by the C runners, with a small `ds4-eval`
-extractor self-test run first:
+All project tests are driven by the C runners:
 
 ```sh
-make test                  # ds4-eval --self-test-extractors, ds4_agent_test, ds4_test
+make test                  # ds4_test
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```

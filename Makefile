@@ -35,31 +35,18 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test cuda-spark cuda-regression
 
 all: help
 
 help:
 	@echo "DS4 build targets (CUDA-only fork for DGX Spark / GB10):"
-	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
-	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
-	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
+	@echo "  make cuda-spark          Build for the DGX Spark / GB10 (sm_120f)"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH=sm_120f
-
-cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH=native
-
-cuda:
-	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
-		echo "error: specify CUDA_ARCH, for example: make cuda CUDA_ARCH=sm_120"; \
-		echo "       or use make cuda-spark / make cuda-generic"; \
-		exit 2; \
-	fi
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) -B ds4 ds4-server ds4-bench CUDA_ARCH=sm_120f
 
 ds4: src/cli/ds4_cli.o src/lib/ds4_help.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -70,10 +57,12 @@ ds4-server: $(SERVER_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/r
 ds4-bench: src/cli/ds4_bench.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-eval: src/cli/ds4_eval.o src/lib/ds4_help.o $(CORE_OBJS)
+ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-agent: $(AGENT_OBJS) src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
+# ds4-eval and ds4-agent are not part of the shipped release (out of scope,
+# untested after the CUDA-only cleanup). Source is kept; build them by name.
+ds4-eval: src/cli/ds4_eval.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
@@ -123,8 +112,7 @@ ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/r
 ds4_agent_test: tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
-test: ds4_test ds4-eval
-	./ds4-eval --self-test-extractors
+test: ds4_test
 	./ds4_test
 
 clean:
