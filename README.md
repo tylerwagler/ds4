@@ -284,16 +284,16 @@ seconds) drops clients that never finish sending their request.
 Supported endpoints:
 
 - `GET /v1/models`
-- `GET /v1/models/deepseek-v4-flash`
-- `GET /v1/models/deepseek-v4-pro`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `POST /v1/completions`
-- `POST /v1/messages`
+- `GET /v1/models/{id}`
+- `POST /v1/chat/completions` — OpenAI-compatible
+- `POST /v1/completions` — OpenAI-compatible
+- `POST /v1/responses` — OpenAI Responses (Codex CLI)
+- `POST /v1/messages` — Anthropic-compatible (Claude Code style clients)
+- `GET /metrics` — Prometheus counters (spec-decode acceptance, token totals)
 
-The Flash and PRO model endpoints are compatibility aliases. They both report
-the model currently loaded from the GGUF passed with `-m`; the endpoint name does
-not select a different model.
+`GET /v1/models/{id}` accepts any id (`deepseek-v4-flash`, `deepseek-v4-pro`)
+as a compatibility alias: it reports the model actually loaded from the GGUF
+passed with `-m`; the id does not select a different model.
 
 There is no `/health` endpoint; use `GET /v1/models` as the health probe.
 
