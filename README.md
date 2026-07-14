@@ -1013,3 +1013,58 @@ first answer:
   logit/model issues.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
+
+## Roadmap
+
+This is the current development direction. Near-term items are planned for
+the v1.x series; longer-term items are directional and may be reordered or
+dropped as measurements come in.
+
+### Near term (v1.x)
+
+- **Temperature-matched draft sampling.** Today drafts are proposed greedily
+  and verified with exact sampled acceptance against the target distribution.
+  The next step is to sample drafts from a real q-distribution built at the
+  request's sampling parameters, with a fused GPU p/q rejection verify:
+  accept with probability `min(1, p/q)`, sample the `(p - q)+` residual on
+  rejection. This is expected to roughly double draft acceptance at
+  temperature compared to greedy drafts. Prior art: the p/q scheme from the
+  DSpark paper, and Marco Palaferri's independent GB10 fork
+  ([xangel82/DS4-GB10-GX10-DSpark-CUDA](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA),
+  MIT) as a reference implementation. Our version will keep the
+  exact-output-distribution property under top-k/top-p/min-p filtering, and
+  the statistical oracle used to validate sampled acceptance will be
+  extended to the p/q case.
+- **Fused K-row GPU accept kernel.** The sampled verify currently reads
+  per-row logits back to the host; a fused accept kernel removes that
+  readback from the decode loop.
+- **Online drafter confidence calibration.** Replace the static
+  confidence schedule that trims low-confidence draft tails with an
+  adaptive threshold calibrated from observed acceptance.
+- **Agent-loop speculative decoding.** Wire speculative decoding into the
+  native agent loop, with rewind-on-forced-token handling so injected
+  protocol tokens do not desynchronize the drafter.
+- **Final measured-allocation release artifact.** Re-solve the prisma
+  allocation at the correct byte budget, requantize, and publish the
+  resulting GGUF together with the quality/performance scoreboard.
+
+### Longer term
+
+- **Multi-session serving.** The supported scope today is one live session
+  at a time. First a session pool with round-robin scheduling and KV-budget
+  admission control; later, batched multi-session decode. Decode is
+  weight-bandwidth-bound, so co-scheduled sessions share a single read of
+  the weights and aggregate throughput should scale near-linearly.
+- **MXFP6 tensor-core paths**, if measured demand holds. MXFP6 (E2M3) is
+  expected to beat `Q6_K` on quality-per-byte for FP8-source tensors.
+- **MoE verify-microbatch routing audit.** Verify batches are only a few
+  rows but currently pass through prefill-shaped routing machinery; audit
+  it and skip what a small batch does not need.
+- **Retire the remaining CPU compute paths.** The engine is CUDA-only; the
+  leftover host-side decode code inherited from upstream should go. In the
+  same pass, revisit the Q8_K activation quantization used by the MoE
+  kernels.
+- **Upstream quantization-pipeline fixes.** Offer the fixes developed here
+  for the measured-KL allocation pipeline — Fisher-proxy normalization,
+  footprint accounting, solver corrections, DP decision units — to the
+  [PrismaQuant](https://github.com/RobTand/prismaquant) project.
