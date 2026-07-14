@@ -34,20 +34,9 @@ It also consumes the local golden fixture:
 ./ds4_test --local-golden-vectors
 ```
 
-The Metal SSD-streaming cache-pressure repro for issue #384 is a focused
-variant of the official-vector check. It forces a 16GiB routed-expert cache and
-runs only the `short_code_completion` case that exposes wrong logits when
-layer-batched decode reuses expert-cache buffers before the command buffer has
-completed:
-
-```sh
-DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
-  ./ds4_test --metal-ssd-streaming-cache-pressure
-```
-
-The runner opens the normal non-quality path with accelerator-specific fast
-routes disabled and pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict
-official-vector check.
+The `--logprob-vectors` runner opens the normal non-quality path with
+accelerator-specific fast routes disabled and pins `DS4_CUDA_PREFILL_CHUNK=2048`
+for this strict official-vector check.
 
 `official.vec` is intentionally trivial to parse from C: each case points to a
 prompt file and each expected token is hex-encoded by bytes. The official JSON
@@ -57,7 +46,7 @@ API response.
 To inspect a local top-logprob dump manually:
 
 ```sh
-./ds4 --metal --nothink -sys "" --temp 0 -n 4 --ctx 16384 \
+./ds4 --cuda --nothink -sys "" --temp 0 -n 4 --ctx 16384 \
   --prompt-file tests/test-vectors/prompts/long_code_audit.txt \
   --dump-logprobs /tmp/long_code_audit.ds4.json \
   --logprobs-top-k 20

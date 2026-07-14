@@ -30,7 +30,7 @@ The corpus is provider-neutral and also includes language/prose rewriting,
 summarization, copy-editing, extraction, multilingual translation, programming
 prompts, Bash scripting, algorithm recall, `ds4-eval` benchmark-reasoning
 prompts, long-context code synthesis, agent transcript replay, log diagnosis,
-prose fact recovery, delayed-constraint and small needle tasks, Metal/C code
+prose fact recovery, delayed-constraint and small needle tasks, CUDA/C code
 review tasks, and inference-specific debugging tasks.
 
 For normal imatrix collection, use `rendered_prompts.txt` so calibration covers

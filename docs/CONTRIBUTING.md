@@ -64,9 +64,6 @@ For kernel or GPU-path changes, also run the CUDA smoke regression:
 make cuda-regression
 ```
 
-The CPU backend is a reference/debug path (select it at runtime with
-`--cpu`), not a performance target.
-
 ## Quality Checks For Quantization Changes
 
 For GGUF or quantization work, use the official-continuation scorer in

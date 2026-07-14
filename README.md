@@ -76,7 +76,6 @@ However, we try to keep the project in a usable state, and we are making
 progress. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
 
-The `ds4-agent` is alpha quality, the project was later added.
 
 ## More Documentation
 
@@ -249,39 +248,6 @@ run-to-run deterministic: accumulation orders are fixed everywhere
 (no atomic-order races, no split-K reduction schemes), so the same prompt,
 sampling parameters, and seed reproduce the same output across runs, and the
 speculative verify pass sees exactly the numerics plain decode would.
-
-## Native agent
-
-DwarfStar features a native coding agent that works in a different way
-than most other systems: the inference is controlled from within the agent
-itself, without socket/API boundaries, so the session is represented
-by the on-disk KV cache itself. Moreover the tools and the system prompt
-are all designed vertically for DeepSeek v4 Flash and PRO. This provides a
-few advantages:
-
-* Low latency experience, bounded mainly by the prefill speed limits. Displaying of generated text, tool calling, start of a new session are always instantaneous.
-* Live progress bar during prefill time.
-* No DSML tool calling conversion, the tools are handled natively in the LLM format.
-* KV cache mismatch are impossible by construction, the current state is always the truth.
-* Everything is tuned for this model.
-* Ability to switch saved sessions with `/list` and `/switch`; full KV sessions resume without a prefill stage.
-
-Agent sessions are stored in `~/.ds4/kvcache`. Use `/save` to persist the
-current session, `/list` to show saved sessions sorted by recent update time,
-and `/switch <sha>` to resume one of them. The session ID is stable across
-future saves and is derived from the first user prompt and creation time.
-`/del <sha>` removes a saved session. `/strip <sha>` keeps the rendered
-conversation text and title but removes the heavy KV payload; switching to a
-stripped session rebuilds the KV cache by prefilling the saved text.
-
-Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
-so relative runtime paths such as the default `./ds4flash.gguf` model and
-`dir-steering/` data resolve from the project tree.
-
-However while the system already works, there is a lot of work to do
-in order to make it ready for prime time. When finally the agent will reach
-the wanted shape, we will *likely* split the server and the client creating a stateful
-session-based protocol that can recreate all that in a client-server way.
 
 ## Benchmarking
 

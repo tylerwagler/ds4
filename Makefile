@@ -48,10 +48,10 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_120f
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH=sm_120f
 
 cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH=native
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
@@ -59,7 +59,7 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval CUDA_ARCH="$(CUDA_ARCH)"
 
 ds4: src/cli/ds4_cli.o src/lib/ds4_help.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -123,9 +123,8 @@ ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/r
 ds4_agent_test: tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_agent_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
-test: ds4_test ds4_agent_test ds4-eval
+test: ds4_test ds4-eval
 	./ds4-eval --self-test-extractors
-	./ds4_agent_test
 	./ds4_test
 
 clean:

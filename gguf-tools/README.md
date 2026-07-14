@@ -7,7 +7,7 @@ The important pieces are:
 
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
 - `quants.[ch]`: the deliberately small local quantization implementation used
-  by the quantizer.  It implements the DS4 output formats we actually ship:
+  by the quantizer.  It implements the DS4 scalar quant formats:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.

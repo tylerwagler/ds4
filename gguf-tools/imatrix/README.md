@@ -35,7 +35,7 @@ gguf-tools/imatrix/dataset/rendered_prompts.txt
 It contains DS4-rendered chat prompts, separated by visible
 `DS4_IMATRIX_PROMPT` markers.  The prompts include:
 
-- C/Metal source-review prompts from this repository.
+- C/CUDA source-review prompts from this repository.
 - Long-context snippets.
 - Agent/tool-call prompts using DS4's DSML syntax.
 - Language/prose rewriting, summarization, extraction, and translation prompts.
@@ -86,7 +86,7 @@ Useful smoke-test limits:
   --imatrix-max-tokens 4096
 ```
 
-The collector is Metal-only because it hooks the layer-major Metal prefill graph.
+The collector is CUDA-only because it hooks the layer-major CUDA prefill graph.
 It does not change inference math; it reads the already materialized MoE inputs
 and accumulates `sum(x[column]^2)` per routed expert.
 
