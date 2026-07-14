@@ -93,6 +93,10 @@ next sections.
   routed-MoE imatrix is collected and used.
 - [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
   how the calibration prompt corpus is generated.
+- [gguf-tools/prisma/README.md](gguf-tools/prisma/README.md): measured-KL
+  per-layer expert-format allocation, used to build the mixed-quant GGUFs.
+- [docs/MODEL_CARD.md](docs/MODEL_CARD.md): synopsis of the official DeepSeek
+  V4 model card, with the architecture details that matter for DS4.
 - [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
   how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
@@ -110,8 +114,8 @@ binder is stricter than upstream's.** It accepts exactly:
 
 | Tensor group | Accepted formats |
 | --- | --- |
-| Attention projections, shared experts | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales) |
-| Routed experts gate/up/down | `IQ2_XXS`/`IQ2_XXS`/`Q2_K`, or all three `MXFP4` |
+| Attention projections, shared experts | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales), run on the FP8 tensor-core GEMM path |
+| Routed experts gate/up/down | Per layer: gate/up as a matching pair in `IQ2_XXS`/`Q2_K`/`MXFP4`, down independently in `IQ2_XXS`/`Q2_K`/`MXFP4`; or all three in the CUTLASS tensor-core `MXFP4` layout |
 | Output head | `BF16` or MXFP8 |
 | Norms, embeddings, indexer, HC | `F32`/`F16` |
 
@@ -120,9 +124,32 @@ error. This means the GGUFs published for upstream ds4 do not load in this
 fork: they use `Q8_0` attention/shared-expert/output tensors (and `Q4_K` in
 the q4 and PRO variants). GGUFs for this fork are produced offline with the
 tools in [gguf-tools/](gguf-tools/README.md), starting from the original FP8
-safetensors. The asymmetric-quantization idea is unchanged from upstream:
-only the routed MoE experts — the large majority of the model bytes — are
-pushed to 2 or 4 bits, while everything else stays high precision.
+safetensors (`deepseek4-quantize`, driven per tensor by a `--format-map`
+manifest from the prisma allocator). The asymmetric-quantization idea is
+unchanged from upstream: only the routed MoE experts — the large majority of
+the model bytes — are pushed to 2 or 4 bits, while everything else stays high
+precision.
+
+A few things this fork's GGUFs do beyond upstream:
+
+- **Per-layer expert formats.** The expert combo is validated per layer, so
+  one GGUF can mix formats across layers. The production allocation is
+  measured, not guessed: the prisma pipeline measures real per-layer KL and
+  promotes whole layers from the `IQ2_XXS`/`Q2_K` floor to `MXFP4` under a
+  byte budget. The `MXFP4` expert tensors are a byte-lossless re-encode of
+  the original Hugging Face expert weights, so promoted layers pay zero
+  requantization loss. Gate/up and down formats are chosen independently per
+  layer; the CUTLASS tensor-core layout is the one exception, since its
+  grouped GEMM runs the whole expert FFN in one dispatch, it applies to all
+  three tensors or none. The measured-allocation build is the current release
+  candidate under evaluation; a uniform all-`Q2_K` build is the fallback.
+- **REAP expert pruning.** Production GGUFs are REAP expert-pruned: expert
+  tensors are dense-trimmed to a per-layer survivor count while the router
+  stays padded to the full expert count. This trades a small quality margin
+  for significant residency headroom on the GB10.
+- **Merged DSpark drafter.** The speculative drafter's tensors ship inside
+  the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
+  speculative decoding section below.
 
 `download_model.sh` still fetches the **upstream** GGUF artifacts, kept for
 reference and as requantization inputs; remember they will not load directly
@@ -164,10 +191,11 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 ## Speed
 
 Performance is measured on this fork's target hardware — a **DGX Spark GB10**
-running the ~97 GB MXFP8/IQ2 Flash build — with `tool-eval-bench` performance
-runs. Decode is bandwidth-bound and stays roughly flat as context grows;
-prefill tapers slowly as the long-context indexer scan grows; the DSpark
-speculative drafter lifts greedy decode well above the single-stream baseline.
+running the ~87 GB REAP-pruned MXFP8/IQ2 Flash build — with `tool-eval-bench`
+performance runs. Decode is bandwidth-bound and stays roughly flat as context
+grows; prefill tapers slowly as the long-context indexer scan grows; the
+DSpark speculative drafter lifts decode well above the single-stream baseline
+at every temperature.
 
 <!-- TODO(release): populate with numbers from tool-eval-bench performance runs before announce. -->
 
@@ -177,11 +205,42 @@ _Throughput table pending current `tool-eval-bench` runs._
 
 DwarfStar is a fully resident engine: the CUDA path makes the whole model
 resident in GPU-addressable memory at load time, plus KV cache, graph scratch,
-and activations. On a 128 GB GB10, the production Flash GGUF (~76 GB), a 64k
-KV cache, and the DSpark drafter all fit together with a comfortable margin.
+and activations. On a 128 GB GB10, the production REAP-pruned Flash GGUF
+(~87 GB, DSpark drafter included), a 64k KV cache, and generation scratch all
+fit together with a comfortable margin.
 A model that does not fit is rejected at startup with a clear error instead of
 silently degrading — there is no partial-residency or streaming fallback, so a
 successful load is also a residency guarantee for the whole run.
+
+Long-context KV state is kept compact by default: the compressed-attention
+cache uses a bit-exact packed value layout (`DS4_ATTN_PACK`, on by default),
+and the ratio-4 indexer cache — the dominant KV term at very long context —
+is stored MXFP4-packed (`DS4_IDX_FP4`, on by default). Set either to `0` only
+for debugging comparisons against the plain f32 layouts.
+
+## Speculative decoding (DSpark)
+
+DwarfStar has exactly one drafter: **DSpark**. The earlier MTP drafter path
+was removed rather than kept as a semi-supported variant. The drafter's
+tensors ship merged inside the main model GGUF and the engine auto-enables
+speculative decoding when it detects them at load — no extra file or flag
+needed. `--no-dspark` opts out, and `--dspark PATH` still loads a split
+drafter file. `ds4-bench` intentionally measures the plain-decode baseline.
+
+Acceptance is **exact sampled acceptance at all temperatures**: a draft token
+is accepted with its filtered target probability, and on rejection the engine
+samples from the residual distribution. The speculative path filters logits
+exactly like the plain sampler (temperature scale, top-k, min-p, top-p), so
+the output distribution is provably identical to plain sampling — greedy
+decoding is just the point-mass special case of the same walk. Speculative
+decoding is purely a speedup, never a quality knob, and it now applies to the
+sampling recipes people actually use, not only `--temp 0`.
+
+This guarantee is only meaningful because decode and prefill numerics are
+run-to-run deterministic: accumulation orders are fixed everywhere
+(no atomic-order races, no split-K reduction schemes), so the same prompt,
+sampling parameters, and seed reproduce the same output across runs, and the
+speculative verify pass sees exactly the numerics plain decode would.
 
 ## Reducing heat, power usage and fan noise
 
@@ -410,7 +469,12 @@ the shared prefix instead of pre-filling from token zero.
 Request parsing and sockets run in client threads, but inference itself is
 serialized through one graph worker. The current server does not batch multiple
 independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+live graph/session. That is the supported release scope: **one live session at
+a time**, with a context you can size up to the model's 1M-token limit.
+Two guardrails keep a misbehaving client from wedging the server: concurrent
+client connections are capped (64; connections over the cap get an immediate
+503 instead of piling up threads), and a whole-request read deadline (30
+seconds) drops clients that never finish sending their request.
 
 Supported endpoints:
 
@@ -452,7 +516,10 @@ ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
 
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
 mode, reasoning is streamed in the native API shape instead of being mixed into
-final text. OpenAI chat streaming
+final text. This holds even when generation stops inside an unterminated
+`<think>` block (token cap or stop sequence): the partial reasoning is
+returned on the reasoning channel and never as visible content, on both the
+streaming and non-streaming paths. OpenAI chat streaming
 also streams tool calls as soon as the DSML invocation is recognized: the tool
 header is sent first, then parameter bytes are forwarded as
 `tool_calls[].function.arguments` deltas while generation continues. The
@@ -529,11 +596,12 @@ higher than the `--ctx` value you started the server with:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-You can use larger context and larger cache if you wish. Full context of
-1M tokens is going to use more or less 26GB of memory (compressed indexer
-alone will be like 22GB), so configure a context which makes sense in
-your system. On the GB10 with ~128GB of unified memory, the 97GB Flash build
-leaves limited headroom, so a context window of 100~300k tokens is wiser.
+You can use larger context and larger cache if you wish, up to the model's
+1M-token context limit. The default MXFP4-packed indexer cache keeps
+long-context KV state far below its old f32 cost, but configure a context
+which makes sense in your system: on the GB10 with ~128GB of unified memory,
+the ~87GB Flash build takes most of the memory, so size the context window to
+the headroom you actually have and to the prefill time you are willing to pay.
 
 The `384000` output limit below avoids token caps since the model is able
 to generate very long replies otherwise (up to 384k tokens). The server
