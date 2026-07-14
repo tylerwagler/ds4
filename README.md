@@ -1,8 +1,8 @@
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
-machines. It is
+**DeepSeek V4 Flash**, with **DeepSeek V4 PRO** as an opportunistic target on
+very high-memory machines. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DeepSeek specific loading,
@@ -141,8 +141,11 @@ A few things this fork's GGUFs do beyond upstream:
   requantization loss. Gate/up and down formats are chosen independently per
   layer; the CUTLASS tensor-core layout is the one exception, since its
   grouped GEMM runs the whole expert FFN in one dispatch, it applies to all
-  three tensors or none. The measured-allocation build is the current release
-  candidate under evaluation; a uniform all-`Q2_K` build is the fallback.
+  three tensors or none. The measured-allocation build is the **shipped
+  release**: in a hardmode `tool-eval-bench` bake-off it scored 92/100 against
+  84/100 for a uniform all-`Q2_K` build, so the measured build ships and the
+  all-`Q2_K` build was dropped. Recommended sampling for the shipped build is
+  `--temp 0.95 --top-p 0.38`.
 - **REAP expert pruning.** Production GGUFs are REAP expert-pruned: expert
   tensors are dense-trimmed to a per-layer survivor count while the router
   stays padded to the full expert count. This trades a small quality margin
@@ -151,22 +154,22 @@ A few things this fork's GGUFs do beyond upstream:
   the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
   speculative decoding section below.
 
-`download_model.sh` still fetches the **upstream** GGUF artifacts, kept for
-reference and as requantization inputs; remember they will not load directly
-here. **Prefer the imatrix versions.**
+`download_model.sh` fetches this fork's shipped GGUF from our release repo,
+published by **Elytron Defense**. It has a single target:
 
 ```sh
-./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
-./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
-./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
-./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
+./download_model.sh v5mx   # measured-allocation release build, ~91 GB on disk
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model.
-Authentication is optional for public downloads, but `--token TOKEN`,
-`HF_TOKEN`, or the local Hugging Face token cache are used when present.
+This downloads `ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf`
+(91,321,404,640 bytes, sha256
+`86d7d83d49b0dd212db822c609f1bdca9085718602fbec226cb9c9245f73dff0`) from
+<https://huggingface.co/twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF>,
+stores it under `./gguf/`, and updates `./ds4flash.gguf` to point at it. The
+script prefers the Xet-aware Hugging Face CLI (`hf download`, chunk-deduplicated
+and resumable) when present and falls back to `curl -C -` otherwise. The repo is
+public, so authentication is optional; `--token TOKEN`, `HF_TOKEN`, or the local
+Hugging Face token cache are used when present.
 
 If you want to regenerate GGUF files or collect a new imatrix, see
 [gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
@@ -191,23 +194,29 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 ## Speed
 
 Performance is measured on this fork's target hardware — a **DGX Spark GB10**
-running the ~87 GB REAP-pruned MXFP8/IQ2 Flash build — with `tool-eval-bench`
-performance runs. Decode is bandwidth-bound and stays roughly flat as context
+running the ~91 GB REAP-pruned MXFP8/IQ2 Flash build — with `tool-eval-bench`
+performance runs. Decode is bandwidth-bound and stays flat as context
 grows; prefill tapers slowly as the long-context indexer scan grows; the
 DSpark speculative drafter lifts decode well above the single-stream baseline
 at every temperature.
 
-<!-- TODO(release): populate with numbers from tool-eval-bench performance runs before announce. -->
+| Context depth | Prefill (t/s) | Decode (t/s, speculative) |
+| ---: | ---: | ---: |
+| 2k | ~420 | 16.5 |
+| 8k | ~390 | 16.5 |
 
-_Throughput table pending current `tool-eval-bench` runs._
+Decode is measured with the merged DSpark drafter on structured/tool
+workloads, where draft acceptance holds at α = 77.2%. Decode throughput is flat
+with context depth out to 8k; the small prefill taper from ~420 to ~390 t/s is
+the growing long-context indexer scan.
 
 ## Model residency
 
 DwarfStar is a fully resident engine: the CUDA path makes the whole model
 resident in GPU-addressable memory at load time, plus KV cache, graph scratch,
 and activations. On a 128 GB GB10, the production REAP-pruned Flash GGUF
-(~87 GB, DSpark drafter included), a 64k KV cache, and generation scratch all
-fit together with a comfortable margin.
+(~91 GB weights + merged DSpark drafter), a 64k KV cache, and generation
+scratch all fit together with a comfortable margin.
 A model that does not fit is rejected at startup with a clear error instead of
 silently degrading — there is no partial-residency or streaming fallback, so a
 successful load is also a residency guarantee for the whole run.
@@ -600,7 +609,7 @@ You can use larger context and larger cache if you wish, up to the model's
 1M-token context limit. The default MXFP4-packed indexer cache keeps
 long-context KV state far below its old f32 cost, but configure a context
 which makes sense in your system: on the GB10 with ~128GB of unified memory,
-the ~87GB Flash build takes most of the memory, so size the context window to
+the ~91GB Flash build takes most of the memory, so size the context window to
 the headroom you actually have and to the prefill time you are willing to pay.
 
 The `384000` output limit below avoids token caps since the model is able
@@ -1044,9 +1053,9 @@ dropped as measurements come in.
 - **Agent-loop speculative decoding.** Wire speculative decoding into the
   native agent loop, with rewind-on-forced-token handling so injected
   protocol tokens do not desynchronize the drafter.
-- **Final measured-allocation release artifact.** Re-solve the prisma
-  allocation at the correct byte budget, requantize, and publish the
-  resulting GGUF together with the quality/performance scoreboard.
+
+The measured-allocation release artifact has **shipped** (the `v5mx` build; see
+Model Weights and Speed above); it is no longer a near-term roadmap item.
 
 ### Longer term
 
