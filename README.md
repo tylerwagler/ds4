@@ -250,28 +250,6 @@ run-to-run deterministic: accumulation orders are fixed everywhere
 sampling parameters, and seed reproduce the same output across runs, and the
 speculative verify pass sees exactly the numerics plain decode would.
 
-## Reducing heat, power usage and fan noise
-
-Long local inference runs can keep the GPU busy for extended periods. If you
-care more about heat, fan noise, power draw, or reducing thermal
-stress on the hardware than about maximum throughput, use `--power N`.
-
-`--power 100` is the default and means full speed. Lower values ask DwarfStar to target
-that percentage of GPU usage: `--power 70` targets about 70%, `--power 50`
-targets about half usage, and so forth. DwarfStar does this by measuring GPU work time
-and inserting small sleeps between work units: during prefill it sleeps between
-layers, and during generation it sleeps between decoded tokens. This reduces
-sustained load without changing model output.
-
-The option is available on the CLI, server, agent, eval, and benchmark tools,
-for example:
-
-```sh
-./ds4 --power 50
-./ds4-agent --power 70
-./ds4-server --power 40 --ctx 100000
-```
-
 ## Native agent
 
 DwarfStar features a native coding agent that works in a different way
