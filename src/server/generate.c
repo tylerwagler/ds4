@@ -80,7 +80,7 @@ static int chat_think_tool_recovery(server *s,
     ds4_tokens toks = {0};
     ds4_tokenize_rendered_chat(s->engine, inject, &toks);
 
-    const int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    const int room = ds4_session_ctx(s->slots[0].sess) - ds4_session_pos(s->slots[0].sess);
     if (toks.len <= 0 ||
         toks.len >= room ||
         *completion + toks.len >= max_tokens) {
@@ -93,7 +93,7 @@ static int chat_think_tool_recovery(server *s,
     }
 
     for (int i = 0; i < toks.len; i++) {
-        if (ds4_session_eval(s->session, toks.v[i], err, errlen) != 0) {
+        if (ds4_session_eval(s->slots[0].sess, toks.v[i], err, errlen) != 0) {
             ds4_tokens_free(&toks);
             return -1;
         }
@@ -172,7 +172,7 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
                                                    char *err, size_t errlen) {
     if (tokens_appended) *tokens_appended = 0;
     if (!s || !suffix || !suffix[0]) return true;
-    const ds4_tokens *live = ds4_session_tokens(s->session);
+    const ds4_tokens *live = ds4_session_tokens(s->slots[0].sess);
     if (!live) {
         if (err && errlen) snprintf(err, errlen, "live session is unavailable");
         return false;
@@ -180,10 +180,10 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
 
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
-    const int before = ds4_session_pos(s->session);
-    bool ok = ds4_session_sync(s->session, &target, err, errlen) == 0;
+    const int before = ds4_session_pos(s->slots[0].sess);
+    bool ok = ds4_session_sync(s->slots[0].sess, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
-        int delta = ds4_session_pos(s->session) - before;
+        int delta = ds4_session_pos(s->slots[0].sess) - before;
         *tokens_appended = delta > 0 ? delta : 0;
     }
     ds4_tokens_free(&target);
@@ -442,10 +442,10 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
     thinking_live_remember(s, visible);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(s->session), strlen(visible));
+               ctx, ds4_session_pos(s->slots[0].sess), strlen(visible));
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
-                ds4_session_pos(s->session), strlen(visible));
+                ds4_session_pos(s->slots[0].sess), strlen(visible));
     free(visible);
 }
 
@@ -474,10 +474,10 @@ static void remember_tool_thinking_checkpoint(server *s, const job *j, const cha
         thinking_live_remember(s, visible.ptr);
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
-                   ctx, ds4_session_pos(s->session), visible.len);
+                   ctx, ds4_session_pos(s->slots[0].sess), visible.len);
         trace_event(s, trace_id,
                     "tool thinking checkpoint remembered: live=%d visible=%zu",
-                    ds4_session_pos(s->session), visible.len);
+                    ds4_session_pos(s->slots[0].sess), visible.len);
     }
     free(suffix);
     buf_free(&visible);
@@ -503,12 +503,12 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
 
     ds4_tokens canonical = {0};
     ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = ds4_session_pos(s->session);
-    const int common = ds4_session_common_prefix(s->session, &canonical);
+    const int live_len = ds4_session_pos(s->slots[0].sess);
+    const int common = ds4_session_common_prefix(s->slots[0].sess, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, ds4_session_tokens(s->session), &live_text_len);
+    char *live_text = render_tokens_text(s->engine, ds4_session_tokens(s->slots[0].sess), &live_text_len);
     if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
@@ -529,7 +529,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
 
     char err[160] = {0};
     ds4_session_rewrite_result rr =
-        ds4_session_rewrite_from_common(s->session, &canonical, common,
+        ds4_session_rewrite_from_common(s->slots[0].sess, &canonical, common,
                                         err, sizeof(err));
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
@@ -547,7 +547,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
-        if (loaded == 0) ds4_session_invalidate(s->session);
+        if (loaded == 0) ds4_session_invalidate(s->slots[0].sess);
 
         char sync_err[160] = {0};
         const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
@@ -593,11 +593,11 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             .headers_sent = true,
         };
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
-        ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
-        ds4_session_set_display_progress(s->session, server_progress_cb, &rebuild_progress);
-        if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
-            ds4_session_set_progress(s->session, NULL, NULL);
-            ds4_session_set_display_progress(s->session, NULL, NULL);
+        ds4_session_set_progress(s->slots[0].sess, server_progress_cb, &rebuild_progress);
+        ds4_session_set_display_progress(s->slots[0].sess, server_progress_cb, &rebuild_progress);
+        if (ds4_session_sync(s->slots[0].sess, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            ds4_session_set_progress(s->slots[0].sess, NULL, NULL);
+            ds4_session_set_display_progress(s->slots[0].sess, NULL, NULL);
             const double rebuild_sec = server_now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
@@ -615,8 +615,8 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                             common, live_len, canonical.len, err);
             }
         } else {
-            ds4_session_set_progress(s->session, NULL, NULL);
-            ds4_session_set_display_progress(s->session, NULL, NULL);
+            ds4_session_set_progress(s->slots[0].sess, NULL, NULL);
+            ds4_session_set_display_progress(s->slots[0].sess, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
@@ -667,10 +667,10 @@ bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *call
 void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
-    const int old_pos = ds4_session_pos(s->session);
-    const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
+    const int old_pos = ds4_session_pos(s->slots[0].sess);
+    const int common = ds4_session_common_prefix(s->slots[0].sess, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
-    trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
+    trace_cache_capture(&cache_diag, ds4_session_tokens(s->slots[0].sess),
                         &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
@@ -873,8 +873,8 @@ void generate_job(server *s, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
-    ds4_session_set_progress(s->session, server_progress_cb, &progress);
-    ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
+    ds4_session_set_progress(s->slots[0].sess, server_progress_cb, &progress);
+    ds4_session_set_display_progress(s->slots[0].sess, server_progress_cb, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -907,11 +907,11 @@ void generate_job(server *s, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+        if (ds4_session_sync(s->slots[0].sess, &prefix, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
-            ds4_session_set_progress(s->session, NULL, NULL);
-            ds4_session_set_display_progress(s->session, NULL, NULL);
+            ds4_session_set_progress(s->slots[0].sess, NULL, NULL);
+            ds4_session_set_display_progress(s->slots[0].sess, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
@@ -931,10 +931,10 @@ void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+    if (ds4_session_sync(s->slots[0].sess, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
-        ds4_session_set_progress(s->session, NULL, NULL);
-        ds4_session_set_display_progress(s->session, NULL, NULL);
+        ds4_session_set_progress(s->slots[0].sess, NULL, NULL);
+        ds4_session_set_display_progress(s->slots[0].sess, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
@@ -949,8 +949,8 @@ void generate_job(server *s, job *j) {
     if (!responses_live_continuation) responses_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
-    ds4_session_set_progress(s->session, NULL, NULL);
-    ds4_session_set_display_progress(s->session, NULL, NULL);
+    ds4_session_set_progress(s->slots[0].sess, NULL, NULL);
+    ds4_session_set_display_progress(s->slots[0].sess, NULL, NULL);
     kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -1046,7 +1046,7 @@ decode_again:
     const char *finish = "length";
     int completion = 0;
     int max_tokens = j->req.max_tokens;
-    int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    int room = ds4_session_ctx(s->slots[0].sess) - ds4_session_pos(s->slots[0].sess);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
@@ -1086,7 +1086,7 @@ decode_again:
     }
 
     while (!g_stop_requested && completion < max_tokens &&
-           ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+           ds4_session_pos(s->slots[0].sess) < ds4_session_ctx(s->slots[0].sess)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -1115,7 +1115,7 @@ decode_again:
         if (ds4_engine_has_dspark(s->engine) && dspark_spec_enabled) {
             /* the speculative block owns sampling (exact sampled acceptance at
              * any temperature; greedy degenerates to the argmax rule) */
-            ntok = ds4_session_generate_speculative(s->session,
+            ntok = ds4_session_generate_speculative(s->slots[0].sess,
                                                     temperature, top_k, top_p, min_p,
                                                     &rng,
                                                     max_tokens - completion,
@@ -1129,12 +1129,12 @@ decode_again:
                 break;
             }
         } else {
-            token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+            token = ds4_session_sample(s->slots[0].sess, temperature, top_k, top_p, min_p, &rng);
             if (token == ds4_token_eos(s->engine)) {
                 finish = "stop";
                 break;
             }
-            if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+            if (ds4_session_eval(s->slots[0].sess, token, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
@@ -1318,7 +1318,7 @@ decode_again:
                 finish = "stop";
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
-                ds4_session_invalidate(s->session);
+                ds4_session_invalidate(s->slots[0].sess);
                 stop_decode = true;
                 break;
             }

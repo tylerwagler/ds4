@@ -568,9 +568,81 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+/* ---- Session pool (multi-session serving, increment 1) ----
+ *
+ * PROCESS-GLOBAL CUDA STATE AUDIT (Tier 1 §1.5 — must-do, read before growing
+ * the pool or adding GPU threads).
+ *
+ * All GPU work in this server runs on the SINGLE worker thread (worker_main in
+ * generate.c). Client threads only parse HTTP and block on a per-job condvar
+ * until the worker finishes (http_server.c handle path); they never touch a
+ * ds4_session_* or ds4_gpu_* entry point. Verified by grepping every
+ * ds4_session_/ds4_gpu_ call site in src/server/*.c: all of them are reached
+ * only from generate_job / worker_main (or from cli_main startup/shutdown,
+ * before the worker starts and after it joins). No CUDA call is made off the
+ * worker thread. This is a correctness invariant, not an accident.
+ *
+ * It matters because the CUDA layer keeps process-global, NON-thread-safe state
+ * that all sessions share:
+ *   - g_cublas / g_cublaslt handles (ds4_cuda_runtime.cu, ds4_cuda_matmul.cu),
+ *     bound to cudaStreamPerThread;
+ *   - the MXFP8 weight map g_fp8_mx_by_offset (std::unordered_map) plus its
+ *     direct-mapped front cache fc_off/fc_ptr (ds4_cuda_matmul.cu);
+ *   - the function-local static lt_shape_cache (ds4_cuda_matmul.cu);
+ *   - the determinism setting CUBLASLT_REDUCTION_SCHEME_NONE (ds4_cuda_matmul.cu).
+ *
+ * Because these are shared and unlocked, Tier 1 keeps ONE GPU worker thread and
+ * multiplexes sessions by time-slicing on that thread. Tier 2 must NOT naively
+ * spawn a second GPU thread: cudaStreamPerThread would give it a distinct
+ * stream but it would still race on g_cublas/g_cublaslt and the weight/shape
+ * caches. Any future concurrency stays on the single GPU lane (batched kernels),
+ * not multiple GPU threads, until these globals are made per-context.
+ *
+ * Increment 1 is pure structural plumbing: the pool has capacity 1, the worker
+ * owns slot 0 and runs each job to completion exactly as the old single-session
+ * server did. Scheduling, re-entrancy, eviction, and batched decode are later
+ * increments. */
+
+/* Pool capacity. 1 keeps behavior bit-identical to the single-session server;
+ * later increments raise this once generate_job is slot-scoped/re-entrant. */
+#define DS4_SESSION_POOL_CAP 1
+
+/* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
+ * usable; weights are queried at runtime (ds4_engine_weights_resident_bytes).
+ * The overhead reserve covers the CUDA context, cuBLASLt workspaces
+ * (~32 MiB/GEMM), and model-mmap page-cache slack. */
+#define DS4_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
+#define DS4_SERVER_PROCESS_OVERHEAD_BYTES (4ull * 1024ull * 1024ull * 1024ull)
+
+typedef enum {
+    SLOT_IDLE = 0,     /* no live job; sess may be warm and reusable */
+    SLOT_PREFILLING,   /* ingesting a prompt (chunked prefill) */
+    SLOT_DECODING,     /* generating tokens */
+    SLOT_EVICTED,      /* graph freed, KV held only in evicted_payload */
+} slot_state;
+
+/* A pool slot owns one logical session's GPU state. In increment 1 only slot 0
+ * is provisioned and the scheduler/eviction fields are inert (documented so the
+ * shape is stable for later increments). */
+typedef struct {
+    ds4_session *sess;                    /* live session; NULL until admitted */
+    struct job  *active_job;              /* request bound to this slot, or NULL */
+    slot_state   state;
+    int          ctx_size;                /* context this slot was admitted for */
+    uint64_t     est_cost_bytes;          /* admission-accounted packed KV+scratch cost */
+    uint64_t     tokens_emitted;          /* decode bookkeeping (scheduler; unused in inc 1) */
+    uint64_t     last_serviced_us;        /* last quantum wall-clock (scheduler; unused) */
+    ds4_session_snapshot *evicted_payload; /* host KV when SLOT_EVICTED (unused in inc 1) */
+} session_slot;
+
 struct server {
     ds4_engine *engine;
-    ds4_session *session;
+    /* Session pool. Capacity DS4_SESSION_POOL_CAP (currently 1). The worker
+     * uses slot 0 exactly as the old single `session` field. */
+    session_slot slots[DS4_SESSION_POOL_CAP];
+    int          n_slots;            /* provisioned slots */
+    uint64_t     kv_budget_bytes;    /* admission ceiling computed at startup */
+    uint64_t     kv_committed_bytes; /* sum of est_cost_bytes over live slots (under mu) */
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;

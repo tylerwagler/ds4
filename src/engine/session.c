@@ -1736,6 +1736,21 @@ int ds4_engine_layer_count(ds4_engine *e) {
 
 
 
+uint64_t ds4_engine_weights_resident_bytes(ds4_engine *e) {
+    if (!e) return 0;
+    /* The GGUF(s) are mmap'd read-only and shared across every session, so this
+     * is a single resident copy competing with per-session KV for the unified
+     * memory budget.  A merged/embedded drafter lives inside e->model and is
+     * already counted; an external drafter and an expert overlay map their own
+     * files and are added when present. */
+    uint64_t bytes = e->model.size;
+    if (e->dspark_ready && e->dspark_external) bytes += e->dspark_model.size;
+    if (e->overlay_ready) bytes += e->overlay_model.size;
+    return bytes;
+}
+
+
+
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
     (void)e;
     if (layer >= DS4_N_LAYER) return 0;

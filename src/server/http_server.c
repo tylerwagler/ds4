@@ -152,7 +152,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             ds4_session_ctx(s->slots[0].sess),
                              s->default_tokens);
 }
 
@@ -189,8 +189,8 @@ static bool send_metrics(server *s, int fd) {
     ds4_spec_metrics m;
     ds4_engine_spec_metrics(s->engine, &m);
     const char *model = server_model_id_from_engine(s->engine);
-    const int pos = ds4_session_pos(s->session);
-    const int ctx = ds4_session_ctx(s->session);
+    const int pos = ds4_session_pos(s->slots[0].sess);
+    const int ctx = ds4_session_ctx(s->slots[0].sess);
     double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
     if (kv > 1.0) kv = 1.0;
     /* Scheduler gauges + prefill counters (single worker -> running is 0/1). */
@@ -318,7 +318,7 @@ void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->session);
+    const int ctx_size = ds4_session_ctx(s->slots[0].sess);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));

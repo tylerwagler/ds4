@@ -1173,6 +1173,49 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend,
 
 
 
+/* Packed variant of the estimate: recompute the three persistent KV caches
+ * (raw ring, attn comp, indexer comp) with the real element/row widths the
+ * graph actually allocates (see gpu_graph_alloc_raw_cap in gpu_diag.c), rather
+ * than the sizeof(float) pessimistic upper bound the base estimate uses.  The
+ * f32 scratch working set (batch_* buffers etc.) is not packed and carries
+ * through from the base estimate unchanged. */
+ds4_context_memory ds4_context_memory_estimate_packed(
+        ds4_backend backend,
+        int         ctx_size,
+        uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(backend, ctx_size, prefill_chunk);
+    if (!ds4_backend_uses_graph(backend)) return m;
+
+    const uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+
+    /* Raw SWA ring: f16 rows under DS4_RAW_F16 (default on), else f32. */
+    const uint64_t raw_elem_bytes = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
+                                                                 : sizeof(float);
+    m.raw_bytes = (uint64_t)DS4_N_LAYER * m.raw_cap * DS4_N_HEAD_DIM * raw_elem_bytes;
+
+    /* Compressed caches: DS4_ATTN_PACK attn comp row + MXFP4 indexer row. */
+    const uint64_t attn_row_bytes  = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    m.compressed_bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint32_t layer_comp_cap = ctx / ratio + 2u;
+        m.compressed_bytes += (uint64_t)layer_comp_cap * attn_row_bytes;
+        if (ratio == 4) {
+            m.compressed_bytes += (uint64_t)layer_comp_cap * index_row_bytes;
+        }
+    }
+
+    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+    return m;
+}
+
+
+
 
 
 

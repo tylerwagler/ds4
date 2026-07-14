@@ -146,6 +146,20 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
+/* Like ds4_context_memory_estimate_with_prefill, but the persistent KV caches
+ * are sized with their real packed element/row widths (f16 raw + DS4_ATTN_PACK
+ * attn comp + MXFP4 indexer) instead of the sizeof(float) upper bound.  This is
+ * the number to use for admission accounting: it reflects actual residency,
+ * which is materially smaller (~4x attn KV, ~8x indexer) than the f32 estimate.
+ * The f32 scratch working set is carried through unchanged. */
+ds4_context_memory ds4_context_memory_estimate_packed(
+        ds4_backend backend,
+        int ctx_size,
+        uint32_t prefill_chunk);
+/* Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
+ * GGUF plus an external drafter and expert overlay when mapped separately.
+ * This competes with per-session KV for the unified-memory budget. */
+uint64_t ds4_engine_weights_resident_bytes(ds4_engine *e);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
