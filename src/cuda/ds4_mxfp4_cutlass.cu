@@ -13,6 +13,8 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 
@@ -49,6 +51,42 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 using ElementSF = cutlass::float_ue8m0_t;
+
+// ---- GROUPED (ptr-array) MXFP4 GEMM: one launch runs every active expert's GEMM. ----
+// Same element/tile config as the per-expert path above, but the builders take POINTER
+// layout tags (LayoutA*, ...), which selects the SM120 blockscaled *array* collective and
+// the KernelPtrArrayTmaWarpSpecializedCooperative schedule (KernelScheduleAuto -> cooperative
+// for grouped; verified accepted by sm120_blockscaled_mma_builder.inl:226-230). Per-group
+// {M,N,K}, A/B/D + SFA/SFB pointer arrays, and per-group strides/SF-layouts are all built on
+// DEVICE from the sorted-pairs/offsets buffers -- no host readback, zero host sync.
+using GProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
+using GCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+    TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAcc, ElementAcc, ElementC, LayoutC*, AlignC, ElementD, LayoutD*, AlignD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+using GCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+    ElementA, LayoutA*, AlignA, ElementB, LayoutB*, AlignB, ElementAcc,
+    TileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename GCollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using GGemmKernel = cutlass::gemm::kernel::GemmUniversal<GProblemShape, GCollectiveMainloop, GCollectiveEpilogue>;
+using GGemm = cutlass::gemm::device::GemmUniversalAdapter<GGemmKernel>;
+
+using GProbElem  = typename GProblemShape::UnderlyingProblemShape;   // Shape<int,int,int>
+using GStrideA   = typename GGemmKernel::InternalStrideA;
+using GStrideB   = typename GGemmKernel::InternalStrideB;
+using GStrideC   = typename GGemmKernel::InternalStrideC;
+using GStrideD   = typename GGemmKernel::InternalStrideD;
+using GLayoutSFA = typename GGemmKernel::CollectiveMainloop::InternalLayoutSFA;
+using GLayoutSFB = typename GGemmKernel::CollectiveMainloop::InternalLayoutSFB;
+using GSm1xxBlkScaledConfig = typename GGemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+using GElemA  = typename GGemm::ElementA;
+using GElemB  = typename GGemm::ElementB;
+using GElemSF = typename GGemmKernel::CollectiveMainloop::ElementSF;
+using GElemC  = typename GGemm::ElementC;
+using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 
 // ---- device activation packer (validated): f32 [M,K] RowMajor -> A data (packed E2M1) + SF (swizzled) ----
 __device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
@@ -248,6 +286,229 @@ extern "C" int ds4_cutlass_expert_ffn(
   cudaDeviceSynchronize();
   cudaFree(scratch);
   return rc;
+}
+
+// ============================================================================================
+// GROUPED MXFP4 PREFILL FFN — single ptr-array grouped GEMM per logical matmul (gate/up/down),
+// replacing routed_moe_launch_cutlass's blocking per-expert host loop. All per-group problem
+// shapes, pointers, strides and SF-layouts are built on DEVICE from the sorted-pairs/offsets
+// buffers; there is NO host readback and NO host sync.
+//
+// SF-LAYOUT INVARIANT (the highest-risk part): the SM120 blockscaled SF atom spans 128 rows
+// (Blk_MN). CUTLASS grouped GEMM reads each group's A-side SF starting at ptr_SFA[g] with its
+// own tile_atom_to_shape_SFA(M_g,K) layout, so every group's rows MUST start on a 128-row
+// boundary in the packed activation buffer. We therefore GATHER each expert's tokens to a
+// 128-padded row offset (padded_offsets[e], a multiple of 128) and pack the whole padded buffer
+// with ONE tile_atom_to_shape_SFA(padded_total,K). Because tile_to_shape(..., Step<_2,_1>) makes
+// the M-tile the outer (slowest) dimension, M-tile t begins at exactly t*per_Mtile_sf elements,
+// so ptr_SFA[e] = SFA_base + (padded_offsets[e]/128)*per_Mtile_sf indexes group e's SF exactly,
+// and the per-group tile_atom_to_shape_SFA(count[e],K) view reads its real rows [0,count[e]).
+// Getting this offset/stride wrong reads scrambled scales — the standalone self-check below
+// exercises a multi-expert problem list against the same double-precision oracle to catch it.
+// ============================================================================================
+
+static int grouped_sm_count(){
+  static int sc = -1;
+  if (sc < 0){ int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0); sc = v > 0 ? v : 1; }
+  return sc;
+}
+
+// Physical SF-A element count for exactly one 128-row M-tile at inner dim K (host + device).
+static __host__ __device__ long grouped_per_mtile_sfA(int K){
+  return (long)cute::size(cute::filter_zeros(GSm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(128, 0, K, 1))));
+}
+
+// One thread per expert e in [0,n_total). Builds every device array the grouped GEMM needs for
+// ONE logical matmul of constant (N,K) across groups (M_g = counts[e]). ptr_A/ptr_SFA index the
+// shared packed-activation buffer at the group's 128-padded row; ptr_B/ptr_SFB index the model
+// weight block for expert e; ptr_D indexes the padded output at the same padded row.
+__global__ static void g_build_arrays(
+    GProbElem *prob,
+    const GElemA **ptrA, GStrideA *dA, const GElemSF **ptrSFA, GLayoutSFA *lSFA,
+    const GElemB **ptrB, GStrideB *dB, const GElemSF **ptrSFB, GLayoutSFB *lSFB,
+    const GElemC **ptrC, GStrideC *dC, GElemD **ptrD, GStrideD *dD,
+    const uint32_t *counts, const uint32_t *padded_off,
+    const uint8_t *A_data, const uint8_t *A_sf, long per_mtile_sfA,
+    const uint8_t *B_base, uint64_t B_stride, uint64_t B_data_bytes,
+    GElemD *D_base, int N, int K, int n_total){
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= n_total) return;
+  int M = (int)counts[e];
+  uint32_t roff = padded_off[e];
+  prob[e] = make_shape(M, N, K);
+  dA[e] = cutlass::make_cute_packed_stride(GStrideA{}, cute::make_shape(M, K, 1));
+  dB[e] = cutlass::make_cute_packed_stride(GStrideB{}, cute::make_shape(N, K, 1));
+  dC[e] = cutlass::make_cute_packed_stride(GStrideC{}, cute::make_shape(M, N, 1));
+  dD[e] = cutlass::make_cute_packed_stride(GStrideD{}, cute::make_shape(M, N, 1));
+  lSFA[e] = GSm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+  lSFB[e] = GSm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+  ptrA[e]   = reinterpret_cast<const GElemA*>(A_data + (size_t)roff * (K / 2));
+  ptrSFA[e] = reinterpret_cast<const GElemSF*>(A_sf + (size_t)(roff / 128u) * per_mtile_sfA);
+  ptrB[e]   = reinterpret_cast<const GElemB*>(B_base + (size_t)e * B_stride);
+  ptrSFB[e] = reinterpret_cast<const GElemSF*>(B_base + (size_t)e * B_stride + B_data_bytes);
+  ptrC[e]   = nullptr;                                    // beta = 0, C unused
+  ptrD[e]   = D_base + (size_t)roff * N;
+}
+
+// Per-group device array set for one logical GEMM shape.
+struct GArrays {
+  GProbElem   *prob;
+  const GElemA **ptrA;  GStrideA *dA;
+  const GElemB **ptrB;  GStrideB *dB;
+  const GElemSF **ptrSFA; GLayoutSFA *lSFA;
+  const GElemSF **ptrSFB; GLayoutSFB *lSFB;
+  const GElemC **ptrC;  GStrideC *dC;
+  GElemD      **ptrD;   GStrideD *dD;
+};
+
+static size_t g_arrays_bytes(int n_total){
+  size_t a = 256, off = 0;
+  auto add = [&](size_t n){ size_t r = off; off = align_up_bytes(off + n, a); (void)r; return r; };
+  add(sizeof(GProbElem)*n_total);
+  add(sizeof(GElemA*)*n_total); add(sizeof(GStrideA)*n_total);
+  add(sizeof(GElemB*)*n_total); add(sizeof(GStrideB)*n_total);
+  add(sizeof(GElemSF*)*n_total); add(sizeof(GLayoutSFA)*n_total);
+  add(sizeof(GElemSF*)*n_total); add(sizeof(GLayoutSFB)*n_total);
+  add(sizeof(GElemC*)*n_total); add(sizeof(GStrideC)*n_total);
+  add(sizeof(GElemD*)*n_total); add(sizeof(GStrideD)*n_total);
+  return off;
+}
+
+static GArrays g_arrays_place(uint8_t *base, int n_total){
+  GArrays g{}; size_t a = 256, off = 0;
+  auto add = [&](size_t n)->uint8_t*{ uint8_t *p = base + off; off = align_up_bytes(off + n, a); return p; };
+  g.prob   = (GProbElem*)  add(sizeof(GProbElem)*n_total);
+  g.ptrA   = (const GElemA**)add(sizeof(GElemA*)*n_total); g.dA = (GStrideA*)add(sizeof(GStrideA)*n_total);
+  g.ptrB   = (const GElemB**)add(sizeof(GElemB*)*n_total); g.dB = (GStrideB*)add(sizeof(GStrideB)*n_total);
+  g.ptrSFA = (const GElemSF**)add(sizeof(GElemSF*)*n_total); g.lSFA = (GLayoutSFA*)add(sizeof(GLayoutSFA)*n_total);
+  g.ptrSFB = (const GElemSF**)add(sizeof(GElemSF*)*n_total); g.lSFB = (GLayoutSFB*)add(sizeof(GLayoutSFB)*n_total);
+  g.ptrC   = (const GElemC**)add(sizeof(GElemC*)*n_total); g.dC = (GStrideC*)add(sizeof(GStrideC)*n_total);
+  g.ptrD   = (GElemD**)     add(sizeof(GElemD*)*n_total); g.dD = (GStrideD*)add(sizeof(GStrideD)*n_total);
+  return g;
+}
+
+static size_t grouped_gemm_workspace_bytes(int n_total, int sm_count){
+  cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
+  typename GGemm::Arguments args{};
+  args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
+  args.problem_shape = {n_total, nullptr, nullptr};
+  args.hw_info = hw;
+  args.epilogue.thread.alpha = 1.0f;
+  args.epilogue.thread.beta  = 0.0f;
+  return GGemm::get_workspace_size(args);
+}
+
+// Launch one grouped blockscaled MXFP4 GEMM over n_total groups (inactive experts carry M=0 and
+// contribute zero M-tiles). Deterministic per problem list; caller owns ordering.
+static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int sm_count){
+  cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
+  typename GGemm::Arguments args{
+    cutlass::gemm::GemmUniversalMode::kGrouped,
+    {n_total, g.prob, nullptr},
+    {g.ptrA, g.dA, g.ptrB, g.dB, g.ptrSFA, g.lSFA, g.ptrSFB, g.lSFB},
+    {{}, g.ptrC, g.dC, g.ptrD, g.dD},
+    hw};
+  args.epilogue.thread.alpha = 1.0f;
+  args.epilogue.thread.beta  = 0.0f;
+  GGemm gemm;
+  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 1;
+  if (gemm.initialize(args, workspace) != cutlass::Status::kSuccess) return 2;
+  return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
+}
+
+// ---- Scratch layout for the grouped FFN (sizing and execution stay in lock-step). ----
+struct ds4_grouped_scratch_layout {
+  size_t xA_off, xSF_off, gate_off, up_off, mid_off, midA_off, midSF_off;
+  size_t gu_arr_off, dn_arr_off, ws_gu_off, ws_dn_off;
+  size_t xSF_bytes, midSF_bytes, ws_bytes, total_bytes;
+};
+
+static ds4_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
+                                                         int in_dim, int mid_dim, int out_dim){
+  ds4_grouped_scratch_layout L{};
+  const size_t a = 256; size_t off = 0;
+  int sm = grouped_sm_count();
+  int tiles = padded_total / 128;
+  L.xA_off = off;  off = align_up_bytes(off + (size_t)padded_total*in_dim/2, a);
+  L.xSF_bytes = (size_t)tiles * grouped_per_mtile_sfA(in_dim) * sizeof(ElementSF);
+  L.xSF_off = off; off = align_up_bytes(off + L.xSF_bytes, a);
+  L.gate_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
+  L.up_off   = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
+  L.mid_off  = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
+  L.midA_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim/2, a);
+  L.midSF_bytes = (size_t)tiles * grouped_per_mtile_sfA(mid_dim) * sizeof(ElementSF);
+  L.midSF_off = off; off = align_up_bytes(off + L.midSF_bytes, a);
+  L.gu_arr_off = off; off = align_up_bytes(off + g_arrays_bytes(n_total), a);
+  L.dn_arr_off = off; off = align_up_bytes(off + g_arrays_bytes(n_total), a);
+  L.ws_bytes = grouped_gemm_workspace_bytes(n_total, sm);
+  L.ws_gu_off = off; off = align_up_bytes(off + L.ws_bytes, a);
+  L.ws_dn_off = off; off = align_up_bytes(off + L.ws_bytes, a);
+  L.total_bytes = off;
+  return L;
+}
+
+extern "C" size_t ds4_cutlass_grouped_moe_scratch_bytes(
+    int padded_total, int n_total_expert, int in_dim, int mid_dim, int out_dim){
+  return grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim).total_bytes;
+}
+
+// Grouped MXFP4 FFN. x_gathered/w_gathered are the per-slot activations gathered to 128-padded
+// row offsets (padding rows must be pre-zeroed by the caller). Writes ffn_out[padded_total,out_dim]
+// (the caller scatters the real rows into the flat down buffer, then moe_sum reduces). No host sync.
+extern "C" int ds4_cutlass_grouped_moe(
+    float *ffn_out, const float *x_gathered, const float *w_gathered,
+    const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
+    uint64_t gate_stride, uint64_t gate_data_bytes,
+    uint64_t down_stride, uint64_t down_data_bytes,
+    float clamp, int n_total_expert,
+    int in_dim, int mid_dim, int out_dim,
+    const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
+    uint8_t *scratch, size_t scratch_bytes){
+  ds4_grouped_scratch_layout L = grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim);
+  if (!scratch || scratch_bytes < L.total_bytes) return -1;
+  int sm = grouped_sm_count();
+  uint8_t   *xA   = scratch + L.xA_off;
+  ElementSF *xSF  = reinterpret_cast<ElementSF*>(scratch + L.xSF_off);
+  float     *gate = reinterpret_cast<float*>(scratch + L.gate_off);
+  float     *up   = reinterpret_cast<float*>(scratch + L.up_off);
+  float     *mid  = reinterpret_cast<float*>(scratch + L.mid_off);
+  uint8_t   *midA = scratch + L.midA_off;
+  ElementSF *midSF= reinterpret_cast<ElementSF*>(scratch + L.midSF_off);
+  GArrays gu = g_arrays_place(scratch + L.gu_arr_off, n_total_expert);
+  GArrays dn = g_arrays_place(scratch + L.dn_arr_off, n_total_expert);
+  void *ws_gu = L.ws_bytes ? (void*)(scratch + L.ws_gu_off) : nullptr;
+  void *ws_dn = L.ws_bytes ? (void*)(scratch + L.ws_dn_off) : nullptr;
+
+  cudaMemsetAsync(xSF, 0, L.xSF_bytes);
+  cudaMemsetAsync(midSF, 0, L.midSF_bytes);
+
+  // Pack the whole padded activation buffer once (one global SF layout; per-group slices below).
+  pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+
+  const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
+  long pmt_in  = grouped_per_mtile_sfA(in_dim);
+  long pmt_mid = grouped_per_mtile_sfA(mid_dim);
+
+  // gate arrays (D = gate) and up arrays (share A/SFA, D = up) — built as two calls.
+  g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
+      gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
+      gate_w,gate_stride,gate_data_bytes, gate, mid_dim, in_dim, n_total_expert);
+  if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
+
+  g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
+      gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
+      up_w,gate_stride,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
+  if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
+
+  { long n = (long)padded_total*mid_dim; int t = 256, b = (int)((n+t-1)/t);
+    swiglu_kernel<<<b,t>>>(mid, gate, up, w_gathered, clamp, mid_dim, n); }
+
+  pack_activation(midA, midSF, mid, padded_total, mid_dim);
+  g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
+      dn.ptrC,dn.dC,dn.ptrD,dn.dD, counts,padded_offsets, midA,(const uint8_t*)midSF,pmt_mid,
+      down_w,down_stride,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
+  if (run_grouped_gemm(n_total_expert, dn, ws_dn, sm) != 0) return 3;
+  return 0;
 }
 
 // ---- Small-batch expert FFN via direct fp4 GEMV (spec-decode verify, n_tokens 2..4). ----
@@ -607,6 +868,79 @@ static void host_to_source(const std::vector<float>& W, std::vector<uint8_t>& e2
     for(int i=0;i<16;i++){ int k=kb*32+i*2; uint8_t lo=h_nib(W[(size_t)n*K+k]/sc), hi=h_nib(W[(size_t)n*K+k+1]/sc); row[i]=(uint8_t)(lo|(hi<<4)); }
   }
 }
+// Multi-expert grouped-GEMM self-check: several experts, tokens round-robin-routed (n_expert=1),
+// run the grouped entry end-to-end (gather to 128-padded rows -> grouped gate/up/down -> scatter)
+// and compare per-token output to a double-precision CPU oracle. Catches SF-slice/offset bugs.
+static int run_grouped_selfcheck(){
+  // E experts total but tokens routed ONLY to a subset -> the rest carry count==0 (M==0 groups),
+  // exactly like a real prefill chunk where not every expert is hit. Verifies the grouped kernel
+  // tolerates empty groups (else the on-model path would silently fall back to the per-expert loop).
+  const int E=8, T=311, in_dim=256, mid_dim=256, out_dim=256; const float clamp=4.0f;
+  const int active[4]={1,3,4,6};   // experts 0,2,5,7 stay empty
+  std::mt19937 rng(11); std::normal_distribution<float> nd(0.f,1.f);
+  std::vector<float> X((size_t)T*in_dim); for(auto&v:X) v=nd(rng);
+  std::vector<std::vector<float>> Wg(E),Wu(E),Wd(E),dqWg(E),dqWu(E),dqWd(E);
+  std::vector<std::vector<uint8_t>> Bgd(E),Bud(E),Bdd(E);
+  std::vector<std::vector<ElementSF>> Bgs(E),Bus(E),Bds(E);
+  for(int e=0;e<E;e++){
+    Wg[e].resize((size_t)mid_dim*in_dim); Wu[e].resize((size_t)mid_dim*in_dim); Wd[e].resize((size_t)out_dim*mid_dim);
+    for(auto&v:Wg[e])v=nd(rng)*0.3f; for(auto&v:Wu[e])v=nd(rng)*0.3f; for(auto&v:Wd[e])v=nd(rng)*0.3f;
+    host_pack_weight(Bgd[e],Bgs[e],dqWg[e],Wg[e],mid_dim,in_dim);
+    host_pack_weight(Bud[e],Bus[e],dqWu[e],Wu[e],mid_dim,in_dim);
+    host_pack_weight(Bdd[e],Bds[e],dqWd[e],Wd[e],out_dim,mid_dim);
+  }
+  // routing: round-robin token->expert; per-token routing weight
+  std::vector<int> sel(T); std::vector<float> route(T);
+  for(int t=0;t<T;t++){ sel[t]=active[t%4]; route[t]=0.5f+std::abs(nd(rng))*0.5f; }
+  std::vector<uint32_t> counts(E,0); for(int t=0;t<T;t++) counts[sel[t]]++;
+  std::vector<uint32_t> padoff(E); uint32_t run=0; for(int e=0;e<E;e++){ padoff[e]=run; run+=(counts[e]+127u)/128u*128u; }
+  const int padded_total=(int)run;
+  // gather to padded rows (per-expert running index), record padded row per token for scatter
+  std::vector<float> xg((size_t)padded_total*in_dim,0.f), wg((size_t)padded_total,0.f);
+  std::vector<int> tok_row(T); std::vector<uint32_t> cur=padoff;
+  for(int t=0;t<T;t++){ uint32_t R=cur[sel[t]]++; tok_row[t]=(int)R;
+    for(int k=0;k<in_dim;k++) xg[(size_t)R*in_dim+k]=X[(size_t)t*in_dim+k]; wg[R]=route[t]; }
+  // oracle (double precision) per token
+  std::vector<float> dqX; host_quant_act(X,dqX,T,in_dim);
+  std::vector<float> mid((size_t)T*mid_dim), ref((size_t)T*out_dim,0.f), dqMid;
+  for(int t=0;t<T;t++){ int e=sel[t];
+    for(int j=0;j<mid_dim;j++){ double g=0,u=0; for(int k=0;k<in_dim;k++){ g+=(double)dqX[(size_t)t*in_dim+k]*dqWg[e][(size_t)j*in_dim+k]; u+=(double)dqX[(size_t)t*in_dim+k]*dqWu[e][(size_t)j*in_dim+k]; }
+      float gf=(float)g,uf=(float)u; if(clamp>1e-6f){if(gf>clamp)gf=clamp;if(uf>clamp)uf=clamp;if(uf<-clamp)uf=-clamp;} mid[(size_t)t*mid_dim+j]=(gf/(1.f+expf(-gf)))*uf*route[t]; } }
+  host_quant_act(mid,dqMid,T,mid_dim);
+  for(int t=0;t<T;t++){ int e=sel[t]; for(int o=0;o<out_dim;o++){ double a=0; for(int j=0;j<mid_dim;j++) a+=(double)dqMid[(size_t)t*mid_dim+j]*dqWd[e][(size_t)o*mid_dim+j]; ref[(size_t)t*out_dim+o]=(float)a; } }
+  // build device weight blobs [data||sf] per expert, stride = data + sf
+  const size_t gdata=(size_t)mid_dim*in_dim/2, gsf=Bgs[0].size()*sizeof(ElementSF);
+  const size_t ddata=(size_t)out_dim*mid_dim/2, dsf=Bds[0].size()*sizeof(ElementSF);
+  const uint64_t gstride=gdata+gsf, dstride=ddata+dsf;
+  std::vector<uint8_t> gate_blob((size_t)E*gstride), up_blob((size_t)E*gstride), down_blob((size_t)E*dstride);
+  for(int e=0;e<E;e++){
+    memcpy(gate_blob.data()+e*gstride, Bgd[e].data(), gdata); memcpy(gate_blob.data()+e*gstride+gdata, Bgs[e].data(), gsf);
+    memcpy(up_blob.data()  +e*gstride, Bud[e].data(), gdata); memcpy(up_blob.data()  +e*gstride+gdata, Bus[e].data(), gsf);
+    memcpy(down_blob.data()+e*dstride, Bdd[e].data(), ddata); memcpy(down_blob.data()+e*dstride+ddata, Bds[e].data(), dsf);
+  }
+  uint8_t *dGate,*dUp,*dDown; cudaMalloc(&dGate,gate_blob.size()); cudaMalloc(&dUp,up_blob.size()); cudaMalloc(&dDown,down_blob.size());
+  cudaMemcpy(dGate,gate_blob.data(),gate_blob.size(),cudaMemcpyHostToDevice);
+  cudaMemcpy(dUp,up_blob.data(),up_blob.size(),cudaMemcpyHostToDevice);
+  cudaMemcpy(dDown,down_blob.data(),down_blob.size(),cudaMemcpyHostToDevice);
+  float *dXg,*dWg2,*dFfn; cudaMalloc(&dXg,xg.size()*4); cudaMalloc(&dWg2,wg.size()*4); cudaMalloc(&dFfn,(size_t)padded_total*out_dim*4);
+  cudaMemcpy(dXg,xg.data(),xg.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dWg2,wg.data(),wg.size()*4,cudaMemcpyHostToDevice);
+  uint32_t *dCounts,*dPadoff; cudaMalloc(&dCounts,E*4); cudaMalloc(&dPadoff,E*4);
+  cudaMemcpy(dCounts,counts.data(),E*4,cudaMemcpyHostToDevice); cudaMemcpy(dPadoff,padoff.data(),E*4,cudaMemcpyHostToDevice);
+  size_t sb=ds4_cutlass_grouped_moe_scratch_bytes(padded_total,E,in_dim,mid_dim,out_dim);
+  uint8_t *dScr; cudaMalloc(&dScr,sb);
+  int rc=ds4_cutlass_grouped_moe(dFfn,dXg,dWg2,dGate,dUp,dDown,gstride,gdata,dstride,ddata,
+        clamp,E,in_dim,mid_dim,out_dim,dCounts,dPadoff,padded_total,dScr,sb);
+  cudaDeviceSynchronize();
+  std::vector<float> ffn((size_t)padded_total*out_dim); cudaMemcpy(ffn.data(),dFfn,ffn.size()*4,cudaMemcpyDeviceToHost);
+  double maxrel=0,maxabs=0; int bad=0;
+  for(int t=0;t<T;t++){ const float*o=ffn.data()+(size_t)tok_row[t]*out_dim; const float*r=ref.data()+(size_t)t*out_dim;
+    for(int c=0;c<out_dim;c++){ double a=fabs((double)o[c]-r[c]); double rr=a/(fabs(r[c])+1e-3); if(rr>maxrel)maxrel=rr; if(a>maxabs)maxabs=a; if(rr>0.05&&a>0.1)bad++; } }
+  printf("grouped(E=%d T=%d padded=%d): rc=%d max_rel=%.5f max_abs=%.4f bad=%d -> %s\n",
+         E,T,padded_total,rc,maxrel,maxabs,bad,(rc==0&&bad==0)?"PASS":"FAIL");
+  cudaFree(dGate);cudaFree(dUp);cudaFree(dDown);cudaFree(dXg);cudaFree(dWg2);cudaFree(dFfn);cudaFree(dCounts);cudaFree(dPadoff);cudaFree(dScr);
+  return (rc==0&&bad==0)?0:1;
+}
+
 int main(int argc,char**argv){
   int T=256,in_dim=2048,mid_dim=1408,out_dim=2048;
   if(argc>=5){T=atoi(argv[1]);in_dim=atoi(argv[2]);mid_dim=atoi(argv[3]);out_dim=atoi(argv[4]);}
@@ -648,6 +982,8 @@ int main(int argc,char**argv){
   double maxrel=0,maxabs=0; int bad=0;
   for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-ref[i]); double r=a/(fabs(ref[i])+1e-3); if(r>maxrel)maxrel=r; if(a>maxabs)maxabs=a; if(r>0.05&&a>0.1)bad++; }
   printf("rc=%d  max_rel=%.5f max_abs=%.4f bad=%d/%zu  -> %s\n", rc,maxrel,maxabs,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
-  return (rc==0&&bad==0)?0:1;
+  int single_fail = (rc==0&&bad==0)?0:1;
+  int grouped_fail = run_grouped_selfcheck();
+  return (single_fail==0 && grouped_fail==0)?0:1;
 }
 #endif

@@ -933,6 +933,42 @@ int ds4_cutlass_expert_ffn_gemv_small(
         int             mid_dim,
         int             out_dim);
 
+/* Grouped (ptr-array) MXFP4 prefill FFN: runs EVERY active expert's gate/up/down as a single
+ * blockscaled grouped GEMM launch each -- replacing the per-expert host loop + blocking offsets
+ * readback in routed_moe_launch_cutlass. Per-group problem shapes, A/B/D + SFA/SFB pointer arrays
+ * and SF-layouts are built on device from `counts`/`padded_offsets`; there is no host readback.
+ *
+ * The caller must gather each expert's tokens to 128-ROW-PADDED offsets (padded_offsets[e], a
+ * multiple of 128) into x_gathered[padded_total,in_dim] + w_gathered[padded_total], PRE-ZEROING
+ * padding rows, because the SM120 SF atom spans 128 rows and each group's SF must start on a
+ * 128-row boundary. Output ffn_out[padded_total,out_dim] holds one pre-weighted result per padded
+ * row; the caller scatters the real rows into the flat down buffer (via the same padded map),
+ * then moe_sum reduces. `padded_total` is a host upper bound (multiple of 128); inactive experts
+ * carry M=0 and contribute nothing. `scratch` must be >= the *_scratch_bytes value. No host sync. */
+size_t ds4_cutlass_grouped_moe_scratch_bytes(
+        int padded_total, int n_total_expert, int in_dim, int mid_dim, int out_dim);
+int ds4_cutlass_grouped_moe(
+        float          *ffn_out,
+        const float    *x_gathered,
+        const float    *w_gathered,
+        const uint8_t  *gate_w,
+        const uint8_t  *up_w,
+        const uint8_t  *down_w,
+        uint64_t        gate_stride,
+        uint64_t        gate_data_bytes,
+        uint64_t        down_stride,
+        uint64_t        down_data_bytes,
+        float           clamp,
+        int             n_total_expert,
+        int             in_dim,
+        int             mid_dim,
+        int             out_dim,
+        const uint32_t *counts,
+        const uint32_t *padded_offsets,
+        int             padded_total,
+        uint8_t        *scratch,
+        size_t          scratch_bytes);
+
 /* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
  * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
  * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to ds4_cutlass_pack_source so the

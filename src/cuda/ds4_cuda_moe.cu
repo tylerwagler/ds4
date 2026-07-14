@@ -1851,6 +1851,238 @@ static int routed_moe_launch_cutlass(
 
 
 
+/* ---- Grouped MXFP4 prefill path (single ptr-array grouped GEMM per gate/up/down; no host
+ * readback, no host sync). Mirrors routed_moe_launch_cutlass but replaces the per-expert loop
+ * with ds4_cutlass_grouped_moe. Experts' tokens are gathered to 128-ROW-PADDED offsets so each
+ * group's block-scaled SF starts on a 128-row atom boundary (see ds4_cutlass_grouped_moe). ---- */
+
+/* padded_offsets[e] = sum_{e'<e} ceil(counts[e']/128)*128 (per-group 128-row-padded row base). */
+__global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uint32_t *counts, uint32_t n_total) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    uint32_t run = 0;
+    for (uint32_t e = 0; e < n_total; e++) {
+        padded_off[e] = run;
+        run += (counts[e] + 127u) / 128u * 128u;
+    }
+}
+
+/* One block per sorted-pair slot s: locate its expert e (offsets[e] <= s < offsets[e+1]), place
+ * the token's activation row at padded row padded_off[e] + (s - offsets[e]), record the routing
+ * weight and the originating pair index (padded_pair[R]) for the later scatter. */
+__global__ static void moe_padded_gather_kernel(
+        float *x_gathered, float *w_gathered, int32_t *padded_pair,
+        const float *x, const float *weights,
+        const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *padded_off,
+        uint32_t pair_count, uint32_t n_total, uint32_t n_expert, uint32_t in_dim) {
+    uint32_t s = blockIdx.x;
+    if (s >= pair_count) return;
+    /* upper_bound(offsets, s) - 1 over [0,n_total) */
+    uint32_t lo = 0, hi = n_total;
+    while (lo < hi) {
+        uint32_t midx = (lo + hi) >> 1;
+        if (offsets[midx] <= s) lo = midx + 1; else hi = midx;
+    }
+    uint32_t e = lo - 1u;
+    uint32_t i = s - offsets[e];
+    uint32_t R = padded_off[e] + i;
+    uint32_t pair = sorted_pairs[s];
+    uint32_t tok = pair / n_expert;
+    const float *src = x + (uint64_t)tok * in_dim;
+    float *dst = x_gathered + (uint64_t)R * in_dim;
+    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) dst[k] = src[k];
+    if (threadIdx.x == 0) { w_gathered[R] = weights[pair]; padded_pair[R] = (int32_t)pair; }
+}
+
+/* One block per padded row R: scatter the pre-weighted FFN result back to the flat down buffer at
+ * its originating pair (padding rows carry padded_pair<0 and are skipped). */
+__global__ static void moe_padded_scatter_kernel(
+        float *down_flat, const float *ffn_out, const int32_t *padded_pair,
+        uint32_t padded_total, uint32_t out_dim) {
+    uint32_t R = blockIdx.x;
+    if (R >= padded_total) return;
+    int32_t pair = padded_pair[R];
+    if (pair < 0) return;
+    const float *src = ffn_out + (uint64_t)R * out_dim;
+    float *dst = down_flat + (uint64_t)pair * out_dim;
+    for (uint32_t k = threadIdx.x; k < out_dim; k += blockDim.x) dst[k] = src[k];
+}
+
+static int routed_moe_launch_cutlass_grouped(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_stride,
+        uint64_t gate_data_bytes,
+        uint64_t down_stride,
+        uint64_t down_data_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens) {
+    if (!out || !down || !model_map || !selected || !weights || !x ||
+        n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
+        gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
+        selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    const uint64_t gate_total_bytes = (uint64_t)n_total_expert * gate_stride;
+    const uint64_t down_total_bytes = (uint64_t)n_total_expert * down_stride;
+    if (gate_total_bytes > model_size - gate_offset ||
+        gate_total_bytes > model_size - up_offset ||
+        down_total_bytes > model_size - down_offset) {
+        return 0;
+    }
+    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total_bytes, "moe_grouped_gate");
+    const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total_bytes, "moe_grouped_up");
+    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total_bytes, "moe_grouped_down");
+    if (!gate_w || !up_w || !down_w) return 0;
+
+    const uint32_t pair_count = n_tokens * n_expert;
+    /* Host upper bound on padded rows: every active expert adds <=127 padding; round to 128. */
+    const uint64_t padded_upper = (((uint64_t)pair_count + 128ull * n_total_expert + 127ull) / 128ull) * 128ull;
+
+    const uint64_t counts_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
+    const uint64_t offsets_bytes = ((uint64_t)n_total_expert + 1) * sizeof(uint32_t);
+    const uint64_t cursors_bytes = counts_bytes;
+    const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
+    const uint64_t padoff_bytes = counts_bytes;
+    const uint64_t xg_bytes = padded_upper * expert_in_dim * sizeof(float);
+    const uint64_t wg_bytes = padded_upper * sizeof(float);
+    const uint64_t ppair_bytes = padded_upper * sizeof(int32_t);
+    const uint64_t ffn_bytes = padded_upper * out_dim * sizeof(float);
+    const uint64_t grp_bytes = ds4_cutlass_grouped_moe_scratch_bytes(
+            (int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
+
+    const uint64_t align = 256;
+    uint64_t off = 0;
+    const uint64_t counts_off = off;  off = cutlass_moe_align_up(off + counts_bytes, align);
+    const uint64_t offsets_off = off; off = cutlass_moe_align_up(off + offsets_bytes, align);
+    const uint64_t cursors_off = off; off = cutlass_moe_align_up(off + cursors_bytes, align);
+    const uint64_t sorted_off = off;  off = cutlass_moe_align_up(off + sorted_bytes, align);
+    const uint64_t padoff_off = off;  off = cutlass_moe_align_up(off + padoff_bytes, align);
+    const uint64_t xg_off = off;      off = cutlass_moe_align_up(off + xg_bytes, align);
+    const uint64_t wg_off = off;      off = cutlass_moe_align_up(off + wg_bytes, align);
+    const uint64_t ppair_off = off;   off = cutlass_moe_align_up(off + ppair_bytes, align);
+    const uint64_t ffn_off = off;     off = cutlass_moe_align_up(off + ffn_bytes, align);
+    const uint64_t grp_off = off;     off = cutlass_moe_align_up(off + grp_bytes, align);
+    const uint64_t total_scratch = off;
+
+    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(total_scratch, "routed_moe grouped");
+    if (!scratch) return 0;
+
+    uint32_t *counts = (uint32_t *)(scratch + counts_off);
+    uint32_t *offsets = (uint32_t *)(scratch + offsets_off);
+    uint32_t *cursors = (uint32_t *)(scratch + cursors_off);
+    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_off);
+    uint32_t *padded_off = (uint32_t *)(scratch + padoff_off);
+    float *x_gathered = (float *)(scratch + xg_off);
+    float *w_gathered = (float *)(scratch + wg_off);
+    int32_t *padded_pair = (int32_t *)(scratch + ppair_off);
+    float *ffn_out = (float *)(scratch + ffn_off);
+    uint8_t *grp_scratch = scratch + grp_off;
+
+    const int32_t *selected_ptr = (const int32_t *)selected->ptr;
+    int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "moe_grouped counts clear");
+    /* padding rows must be zeroed (pack sees clean data) and unmapped (padded_pair = -1). */
+    if (ok) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_bytes), "moe_grouped xg clear");
+    if (ok) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_bytes), "moe_grouped wg clear");
+    if (ok) ok = cuda_ok(cudaMemsetAsync(padded_pair, 0xFF, ppair_bytes), "moe_grouped ppair clear");
+    if (ok) {
+        moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
+        ok = cuda_ok(cudaGetLastError(), "moe_grouped count launch");
+    }
+    if (ok) {
+        moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
+        ok = cuda_ok(cudaGetLastError(), "moe_grouped prefix launch");
+    }
+    if (ok) {
+        moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
+        ok = cuda_ok(cudaGetLastError(), "moe_grouped scatter launch");
+    }
+    if (ok) {
+        moe_padded_offsets_kernel<<<1, 1>>>(padded_off, counts, n_total_expert);
+        ok = cuda_ok(cudaGetLastError(), "moe_grouped padded offsets launch");
+    }
+    if (ok) {
+        moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair,
+                (const float *)x->ptr, (const float *)weights->ptr,
+                sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
+        ok = cuda_ok(cudaGetLastError(), "moe_grouped gather launch");
+    }
+    if (ok) {
+        int rc = ds4_cutlass_grouped_moe(ffn_out, x_gathered, w_gathered,
+                (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
+                gate_stride, gate_data_bytes, down_stride, down_data_bytes,
+                clamp, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
+                counts, padded_off, (int)padded_upper, grp_scratch, grp_bytes);
+        if (rc != 0) return 0;
+    }
+    if (ok) {
+        moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>((float *)down->ptr, ffn_out,
+                padded_pair, (uint32_t)padded_upper, out_dim);
+        ok = cuda_ok(cudaGetLastError(), "moe_grouped padded scatter launch");
+    }
+    if (!ok) return 0;
+
+    const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
+    moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
+            (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+    return cuda_ok(cudaGetLastError(), "moe_grouped sum launch");
+}
+
+/* A/B dispatcher: DS4_MOE_FP4_GROUPED=0 forces the legacy per-expert loop (routed_moe_launch_cutlass);
+ * default (unset or !=0) uses the grouped single-launch path. Same result, bit-exact. */
+static int routed_moe_launch_cutlass_dispatch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_stride, uint64_t gate_data_bytes, uint64_t down_stride, uint64_t down_data_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t n_tokens) {
+    static int grouped = -1;
+    if (grouped < 0) {
+        const char *e = getenv("DS4_MOE_FP4_GROUPED");
+        grouped = !(e && e[0] == '0');
+    }
+    if (grouped) {
+        int rc = routed_moe_launch_cutlass_grouped(out, down, model_map, model_size,
+                gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
+                down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+        {
+            static int glog = -1;
+            if (glog < 0) glog = getenv("DS4_MOE_GROUPED_LOG") != NULL ? 1 : 0;
+            static int logged = 0;
+            if (glog && !logged) { logged = 1;
+                fprintf(stderr, "ds4: moe grouped path rc=%d n_tok=%u n_total=%u n_exp=%u -> %s\n",
+                        rc, n_tokens, n_total_expert, n_expert, rc ? "USED grouped" : "FELL BACK to per-expert"); }
+        }
+        if (rc) return rc;   /* any failure falls through to the legacy loop (safety net) */
+    }
+    return routed_moe_launch_cutlass(out, down, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
+            down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+}
+
+
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -2400,6 +2632,13 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
+    {
+        static int entry_log = -1;
+        if (entry_log < 0) entry_log = getenv("DS4_MOE_PATH_LOG") != NULL ? 200 : 0;
+        if (entry_log > 0) { entry_log--;
+            fprintf(stderr, "ds4: moe_batch ENTRY layer=%u gate_type=%u down_type=%u n_tok=%u\n",
+                    layer_index, gate_type, down_type, n_tokens); }
+    }
     if (gate_type == 40u && down_type == 40u) {
         /* Small batches (spec-decode verify, n_tokens 2..4): direct fp4 GEMV over the
          * packed expert weights -- 4 launches per layer (act-roundtrip + gate/up+swiglu
@@ -2463,7 +2702,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
             /* any failure: fall through to the grouped CUTLASS path */
         }
         if (path_log > 0) fprintf(stderr, "ds4: moe40 layer=%u -> grouped\n", layer_index);
-        return routed_moe_launch_cutlass(out, down, model_map, model_size,
+        return routed_moe_launch_cutlass_dispatch(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,
                                          down_expert_bytes, down_row_bytes,
