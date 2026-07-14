@@ -62,6 +62,14 @@ static byte_buf i64_to_i32(const st_value *src) {
 }
 
 size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
+    if (type == DS4Q_TYPE_CUTLASS_MXFP4) {
+        /* Not a fixed-stride row format: per expert [K=ne[0], N=ne[1]] the
+         * blob is E2M1 data + a padded swizzled SF tile, expert-major. */
+        if (n_dims < 2) die("cutlass_mxfp4 tensor must be at least 2D");
+        size_t nbytes = ds4q_cutlass_mxfp4_bytes(ne[1], ne[0]);
+        for (int i = 2; i < n_dims; i++) nbytes *= (size_t)ne[i];
+        return nbytes;
+    }
     size_t nbytes = ds4q_row_size(type, ne[0]);
     for (int i = 1; i < n_dims; i++) nbytes *= (size_t)ne[i];
     return nbytes;
@@ -95,6 +103,8 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
         free(hf_name);
         return b;
     }
+    if (target == DS4Q_TYPE_CUTLASS_MXFP4)
+        die("cutlass_mxfp4 is only supported for routed-expert tensors");
     if (!is_quantizable_target(target)) die("unsupported regular target type");
     int64_t n = 0;
     float *f32 = NULL;
@@ -153,6 +163,20 @@ static void generate_one_expert(expert_job *j, int xid) {
     st_value w = db_read(j->db, weight_name);
     st_value s = db_read(j->db, scale_name);
     if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) die("expert shape mismatch");
+    if (j->target == DS4Q_TYPE_CUTLASS_MXFP4) {
+        /* Byte-lossless: the QAT source already stores E2M1 nibbles + E8M0
+         * block scales; copy them verbatim into the CUTLASS B layout. */
+        if (strcmp(w.dtype, "I8") != 0 || strcmp(s.dtype, "F8_E8M0") != 0)
+            die("cutlass_mxfp4 requires an E2M1(I8)+E8M0 QAT source");
+        if (s.n_dims != 2 || s.shape[0] != j->nrows || s.shape[1] * 32 != j->ncols)
+            die("expert scale shape mismatch");
+        ds4q_pack_cutlass_mxfp4(w.data, s.data,
+                                j->out->data + (size_t)xid * j->per_expert,
+                                j->nrows, j->ncols);
+        st_value_free(&w);
+        st_value_free(&s);
+        return;
+    }
     int64_t n = 0;
     float *f32 = dequant_fp4_weight(&w, &s, &n);
     const char *names[3] = { j->gguf_name, weight_name, NULL };
@@ -194,7 +218,9 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     const char *wid = expert_part_name(e.part);
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
-    const size_t per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
+    const size_t per_expert = target == DS4Q_TYPE_CUTLASS_MXFP4
+        ? ds4q_cutlass_mxfp4_bytes(nrows, ncols)
+        : (size_t)nrows * ds4q_row_size(target, ncols);
     byte_buf out = { .size = per_expert * (size_t)n_experts, .data = xmalloc(per_expert * (size_t)n_experts) };
     ds4q_quantize_init(target);
     int worker_count = n_threads > 0 ? n_threads : 8;

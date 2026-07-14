@@ -51,6 +51,7 @@ static void usage(const char *argv0) {
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q2_k, iq2_xxs, fp8_e4m3, mxfp4\n");
+    printf("               cutlass_mxfp4 (routed experts only: tensor-core B layout, type 40)\n");
 }
 
 static char *need_value(int argc, char **argv, int *i, const char *arg) {

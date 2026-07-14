@@ -41,15 +41,17 @@ deepseek4-quantize --hf HF_DIR --template T.gguf \
 ## Notes
 
 - Allocation unit = whole MoE layer (gate+up+down pick one preset: **cheap**
-  IQ2_XXS/Q2_K ~2.2 bpw, or **rich** MXFP4 4.25 bpw, byte-lossless vs the HF
-  source). Per-expert formats are structurally unavailable: the GGUF stacks
-  all 256 experts per tensor.
+  IQ2_XXS/Q2_K ~2.2 bpw, or **rich** CUTLASS_MXFP4 4.25 bpw, byte-lossless vs
+  the HF source). Per-expert formats are structurally unavailable: the GGUF
+  stacks all 256 experts per tensor.
 - `measure_layer_kl.py` needs the engine's `--expert-overlay` +
   `--kl-file/--kl-ref-dump/--kl-score` (see `ds4 --help-full`); resumable,
   one instance at a time.
-- Rich layers served on the tensor-core prefill path additionally want the
-  CUTLASS type-40 splice (`converter/splice_cutlass_mxfp4.py`) as a post-step;
-  plain type-39 MXFP4 decodes identically but skips prefill batching.
+- Rich layers are emitted directly as CUTLASS type-40 (`cutlass_mxfp4`) by
+  `deepseek4-quantize` — the tensor-core prefill layout, byte-identical to
+  the old `converter/splice_cutlass_mxfp4.py` post-step output (splice
+  retired; the quantizer packs data + swizzled SF natively). Plain type-39
+  `mxfp4` still decodes identically but skips prefill batching.
 - Proxy-path inputs: `extract_sens.py imatrix.dat > sens.json`, and
   `deepseek4-quantize --mse-probe mse.json` (writes `.sens.json` sidecar).
   Without any inputs a documented SYNTHETIC fallback runs so the machinery is

@@ -235,7 +235,8 @@ ds4q_type parse_type(const char *raw) {
 }
 
 bool is_quantizable_target(ds4q_type type) {
-    return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 || ds4q_can_quantize(type);
+    return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 ||
+           type == DS4Q_TYPE_CUTLASS_MXFP4 || ds4q_can_quantize(type);
 }
 
 /* --format-map: load a prisma_alloc.py manifest ({"tensor.name": "FMT", ...})

@@ -48,7 +48,11 @@ const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_TQ1_0]   = { "tq1_0",   QK_K,  54, false, false },
     [DS4Q_TYPE_TQ2_0]   = { "tq2_0",   QK_K,  66, false, false },
     [DS4Q_TYPE_MXFP4]   = { "mxfp4",      32,  17, true,  false },
-    [DS4Q_TYPE_NVFP4]   = { "nvfp4",      64,  36, false, false },
+    /* type_size 0: not a fixed-stride row format (per-expert data + swizzled
+     * SF tile); size via ds4q_cutlass_mxfp4_bytes().  ds4q_row_size returns 0
+     * and ds4q_can_quantize false by design -- the expert generation path
+     * packs it explicitly via ds4q_pack_cutlass_mxfp4. */
+    [DS4Q_TYPE_CUTLASS_MXFP4] = { "cutlass_mxfp4", 32, 0, false, false },
     [DS4Q_TYPE_Q1_0]    = { "q1_0",      128,  18, false, false },
 };
 

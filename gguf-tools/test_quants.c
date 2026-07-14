@@ -111,6 +111,56 @@ int main(void) {
                   "mxfp4 exact value %g came back as %g (i=%d)", xv[i], rc[i], i);
     }
 
+    /* CUTLASS_MXFP4 (type 40) pack invariants:
+     *   1. sizing matches the real dspark expert blobs (N=2048, K=4096 ->
+     *      4456448 B/expert incl. 262144 B of SF; ground truth measured from
+     *      gguf/dspark.gguf, produced by the validated CUTLASS packer);
+     *   2. the data region is the source E2M1 array byte-verbatim;
+     *   3. the SF swizzle is a bijection into the padded tile (every source
+     *      scale lands on a unique in-range offset; padding bytes stay 0),
+     *      and unswizzling recovers the source scales exactly. */
+    {
+        CHECK(ds4q_cutlass_mxfp4_sf_bytes(2048, 4096) == 262144,
+              "cutlass_mxfp4 sf_bytes(2048,4096) = %zu, want 262144",
+              ds4q_cutlass_mxfp4_sf_bytes(2048, 4096));
+        CHECK(ds4q_cutlass_mxfp4_bytes(2048, 4096) == 4456448,
+              "cutlass_mxfp4 bytes(2048,4096) = %zu, want 4456448",
+              ds4q_cutlass_mxfp4_bytes(2048, 4096));
+
+        const int64_t NN = 320, KK = 224;   /* exercises padding: 320 rows -> 384, 7 kblocks -> 8 */
+        const size_t db = (size_t)(NN * KK / 2);
+        const size_t sb = ds4q_cutlass_mxfp4_sf_bytes(NN, KK);
+        const int64_t kbn = KK / 32;
+        uint8_t *e2m1 = malloc(db);
+        uint8_t *e8m0 = malloc((size_t)(NN * kbn));
+        uint8_t *blob = malloc(db + sb);
+        for (size_t i = 0; i < db; i++) e2m1[i] = (uint8_t)(rnd() * 256);
+        for (int64_t i = 0; i < NN * kbn; i++) e8m0[i] = (uint8_t)(1 + i % 253); /* nonzero */
+        ds4q_pack_cutlass_mxfp4(e2m1, e8m0, blob, NN, KK);
+
+        CHECK(memcmp(blob, e2m1, db) == 0, "cutlass_mxfp4 data region is not byte-verbatim");
+
+        /* Unswizzle by scanning the SF region: each nonzero byte must map
+         * back from exactly one (row, kb); count and compare values. */
+        const uint8_t *sf = blob + db;
+        size_t nonzero = 0;
+        for (size_t i = 0; i < sb; i++) if (sf[i]) nonzero++;
+        CHECK(nonzero == (size_t)(NN * kbn),
+              "cutlass_mxfp4 SF nonzero count %zu, want %lld (swizzle not injective or out of range)",
+              nonzero, (long long)(NN * kbn));
+        int sf_bad = 0;
+        const int64_t kbp = (kbn + 3) / 4 * 4;
+        for (int64_t r = 0; r < NN && sf_bad < 8; r++) {
+            for (int64_t kb = 0; kb < kbn; kb++) {
+                size_t off = (size_t)((r / 128) * (kbp / 4) + kb / 4) * 512
+                           + (size_t)(r % 32) * 16 + (size_t)((r % 128) / 32) * 4 + (size_t)(kb % 4);
+                if (off >= sb || sf[off] != e8m0[r * kbn + kb]) { sf_bad++; break; }
+            }
+        }
+        CHECK(sf_bad == 0, "cutlass_mxfp4 SF unswizzle mismatch on %d row(s)", sf_bad);
+        free(e2m1); free(e8m0); free(blob);
+    }
+
     free(x);
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("OK\n");

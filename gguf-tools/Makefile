@@ -32,7 +32,7 @@ QUANTIZE_OBJS := $(QUANTIZE_SRCS:.c=.o)
 QUANTS_SRCS := quants_common.c quants_fp.c quants_kquants.c
 QUANTS_OBJS := $(QUANTS_SRCS:.c=.o)
 
-.PHONY: all clean quality-score test
+.PHONY: all clean quality-score test test-cutlass-mxfp4
 
 all: deepseek4-quantize
 
@@ -43,6 +43,22 @@ test_quants: test_quants.c $(QUANTS_OBJS)
 # once shipped sign-stripped MXFP4 donors while test_quants (rebuilt) passed.
 test: test_quants deepseek4-quantize
 	./test_quants
+
+# Byte-compare the quantizer's native cutlass_mxfp4 (type 40) output against
+# a reference GGUF whose type-40 tensors were produced by the validated
+# CUTLASS packer (the retired converter/splice_cutlass_mxfp4.py pipeline).
+# Needs the QAT HF snapshot and a reference GGUF on disk; override the paths
+# as needed. Checks one gate and one down tensor (different N/K orientation).
+DSV4_HF ?= $(HOME)/models/dsv4-flash-dspark
+CUTLASS_REF_GGUF ?= ../gguf/dspark.gguf
+test-cutlass-mxfp4: deepseek4-quantize
+	./deepseek4-quantize --hf $(DSV4_HF) --template $(CUTLASS_REF_GGUF) \
+	    --compare-tensor dspark.0.ffn_gate_exps.weight | tee /tmp/dsq-t40-gate.txt
+	grep -q '^byte_compare: OK' /tmp/dsq-t40-gate.txt
+	./deepseek4-quantize --hf $(DSV4_HF) --template $(CUTLASS_REF_GGUF) \
+	    --compare-tensor dspark.0.ffn_down_exps.weight | tee /tmp/dsq-t40-down.txt
+	grep -q '^byte_compare: OK' /tmp/dsq-t40-down.txt
+	@echo "cutlass_mxfp4 byte-compare: OK"
 
 quantize/%.o: quantize/%.c quantize/dsq_internal.h quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -Iquantize -c -o $@ $<

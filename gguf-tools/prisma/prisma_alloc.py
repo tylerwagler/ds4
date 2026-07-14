@@ -33,23 +33,27 @@ BLOCK = {
     "IQ2_XXS": (256, 66),   # 2.0625 bpw
     "Q2_K":    (256, 84),   # 2.625
     "MXFP4":   (32,  17),   # 4.25 — lossless vs source
+    # CUTLASS B layout (type 40): 16 B E2M1 data + 1 B swizzled SF per 32.
+    # Same 4.25 bpw as MXFP4 for real expert dims (N%128==0, K-blocks%4==0
+    # -> no SF tile padding), so the DP budget math is unchanged.
+    "CUTLASS_MXFP4": (32, 17),
     "FP8_E4M3":(32,  33),   # 8.25
     "F16":     ( 1,   2),
     "F32":     ( 1,   4),
 }
 # Candidate presets. Each MoE layer picks one: cheap (IQ2_XXS/Q2_K) or rich
-# (MXFP4 all three, lossless vs the HF source).  No Q4_K/Q3_K/Q5_K/Q6_K/Q8_0
-# — those are no longer producible or servable.
-# NOTE: rich layers served on the prefill tensor-core path additionally need
-# the CUTLASS type-40 splice (converter/splice_cutlass_mxfp4.py) as a
-# post-step; plain type-39 MXFP4 decodes fine but skips prefill batching.
+# (CUTLASS_MXFP4 all three, byte-lossless vs the HF source).  No
+# Q4_K/Q3_K/Q5_K/Q6_K/Q8_0 — those are no longer producible or servable.
+# Rich layers go straight to CUTLASS type-40 (tensor-core prefill layout):
+# deepseek4-quantize packs it natively from --format-map, one pass, no
+# post-step splice.
 PRESETS = {
     "cheap": {"gate": "IQ2_XXS", "up": "IQ2_XXS", "down": "Q2_K"},   # ~2.06 / 2.6 bpw
     "mid":   {"gate": "Q2_K",    "up": "Q2_K",    "down": "Q2_K"},   # 2.625 bpw everywhere
-    "rich":  {"gate": "MXFP4",   "up": "MXFP4",   "down": "MXFP4"},  # 4.25 bpw, lossless
+    "rich":  {"gate": "CUTLASS_MXFP4", "up": "CUTLASS_MXFP4", "down": "CUTLASS_MXFP4"},  # 4.25 bpw, lossless
 }
 PRESET_ORDER = ["cheap", "mid", "rich"]        # ascending size
-ROUTED_CANDS = ["IQ2_XXS", "Q2_K", "MXFP4"]    # display only, bpw-ascending
+ROUTED_CANDS = ["IQ2_XXS", "Q2_K", "CUTLASS_MXFP4"]    # display only, bpw-ascending
 
 MIB = 1 << 20   # DP budget granularity
 
@@ -87,10 +91,10 @@ def synth_sens(t):
     return s
 
 def synth_mse(n_el, fmt):
-    """Synthetic round-trip MSE fallback (NOT real). MXFP4 is lossless vs the
-    FP4 source, so its MSE is effectively zero.  IQ2_XXS/Q2_K get the old
-    exponential falloff with bpw gap from MXFP4."""
-    if fmt == "MXFP4":
+    """Synthetic round-trip MSE fallback (NOT real). MXFP4/CUTLASS_MXFP4 are
+    lossless vs the FP4 source, so their MSE is effectively zero.  IQ2_XXS/
+    Q2_K get the old exponential falloff with bpw gap from MXFP4."""
+    if fmt in ("MXFP4", "CUTLASS_MXFP4"):
         return 1e-12   # lossless
     return math.exp(-1.4 * (bpw(fmt) - 2.0))
 
@@ -249,9 +253,9 @@ def main():
         cnt = "  ".join(f"{k}:{c.get(k,0)}" for k in ROUTED_CANDS)
         print(f"target {gb:>5.0f} GB -> actual {total:5.1f} GB  fixed {fixed/1e9:4.1f}  "
               f"routed {rtot/1e9:5.1f}  dKL_saved {saved:10.6f}   [{cnt}]  -> {os.path.basename(outp)}")
-        if c.get("MXFP4", 0):
-            print(f"#   note: {c['MXFP4']//3} rich layers -> for TC prefill, splice to CUTLASS "
-                  f"type-40 via converter/splice_cutlass_mxfp4.py after quantizing")
+        if c.get("CUTLASS_MXFP4", 0):
+            print(f"#   note: {c['CUTLASS_MXFP4']//3} rich layers -> CUTLASS type-40, "
+                  f"packed natively by deepseek4-quantize --format-map (no post-step)")
 
 if __name__ == "__main__":
     main()

@@ -154,3 +154,50 @@ void ds4q_dequantize_mxfp4(const void *blocks, float *out, int64_t n) {
         b += 17;
     }
 }
+
+/* ---- CUTLASS_MXFP4 (type 40): the grouped tensor-core MoE weight layout.
+ * Per expert of shape [N=nrows(out), K=ncols(in)]:
+ *   data: N*K/2 bytes -- the source E2M1 [N, K/2] nibble array verbatim
+ *         (K-major sub-byte order matches CUTLASS ColumnMajor B packing);
+ *   SF:   swizzled E8M0 scale tile, one byte per (row, 32-elem K-block),
+ *         Blackwell 128x4 tile-atom layout (rows padded to 128, K-blocks
+ *         padded to 4, padding zero-filled).
+ * The swizzle is the same one the engine uses for cuBLASLt MX block scales
+ * (mx_sfoff in src/cuda/ds4_cuda_matmul.cu) and matches CUTLASS
+ * Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB. ---- */
+static inline size_t ds4q_mx_sfoff(int64_t row, int64_t kb, int64_t kbp) {
+    return (size_t)((row / 128) * (kbp / 4) + kb / 4) * 512
+         + (size_t)(row % 32) * 16
+         + (size_t)((row % 128) / 32) * 4
+         + (size_t)(kb % 4);
+}
+
+size_t ds4q_cutlass_mxfp4_sf_bytes(int64_t nrows, int64_t ncols) {
+    const int64_t rows_pad = (nrows + 127) / 128 * 128;
+    const int64_t kb_pad = (ncols / 32 + 3) / 4 * 4;
+    return (size_t)rows_pad * (size_t)kb_pad;
+}
+
+size_t ds4q_cutlass_mxfp4_bytes(int64_t nrows, int64_t ncols) {
+    return (size_t)nrows * (size_t)ncols / 2 + ds4q_cutlass_mxfp4_sf_bytes(nrows, ncols);
+}
+
+void ds4q_pack_cutlass_mxfp4(const uint8_t *e2m1, const uint8_t *e8m0,
+                             void *dst, int64_t nrows, int64_t ncols) {
+    if (ncols % 32 != 0) {
+        fprintf(stderr, "ds4-quantize: cutlass_mxfp4 ncols %lld is not divisible by 32\n",
+                (long long)ncols);
+        exit(1);
+    }
+    const size_t data_bytes = (size_t)nrows * (size_t)ncols / 2;
+    memcpy(dst, e2m1, data_bytes);
+    uint8_t *sf = (uint8_t *)dst + data_bytes;
+    const int64_t kb_n = ncols / 32;
+    const int64_t kb_pad = (kb_n + 3) / 4 * 4;
+    memset(sf, 0, ds4q_cutlass_mxfp4_sf_bytes(nrows, ncols));
+    for (int64_t r = 0; r < nrows; r++) {
+        for (int64_t kb = 0; kb < kb_n; kb++) {
+            sf[ds4q_mx_sfoff(r, kb, kb_pad)] = e8m0[(size_t)r * (size_t)kb_n + (size_t)kb];
+        }
+    }
+}

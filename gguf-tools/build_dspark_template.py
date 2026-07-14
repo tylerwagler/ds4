@@ -5,9 +5,13 @@ The gguf Python library doesn't support FP8_E4M3 (38) or MXFP4 (39) types, so
 this writes the GGUF binary directly.  Output has tensor info entries (zero
 weight data) for all DSpark tensors under the dspark.* namespace.
 
-Feed to quantizer:
+Feed to quantizer (cutlass_mxfp4 = CUTLASS type-40 routed experts, the
+tensor-core layout the engine's DSpark path loads; byte-lossless from the QAT
+E2M1+E8M0 source):
   gguf-tools/deepseek4-quantize \\
-    --hf HF_DIR --template dspark_template.gguf --out dspark.gguf --experts mxfp4
+    --hf HF_DIR --template dspark_template.gguf --out dspark.gguf \\
+    --experts cutlass_mxfp4
+Then splice into the main model with gguf-tools/merge_dspark_gguf.py.
 """
 import json, os, struct, sys
 

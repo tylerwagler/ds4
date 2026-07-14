@@ -53,7 +53,9 @@ typedef enum {
     DS4Q_TYPE_TQ2_0   = 35,
     DS4Q_TYPE_FP8_E4M3 = 38,   /* MXFP8: E4M3 + per-32 E8M0 block scale (33 B/32) */
     DS4Q_TYPE_MXFP4   = 39,
-    DS4Q_TYPE_NVFP4   = 40,
+    DS4Q_TYPE_CUTLASS_MXFP4 = 40, /* per-expert CUTLASS B layout: E2M1 data
+                                   * (K-major, byte-verbatim from source) +
+                                   * Blackwell 128x4 swizzled E8M0 SF tile */
     DS4Q_TYPE_Q1_0    = 41,
     DS4Q_TYPE_COUNT   = 42,
 } ds4q_type;
@@ -71,6 +73,17 @@ void ds4q_dequantize_iq2_xxs(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_q2_k(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_fp8_e4m3(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_mxfp4(const void *blocks, float *out, int64_t n);
+
+/* CUTLASS_MXFP4 (type 40) helpers.  One expert of shape [nrows=N(out),
+ * ncols=K(in)] packs as data (N*K/2 bytes, the source E2M1 [N,K/2] array
+ * verbatim) followed by the swizzled scale-factor tile (one E8M0 byte per
+ * 32-elem K-block; rows padded to 128, K-blocks padded to 4).  Matches the
+ * engine's DS4_TENSOR_CUTLASS_MXFP4 and the CUTLASS Sm1xx SFB atom layout;
+ * validated byte-identical to the mxfp4_pack_source_cli splice output. */
+size_t ds4q_cutlass_mxfp4_sf_bytes(int64_t nrows, int64_t ncols);
+size_t ds4q_cutlass_mxfp4_bytes(int64_t nrows, int64_t ncols);
+void ds4q_pack_cutlass_mxfp4(const uint8_t *e2m1, const uint8_t *e8m0,
+                             void *dst, int64_t nrows, int64_t ncols);
 void ds4q_quantize_init(ds4q_type type);
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
