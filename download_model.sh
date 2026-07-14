@@ -1,11 +1,13 @@
 #!/bin/sh
 set -e
 
-REPO="antirez/deepseek-v4-gguf"
-Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
-Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
-Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
-PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
+# ds4 (DwarfStar) release GGUFs live in this repo. Each file is a single,
+# self-contained artifact: REAP-25-pruned DeepSeek-V4-Flash experts, MXFP8
+# attention/shared/head, and the DSpark drafter merged in-file (auto-enabled
+# on load). The repo is private during pre-release; downloads need a token
+# (--token, HF_TOKEN, or the local HF cache) until it is made public.
+REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
+V5MX_FILE="ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -17,51 +19,34 @@ TOKEN=${HF_TOKEN:-}
 
 usage() {
     cat <<EOF
-DeepSeek V4 GGUF downloader
+DeepSeek V4 Flash GGUF downloader (ds4 / DwarfStar)
 
 Usage:
-  ./download_model.sh q2-imatrix [--token TOKEN]
-  ./download_model.sh q2-q4-imatrix [--token TOKEN]
-  ./download_model.sh q4-imatrix [--token TOKEN]
-  ./download_model.sh pro-q2-imatrix [--token TOKEN]
+  ./download_model.sh v5mx [--token TOKEN]
 
 Targets:
 
-  q2-imatrix
-       2-bit routed experts, about 81 GB on disk.
-       Recommended model for 96 and 128 GB RAM machines.
-
-  q2-q4-imatrix
-       Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
-       using q4 routed experts. About 98 GB on disk. Good for higher
-       quality inference for 128 GB MacBooks. Works on DGX Spark but loading
-       may struggle compared to q2-imatrix.
-
-  q4-imatrix
-       4-bit routed experts, about 153 GB on disk.
-       Recommended model for machines with 256 GB RAM or more.
-
-  pro-q2-imatrix
-       DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
-       on disk; intended for 512 GB RAM machines.
+  v5mx   Measured-allocation release build, about 91 GB on disk. Routed
+         experts on an IQ2_XXS floor with byte-lossless MXFP4 promoted on the
+         quality-sensitive layers (per-layer, per-role); MXFP8 attention,
+         shared experts, and LM head; DSpark drafter merged in-file.
+         Targets a single NVIDIA GB10 (~121 GB usable) with room for a 1M
+         token context. Requires a ds4 engine built with CUDA_ARCH=sm_120f.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
-                 cache is used if present.
+                 cache is used if present. Required while the repo is private.
 
 Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
 
-After main-model downloads the script updates:
+After download the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
 
 Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
-
-PRO files are downloaded with the official Hugging Face downloader because
-they are too large for the curl path used by the smaller GGUF files.
 EOF
 }
 
@@ -74,10 +59,7 @@ MODEL=$1
 shift
 
 case "$MODEL" in
-    q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
-    q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
-    q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
-    pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
+    v5mx) MODEL_FILE=$V5MX_FILE ;;
     -h|--help|help)
         usage
         exit 0
@@ -112,17 +94,6 @@ if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
     TOKEN=$(cat "$HOME/.cache/huggingface/token")
 fi
 
-needs_hf_download() {
-    case "$1" in
-        "$PRO_Q2_IMATRIX_FILE")
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
 find_hf_command() {
     if command -v hf >/dev/null 2>&1; then
         printf '%s\n' hf
@@ -131,10 +102,13 @@ find_hf_command() {
     return 1
 }
 
-download_one_hf() {
+# Prefer the official Hugging Face CLI when present: it is Xet-aware, so large
+# GGUFs download chunk-deduplicated and resumable. Fall back to curl otherwise.
+download_one() {
     file=$1
     out="$OUT_DIR/$file"
     part="$out.part"
+    url="https://huggingface.co/$REPO/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
 
@@ -145,72 +119,33 @@ download_one_hf() {
 
     if [ -e "$part" ]; then
         echo "Found curl partial download: $part" >&2
-        echo "The Hugging Face downloader cannot resume curl .part files." >&2
-        echo "Move or remove that partial download before retrying this PRO target." >&2
-        exit 1
-    fi
-
-    HF_CMD=$(find_hf_command || true)
-    if [ -z "$HF_CMD" ]; then
-        echo "PRO downloads require the official Hugging Face CLI." >&2
-        echo "Install it with:" >&2
-        echo "  python3 -m pip install -U huggingface_hub hf_xet" >&2
-        exit 1
+        echo "Remove it before retrying, or the resume may be inconsistent." >&2
     fi
 
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
-    echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
-    if [ -n "$TOKEN" ]; then
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+    HF_CMD=$(find_hf_command || true)
+    if [ -n "$HF_CMD" ]; then
+        if [ -n "$TOKEN" ]; then
+            "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+        else
+            "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
+        fi
     else
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
+        if [ -n "$TOKEN" ]; then
+            curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
+        else
+            curl -fL --progress-meter -C - -o "$part" "$url"
+        fi
+        mv "$part" "$out"
     fi
 
     if [ ! -s "$out" ]; then
-        echo "Hugging Face download finished but expected file is missing: $out" >&2
+        echo "Download finished but expected file is missing: $out" >&2
         exit 1
     fi
-}
-
-download_one() {
-    file=$1
-    out="$OUT_DIR/$file"
-    part="$out.part"
-    aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
-
-    if needs_hf_download "$file"; then
-        download_one_hf "$file"
-        return
-    fi
-
-    mkdir -p "$OUT_DIR"
-
-    if [ -e "$aria2_part" ]; then
-        echo "Found incomplete aria2 download sidecar: $aria2_part" >&2
-        echo "Finish or remove that partial download before using this curl downloader." >&2
-        exit 1
-    fi
-
-    if [ -s "$out" ]; then
-        echo "Already downloaded: $out"
-        return
-    fi
-
-    echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
-    echo "If the download stops, run the same command again to resume it."
-
-    if [ -n "$TOKEN" ]; then
-        curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
-    else
-        curl -fL --progress-meter -C - -o "$part" "$url"
-    fi
-
-    mv "$part" "$out"
 }
 
 download_one "$MODEL_FILE"
