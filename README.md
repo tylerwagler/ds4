@@ -1,8 +1,7 @@
 # DwarfStar
 
-**DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**, with **DeepSeek V4 PRO** as an opportunistic target on
-very high-memory machines. It is
+**DwarfStar** is a small native inference engine built for **DeepSeek V4
+Flash** on a single **NVIDIA GB10 (DGX Spark, ~128 GB unified memory)**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DeepSeek specific loading,
@@ -22,17 +21,17 @@ This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
-**Note that DeepSeek v4** is not our only target. Right now Flash and PRO are the
-perfect fit because of capabilities, size, KV cache efficiency. If tomorrow a
-better open weight model is released for the 128GB size, we could switch, the same
-for other important size classes like 512GB of RAM. The project is stictly
-opportunistic depending on what open weight models exist in a given moment.
-If a new model will be supported, the old one may be removed completely and
-no longer supported, unless there is some kind of overlap of abilities.
+This fork's target is deliberately narrow: **DeepSeek-V4-Flash on a single
+GB10**. Flash is the right fit for a 128 GB box — quasi-frontier capability,
+2-bit-tolerant experts, and a compressed KV cache that makes million-token
+contexts practical. The bet is one model, one class of machine, done end to
+end rather than a generic runner. If a materially better open-weight model
+lands for this size class, the engine can follow it; the model is a target,
+not a permanent commitment.
 
 ## Motivations
 
-* Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier. The PRO is even better. Both resist 2 bit quantization very well.
+* Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier, and its experts resist 2-bit quantization remarkably well.
 * Very capable computers like MacBooks, the DGX Spark now exist.
 * DeepSeek v4 kv cache design makes it pratical to run very big contexts. Other vendors are using this approach.
 * This few hundred billions models are strictly better than smaller (even if dense) models, regardless of what benchmarks say.
