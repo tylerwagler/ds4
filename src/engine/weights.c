@@ -174,7 +174,7 @@ DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
 
 
 /* Computes (gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes)
- * for any of the three supported routed-expert quant combos, centralizing the
+ * for any supported routed-expert quant combo, centralizing the
  * dispatch-site pattern `row_bytes = routed_expert_row_bytes(t); expert_bytes =
  * t->dim[1] * row_bytes` that's repeated across gpu_prefill.c/gpu_decode.c.
  *
@@ -192,9 +192,9 @@ bool routed_expert_gate_down_layout(
         uint64_t         *gate_row_bytes,
         uint64_t         *down_expert_bytes,
         uint64_t         *down_row_bytes) {
-    /* NOTE: gate and down are NOT always the same type -- the IQ2_XXS/Q2_K combo pairs a
-     * gate/up type with a *different* down type by design (see
-     * tensor_expect_routed_expert_combo). Only MXFP4 and CUTLASS_MXFP4 share gate==down. */
+    /* NOTE: gate and down are NOT always the same type -- gate/up and down
+     * formats pair freely per layer by design (see
+     * tensor_expect_routed_expert_combo). Only CUTLASS_MXFP4 requires gate==down. */
     if (!gate || !down) return false;
 
     if (gate->type == DS4_TENSOR_CUTLASS_MXFP4) {
@@ -222,34 +222,37 @@ bool routed_expert_gate_down_layout(
 
 
 
-/* The CUDA routed-MoE dispatcher executes exactly three expert quant combos:
- * gate/up IQ2_XXS with Q2_K down; gate/up/down all MXFP4 (FP4_E2M1, dp4a
- * dequant-dot path); or gate/up/down all CUTLASS_MXFP4 (tensor-core grouped
- * GEMM path, expert-major data+SF layout). Reject anything else at load with
+/* The CUDA routed-MoE dispatcher selects kernels per role and per layer:
+ * gate/up (always a matching pair -- the fused gate+up kernels assume one
+ * format) in {IQ2_XXS, Q2_K, MXFP4}, down in {IQ2_XXS, Q2_K, MXFP4}, in any
+ * pairing, and the combo may differ layer to layer (prisma per-layer
+ * allocation). CUTLASS_MXFP4 is the exception: the grouped tensor-core GEMM
+ * path runs the whole expert FFN in one dispatch, so cutlass gate/up
+ * requires cutlass down (and vice versa). Reject anything else at load with
  * one clear error instead of a silent kernel-dispatch failure at the first
  * MoE layer. */
 static void tensor_expect_routed_expert_combo(
         const ds4_tensor *gate,
         const ds4_tensor *up,
         const ds4_tensor *down) {
-    const bool iq2_combo = gate->type == DS4_TENSOR_IQ2_XXS &&
-                           up->type   == DS4_TENSOR_IQ2_XXS &&
-                           down->type == DS4_TENSOR_Q2_K;
-    const bool mxfp4_combo = gate->type == DS4_TENSOR_FP4_E2M1 &&
-                             up->type   == DS4_TENSOR_FP4_E2M1 &&
-                             down->type == DS4_TENSOR_FP4_E2M1;
-    const bool cutlass_mxfp4_combo = gate->type == DS4_TENSOR_CUTLASS_MXFP4 &&
-                                     up->type   == DS4_TENSOR_CUTLASS_MXFP4 &&
-                                     down->type == DS4_TENSOR_CUTLASS_MXFP4;
-    const bool q2k_combo = gate->type == DS4_TENSOR_Q2_K &&
-                           up->type   == DS4_TENSOR_Q2_K &&
-                           down->type == DS4_TENSOR_Q2_K;
-    if (iq2_combo || mxfp4_combo || cutlass_mxfp4_combo || q2k_combo) return;
+    const bool gate_up_pair = gate->type == up->type;
+    const bool cutlass = gate->type == DS4_TENSOR_CUTLASS_MXFP4;
+    const bool gate_ok = gate->type == DS4_TENSOR_IQ2_XXS ||
+                         gate->type == DS4_TENSOR_Q2_K ||
+                         gate->type == DS4_TENSOR_FP4_E2M1 ||
+                         cutlass;
+    const bool down_ok = cutlass
+        ? down->type == DS4_TENSOR_CUTLASS_MXFP4
+        : (down->type == DS4_TENSOR_IQ2_XXS ||
+           down->type == DS4_TENSOR_Q2_K ||
+           down->type == DS4_TENSOR_FP4_E2M1);
+    if (gate_up_pair && gate_ok && down_ok) return;
     fprintf(stderr,
             "ds4: unsupported routed expert quant combo at tensor %.*s: "
-            "gate=%s up=%s down=%s; supported combos are "
-            "gate/up=iq2_xxs with down=q2_k, gate/up/down=q2_k, gate/up/down=mxfp4, "
-            "or gate/up/down=cutlass_mxfp4\n",
+            "gate=%s up=%s down=%s; gate/up must match and be one of "
+            "iq2_xxs/q2_k/mxfp4/cutlass_mxfp4, down one of iq2_xxs/q2_k/mxfp4 "
+            "(cutlass_mxfp4 gate/up pairs only with cutlass_mxfp4 down); "
+            "combos may differ per layer\n",
             (int)gate->name.len,
             gate->name.ptr,
             tensor_type_name(gate->type),
