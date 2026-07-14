@@ -193,13 +193,17 @@ at every temperature.
 
 | Context depth | Prefill (t/s) | Decode (t/s, speculative) |
 | ---: | ---: | ---: |
-| 2k | ~420 | 16.5 |
-| 8k | ~390 | 16.5 |
+| 2k | ~306 | 16.5 |
+| 8k | ~289 | 16.5 |
 
-Decode is measured with the merged DSpark drafter on structured/tool
-workloads, where draft acceptance holds at α = 77.2%. Decode throughput is flat
-with context depth out to 8k; the small prefill taper from ~420 to ~390 t/s is
-the growing long-context indexer scan.
+Measured on the shipped v5mx build (`ds4-bench` prefill sweep, single stream).
+Decode is measured with the merged DSpark drafter on structured/tool workloads,
+where draft acceptance holds at α = 77.2%, and is flat with context depth out to
+8k. Prefill runs ~290-306 t/s: the byte-lossless MXFP4 rich-expert layers are
+~4.25 bpw versus the ~2 bpw floor, so they read ~2x the weight bytes and set the
+prefill rate. (A uniform 2-bit build prefills faster, ~390-420 t/s, but scores
+lower on quality — the measured allocation trades some prefill for the +8-point
+tool-use win.)
 
 ## Model residency
 
