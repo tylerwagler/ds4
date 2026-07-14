@@ -2630,7 +2630,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 }
 
 
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     {
         static int entry_log = -1;
@@ -2718,5 +2718,63 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
                              layer_index, n_tokens);
+}
+
+/* ---- Per-format MoE prefill timing (DS4_MOE_TIME=1). Buckets each batch MoE call's GPU time
+ * by (gate_type,down_type) via a CUDA-event pair around the impl, and dumps a table at exit.
+ * The event sync perturbs host wall-time but the measured per-call GPU interval is accurate;
+ * this is a diagnostic-only path (one getenv read, no per-token flag branching in production). */
+struct moe_time_bucket { uint32_t gate_type, down_type; double ms; uint64_t calls; };
+static moe_time_bucket g_moe_time[64];
+static int g_moe_time_n = 0;
+static void moe_time_dump(void){
+    if (g_moe_time_n == 0) return;
+    double tot = 0; for (int i = 0; i < g_moe_time_n; i++) tot += g_moe_time[i].ms;
+    fprintf(stderr, "\n=== DS4_MOE_TIME per-format MoE batch GPU time (total %.2f ms over all calls) ===\n", tot);
+    for (int i = 0; i < g_moe_time_n; i++) {
+        moe_time_bucket *b = &g_moe_time[i];
+        fprintf(stderr, "  gate_type=%2u down_type=%2u : %9.2f ms  (%5.1f%%)  calls=%llu  avg=%.3f ms\n",
+                b->gate_type, b->down_type, b->ms, tot > 0 ? 100.0 * b->ms / tot : 0.0,
+                (unsigned long long)b->calls, b->calls ? b->ms / (double)b->calls : 0.0);
+    }
+    fprintf(stderr, "=== end DS4_MOE_TIME ===\n");
+}
+static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
+    for (int i = 0; i < g_moe_time_n; i++)
+        if (g_moe_time[i].gate_type == gt && g_moe_time[i].down_type == dt) {
+            g_moe_time[i].ms += ms; g_moe_time[i].calls++; return;
+        }
+    if (g_moe_time_n < 64) {
+        static int registered = 0;
+        if (!registered) { registered = 1; atexit(moe_time_dump); }
+        g_moe_time[g_moe_time_n].gate_type = gt; g_moe_time[g_moe_time_n].down_type = dt;
+        g_moe_time[g_moe_time_n].ms = ms; g_moe_time[g_moe_time_n].calls = 1; g_moe_time_n++;
+    }
+}
+
+extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+    static int time_moe = -1;
+    if (time_moe < 0) time_moe = getenv("DS4_MOE_TIME") != NULL ? 1 : 0;
+    if (!time_moe) {
+        return routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+                gate_offset, up_offset, down_offset, gate_type, down_type,
+                gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+                n_total_expert, n_expert, clamp, x, layer_index, n_tokens, mid_is_f16);
+    }
+    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s, 0);
+    int r = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, clamp, x, layer_index, n_tokens, mid_is_f16);
+    cudaEventRecord(e, 0);
+    if (cudaEventSynchronize(e) == cudaSuccess) {
+        float ms = 0; cudaEventElapsedTime(&ms, s, e);
+        moe_time_accum(gate_type, down_type, (double)ms);
+    }
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    return r;
 }
 
