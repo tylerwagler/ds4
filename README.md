@@ -154,8 +154,8 @@ A few things this fork's GGUFs do beyond upstream:
   the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
   speculative decoding section below.
 
-`download_model.sh` fetches this fork's shipped GGUF from our release repo,
-published by **Elytron Defense**. It has a single target:
+`download_model.sh` fetches this fork's shipped GGUF from our release repo. It
+has a single target:
 
 ```sh
 ./download_model.sh v5mx   # measured-allocation release build, ~91 GB on disk
