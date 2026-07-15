@@ -45,9 +45,19 @@
  *   S5  A=126, B=639: rows [A@126 B@639] -> B emits at ratio 4 (row 159)
  *       AND ratio 128 (row 4) while A (at an unrelated position) closes no
  *       group; bank A bit-untouched at both ratios.
+ *   S6  A=502, B=664: rows [A@502 A@503 B@664..667] — S4's shape and S4's
+ *       bank B EXACTLY, with only the BATCHMATE (A) moved 202/203 -> 502/503
+ *       -> bank B's emitted rows must be BYTE-IDENTICAL to S4's.  This is
+ *       the gate for per-row positions (increment 3 Part A): A's position
+ *       reaches the kernels only via positions[], so a kernel that ignores
+ *       positions[] moves B's rows.  S4's swap/order checks cannot see it
+ *       (they hold positions fixed and permute banks -> a wrong rotation is
+ *       identical on both sides), and the decode gate cannot either (its
+ *       positions never vary with batch width).
  *
  * TEETH (each seeded as a local engine edit, gate re-run, edit reverted;
- * all three verified caught on the increment-2 tree, 2026-07):
+ * T1-T3 verified caught on the increment-2 tree, 2026-07; T4 verified on
+ * this tree, 2026-07-15):
  *   T1  wrong-bank emit commit — gpu_prefill.c multiseq emit loop, commit
  *       the staged comp row to bank 0 instead of the row's bank:
  *           gpu_graph_commit_attn_comp_stage_bank(g, il, 0, comp_row, 1)
@@ -61,6 +71,14 @@
  *       the compressed-layer chunked branch's raw KV store to the classic
  *       single-cache call (drop the banked scatter)
  *       -> S1 "emitted rows depend on populate order (cur-bank leak)" FAIL.
+ *   T4  ignored per-row positions (Part A) — make BOTH RoPE kernels drop the
+ *       positions array, src/cuda/ds4_cuda_norm_kv.cu:
+ *           const uint32_t rope_pos = pos0 + t;               (~:142)
+ *           const uint32_t rope_pos = pos0 + t * pos_stride;  (~:238)
+ *       -> S6 "bank B's emitted rows changed when only its BATCHMATE's
+ *          position moved" FAIL (B rotates at 502+ instead of 664+).
+ *       S1-S5 all still PASS under this seed — S6 is the only check in
+ *       either gate with teeth for the position path.
  *
  * usage: DS4_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate MODEL
  *        (from the repo root — reads tests/long_context_story_prompt.txt;
@@ -602,6 +620,51 @@ int main(int argc, char **argv) {
         } else if (ok) {
             CHECK(0, "S4: solo reference runs failed");
         }
+
+        /* ---- S6: BATCHMATE-POSITION independence (the Part-A gate) ----
+         * Identical batch SHAPE to S4 — same 6 rows, same order, same banks,
+         * bank B at the same positions 664..667 with the same tokens and the
+         * same emit topology (A closes one ratio-4 group, B closes one) —
+         * but bank A sits at 502/503 instead of 202/203.
+         *
+         * Bank B's rows, shape, position and content are all unchanged, so
+         * B's emitted rows MUST be byte-identical to S4's.  The only thing
+         * that differs in the whole step is A's position, which reaches the
+         * kernels ONLY through the per-row positions[] array.  A kernel that
+         * ignores positions[] and falls back to pos0 + t * pos_stride
+         * rotates B against A's run instead of its own, so B's rows move ->
+         * FAIL.  Nothing else in either gate can observe that: S4's swap and
+         * order checks hold positions fixed and permute banks, so a wrong
+         * rotation is identical on both sides of those comparisons, and the
+         * decode gate's positions are a function of bank and step but never
+         * of batch width (see that gate's header).  This is the check with
+         * teeth for per-row positions. */
+        emit_rows s6_a, s6_b;
+        const step_row rows_s6[6] = {
+            {0, 502, stream_tok(0, 502)}, {0, 503, stream_tok(0, 503)},
+            {1, 664, stream_tok(1, 664)}, {1, 665, stream_tok(1, 665)},
+            {1, 666, stream_tok(1, 666)}, {1, 667, stream_tok(1, 667)},
+        };
+        bool ok_s6 = ok && mixed_scenario(0, 502, 1, 664, rows_s6, 6,
+                                          125, -1, 166, -1, 503, 667,
+                                          "S6(mixed)", &s6_a, &s6_b, 0);
+        if (ok_s6) {
+            const int eq6 = emit_rows_equal(&s6_b, &mixed_b, "S6 B vs S4 B");
+            CHECK(eq6,
+                  "S6: bank B's emitted rows changed when only its BATCHMATE's "
+                  "position moved (202/203 -> 502/503) — B's own rows, shape "
+                  "and position are identical, so a per-row position is being "
+                  "ignored (RoPE/ring/visible-comp reading pos0+t, not "
+                  "positions[t])");
+            if (eq6)
+                printf("S6: batchmate-position independence — B byte-identical "
+                       "across A@202 and A@502 OK\n");
+            emit_rows_free(&s6_a);
+            emit_rows_free(&s6_b);
+        } else if (ok) {
+            CHECK(0, "S6: scenario execution failed");
+        }
+
         if (ok) { emit_rows_free(&mixed_a); emit_rows_free(&mixed_b); }
         if (ok_sw) { emit_rows_free(&swap_a); emit_rows_free(&swap_b); }
     }

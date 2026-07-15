@@ -38,6 +38,22 @@
  * gate's job (tests/multiseq_frontier_gate.c); this gate is its end-to-end
  * token-stream complement.
  *
+ * WHAT THIS GATE IS BLIND TO (do not add it here — it is S6's job):
+ * per-row POSITIONS.  reqs[k].pos below is a function of the bank k and the
+ * step j, never of the batch width n, so bank k occupies the same rows at
+ * the same positions at N=2 and at N=3.  A kernel that ignored positions[]
+ * entirely would apply the SAME wrong rotation at both widths, and the
+ * neutrality comparison would still pass — co-scheduling neutrality is
+ * width-invariant by construction in this instantiation.  The frontier
+ * gate's S6 (batchmate-position independence) is the check with teeth for
+ * the position path.
+ *
+ * DSPARK: `DS4_GATE_NO_DSPARK=1` opens the engine with speculation disabled
+ * (the ds4-bench/ds4-eval/agent and `ds4-server --no-dspark` config, and a
+ * different allocation shape).  The driver must work there — it is plain
+ * decode by contract at n >= 2 and must not depend on the speculation
+ * machinery having been initialized.  Run via `make cuda-multiseq-gate-nodspark`.
+ *
  * INFORMATIONAL (reported, never fatal): each bank's stream vs the same
  * prompt decoded solo through classic decode — first divergence step and the
  * logit gap between the two candidates at that step, measured on the live
@@ -219,6 +235,125 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
     return ok;
 }
 
+/* HARD GATE: the classic single-bank entries must FAIL LOUD after a multiseq
+ * step, not silently corrupt.
+ *
+ * After a multiseq step the graph's scalar frontier counters hold a
+ * cross-bank SUPERSET, not any single bank's truth.  ds4_session_eval decodes
+ * against those scalars unconditionally (it never consulted checkpoint_valid,
+ * so clearing that flag never covered this path): it would emit its
+ * compressor row at the superset index and attend over the rows below it — a
+ * previous tenant's bytes when the live bank's frontier is lower.  Wrong
+ * logits, silently.  ds4_session_decode_multiseq is public, so a server is
+ * exactly the caller that hits this.
+ *
+ * Asserted here: (1) eval fails after a multiseq step, (2) the speculative
+ * entries fail too (same counters), (3) a fresh ds4_session_sync — the
+ * documented escape hatch, and one available to public callers — clears the
+ * condition and eval works again. */
+static bool check_stale_classic_fails_loud(void) {
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if ((int)gpu_graph_bank_pool_count(g) < 2) {
+        printf("STALE-GUARD: skipped (pool %u < 2)\n", gpu_graph_bank_pool_count(g));
+        ds4_session_free(s);
+        return true;
+    }
+    const int vocab = ds4_engine_logits_width(g_e);
+    char err[256];
+    bool ok = true;
+    int last[2] = {0, 0};
+    for (int k = 0; ok && k < 2; k++) {
+        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
+        ds4_session_invalidate(s);
+        ds4_tokens p;
+        ok = make_prompt(k, &p);
+        if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+            fprintf(stderr, "stale-guard populate bank %d failed: %s\n", k, err);
+            ok = false;
+        }
+        if (ok) {
+            gpu_graph_bank_counters_capture(g, (uint32_t)k);
+            last[k] = ds4_session_argmax(s);
+        }
+        ds4_tokens_free(&p);
+    }
+    float *logits = ok ? malloc((size_t)2 * vocab * sizeof(float)) : NULL;
+    if (ok && !logits) ok = false;
+    if (ok) {
+        /* Sanity: eval works BEFORE any multiseq step (so a later failure is
+         * the guard firing, not an unrelated broken session). */
+        if (ds4_session_eval(s, last[1], err, sizeof(err)) != 0) {
+            CHECK(0, "stale-guard: eval failed BEFORE any multiseq step (%s)", err);
+            ok = false;
+        }
+    }
+    if (ok) {
+        /* Re-establish bank 1's frontier: the eval above advanced it. */
+        ds4_tokens p;
+        ok = make_prompt(1, &p);
+        if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) ok = false;
+        if (ok) gpu_graph_bank_counters_capture(g, 1u);
+        ds4_tokens_free(&p);
+        if (!ok) CHECK(0, "stale-guard: bank 1 re-sync failed");
+    }
+    if (ok) {
+        ds4_multiseq_req reqs[2];
+        for (int k = 0; k < 2; k++) {
+            reqs[k].bank = (uint32_t)k;
+            reqs[k].pos = g_prompt_len[k];
+            reqs[k].token = last[k];
+        }
+        const int rc = ds4_session_decode_multiseq(s, reqs, 2, logits,
+                                                   2 * vocab, err, sizeof(err));
+        if (rc != 0) {
+            CHECK(0, "stale-guard: multiseq step failed (rc=%d): %s", rc, err);
+            ok = false;
+        }
+    }
+    if (ok) {
+        err[0] = '\0';
+        const int rc = ds4_session_eval(s, last[0], err, sizeof(err));
+        CHECK(rc != 0,
+              "STALE CLASSIC STATE NOT CAUGHT: ds4_session_eval SUCCEEDED after "
+              "a multiseq step — it decoded against cross-bank superset frontier "
+              "counters and silently corrupted KV");
+        if (rc != 0) printf("STALE-GUARD: eval after multiseq fails loud OK (%s)\n", err);
+
+        err[0] = '\0';
+        int acc[4];
+        const int rcs = ds4_session_eval_speculative_block(s, last[0], 4, -1, acc,
+                                                           4, err, sizeof(err));
+        CHECK(rcs <= 0,
+              "STALE CLASSIC STATE NOT CAUGHT: ds4_session_eval_speculative_block "
+              "SUCCEEDED after a multiseq step (returned %d)", rcs);
+        if (rcs <= 0) printf("STALE-GUARD: spec block eval after multiseq fails loud OK\n");
+    }
+    if (ok) {
+        /* The escape hatch: a fresh sync rebuilds per-bank state (reset zeroes
+         * the counters) and classic decode must work again. */
+        ds4_tokens p;
+        bool ok2 = make_prompt(0, &p);
+        if (ok2 && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+            CHECK(0, "stale-guard: re-sync after multiseq failed: %s", err);
+            ok2 = false;
+        }
+        if (ok2) {
+            CHECK(ds4_session_eval(s, ds4_session_argmax(s), err, sizeof(err)) == 0,
+                  "stale-guard: eval still refused after a re-sync — the "
+                  "documented recovery path does not clear the condition (%s)",
+                  err);
+            printf("STALE-GUARD: re-sync clears the condition, classic eval "
+                   "works again OK\n");
+        }
+        ds4_tokens_free(&p);
+    }
+    free(logits);
+    ds4_session_free(s);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL [MAXN] [STEPS]\n", argv[0]);
@@ -235,7 +370,27 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = DS4_BACKEND_CUDA;
+    /* DS4_GATE_NO_DSPARK: run the whole gate with speculation DISABLED, the
+     * way ds4-bench/ds4-eval/ds4-agent and `ds4-server --no-dspark` open the
+     * engine.  This is a real serving config (and the one increment 4's
+     * server will plausibly run), and it is a DIFFERENT allocation shape: the
+     * DSpark graph state is never allocated.  The driver used to reject every
+     * step here because the shared multi-row logits slab was allocated only
+     * as a side effect of DSpark init — a config no gate covered, because
+     * both gates default to the drafter-merged FRONTIER_MODEL.  Read once at
+     * startup (this is the test's own config, not a hot path). */
+    if (getenv("DS4_GATE_NO_DSPARK") != NULL) {
+        opt.dspark_disable = true;
+        printf("CONFIG: DSpark DISABLED (dspark_disable=1) — the driver must "
+               "work with no speculation machinery allocated\n");
+    }
     if (ds4_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (getenv("DS4_GATE_NO_DSPARK") != NULL && ds4_engine_has_dspark(g_e)) {
+        fprintf(stderr, "MULTISEQ GATE FAIL: DS4_GATE_NO_DSPARK set but the "
+                        "engine still reports a drafter — the no-dspark case "
+                        "is not actually being exercised\n");
+        return 1;
+    }
 
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
@@ -321,6 +476,8 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    if (!check_stale_classic_fails_loud()) CHECK(0, "stale-classic guard check failed to run");
 
     for (int k = 0; k < maxn; k++) free(solo[k]);
     for (int n = 0; n < GATE_MAX_N; n++)

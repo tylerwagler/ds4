@@ -35,7 +35,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark
 
 all: help
 
@@ -48,6 +48,9 @@ help:
 	@echo "                           FRONTIER_MODEL=./ds4flash.gguf by default)"
 	@echo "  make cuda-multiseq-gate  Multiseq-vs-solo token-stream gate + aggregate"
 	@echo "                           throughput at N=1..3 (needs the model)"
+	@echo "  make cuda-multiseq-gate-nodspark"
+	@echo "                           The same gate with speculation disabled"
+	@echo "                           (--no-dspark config; needs the model)"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -87,6 +90,13 @@ cuda-frontier-gate: tests/multiseq_frontier_gate
 # manually on the GB10 with the same memory discipline as the frontier gate.
 cuda-multiseq-gate: tests/multiseq_decode_gate
 	DS4_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 512
+
+# The same gate with speculation DISABLED — the ds4-bench/ds4-eval/agent and
+# `ds4-server --no-dspark` config, and a different allocation shape (no DSpark
+# graph state).  The driver must work there; it used to reject every step.
+# Shorter (N=2, 64 steps): this is a config gate, not a throughput run.
+cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
+	DS4_MSEQ_BANKS=2 DS4_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
 
 src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
