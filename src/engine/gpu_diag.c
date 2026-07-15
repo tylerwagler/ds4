@@ -733,11 +733,13 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
         return false;
     }
     const uint32_t n_banks = gpu_graph_bank_pool_count(g);
-    if (pos[0] == 0) {
+    if (pos[0] <= 0) {
         /* Admission (from-zero) prefill stays on the classic single-bank
-         * view path in v1 — a fresh bank must be populated there first. */
-        fprintf(stderr, "ds4: multiseq step rejected: position-0 rows "
-                        "(admission prefill is single-bank classic)\n");
+         * view path in v1 — a fresh bank must be populated there first.
+         * Negative first positions are equally out of contract (and would
+         * otherwise wrap through the uint32 casts below). */
+        fprintf(stderr, "ds4: multiseq step rejected: first position %d <= 0 "
+                        "(admission prefill is single-bank classic)\n", pos[0]);
         return false;
     }
     /* v1 constraint: globally consecutive positions, contiguous per-bank
@@ -767,10 +769,14 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
             prev_bank = seq[t];
         }
     }
-    if (capture_cur) {
-        gpu_graph_bank_counters_capture(
-                g, g->banks.n_banks ? g->banks.cur_bank : 0u);
-    }
+    /* capture_cur: the classic scalar counters are the CURRENT bank's truth
+     * (its per-bank slots may be stale — e.g. still holding a previous
+     * step's values).  The capture is COMMITTED only after every rejection
+     * point below has passed: a rejected begin must leave ms_n_comp[cur]
+     * untouched too (the scalars can hold a previous step's cross-bank
+     * superset, which would corrupt the bank's frontier record).  Until
+     * then the validation loop reads the scalars directly for cur_bank. */
+    const uint32_t cur_bank = g->banks.n_banks ? g->banks.cur_bank : 0u;
     /* DRIVER CONTRACT check: each batched bank's committed frontier is
      * position-true at its first row — floor(first_pos / ratio) compressed
      * rows.  A bank that lags (mid-admission-prefill) must never be
@@ -780,17 +786,21 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
         if (t > 0 && seq[t] == seq[t - 1]) continue;
         const uint32_t b = (uint32_t)seq[t];
         const uint32_t p = (uint32_t)pos[t];
+        const bool use_scalars = capture_cur && b == cur_bank;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            if (g->ms_n_comp[b][il] != p / ratio ||
-                (ratio == 4 && g->ms_n_index_comp[b][il] != p / ratio)) {
+            const uint32_t have_comp = use_scalars ? g->layer_n_comp[il]
+                                                   : g->ms_n_comp[b][il];
+            const uint32_t have_index = use_scalars ? g->layer_n_index_comp[il]
+                                                    : g->ms_n_index_comp[b][il];
+            if (have_comp != p / ratio ||
+                (ratio == 4 && have_index != p / ratio)) {
                 fprintf(stderr,
                         "ds4: multiseq step rejected: bank %u frontier not "
                         "position-true at layer %u (pos %u ratio %u: "
                         "n_comp %u want %u, n_index_comp %u)\n",
-                        b, il, p, ratio, g->ms_n_comp[b][il], p / ratio,
-                        g->ms_n_index_comp[b][il]);
+                        b, il, p, ratio, have_comp, p / ratio, have_index);
                 return false;
             }
         }
@@ -853,6 +863,10 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
             return false;
         }
     }
+    /* All rejection points passed: NOW commit the cur-bank capture (the
+     * scalars are still the pre-step classic values here — the superset
+     * write below is the first scalar mutation). */
+    if (capture_cur) gpu_graph_bank_counters_capture(g, cur_bank);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -899,6 +913,13 @@ bool gpu_graph_multiseq_step_end(ds4_gpu_graph *g) {
                     "ds4: multiseq step_end FAILED: layer %u superset %u "
                     "mutated mid-step (want %u)\n",
                     il, g->layer_n_comp[il], sup);
+            ok = false;
+        }
+        if (ok && ratio == 4 && g->layer_n_index_comp[il] != sup) {
+            fprintf(stderr,
+                    "ds4: multiseq step_end FAILED: layer %u indexer superset "
+                    "%u mutated mid-step (want %u)\n",
+                    il, g->layer_n_index_comp[il], sup);
             ok = false;
         }
     }

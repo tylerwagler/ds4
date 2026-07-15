@@ -1197,6 +1197,18 @@ static int check_multibank_indexer(void) {
                 case_rc = mb_idx_run_case("fp4", rows, 4, slab, comp_cap,
                                           n_comp_sup, ratio, n_banks, 4, head_dim,
                                           bank_bytes, 8);
+                /* fp4 direct-one fast tier (n_tokens == 1, n_head 64): the
+                 * n_head=4 case above dispatches the generic kernel, so the
+                 * banked fp4 DIRECT-ONE tier needs its own row (same slab;
+                 * emit-boundary qpos 39 as visibility teeth).  Reference is
+                 * the same scalar-mode dispatch on the bank's view. */
+                if (case_rc == 0) {
+                    const mb_row one[1] = { {1, 39, 0} };
+                    case_rc = mb_idx_run_case("fp4-direct-one", one, 1, slab,
+                                              comp_cap, n_comp_sup, ratio,
+                                              n_banks, 64, head_dim,
+                                              bank_bytes, 8);
+                }
             }
             ds4_gpu_indexer_set_fp4(0);
         }

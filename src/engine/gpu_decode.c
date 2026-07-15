@@ -328,6 +328,13 @@ static bool gpu_graph_decode_descr_prepare(ds4_gpu_graph *g, uint32_t pos) {
         if (!g->descr_diag_pos || !g->descr_diag_seq ||
             !ds4_gpu_tensor_write(g->descr_diag_seq, 0, &bank0, sizeof(bank0))) {
             fprintf(stderr, "ds4: DS4_DECODE_DESCR descriptor alloc failed\n");
+            /* Release and reset BOTH so a later call retries the whole block
+             * instead of keying off a half-allocated descr_diag_pos and
+             * failing forever (descr_diag_seq NULL / unwritten). */
+            ds4_gpu_tensor_free(g->descr_diag_pos);
+            ds4_gpu_tensor_free(g->descr_diag_seq);
+            g->descr_diag_pos = NULL;
+            g->descr_diag_seq = NULL;
             return false;
         }
     }

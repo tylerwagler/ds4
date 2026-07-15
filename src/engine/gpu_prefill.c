@@ -791,7 +791,15 @@ bool gpu_graph_encode_layer_attention_batch(
                                                  mseq ? nb : 1) != 0;
         if (ok && !gpu_graph_raw_f16_enabled()) {
             /* diag-only dump; the dumper reads f32 and would misinterpret a
-             * __half ring — skip it under DS4_RAW_F16. */
+             * __half ring — skip it under DS4_RAW_F16.  Under mseq the store
+             * above scattered through the WHOLE bank pool while this classic
+             * view shows only the current bank — annotate rather than let
+             * the dump masquerade as the stored bytes (the tag itself is a
+             * filename/filter key, so it stays "raw_cache"). */
+            if (mseq && gpu_graph_debug_wants("raw_cache", il, pos0)) {
+                fprintf(stderr, "ds4: raw_cache dump layer %u pos %u: cur-bank "
+                                "view; banked stores not shown\n", il, pos0);
+            }
             gpu_graph_debug_dump_tensor("raw_cache",
                                           g->layer_raw_cache[il],
                                           (uint64_t)n_raw * DS4_N_HEAD_DIM,
