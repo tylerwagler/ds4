@@ -2568,6 +2568,16 @@ static bool worker_eviction_could_help(server *s, const job *j,
     const uint64_t est =
         ds4_engine_session_cost_bytes(s->engine, provision_ctx_for_job(s, j));
     if (est == 0) return false;
+    /* Model the MemAvailable floor too (2026-07-15 review): a POOL_FULL
+     * refusal never consulted it, so on a physically tight box the gate
+     * could open, one warm session be evicted, and the re-provisioning then
+     * refuse on MEM_FLOOR anyway — the exact churn the refusal-reason gate
+     * exists to prevent. Eviction does not promptly raise MemAvailable (see
+     * the block comment above), so if the floor refuses NOW it will refuse
+     * after the eviction too; skip. Fail closed on an unreadable gauge,
+     * matching provision_slot. One /proc read per failed bind attempt. */
+    const uint64_t avail = server_mem_available_bytes();
+    if (avail < est + DS4_SERVER_MEM_FLOOR_BYTES) return false;
     uint64_t reclaimable = 0;
     bool any = false;
     for (int i = 1; i < s->n_slots; i++) {

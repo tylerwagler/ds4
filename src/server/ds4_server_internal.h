@@ -727,9 +727,10 @@ typedef enum {
 typedef struct gen_state gen_state;
 
 /* A pool slot owns one logical session's GPU state. Slot 0 is provisioned at
- * startup; slots 1..cap-1 lazily by the scheduler (worker thread only). The
- * eviction fields are inert until increment 4 (documented so the shape is
- * stable for later increments). */
+ * startup and pinned; slots 1..cap-1 are provisioned lazily and evicted
+ * LRU-first by the scheduler (worker thread only) — an evicted slot is a
+ * reusable hole (sess == NULL, state SLOT_EVICTED) below the n_slots
+ * high-water mark. */
 typedef struct {
     ds4_session *sess;                    /* live session; NULL until admitted */
     struct job  *active_job;              /* request bound to this slot, or NULL */
