@@ -127,6 +127,17 @@ void gpu_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_index_state_score[il]);
     }
+    /* Bank-pool slabs (the layer_* pointers freed above were views into
+     * these when the pool was enabled; view frees release no memory). */
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->banks.raw[il]);
+        ds4_gpu_tensor_free(g->banks.comp[il]);
+        ds4_gpu_tensor_free(g->banks.index[il]);
+        ds4_gpu_tensor_free(g->banks.askv[il]);
+        ds4_gpu_tensor_free(g->banks.assc[il]);
+        ds4_gpu_tensor_free(g->banks.iskv[il]);
+        ds4_gpu_tensor_free(g->banks.issc[il]);
+    }
     /* The batched-copy tables cache raw device pointers into the state tensors
      * freed above; drop them so a rebuilt graph re-prepares fresh tables. */
     ds4_gpu_batched_copy_free(g->spec_snap_copies);

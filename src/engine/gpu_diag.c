@@ -266,7 +266,9 @@ static void gpu_graph_compute_dims(
  * incident: three ctx=65536 slots admitted at 0.5 GiB each consumed the whole
  * GB10 and hard-locked the machine).
  *
- * KEEP IN SYNC with the two allocators below (same order, same expressions).
+ * KEEP IN SYNC with the allocators below (gpu_graph_alloc_raw_cap,
+ * gpu_graph_bank_slabs_alloc, gpu_graph_init_dspark_target — same order,
+ * same expressions).
  * The server reconciles this estimate against the measured allocation delta
  * after every session create and logs a loud warning on >10% drift, so a
  * missed buffer surfaces on the first live run instead of as an
@@ -297,24 +299,29 @@ uint64_t gpu_graph_session_bytes(
 
     /* Persistent KV caches (raw ring, packed attn comp, indexer comp) plus the
      * indexer_scores/comp_mask working pair — shared with the managed-vs-device
-     * KV placement policy the allocator itself uses. */
+     * KV placement policy the allocator itself uses.  In bank-pool mode the
+     * persistent KV slabs (and the per-bank compressor state lanes below)
+     * scale with the pool size; everything else is shared by all banks. */
+    const uint64_t n_banks = gpu_graph_bank_pool_n();
     uint64_t kv_cache_bytes = 0;
     uint64_t total = gpu_graph_context_bytes_for_kv_policy(
             dz.ctx_size, dz.raw_cap, dz.prefill_cap, &kv_cache_bytes);
+    if (n_banks > 1u) total += (n_banks - 1u) * kv_cache_bytes;
 
-    /* Per-layer attention/indexer state (and their spec shadows). */
+    /* Per-layer attention/indexer state — one lane per bank — and the
+     * single-lane spec shadows (spec never runs against a shared pool). */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
         const uint64_t attn_state = (uint64_t)coff * DS4_N_HEAD_DIM *
                                     coff * ratio * f32;
-        total += 2ull * attn_state;                       /* layer_attn_state_kv/score */
+        total += n_banks * 2ull * attn_state;             /* layer_attn_state_kv/score */
         if (enable_spec) total += 2ull * attn_state;      /* spec_attn_state_kv/score */
         if (ratio == 4) {
             const uint64_t index_state = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM *
                                          coff * ratio * f32;
-            total += 2ull * index_state;                  /* layer_index_state_kv/score */
+            total += n_banks * 2ull * index_state;        /* layer_index_state_kv/score */
             if (enable_spec) total += 2ull * index_state; /* spec_index_state_kv/score */
         }
     }
@@ -446,6 +453,181 @@ static int gpu_graph_kv_managed_override(void) {
 
 
 
+/* DS4_MSEQ_BANKS: Tier-2 bank-pool size for the next graph allocation.
+ * 1 (default) keeps the classic single-session cache layout; 2..DS4_MSEQ_MAX
+ * allocates the fixed per-bank slabs (ds4_bank_slabs) and installs bank-0
+ * views, so every existing single-session path runs unmodified against
+ * bank 0.  Read once per process at graph allocation — never on a
+ * token/layer path.  Interim wiring: later increments make the server pass
+ * the pool size explicitly instead. */
+uint32_t gpu_graph_bank_pool_n(void) {
+    static long cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_MSEQ_BANKS");
+        long n = 1;
+        if (v && v[0]) {
+            char *end = NULL;
+            n = strtol(v, &end, 10);
+            if (end == v || (end && *end != '\0') || n < 1) {
+                fprintf(stderr,
+                        "ds4: DS4_MSEQ_BANKS=\"%s\" not recognized (want 1..%u); "
+                        "bank pool disabled\n", v, DS4_MSEQ_MAX);
+                n = 1;
+            } else if (n > (long)DS4_MSEQ_MAX) {
+                fprintf(stderr, "ds4: DS4_MSEQ_BANKS=%ld clamped to %u\n",
+                        n, DS4_MSEQ_MAX);
+                n = (long)DS4_MSEQ_MAX;
+            }
+        }
+        cached = n;
+    }
+    return (uint32_t)cached;
+}
+
+
+
+/* Allocate the fixed per-bank KV slabs (layout: ds4_bank_slabs in
+ * ds4_engine_internal.h; design adapted from Entrpi/ds4 v0.2 — citation at
+ * the struct).  Per-bank byte expressions MUST match the single-session
+ * branches in gpu_graph_alloc_raw_cap below and the pricing in
+ * gpu_graph_session_bytes.  Compressor state lanes are primed for every bank
+ * here (kv = 0, score = -inf), exactly like a fresh single-session graph, so
+ * a later bank admit starts from the same state a cold session would. */
+static bool gpu_graph_bank_slabs_alloc(
+        ds4_gpu_graph      *g,
+        uint32_t              n_banks,
+        bool                  managed_kv_cache,
+        const gpu_graph_dims *dz) {
+    ds4_bank_slabs *b = &g->banks;
+    const uint64_t raw_elem = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
+                                                          : sizeof(float);
+    b->n_banks = n_banks;
+    b->cur_bank = 0;
+    b->raw_bank_bytes = (uint64_t)dz->raw_cap * DS4_N_HEAD_DIM * raw_elem;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        /* uint32 row-ABI audit: batched kernels address rows as
+         * seq_id * cap + local in uint32; reject the geometry up front. */
+        if ((uint64_t)n_banks * dz->raw_cap > 4294967296ull ||
+            (uint64_t)n_banks * dz->layer_comp_cap[il] > 4294967296ull) {
+            fprintf(stderr,
+                    "ds4: bank pool geometry overflows the uint32 row ABI "
+                    "(%u banks x raw_cap %u / comp_cap %u)\n",
+                    n_banks, dz->raw_cap, dz->layer_comp_cap[il]);
+            return false;
+        }
+        b->raw[il] = gpu_graph_alloc_kv_cache_tensor(
+                managed_kv_cache, (uint64_t)n_banks * b->raw_bank_bytes);
+        ok = b->raw[il] != NULL;
+        if (!ok || ratio == 0) continue;
+
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
+        const uint64_t attn_rows = (uint64_t)coff * ratio;
+        const uint64_t attn_lane = attn_width * attn_rows * sizeof(float);
+        b->comp_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
+                                 gpu_graph_attn_comp_cache_row_bytes();
+        b->astate_bank_bytes[il] = attn_lane;
+        /* ctx-scaled comp slabs are always managed in pool mode: unified-
+         * memory demand paging keeps short banks from paying worst-case
+         * residency (the VMM adaptation, see ds4_bank_slabs). */
+        b->comp[il] = ds4_gpu_tensor_alloc_managed(
+                (uint64_t)n_banks * b->comp_bank_bytes[il]);
+        b->askv[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+        b->assc[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+        ok = b->comp[il] && b->askv[il] && b->assc[il] &&
+             gpu_tensor_fill_f32(b->askv[il], 0.0f,
+                                 (uint64_t)n_banks * attn_width * attn_rows) &&
+             gpu_tensor_fill_f32(b->assc[il], DS4_NEG_INF,
+                                 (uint64_t)n_banks * attn_width * attn_rows);
+        if (ok && ratio == 4) {
+            const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
+            const uint64_t index_rows = (uint64_t)coff * ratio;
+            const uint64_t index_lane = index_width * index_rows * sizeof(float);
+            const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
+                ? DS4_ENGINE_IDXFP4_ROWBYTES
+                : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            b->index_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
+                                      index_row_bytes;
+            b->istate_bank_bytes[il] = index_lane;
+            b->index[il] = ds4_gpu_tensor_alloc_managed(
+                    (uint64_t)n_banks * b->index_bank_bytes[il]);
+            b->iskv[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            b->issc[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            ok = b->index[il] && b->iskv[il] && b->issc[il] &&
+                 gpu_tensor_fill_f32(b->iskv[il], 0.0f,
+                                     (uint64_t)n_banks * index_width * index_rows) &&
+                 gpu_tensor_fill_f32(b->issc[il], DS4_NEG_INF,
+                                     (uint64_t)n_banks * index_width * index_rows);
+        }
+    }
+    return ok;
+}
+
+
+
+/* Re-install the graph's per-layer cache views onto `bank`.  Pure host-side
+ * pointer surgery (view wrappers are freed/recreated; no device work), so the
+ * caller must guarantee the device is idle with respect to the previous
+ * bank's views.  The spec frontier copy tables bake raw device pointers of
+ * the state views, so they are dropped for lazy rebuild. */
+bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    ds4_bank_slabs *b = &g->banks;
+    if (bank == b->cur_bank) return true;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        ds4_gpu_tensor_free(g->layer_raw_cache[il]);
+        g->layer_raw_cache[il] = ds4_gpu_tensor_view(
+                b->raw[il], (uint64_t)bank * b->raw_bank_bytes, b->raw_bank_bytes);
+        ok = g->layer_raw_cache[il] != NULL;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ok || ratio == 0) continue;
+        ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+        ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->layer_attn_state_score[il]);
+        g->layer_attn_comp_cache[il] = ds4_gpu_tensor_view(
+                b->comp[il], (uint64_t)bank * b->comp_bank_bytes[il],
+                b->comp_bank_bytes[il]);
+        g->layer_attn_state_kv[il] = ds4_gpu_tensor_view(
+                b->askv[il], (uint64_t)bank * b->astate_bank_bytes[il],
+                b->astate_bank_bytes[il]);
+        g->layer_attn_state_score[il] = ds4_gpu_tensor_view(
+                b->assc[il], (uint64_t)bank * b->astate_bank_bytes[il],
+                b->astate_bank_bytes[il]);
+        ok = g->layer_attn_comp_cache[il] && g->layer_attn_state_kv[il] &&
+             g->layer_attn_state_score[il];
+        if (ok && ratio == 4) {
+            ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
+            ds4_gpu_tensor_free(g->layer_index_state_kv[il]);
+            ds4_gpu_tensor_free(g->layer_index_state_score[il]);
+            g->layer_index_comp_cache[il] = ds4_gpu_tensor_view(
+                    b->index[il], (uint64_t)bank * b->index_bank_bytes[il],
+                    b->index_bank_bytes[il]);
+            g->layer_index_state_kv[il] = ds4_gpu_tensor_view(
+                    b->iskv[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                    b->istate_bank_bytes[il]);
+            g->layer_index_state_score[il] = ds4_gpu_tensor_view(
+                    b->issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                    b->istate_bank_bytes[il]);
+            ok = g->layer_index_comp_cache[il] && g->layer_index_state_kv[il] &&
+                 g->layer_index_state_score[il];
+        }
+    }
+    /* Stale pointer hygiene (mirrors gpu_graph_free). */
+    ds4_gpu_batched_copy_free(g->spec_snap_copies);
+    ds4_gpu_batched_copy_free(g->spec_restore_copies);
+    g->spec_snap_copies = NULL;
+    g->spec_restore_copies = NULL;
+    g->spec_frontier_copy_n = 0;
+    g->spec_frontier_copy_init = 0;
+    if (ok) b->cur_bank = bank;
+    return ok;
+}
+
+
+
 /* Allocate the GPU graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
 bool gpu_graph_alloc_raw_cap(
@@ -540,6 +722,17 @@ bool gpu_graph_alloc_raw_cap(
                 (double)context_bytes / 1073741824.0);
     }
 
+    /* Tier-2 bank pool: allocate the per-bank slabs first; the per-layer
+     * cache pointers below then become bank-0 views instead of owning
+     * allocations, and all single-session code runs unmodified. */
+    const uint32_t n_banks = gpu_graph_bank_pool_n();
+    if (n_banks >= 2u &&
+        !gpu_graph_bank_slabs_alloc(g, n_banks, managed_kv_cache, &dz)) {
+        gpu_graph_free(g);
+        return false;
+    }
+    const bool banked = g->banks.n_banks != 0;
+
     g->cur_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->flat_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->hc_mix = ds4_gpu_tensor_alloc(mix_hc * sizeof(float));
@@ -562,29 +755,41 @@ bool gpu_graph_alloc_raw_cap(
     const uint64_t raw_elem_bytes = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
                                                                 : sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->layer_raw_cache[il] = gpu_graph_alloc_kv_cache_tensor(
-                managed_kv_cache,
-                (uint64_t)raw_cap * DS4_N_HEAD_DIM * raw_elem_bytes);
+        g->layer_raw_cache[il] = banked
+            ? ds4_gpu_tensor_view(g->banks.raw[il], 0, g->banks.raw_bank_bytes)
+            : gpu_graph_alloc_kv_cache_tensor(
+                    managed_kv_cache,
+                    (uint64_t)raw_cap * DS4_N_HEAD_DIM * raw_elem_bytes);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
             const uint64_t comp_row_bytes = gpu_graph_attn_comp_cache_row_bytes();
-            g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
-                    managed_kv_cache,
-                    (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
-            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+            if (banked) {
+                g->layer_attn_comp_cache[il] = ds4_gpu_tensor_view(
+                        g->banks.comp[il], 0, g->banks.comp_bank_bytes[il]);
+                g->layer_attn_state_kv[il] = ds4_gpu_tensor_view(
+                        g->banks.askv[il], 0, g->banks.astate_bank_bytes[il]);
+                g->layer_attn_state_score[il] = ds4_gpu_tensor_view(
+                        g->banks.assc[il], 0, g->banks.astate_bank_bytes[il]);
+            } else {
+                g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
+                g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+            }
             if (enable_spec) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             }
-            if (g->layer_attn_state_kv[il]) {
+            /* Banked mode primes every bank's state lanes at slab alloc. */
+            if (!banked && g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
                                 gpu_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows);
             }
-            if (g->layer_attn_state_score[il]) {
+            if (!banked && g->layer_attn_state_score[il]) {
                 state_init_ok = state_init_ok &&
                                 gpu_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows);
             }
@@ -595,20 +800,29 @@ bool gpu_graph_alloc_raw_cap(
                 const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
                     ? DS4_ENGINE_IDXFP4_ROWBYTES
                     : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-                g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
-                        managed_kv_cache,
-                        (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
-                g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                if (banked) {
+                    g->layer_index_comp_cache[il] = ds4_gpu_tensor_view(
+                            g->banks.index[il], 0, g->banks.index_bank_bytes[il]);
+                    g->layer_index_state_kv[il] = ds4_gpu_tensor_view(
+                            g->banks.iskv[il], 0, g->banks.istate_bank_bytes[il]);
+                    g->layer_index_state_score[il] = ds4_gpu_tensor_view(
+                            g->banks.issc[il], 0, g->banks.istate_bank_bytes[il]);
+                } else {
+                    g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
+                            managed_kv_cache,
+                            (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
+                    g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                }
                 if (enable_spec) {
                     g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 }
-                if (g->layer_index_state_kv[il]) {
+                if (!banked && g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
                                     gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, index_width * index_rows);
                 }
-                if (g->layer_index_state_score[il]) {
+                if (!banked && g->layer_index_state_score[il]) {
                     state_init_ok = state_init_ok &&
                                     gpu_tensor_fill_f32(g->layer_index_state_score[il], DS4_NEG_INF, index_width * index_rows);
                 }

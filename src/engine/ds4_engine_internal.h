@@ -814,6 +814,49 @@ typedef struct {
  * tensor names follow the model stages rather than generic graph nodes.
  */
 
+/* Tier-2 multi-session bank pool (compile-time bound on co-scheduled
+ * sessions; the runtime co-schedule cap is a later, smaller number).
+ *
+ * Multi-sequence batched-decode KV banking design (per-row positions[]/
+ * seq_id[] descriptors over fixed per-bank KV slabs) adapted from the
+ * MIT-licensed Entrpi/ds4 fork (https://github.com/Entrpi/ds4, v0.2,
+ * c71a49ac9316db02eaa6322dee2c919e6de1e792).  Reimplemented from scratch
+ * against this engine's packed MXFP8/MXFP4 KV layout; no Entrpi code was
+ * copied. */
+#define DS4_MSEQ_MAX 8u
+
+/* Fixed per-bank KV slabs: per layer, one contiguous allocation per cache
+ * kind, bank-major, stride = one bank's single-session capacity.  When the
+ * pool is enabled (n_banks >= 2), the graph's per-layer cache pointers
+ * (layer_raw_cache[il] etc.) are VIEWS into these slabs — a single-bank view
+ * means every existing single-session code path (prefill, decode, snapshot,
+ * spec) runs unmodified against that bank; the batched decode kernels address
+ * other banks with per-row seq_id[t]*cap offsets over the whole slab.
+ *
+ * The ctx-scaled comp/index slabs are cudaMallocManaged: on GB10 unified
+ * memory that is the demand-paged analog of the reference's cuMemAddressReserve
+ * VMM scheme (physical pages materialize on first touch, address math is
+ * byte-identical to an eager slab), so short sessions do not pay resident
+ * memory for worst-case padding.  Raw rings and compressor state lanes are
+ * eager (fixed floor).  n_banks == 0 means the pool is disabled and the graph
+ * owns plain single-session cache tensors. */
+typedef struct {
+    uint32_t n_banks;                        /* 0 = pool disabled */
+    uint32_t cur_bank;                       /* bank the installed views address */
+    uint64_t raw_bank_bytes;                 /* raw_cap * head_dim * raw elem */
+    uint64_t comp_bank_bytes[DS4_MAX_LAYER];  /* layer_comp_cap * comp row bytes */
+    uint64_t index_bank_bytes[DS4_MAX_LAYER]; /* layer_comp_cap * indexer row bytes */
+    uint64_t astate_bank_bytes[DS4_MAX_LAYER];/* attn compressor frontier lane */
+    uint64_t istate_bank_bytes[DS4_MAX_LAYER];/* indexer compressor frontier lane */
+    ds4_gpu_tensor *raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *askv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *assc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *iskv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *issc[DS4_MAX_LAYER];
+} ds4_bank_slabs;
+
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -1029,6 +1072,11 @@ typedef struct {
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
     bool quality;
+
+    /* Tier-2 bank pool (see ds4_bank_slabs above).  banks.n_banks == 0 keeps
+     * the classic single-session layout; >= 2 makes the per-layer cache
+     * pointers bank views into the slabs. */
+    ds4_bank_slabs banks;
 } ds4_gpu_graph;
 
 /* =========================================================================
@@ -1757,9 +1805,19 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_spec);
+/* Bank-pool size the next gpu_graph_alloc_raw_cap will use (DS4_MSEQ_BANKS,
+ * read once, clamped to [1, DS4_MSEQ_MAX]; 1 = pool disabled).  Interim
+ * wiring: later increments make the server pass the pool size explicitly. */
+uint32_t gpu_graph_bank_pool_n(void);
+/* Re-install the graph's per-layer cache views onto `bank` (pool mode only).
+ * Contract: call only between fully synchronized forwards — the previous
+ * bank's enqueued work must be complete, because the graph pointers change
+ * under every subsequent launch. */
+bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank);
 /* TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
  * graph state when enable_spec); the sizing side of the admission-control
- * single source of truth (see gpu_diag.c). */
+ * single source of truth (see gpu_diag.c).  Includes the whole bank pool
+ * when DS4_MSEQ_BANKS >= 2 (same knob the allocator reads). */
 uint64_t gpu_graph_session_bytes(
         const ds4_weights       *weights,
         const ds4_layer_weights *layer,
