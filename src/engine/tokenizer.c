@@ -979,8 +979,12 @@ static inline uint32_t sample_desc_key(float f) {
  * changing the emitted token stream.
  *
  * So: the caller fills `a` in ascending-id order and this sort is stable,
- * which reproduces the stable merge sort glibc's qsort uses at this size.
- * tests/ds4_test.c --sampler pins it (and catches a tie-order flip).
+ * making ascending-id the canonical tie order. That also matches what the
+ * replaced qsort produced at this size (glibc takes its stable msort_with_tmp
+ * path for a 129280 x 12B array -- verified), but nothing here depends on that
+ * unspecified detail: this sort is stable by construction and libc-independent.
+ * tests/ds4_test.c --sampler pins the order explicitly (and catches a
+ * tie-order flip on a realistic shape -- ties are common, not adversarial).
  *
  * Requires n >= 1. */
 static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
@@ -1172,6 +1176,12 @@ static int sample_full_vocab(
  * probability. It is not an equivalent rewrite; tests/ds4_test.c --sampler
  * catches it. The full descending sort and the full-vocab sum are both
  * load-bearing; only their cost is negotiable.
+ *
+ * ALIASING CONTRACT: `out`'s ids/probs must never point into `scratch`. The
+ * spec walk (session.c) holds one dist at a time while reusing the scratch
+ * across accepted positions, so handing `out` a scratch pointer to save the
+ * malloc would be silently wrong the moment two dists overlap — and the
+ * --sampler gate builds one dist at a time, so it would NOT catch it.
  */
 int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,

@@ -1689,10 +1689,24 @@ static int ref_sample_argmax(const float *logits, uint32_t n_vocab) {
     return best;
 }
 
+/* Tie order is pinned EXPLICITLY (ascending id) rather than inherited from
+ * qsort's stability. Ties are not hypothetical: ~129k float32 logits over a
+ * normal range collide with ~99.96% probability, and the tie-order mutant is
+ * caught on the realistic-peaked shape at rank 2969 (inside the nucleus).
+ * The pre-rewrite code got ascending-id ties because glibc's qsort happens to
+ * take the stable msort_with_tmp path at this size (129280 x 12B, verified) --
+ * an unspecified detail upstream has been trying to remove since the 2.37
+ * introsort work. Without this tiebreak, a future glibc would fail this gate
+ * with a tie diff that looks like a radix bug but is reference drift, inviting
+ * a "fix" to the wrong side. This comparator now pins the same order
+ * canonically, glibc-independently. */
 static int ref_cand_cmp_desc(const void *a, const void *b) {
     const sample_candidate *ca = a;
     const sample_candidate *cb = b;
-    return (cb->logit > ca->logit) - (cb->logit < ca->logit);
+    if (ca->logit != cb->logit) {
+        return (cb->logit > ca->logit) - (cb->logit < ca->logit);
+    }
+    return (ca->id > cb->id) - (ca->id < cb->id);
 }
 
 static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
@@ -2074,10 +2088,34 @@ static const samp_cfg samp_cfgs[] = {
     {-1.0f,   0, 1.0f,  0.05f, "temp<0 (greedy early-out)"},
 };
 
+/* The reference comparator above compares floats, so it is sensitive to
+ * flush-to-zero; the production key (sample_desc_key) is integer-only and is
+ * NOT. Production binaries are nvcc-linked and measure FPCR=0x0 (FZ clear), so
+ * the two agree on subnormals. A gcc -ffast-math link would pull in
+ * crtfastmath.o ("msr fpcr, x0" with bit 24 set), flush subnormals to zero in
+ * the REFERENCE only, and surface here as a mystifying rank-8 id diff on the
+ * subnormal shape. Say so out loud instead. */
+static void sampler_warn_if_flush_to_zero(void) {
+#if defined(__aarch64__)
+    uint64_t fpcr = 0;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    if (fpcr & (1u << 24)) {
+        fprintf(stderr,
+                "ds4_test: WARNING: FPCR.FZ is set (fpcr=0x%llx) — this binary was "
+                "linked with crtfastmath.o (gcc -ffast-math), so the float reference "
+                "comparator flushes subnormals while the production integer key does "
+                "not. A subnormal-shape id diff below is REFERENCE drift, not a "
+                "sampler bug.\n",
+                (unsigned long long)fpcr);
+    }
+#endif
+}
+
 static void test_sampler_dist_equivalence(void) {
     const uint32_t n = SAMP_N_VOCAB;
     float *logits = malloc((size_t)n * sizeof(float));
     TEST_ASSERT(logits != NULL);
+    sampler_warn_if_flush_to_zero();
     ds4_sample_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
 
