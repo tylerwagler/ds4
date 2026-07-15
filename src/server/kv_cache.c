@@ -551,9 +551,9 @@ bool kv_cache_store_live_prefix(server *s, session_slot *sl,
 
 
 
-void kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
+bool kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
     const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
-    if (!tokens) return;
+    if (!tokens) return false;
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
@@ -583,13 +583,16 @@ void kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
+    bool stored;
     if (visible_text) {
-        kv_cache_store_live_prefix_text(s, sl, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+        stored = kv_cache_store_live_prefix_text(s, sl, tokens, tokens->len,
+                                                 reason, visible_text,
+                                                 visible_ext, visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, sl, tokens, tokens->len, reason);
+        stored = kv_cache_store_live_prefix(s, sl, tokens, tokens->len, reason);
     }
+    return stored;
 }
 
 

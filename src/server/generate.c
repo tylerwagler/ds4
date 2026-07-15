@@ -1,4 +1,7 @@
 #include "ds4_server_internal.h"
+/* ds4_gpu_tensor_alloc_bytes_current: the eviction path verifies that freeing
+ * a session releases (allocator ground truth) what the ledger committed. */
+#include "ds4_gpu.h"
 
 
 
@@ -2207,9 +2210,36 @@ static uint64_t server_mem_available_bytes(void) {
  * state — the packed-KV estimate under-counted ~10x and hard-locked the
  * machine, 2026-07-13). Returns NULL when the pool is at capacity, admission
  * fails, MemAvailable would drop below the floor, or session creation fails —
- * the job then waits in the queue, exactly like an admission rejection. */
-static session_slot *provision_slot(server *s, int ctx) {
-    if (s->n_slots >= DS4_SESSION_POOL_CAP) return NULL;
+ * the job then waits in the queue, exactly like an admission rejection.
+ * Since increment 4, an evicted slot leaves a hole (sess == NULL) below
+ * n_slots; provisioning reuses the lowest hole before extending the pool, so
+ * n_slots stays the high-water published count every reader iterates by
+ * (they all skip sess == NULL entries). *refusal reports WHY provisioning
+ * failed: the eviction path only acts on refusals eviction can actually
+ * relieve (a full pool or a full ledger — never the MemAvailable floor,
+ * which freed CUDA memory does not promptly move; see worker_try_bind). */
+typedef enum {
+    PROVISION_OK = 0,
+    PROVISION_REFUSED_POOL_FULL,   /* no free slot entry — eviction helps */
+    PROVISION_REFUSED_ADMISSION,   /* ledger full — eviction helps */
+    PROVISION_REFUSED_MEM_FLOOR,   /* machine physically tight (incl. an
+                                      unreadable /proc/meminfo, fail closed) —
+                                      eviction does NOT promptly help */
+    PROVISION_REFUSED_CREATE_FAIL, /* allocation failed — eviction unsafe to
+                                      chain on (same physical pressure) */
+} provision_refusal;
+
+static session_slot *provision_slot(server *s, int ctx,
+                                    provision_refusal *refusal) {
+    *refusal = PROVISION_OK;
+    int idx = -1;
+    for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) {
+        if (!s->slots[i].sess) { idx = i; break; }
+    }
+    if (idx < 0) { /* pool at capacity */
+        *refusal = PROVISION_REFUSED_POOL_FULL;
+        return NULL;
+    }
     const uint64_t est = ds4_engine_session_cost_bytes(s->engine, ctx);
     pthread_mutex_lock(&s->mu);
     const uint64_t committed = s->kv_committed_bytes;
@@ -2233,6 +2263,7 @@ static session_slot *provision_slot(server *s, int ctx) {
                        (double)committed / (1024.0 * 1024.0 * 1024.0),
                        (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0));
         }
+        *refusal = PROVISION_REFUSED_ADMISSION;
         return NULL;
     }
     /* Belt and suspenders: whatever the ledger says, do not start a create
@@ -2249,6 +2280,7 @@ static session_slot *provision_slot(server *s, int ctx) {
                        "ds4-server: /proc/meminfo MemAvailable unreadable; "
                        "refusing slot provisioning (jobs queue for existing slots)");
         }
+        *refusal = PROVISION_REFUSED_MEM_FLOOR;
         return NULL;
     }
     if (avail < est + DS4_SERVER_MEM_FLOOR_BYTES) {
@@ -2265,6 +2297,7 @@ static session_slot *provision_slot(server *s, int ctx) {
                        (double)DS4_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
                        ctx);
         }
+        *refusal = PROVISION_REFUSED_MEM_FLOOR;
         return NULL;
     }
     last_rejected_reason = 0; /* provisioning proceeds: re-arm rejection logs */
@@ -2275,28 +2308,49 @@ static session_slot *provision_slot(server *s, int ctx) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: slot session create failed (ctx=%d); job queued",
                    ctx);
+        *refusal = PROVISION_REFUSED_CREATE_FAIL;
         return NULL;
     }
     const uint64_t actual =
-        server_reconciled_session_cost(s->n_slots, ctx, est,
+        server_reconciled_session_cost(idx, ctx, est,
                                        ds4_session_resident_bytes(sess));
-    session_slot *sl = &s->slots[s->n_slots];
+    session_slot *sl = &s->slots[idx];
     sl->sess = sess;
     sl->state = SLOT_IDLE;
     sl->ctx_size = ctx;
     sl->est_cost_bytes = actual; /* ledger commits ACTUALS */
+    sl->tokens_emitted = 0;
+    /* A freshly provisioned (or evicted-and-reused) slot must not be the next
+     * LRU victim purely because its last-serviced stamp is stale/zero. */
+    sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+    sl->continued_last_store_tokens = 0;
     pthread_mutex_lock(&s->mu);
     s->kv_committed_bytes += actual;
-    s->n_slots++; /* publish only after the slot is fully initialized */
+    /* publish only after the slot is fully initialized */
+    if (idx >= s->n_slots) s->n_slots = idx + 1;
     pthread_mutex_unlock(&s->mu);
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: provisioned slot %d ctx=%d committed(actual)=%.2f GiB "
                "total committed=%.2f GiB / %.2f GiB",
-               s->n_slots - 1, ctx,
+               idx, ctx,
                (double)actual / (1024.0 * 1024.0 * 1024.0),
                (double)s->kv_committed_bytes / (1024.0 * 1024.0 * 1024.0),
                (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0));
     return sl;
+}
+
+
+
+/* Context a lazily provisioned slot would be created with for this job: the
+ * secondary-slot default, raised to the job's need, capped at slot 0's ctx.
+ * Shared by the provisioning path and the eviction could-it-help precheck so
+ * they price the same session shape. */
+static int provision_ctx_for_job(const server *s, const job *j) {
+    int ctx = DS4_SERVER_EXTRA_SLOT_CTX_TOKENS;
+    if (ctx > s->slots[0].ctx_size) ctx = s->slots[0].ctx_size;
+    const int needed = job_needed_ctx(s, j);
+    if (ctx < needed) ctx = needed;
+    return ctx;
 }
 
 
@@ -2320,8 +2374,20 @@ static session_slot *provision_slot(server *s, int ctx) {
  *      warmest free slot exactly like the single-session server did.
  * Returns NULL when the job must wait for a slot to free — except when
  * *reject_ctx is set nonzero (the owner slot's ctx_size), which means the
- * job can never run and must be failed, not left queued. */
-static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx) {
+ * job can never run and must be failed, not left queued. *waiting_owner is
+ * set when the NULL means "the continuation's owner slot is busy": eviction
+ * cannot help that job, only the owner finishing can. *clobbers is set when
+ * the returned slot would overwrite another conversation's warm KV — the
+ * caller may prefer evict(LRU)+provision over that (increment 4). *refusal
+ * reports why a fresh provisioning was refused (PROVISION_OK when none was
+ * attempted or it succeeded) so the eviction path can act only on refusals
+ * eviction relieves. */
+static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
+                                         bool *waiting_owner, bool *clobbers,
+                                         provision_refusal *refusal) {
+    *waiting_owner = false;
+    *clobbers = false;
+    *refusal = PROVISION_OK;
     session_slot *owner = NULL;
     if (j->req.api == API_RESPONSES && j->req.responses_live_call_ids.len > 0) {
         owner = responses_live_slot_for_ids(s, &j->req.responses_live_call_ids);
@@ -2334,6 +2400,7 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx) {
             *reject_ctx = owner->ctx_size;
             return NULL;
         }
+        *waiting_owner = owner->active_job != NULL;
         return owner->active_job ? NULL : owner;
     }
 
@@ -2353,13 +2420,253 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx) {
     const bool best_clobbers_warm_state =
         best && best_common == 0 && ds4_session_pos(best->sess) > 0;
     if (!best || best_clobbers_warm_state) {
-        int ctx = DS4_SERVER_EXTRA_SLOT_CTX_TOKENS;
-        if (ctx > s->slots[0].ctx_size) ctx = s->slots[0].ctx_size;
-        if (ctx < needed) ctx = needed;
-        session_slot *fresh = provision_slot(s, ctx);
+        session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j),
+                                             refusal);
         if (fresh) return fresh;
     }
+    *clobbers = best_clobbers_warm_state;
     return best;
+}
+
+
+
+/* =========================================================================
+ * Increment 4: LRU eviction of idle slots.
+ *
+ * Sessions were previously never freed at runtime: once the admission budget
+ * was consumed by idle-but-warm sessions, new conversations either queued
+ * forever (no fitting free slot) or silently clobbered the warmest idle slot
+ * chosen by scan order. Now, when the queue head cannot be placed cleanly —
+ * no fitting free slot, or only a slot whose warm KV belongs to another
+ * conversation — AND provisioning was refused by a constraint eviction can
+ * actually relieve (a full pool or a full admission ledger), the worker
+ * evicts the least-recently-serviced IDLE slot: snapshot its KV to the disk
+ * kv cache (the same LRU store used for shutdown/cold checkpoints — plan
+ * Tier 1 §1.3 "spill target"), free the session, release its ACTUAL
+ * committed bytes from the ledger, and retry placement (the freed budget +
+ * slot entry let provisioning succeed). The clobber fallback remains when
+ * eviction cannot help: it is an in-place eviction of that one slot
+ * (gen_begin disk-stores the displaced state), so correctness is identical —
+ * LRU eviction just picks a better victim and keeps warmer conversations
+ * alive.
+ *
+ * MemAvailable-floor refusals deliberately do NOT trigger eviction. Measured
+ * on the GB10 (driver 610, 2026-07-14 smoke): freeing two 2.5 GiB sessions
+ * moved MemAvailable only 5.98 -> 6.07 GiB — cudaFree'd memory does not
+ * promptly return to the kernel's gauge, so post-eviction provisioning kept
+ * refusing on the same floor while two warm conversations were lost for
+ * nothing (and the server degraded to one effective slot). A floor refusal
+ * means the machine is physically tight; the honest response is to queue the
+ * head until a slot frees, not to churn snapshots.
+ *
+ * Restore path: none of it is new. gen_begin's cache resolution already
+ * prefers a disk-text snapshot over cold prefill (kv_cache_try_load), and the
+ * "evict" snapshot is keyed exactly like a shutdown checkpoint — by rendered
+ * transcript bytes, or by the visible protocol transcript when a live
+ * responses/thinking binding covers the frontier. A returning client binds to
+ * any free slot and restores from disk there; no extra routing metadata is
+ * needed because the kvstore's text-prefix index IS the metadata. Live
+ * tool-state continuations of an evicted slot get the protocol's honest 409
+ * (their sampled frontier is gone), exactly like a server restart.
+ *
+ * Slot 0 is PINNED — never evicted: (a) client threads read
+ * ds4_session_ctx(s->slots[0].sess) lock-free (http_server.c) under the
+ * CUDA-state audit's immutable-after-startup exception, so freeing that
+ * session would be a data race; (b) slot 0 is the only slot guaranteed to fit
+ * any admissible request (job_needed_ctx caps at its ctx), which preserves
+ * the scheduler invariant that an all-idle pool always binds the head (the
+ * worker sleeps on the condvar when nothing is active) and guarantees the
+ * pool never reaches zero slots; (c) as the largest session it is the most
+ * expensive one to bring back. When small sessions need room, evicting the
+ * idle secondaries (this code) frees the same budget without touching it.
+ *
+ * Like lazy provisioning, eviction is a deliberate multi-second quantum
+ * overshoot on the single GPU worker thread: the snapshot forces a full
+ * device sync + a multi-GiB D2H copy + a disk write, and ds4_session_free
+ * tears down the graph. It happens only at a scheduling boundary (bind time),
+ * and only when the alternative is queueing forever.
+ * ========================================================================= */
+
+uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
+    if (slot_cost > committed_total) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: EVICTION LEDGER UNDERFLOW: releasing %.2f GiB from "
+                   "%.2f GiB committed — provision/evict pairing is out of sync; "
+                   "clamping the ledger to 0 (the MemAvailable floor remains the "
+                   "backstop against the resulting over-admission)",
+                   (double)slot_cost / (1024.0 * 1024.0 * 1024.0),
+                   (double)committed_total / (1024.0 * 1024.0 * 1024.0));
+        return 0;
+    }
+    return committed_total - slot_cost;
+}
+
+
+
+int server_evict_pick_victim(const session_slot *slots, int n_slots,
+                             const bool *protect) {
+    int victim = -1;
+    for (int i = 1; i < n_slots; i++) { /* slot 0 pinned (see block comment) */
+        const session_slot *sl = &slots[i];
+        if (!sl->sess || sl->active_job) continue;
+        if (protect && protect[i]) continue;
+        if (victim < 0 ||
+            sl->last_serviced_us < slots[victim].last_serviced_us ||
+            (sl->last_serviced_us == slots[victim].last_serviced_us &&
+             sl->est_cost_bytes < slots[victim].est_cost_bytes))
+        {
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+
+
+/* Mark slots some QUEUED live-tool-state continuation still needs: that KV
+ * frontier exists only on its owner slot, so evicting it would turn the
+ * queued job into a 409 the moment it binds. The queue is snapshotted under
+ * mu; the job pointers stay valid afterwards because only this worker pops
+ * jobs and each client thread blocks on its job condvar until then. The
+ * owner lookups (tool_mu + session pos) run after mu is released — the two
+ * locks are never nested. */
+static void worker_protect_queued_owner_slots(server *s,
+                                              bool protect[DS4_SESSION_POOL_CAP]) {
+    memset(protect, 0, sizeof(protect[0]) * DS4_SESSION_POOL_CAP);
+    job *queued[DS4_SERVER_MAX_CLIENTS];
+    int n = 0;
+    pthread_mutex_lock(&s->mu);
+    for (job *q = s->head; q && n < DS4_SERVER_MAX_CLIENTS; q = q->next) {
+        queued[n++] = q;
+    }
+    pthread_mutex_unlock(&s->mu);
+    for (int i = 0; i < n; i++) {
+        const request *r = &queued[i]->req;
+        session_slot *owner = NULL;
+        if (r->api == API_RESPONSES && r->responses_live_call_ids.len > 0) {
+            owner = responses_live_slot_for_ids(s, &r->responses_live_call_ids);
+        } else if (r->api == API_ANTHROPIC &&
+                   r->anthropic_live_call_ids.len > 0) {
+            owner = anthropic_live_slot_for_ids(s, &r->anthropic_live_call_ids);
+        }
+        if (owner) protect[owner - s->slots] = true;
+    }
+}
+
+
+
+/* Pointless-eviction guard #2: evicting is only worth its cost if releasing
+ * idle sessions can actually admit the provisioning the head job needs.
+ * If even reclaiming EVERY unprotected idle slot leaves admission refusing,
+ * skip eviction entirely — the head is genuinely waiting for a busy slot to
+ * free, and evicting warm idle sessions would only churn snapshots. (Host
+ * arithmetic only: ds4_engine_session_cost_bytes is the same sizing code the
+ * allocator uses, no CUDA work; runs only on failed bind attempts. Guard #1
+ * is the provisioning-refusal reason check in worker_try_bind.) */
+static bool worker_eviction_could_help(server *s, const job *j,
+                                       const bool *protect) {
+    const uint64_t est =
+        ds4_engine_session_cost_bytes(s->engine, provision_ctx_for_job(s, j));
+    if (est == 0) return false;
+    uint64_t reclaimable = 0;
+    bool any = false;
+    for (int i = 1; i < s->n_slots; i++) {
+        const session_slot *sl = &s->slots[i];
+        if (!sl->sess || sl->active_job || (protect && protect[i])) continue;
+        reclaimable += sl->est_cost_bytes;
+        any = true;
+    }
+    if (!any) return false;
+    pthread_mutex_lock(&s->mu);
+    const uint64_t committed = s->kv_committed_bytes;
+    pthread_mutex_unlock(&s->mu);
+    const uint64_t after = committed > reclaimable ? committed - reclaimable : 0;
+    return server_kv_admits(s->kv_budget_bytes, after, est);
+}
+
+
+
+/* Evict one idle slot (LRU victim): snapshot to the disk kv cache when
+ * possible, free the session, release the ledger, and leave the slot entry
+ * (sess == NULL) for provision_slot to reuse. Failure honesty: a failed or
+ * unavailable snapshot only costs the returning client a re-prefill — the
+ * eviction itself proceeds, and the response always belongs to the right
+ * conversation because the freed KV can never be read again. Returns false
+ * when nothing is evictable. Worker thread only. */
+static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
+    const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect);
+    if (vi < 0) return false;
+    session_slot *sl = &s->slots[vi];
+
+    const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
+    const int live_tokens = tokens ? tokens->len : 0;
+    bool stored = false;
+    if (s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
+        stored = kv_cache_store_current(s, sl, "evict");
+    }
+    if (!stored && live_tokens > 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: slot %d evicting WITHOUT a disk snapshot (%s); "
+                   "a returning client re-prefills (correctness unaffected)",
+                   vi,
+                   !s->kv.enabled ? "kv disk cache disabled"
+                   : live_tokens < s->kv.opt.min_tokens
+                       ? "conversation below kv-cache min-tokens"
+                       : "snapshot write failed");
+    }
+    /* The live protocol bindings describe a sampled frontier that is about to
+     * lose its GPU state; clear them AFTER the store (snapshot keying reads
+     * them). A later continuation of those ids gets the protocol's 409. */
+    responses_live_clear(s, sl);
+    anthropic_live_clear(s, sl);
+    thinking_live_clear(s, sl);
+
+    /* Free the session and verify, against the allocator's ground-truth
+     * counter, that the bytes the ledger is about to release actually came
+     * back (the create-side twin of server_reconciled_session_cost). */
+    const uint64_t committed = sl->est_cost_bytes;
+    const uint64_t alloc_before = ds4_gpu_tensor_alloc_bytes_current();
+    ds4_session_free(sl->sess);
+    const uint64_t alloc_after = ds4_gpu_tensor_alloc_bytes_current();
+    const uint64_t freed =
+        alloc_before > alloc_after ? alloc_before - alloc_after : 0;
+    if (committed > 0 &&
+        (freed > committed + committed / 10 ||
+         committed > freed + freed / 10))
+    {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: EVICTION FREED-BYTES DRIFT >10%%: ledger releases "
+                   "%.2f GiB but the allocator freed %.2f GiB — session teardown "
+                   "is leaking or freeing unaccounted allocations",
+                   (double)committed / (1024.0 * 1024.0 * 1024.0),
+                   (double)freed / (1024.0 * 1024.0 * 1024.0));
+    }
+    const int evicted_ctx = sl->ctx_size;
+    sl->sess = NULL;
+    sl->gen = NULL;
+    sl->active_job = NULL;
+    sl->state = SLOT_EVICTED;
+    sl->ctx_size = 0;
+    sl->est_cost_bytes = 0;
+    sl->tokens_emitted = 0;
+    sl->last_serviced_us = 0;
+    sl->continued_last_store_tokens = 0;
+    pthread_mutex_lock(&s->mu);
+    s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
+    const uint64_t committed_now = s->kv_committed_bytes;
+    pthread_mutex_unlock(&s->mu);
+    protect[vi] = true; /* freed hole; never a candidate again this round */
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: evicted slot %d ctx=%d tokens=%d snapshot=%s "
+               "released=%.2f GiB (allocator freed %.2f GiB) "
+               "committed now %.2f / %.2f GiB, MemAvailable %.2f GiB",
+               vi, evicted_ctx, live_tokens, stored ? "disk" : "none",
+               (double)committed / (1024.0 * 1024.0 * 1024.0),
+               (double)freed / (1024.0 * 1024.0 * 1024.0),
+               (double)committed_now / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)server_mem_available_bytes() / (1024.0 * 1024.0 * 1024.0));
+    return true;
 }
 
 
@@ -2368,7 +2675,14 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx) {
  * head must wait (its owner slot is busy, or no fitting slot is free), later
  * jobs wait behind it — simple and starvation-free. Returns true when the
  * head was consumed: bound to a slot, or failed explicitly (a continuation
- * that cannot fit its owner slot — see choose_slot_for_job). */
+ * that cannot fit its owner slot — see choose_slot_for_job). When the head
+ * cannot be placed cleanly (nothing fits, or only a warm slot it would
+ * clobber), it is not waiting on a busy owner, and the provisioning refusal
+ * is one eviction can relieve (full pool / full ledger — never the
+ * MemAvailable floor, see the increment-4 block above), idle slots are
+ * evicted LRU-first until the head binds without clobbering or eviction
+ * stops helping — then the clobber fallback binds it exactly like the
+ * increment-3 scheduler did. */
 static bool worker_try_bind(server *s) {
     pthread_mutex_lock(&s->mu);
     job *j = s->head; /* peek: only the worker pops */
@@ -2376,7 +2690,28 @@ static bool worker_try_bind(server *s) {
     if (!j) return false;
 
     int reject_ctx = 0;
-    session_slot *sl = choose_slot_for_job(s, j, &reject_ctx);
+    bool waiting_owner = false;
+    bool clobbers = false;
+    provision_refusal refusal = PROVISION_OK;
+    session_slot *sl = choose_slot_for_job(s, j, &reject_ctx, &waiting_owner,
+                                           &clobbers, &refusal);
+    if ((!sl || clobbers) && !waiting_owner && reject_ctx == 0 &&
+        (refusal == PROVISION_REFUSED_POOL_FULL ||
+         refusal == PROVISION_REFUSED_ADMISSION))
+    {
+        bool protect[DS4_SESSION_POOL_CAP];
+        worker_protect_queued_owner_slots(s, protect);
+        if (worker_eviction_could_help(s, j, protect)) {
+            while ((!sl || clobbers) &&
+                   (refusal == PROVISION_REFUSED_POOL_FULL ||
+                    refusal == PROVISION_REFUSED_ADMISSION) &&
+                   worker_evict_one(s, protect))
+            {
+                sl = choose_slot_for_job(s, j, &reject_ctx, &waiting_owner,
+                                         &clobbers, &refusal);
+            }
+        }
+    }
     if (!sl && reject_ctx > 0) {
         /* The job can never run: pop it and send the front door's
          * context_length_exceeded client error (against the owner slot's
@@ -2461,10 +2796,13 @@ static void worker_finish_slot(server *s, session_slot *sl) {
  *
  * Quantum overshoot: binding may lazily provision a slot, and
  * provision_slot's ds4_session_create is a multi-GiB allocation that can
- * take SECONDS — every bound slot stalls for its duration. That is the
- * largest quantum overshoot in the system (larger than the DSpark ≤17-token
- * fused burst) and is deliberate single-thread design: the CUDA-state audit
- * (ds4_server_internal.h) rules out a second GPU thread. */
+ * take SECONDS — every bound slot stalls for its duration. Binding may also
+ * EVICT idle slots first (increment 4): snapshot-to-disk (full device sync +
+ * multi-GiB D2H + disk write) plus session teardown, then the provisioning
+ * on top. These are the largest quantum overshoots in the system (larger
+ * than the DSpark ≤17-token fused burst) and are deliberate single-thread
+ * design: the CUDA-state audit (ds4_server_internal.h) rules out a second
+ * GPU thread, and both happen only at a scheduling boundary. */
 void *worker_main(void *arg) {
     server *s = arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */

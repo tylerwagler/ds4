@@ -659,7 +659,15 @@ typedef struct {
  * Increment 3 adds the scheduler: the worker binds queued jobs to free slots
  * (FIFO, warmest-prefix slot choice, lazily provisioning extra slots under the
  * KV admission budget) and round-robins one quantum at a time over the bound
- * slots. Eviction and batched decode are later increments. */
+ * slots. Increment 4 adds LRU eviction: when the queue head cannot be placed
+ * cleanly (no fitting free slot, or only a warm slot it would clobber) and
+ * provisioning was refused by a constraint eviction can relieve (full pool /
+ * full admission ledger — deliberately NOT the MemAvailable floor, which
+ * freed CUDA memory does not promptly move), the worker evicts the
+ * least-recently-serviced IDLE slot — snapshot to the disk kv cache, free
+ * the session, release its ACTUAL bytes from the ledger — and provisions in
+ * its place (see the increment-4 block in generate.c; slot 0 is pinned).
+ * Batched decode is a later increment (Tier 2). */
 
 /* Pool capacity (increment 3). Slot 0 is provisioned at startup with the
  * configured --ctx-size; the rest are provisioned lazily, only when a job
@@ -705,7 +713,11 @@ typedef enum {
     SLOT_IDLE = 0,     /* no live job; sess may be warm and reusable */
     SLOT_PREFILLING,   /* ingesting a prompt (chunked prefill) */
     SLOT_DECODING,     /* generating tokens */
-    SLOT_EVICTED,      /* graph freed, KV held only in evicted_payload */
+    SLOT_EVICTED,      /* session freed, ledger released; KV state spilled to
+                          the disk kv cache (snapshot-on-evict) so a returning
+                          client restores via the normal disk-text path instead
+                          of a cold prefill. The slot entry (sess == NULL) is
+                          reusable by the next provisioning. */
 } slot_state;
 
 /* Resumable per-job generation state (defined in generate.c). Owns everything
@@ -734,7 +746,6 @@ typedef struct {
      * the shared ds4_kvstore keeps one continued_last_store_tokens field, but
      * the schedule it tracks belongs to this slot's conversation. */
     int          continued_last_store_tokens;
-    ds4_session_snapshot *evicted_payload; /* host KV when SLOT_EVICTED (unused in inc 3) */
     /* Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
@@ -1207,7 +1218,10 @@ bool kv_cache_file_size_fits(const kv_disk_cache *kc,
 bool kv_cache_store_live_prefix(server *s, session_slot *sl,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason);
-void kv_cache_store_current(server *s, session_slot *sl, const char *reason);
+/* Returns whether a checkpoint file was actually written — eviction uses this
+ * for failure honesty (evict-without-snapshot falls back to client re-prefill;
+ * older callers ignore the result as before). */
+bool kv_cache_store_current(server *s, session_slot *sl, const char *reason);
 /* The continued-store frontier (lib field kc->continued_last_store_tokens) is
  * per-conversation state on a kvstore shared by every slot. Every
  * tracker-touching operation brackets itself with these on the single worker
@@ -1266,6 +1280,19 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
 uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
                                                uint64_t est_bytes,
                                                uint64_t actual_bytes);
+/* Eviction ledger release: subtract an evicted slot's committed bytes from
+ * the admission ledger total, warning loudly (and clamping to 0, which fails
+ * toward over-admission being caught by the MemAvailable floor rather than
+ * leaking budget forever) if the pairing ever underflows (defined in
+ * generate.c; unit-tested in cli_main.c). */
+uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
+/* LRU eviction victim: least-recently-serviced idle provisioned slot,
+ * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
+ * NULL) marks slots a queued live continuation still needs. Returns a slot
+ * index or -1. Pure selection over host fields — never dereferences sess
+ * (defined in generate.c; unit-tested in cli_main.c). */
+int server_evict_pick_victim(const session_slot *slots, int n_slots,
+                                    const bool *protect);
 void trace_cache_capture(
         trace_cache_diag *d,
         const ds4_tokens *live,

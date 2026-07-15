@@ -4740,6 +4740,87 @@ static void test_kv_admission_budget_math(void) {
 
 
 
+/* Multi-session increment 4: eviction is the first runtime session-free path,
+ * so the ledger must balance EXACTLY across provision→evict→provision cycles
+ * — each provisioning commits the session's ACTUAL allocator bytes and each
+ * eviction releases that same stored value. */
+static void test_session_eviction_ledger_math(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull;
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t budget = server_kv_budget_bytes(87450ull * MiB); /* ~11.6 GiB */
+    const uint64_t slot0 = 4710ull * MiB;   /* startup slot, ctx 64k measured */
+    const uint64_t a = 2560ull * MiB;       /* lazy 64k slot (pc 2048 shape) */
+    const uint64_t b = 2571ull * MiB;       /* same shape, distinct actual */
+
+    /* provision slot0 + a + b, filling the budget */
+    uint64_t committed = slot0;
+    TEST_ASSERT(server_kv_admits(budget, committed, a));
+    committed += a;
+    TEST_ASSERT(server_kv_admits(budget, committed, b));
+    committed += b;
+    /* pool full for another a-sized session: admission refuses */
+    TEST_ASSERT(!server_kv_admits(budget, committed, 2560ull * MiB));
+
+    /* evict a: the exact committed value comes back, and the freed budget
+     * admits an equal-shape provisioning again */
+    committed = server_ledger_release(committed, a);
+    TEST_ASSERT(committed == slot0 + b);
+    TEST_ASSERT(server_kv_admits(budget, committed, a));
+    committed += a;
+    TEST_ASSERT(committed == slot0 + b + a);
+
+    /* evict everything back down to slot 0: balance is exact, not approximate */
+    committed = server_ledger_release(committed, b);
+    committed = server_ledger_release(committed, a);
+    TEST_ASSERT(committed == slot0);
+    committed = server_ledger_release(committed, slot0);
+    TEST_ASSERT(committed == 0);
+
+    /* releasing more than is committed means the pairing broke: clamp to 0
+     * (warns loudly; the MemAvailable floor backstops the over-admission) */
+    TEST_ASSERT(server_ledger_release(1ull * GiB, 2ull * GiB) == 0);
+    TEST_ASSERT(server_ledger_release(0, 1) == 0);
+}
+
+
+
+/* Victim selection: LRU over IDLE provisioned slots, slot 0 pinned, active
+ * and protected slots skipped, ties broken by smallest committed bytes
+ * (cheapest to bring back). Pure host-field selection — the fake sess
+ * pointers are never dereferenced. */
+static void test_session_eviction_victim_selection(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull;
+    session_slot slots[DS4_SESSION_POOL_CAP];
+    memset(slots, 0, sizeof(slots));
+    ds4_session *fake = (ds4_session *)&slots; /* non-NULL, never dereferenced */
+    for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) slots[i].sess = fake;
+    slots[0].last_serviced_us = 1;              /* oldest of all — but pinned */
+    slots[0].est_cost_bytes = 9ull * GiB;
+    slots[1].last_serviced_us = 100;
+    slots[1].est_cost_bytes = 3ull * GiB;
+    slots[2].last_serviced_us = 50;
+    slots[2].est_cost_bytes = 2ull * GiB;
+    slots[3].last_serviced_us = 50;             /* LRU tie with slot 2 */
+    slots[3].est_cost_bytes = 1ull * GiB;       /* ...but cheaper to restore */
+
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL) == 3); /* LRU tie-break */
+    bool protect[DS4_SESSION_POOL_CAP] = {0};
+    protect[3] = true;
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 2); /* protected skipped */
+    slots[2].active_job = (struct job *)&slots;                    /* busy skipped */
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 1);
+    slots[1].sess = NULL;                                          /* hole skipped */
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == -1);
+    protect[3] = false;
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 3);
+    /* n_slots bounds the scan: slot 3 invisible when only 3 are published */
+    TEST_ASSERT(server_evict_pick_victim(slots, 3, protect) == -1);
+    /* slot 0 alone is never a victim */
+    TEST_ASSERT(server_evict_pick_victim(slots, 1, NULL) == -1);
+}
+
+
+
 /* Multi-session increment 2: while a job is bound to a slot, the worker's
  * send_all() routes through a slot_writer — writes that do not fit the socket
  * buffer defer instead of blocking, and flushes deliver every byte in order.
@@ -4847,6 +4928,8 @@ static void test_slot_writer_stall_times_out(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_kv_admission_budget_math();
+    test_session_eviction_ledger_math();
+    test_session_eviction_victim_selection();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();

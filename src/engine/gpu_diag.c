@@ -410,6 +410,33 @@ uint64_t gpu_graph_session_bytes(
 
 
 
+/* DS4_KV_MANAGED: measurement override for the managed-vs-device placement of
+ * the PERSISTENT KV caches (raw ring + attn/index comp caches), for the
+ * multi-session UVM over-provisioning design (plan addendum 2026-07-14 —
+ * first-touch fault cost must be measured before committing to
+ * always-managed slot KV). Unset/empty → the size-based policy
+ * (ds4_gpu_should_use_managed_kv_cache) decides, as before. "1"/"on" →
+ * force cudaMallocManaged; "0"/"off"/"false" → force device cudaMalloc.
+ * Read once per process (static cache) and consulted only at graph
+ * allocation (session create) — never on a token/layer path. */
+static int gpu_graph_kv_managed_override(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char *v = getenv("DS4_KV_MANAGED");
+        if (!v || !v[0]) {
+            cached = -1;
+        } else if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
+                   strcasecmp(v, "false") == 0) {
+            cached = 0;
+        } else {
+            cached = 1;
+        }
+    }
+    return cached;
+}
+
+
+
 /* Allocate the GPU graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
 bool gpu_graph_alloc_raw_cap(
@@ -472,8 +499,20 @@ bool gpu_graph_alloc_raw_cap(
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         gpu_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
-    const bool managed_kv_cache =
-        ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+    const int managed_override = gpu_graph_kv_managed_override();
+    const bool managed_kv_cache = managed_override >= 0
+        ? managed_override != 0
+        : ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+    if (managed_override >= 0) {
+        fprintf(stderr,
+                "ds4: DS4_KV_MANAGED override: KV caches use %s allocation "
+                "(measurement flag; policy would have chosen %s)\n",
+                managed_kv_cache ? "MANAGED (cudaMallocManaged)"
+                                 : "DEVICE (cudaMalloc)",
+                ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes,
+                                                    context_bytes) != 0
+                    ? "managed" : "device");
+    }
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
