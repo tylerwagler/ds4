@@ -1709,6 +1709,17 @@ int ds4_engine_vocab_size(ds4_engine *e) {
 
 
 
+/* The engine's logits ROW WIDTH — the shape profile's n_vocab, which is what
+ * every logits buffer the engine writes is strided by.  This is NOT
+ * ds4_engine_vocab_size (the tokenizer table length): the loader never checks
+ * the two against each other, and sizing a logits buffer from the tokenizer
+ * length is exactly the mismatch that produced an unbounded-logits write. */
+int ds4_engine_logits_width(const ds4_engine *e) {
+    return e ? (int)DS4_N_VOCAB : 0;
+}
+
+
+
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_SHAPE_NAME;
@@ -2041,6 +2052,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
+    /* The rebuild path is the one place classic per-bank truth is legitimately
+     * re-established: reset_prefill_state zeroes layer_n_comp /
+     * layer_n_index_comp, so the scalars stop holding any multiseq superset
+     * and the prefill below refills them from zero against the installed
+     * bank.  (The prefix-resume path above cannot be reached while dirty —
+     * decode_multiseq clears checkpoint_valid, which that path gates on.) */
+    s->mseq_dirty = false;
     if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
         ds4_sync_progress progress = {
@@ -2280,6 +2298,18 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return 1;
+    /* Fail loud rather than corrupt: after a multiseq step the graph's scalar
+     * frontier counters hold a cross-bank superset, so this decode would emit
+     * its compressor row at the superset index and attend over another bank's
+     * rows — wrong logits, silently.  ds4_session_sync re-establishes per-bank
+     * state (rebuild path) and clears the flag. */
+    if (s->mseq_dirty) {
+        snprintf(err, errlen,
+                 "session eval after a multiseq decode step: classic per-bank "
+                 "state is stale (frontier counters hold a cross-bank "
+                 "superset); re-sync the session first");
+        return 1;
+    }
     ds4_engine *e = s->engine;
     if (!gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
@@ -2306,14 +2336,27 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
  * The session's own single-bank bookkeeping is not merely un-advanced, it is
  * INVALIDATED on success: a multiseq step leaves the scalar frontier
  * counters holding a cross-bank superset (never any single bank's truth) and
- * advances a bank's KV past s->checkpoint.  Leaving checkpoint_valid set
- * would let a later ds4_session_sync take its prefix-resume path (it gates
- * on checkpoint_valid alone) or ds4_session_eval decode against superset
- * counters — silent KV corruption, exactly the class this code fails loud
- * on everywhere else.  Invalidating makes the classic paths rebuild instead.
+ * advances a bank's KV past s->checkpoint.
+ *
+ * TWO separate guards are needed, because they cover different callers:
+ *
+ *   checkpoint_valid = false  stops ds4_session_sync from taking its
+ *       prefix-resume path (it gates on checkpoint_valid alone), forcing the
+ *       rebuild path — which resets the graph's prefill state and so
+ *       re-establishes per-bank truth.
+ *
+ *   mseq_dirty = true  stops ds4_session_eval.  checkpoint_valid does NOT
+ *       cover it: ds4_session_eval never reads checkpoint_valid — it calls
+ *       gpu_graph_eval_token_raw_swa(..., s->checkpoint.len, ...)
+ *       unconditionally, which reads g->layer_n_comp[il] (the cross-bank
+ *       superset) as its emit row, writes the compressor row there, and
+ *       attends over every row below it — a previous tenant's bytes when the
+ *       current bank's true frontier is lower.  Wrong logits, silently.  So
+ *       eval fails loud while dirty instead of corrupting.
+ *
  * The caller owns per-bank histories and must re-establish per-bank state
- * explicitly (gpu_graph_bank_counters_install + a fresh sync) to resume
- * classic work on a bank. */
+ * explicitly to resume classic work on a bank: a fresh ds4_session_sync
+ * (rebuild path) clears both flags. */
 #define DS4_MULTISEQ_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
@@ -2346,13 +2389,21 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
                                                    &e->weights, tokens, pos,
                                                    bank, n, logits);
     if (rc == 0) {
+        /* Recoverable: the driver rejected before arming the step, so nothing
+         * was mutated — the upload writes ahead of it touch scratch only, and
+         * every gpu_graph_multiseq_step_begin rejection point precedes its
+         * first scalar write (the superset refresh) and its cur-bank capture.
+         * The classic view is therefore still true: leave both flags alone so
+         * the caller can fix the batch and retry, or fall back to classic. */
         DS4_MULTISEQ_ERR("multiseq decode step rejected (recoverable; "
                          "reason on stderr)");
         return 1;
     }
-    /* Success and failure alike leave the classic single-bank view stale
-     * (see above); only the diagnosis differs. */
+    /* The step was armed: the scalar counters hold a superset on success, and
+     * on a fatal mid-sweep failure their state is unknown.  Both leave the
+     * classic single-bank view stale (see above); only the diagnosis differs. */
     s->checkpoint_valid = false;
+    s->mseq_dirty = true;
     s->spec_carry_valid = false;
     if (rc == 1) return 0;
     DS4_MULTISEQ_ERR("multiseq decode step failed mid-sweep "
@@ -2954,6 +3005,15 @@ int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
+    /* Same stale-classic-state guard as ds4_session_eval: the spec loop
+     * decodes and emits against the graph's scalar frontier counters, which
+     * hold a cross-bank superset after a multiseq step. */
+    if (s->mseq_dirty) {
+        snprintf(err, errlen,
+                 "speculative generate after a multiseq decode step: classic "
+                 "per-bank state is stale; re-sync the session first");
+        return 0;
+    }
     int first;
     const bool carry_params_match =
         s->spec_carry_temp == temperature && s->spec_carry_top_k == top_k &&
@@ -2995,6 +3055,14 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
+    /* Same stale-classic-state guard as ds4_session_eval (which the no-dspark
+     * fallback below would otherwise hit one frame deeper). */
+    if (s->mseq_dirty) {
+        snprintf(err, errlen,
+                 "speculative block eval after a multiseq decode step: classic "
+                 "per-bank state is stale; re-sync the session first");
+        return -1;
+    }
     if (!ds4_engine_has_dspark(s->engine)) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;

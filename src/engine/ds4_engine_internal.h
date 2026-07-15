@@ -905,6 +905,12 @@ typedef struct {
     uint32_t spec_frontier_copy_n;
     uint64_t spec_frontier_copy_max_bytes;
     int spec_frontier_copy_init;
+    /* Shared multi-row logits slab (16 rows x n_vocab f32), written by every
+     * batched multi-row output head: the DSpark draft/verify passes,
+     * gpu_graph_verify_suffix_tops, and the Tier-2 batched multi-session
+     * decode driver.  Despite the "spec_" name it is NOT speculation-owned —
+     * gpu_graph_alloc_raw_cap allocates it unconditionally so the batched
+     * paths work with speculation disabled. */
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_MAX_LAYER];
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
@@ -1249,6 +1255,18 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    /* A multiseq step has run and the graph's CLASSIC per-bank state is no
+     * longer re-establishable by bookkeeping alone: the scalar frontier
+     * counters (layer_n_comp / layer_n_index_comp) hold a cross-bank
+     * SUPERSET, not any single bank's truth.  Any classic entry that decodes
+     * against those scalars (ds4_session_eval) would emit its compressor row
+     * at the superset index and attend over the rows below it — a previous
+     * tenant's bytes — producing wrong logits SILENTLY.  checkpoint_valid
+     * does NOT cover this: ds4_session_eval never reads it.  Set on every
+     * decode_multiseq path that armed a step; cleared only where per-bank
+     * device state is legitimately re-established (ds4_session_sync's rebuild
+     * path, via gpu_graph_reset_prefill_state zeroing the counters). */
+    bool mseq_dirty;
     /* GPU bytes this session's create actually allocated (tensor-allocator
      * delta across ds4_session_create); the server ledger commits this. */
     uint64_t resident_bytes;

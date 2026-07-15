@@ -110,7 +110,14 @@ typedef struct {
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
+/* Tokenizer table length. NOT the logits row width — see
+ * ds4_engine_logits_width, and never size a logits buffer from this. */
 int ds4_engine_vocab_size(ds4_engine *e);
+/* Row width (in floats) of every logits buffer the engine writes: the shape
+ * profile's n_vocab. Size logits buffers with THIS — it is the stride
+ * ds4_session_decode_multiseq writes its rows at, and the loader does not
+ * check it against ds4_engine_vocab_size. */
+int ds4_engine_logits_width(const ds4_engine *e);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 
@@ -280,10 +287,26 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
  * bank, no position-0 rows, and NO speculation co-scheduled (n >= 2 is
  * plain decode by contract).
  *
+ * `logits` receives n rows of ds4_engine_logits_width(engine) floats; row k
+ * corresponds to reqs[k] (i.e. bank reqs[k].bank). `logits_cap` is the
+ * buffer's capacity IN FLOATS and must be at least n * that width — size it
+ * with ds4_engine_logits_width, never ds4_engine_vocab_size.
+ *
  * On success the session's classic single-bank bookkeeping is INVALIDATED
  * (the scalar frontier counters now hold a cross-bank superset and the
  * checkpoint no longer describes any one bank): the caller owns per-bank
  * histories, and classic per-bank work must re-establish state explicitly.
+ * Until it does, the classic single-session entries that would decode
+ * against those superset counters FAIL LOUD rather than corrupt KV:
+ * ds4_session_eval, ds4_session_generate_speculative and
+ * ds4_session_eval_speculative_block all return an error. A ds4_session_sync
+ * (which rebuilds from zero) re-establishes state and clears the condition.
+ *
+ * The session's own s->logits is NOT updated by a multiseq step (the step has
+ * no single "the session's" row — every row belongs to a bank). Accordingly
+ * ds4_session_argmax(s) / ds4_session_token_logprob(s, ...) keep returning
+ * the pre-step classic distribution and must not be used to interpret a
+ * multiseq result: sample from the `logits` rows returned here instead.
  *
  * Returns 0 on success; 1 on a recoverable rejection (bad args/contract; no
  * state mutated); -1 on a fatal mid-sweep failure (tear the session down). */

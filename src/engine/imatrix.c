@@ -1079,18 +1079,25 @@ int gpu_graph_decode_multiseq_batch(
         n_active > gpu_graph_bank_pool_count(g) ||
         n_active > g->prefill_cap || !g->spec_logits) {
         fprintf(stderr, "ds4: multiseq decode rejected: bad args (n_active=%u"
-                        " pool=%u)\n", n_active,
-                g ? gpu_graph_bank_pool_count(g) : 0u);
+                        " pool=%u prefill_cap=%u logits_slab=%s)\n", n_active,
+                g ? gpu_graph_bank_pool_count(g) : 0u,
+                g ? g->prefill_cap : 0u,
+                (g && g->spec_logits) ? "ok" : "MISSING");
         return 0;
     }
 
     /* Gather each session's current token into the batch input rows.  The
      * token embedding is position/bank-independent, so the existing prompt
-     * uploader runs unmodified over a stack view of the caller's array
-     * (this is exactly how classic decode feeds the graph, batched). */
+     * uploader runs unmodified over a stack copy of the caller's array (this
+     * is exactly how classic decode feeds the graph, batched).  The copy
+     * (<= DS4_MSEQ_MAX ints) keeps the caller's `const int *` honest — the
+     * token_vec ABI is non-const and casting it away here would license a
+     * write we do not make. */
+    int cur_tokens[DS4_MSEQ_MAX];
+    memcpy(cur_tokens, tokens, (size_t)n_active * sizeof(cur_tokens[0]));
     token_vec cur;
     memset(&cur, 0, sizeof(cur));
-    cur.v = (int *)tokens;
+    cur.v = cur_tokens;
     cur.len = cur.cap = (int)n_active;
     if (!gpu_graph_upload_prompt_tokens(g->prefill_tokens, &cur, 0, n_active) ||
         !gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,

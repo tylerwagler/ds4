@@ -362,6 +362,14 @@ uint64_t gpu_graph_session_bytes(
     total += 2ull * DS4_N_EMBD * f32;                     /* output_embd, output_norm */
     total += dz.vocab_dim * f32;                          /* logits */
     total += pc * sizeof(int32_t);                        /* prefill_tokens */
+    /* Multi-row logits readback slab.  Allocated unconditionally (NOT under
+     * enable_spec): besides the DSpark draft/verify passes it is the output
+     * buffer of every batched multi-row head — gpu_graph_verify_suffix_tops
+     * and the Tier-2 batched multi-session decode driver
+     * (gpu_graph_decode_multiseq_batch) both read their rows out of it, and
+     * those paths must work with speculation disabled (--no-dspark,
+     * ds4-bench/ds4-eval/agent, or any model without a merged drafter). */
+    total += 16ull * DS4_N_VOCAB * f32;                   /* spec_logits */
 
     /* Batch (prefill working set) buffers — the pc-scaled bulk that dominates
      * the non-KV cost (~4 GiB at pc=4096 on Flash). */
@@ -410,7 +418,6 @@ uint64_t gpu_graph_session_bytes(
         total += (uint64_t)DS4_N_EMBD * f32;              /* dspark_proj_out */
         total += 3ull * DS4_N_HEAD_DIM * f32;             /* dspark_seed_kv/norm/rot */
         total += (uint64_t)DS4_N_VOCAB * f32;             /* dspark_markov_logits */
-        total += 16ull * DS4_N_VOCAB * f32;               /* spec_logits */
     }
     return total;
 }
@@ -765,10 +772,23 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
                                 "single-bank classic)\n", seq[t], pos[t]);
                 return false;
             }
-        } else if (pos[t] != pos[t - 1] + 1) {
+        } else if ((int64_t)pos[t] != (int64_t)pos[t - 1] + 1) {
+            /* int64 arithmetic: pos[t-1] == INT32_MAX would make the int32
+             * increment signed overflow (UB) before the per-row bound below
+             * could reject it. */
             fprintf(stderr, "ds4: multiseq step rejected: bank %d positions "
                             "not consecutive within its run (row %u: %d, "
-                            "want %d)\n", seq[t], t, pos[t], pos[t - 1] + 1);
+                            "want %lld)\n", seq[t], t, pos[t],
+                    (long long)((int64_t)pos[t - 1] + 1));
+            return false;
+        }
+        /* Bound EVERY row (not just each run's first): positions are cast to
+         * uint32 downstream (ring slot, visible-comp, RoPE), and the
+         * position-derived arithmetic below adds 1. */
+        if (pos[t] <= 0 || pos[t] == INT32_MAX) {
+            fprintf(stderr, "ds4: multiseq step rejected: bank %d row %u "
+                            "position %d out of range (want 0 < pos < "
+                            "INT32_MAX)\n", seq[t], t, pos[t]);
             return false;
         }
     }
@@ -1199,6 +1219,14 @@ bool gpu_graph_alloc_raw_cap(
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
+    /* Shared multi-row logits slab (16 rows).  Unconditional, NOT gated on
+     * speculation: every batched multi-row output head writes its rows here —
+     * the DSpark draft/verify passes, gpu_graph_verify_suffix_tops, and the
+     * Tier-2 batched multi-session decode driver.  It used to be allocated
+     * only by gpu_graph_init_dspark_target (session create, dspark_ready
+     * only), which left the multiseq driver rejecting every step whenever
+     * speculation was off. */
+    g->spec_logits = ds4_gpu_tensor_alloc(16ull * DS4_N_VOCAB * sizeof(float));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_flat_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -1278,7 +1306,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
-                    g->prefill_tokens &&
+                    g->prefill_tokens && g->spec_logits &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
                     g->batch_attn_cur && g->batch_attn_norm &&
@@ -1369,12 +1397,9 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits;
     }
-    /* Speculative-logits buffer for the N-token draft base logits and the
-     * target verify pass. */
-    if (!g->spec_logits) {
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
-    }
-    ok = ok && g->spec_logits;
+    /* spec_logits is NOT allocated here: it is the shared multi-row logits
+     * slab, allocated unconditionally by gpu_graph_alloc_raw_cap (the batched
+     * decode driver needs it with speculation disabled). */
     return ok;
 }
 
