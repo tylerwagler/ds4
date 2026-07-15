@@ -1893,10 +1893,12 @@ void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank);
  * and refreshes the scalar superset counters ONCE (the step's emit-inclusive
  * bound, max over rows of (pos+1)/ratio).  capture_cur first captures the
  * current bank's scalars into its ms row (single-session diagnostic use).
- * v1 constraint (fail-loud): row positions must be globally consecutive
- * (pos[t] == pos[0]+t) with each bank's rows contiguous — the batch upstream
- * stages (RoPE, per-token compressor loop inputs) are keyed on pos0+t until
- * the driver increment adds per-row-position variants.  Every rejection
+ * Constraint (fail-loud): each bank's rows form ONE contiguous run with
+ * consecutive positions inside the run (pos ascending by 1), and every run
+ * starts at a position > 0 (position-0 rows rejected — admission prefill is
+ * classic single-bank in v1).  Banks may sit at unrelated positions: every
+ * upstream batch stage is per-row-position driven (RoPE variants take the
+ * batch_positions device array; NULL degenerates to pos0+t).  Every rejection
  * prints the reason.  Disarm + self-check with gpu_graph_multiseq_step_end
  * after the layer sweep (it validates every batched bank's frontier advanced
  * to its position-derived value and the superset equals max over banks). */

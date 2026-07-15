@@ -640,7 +640,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                        attn_factor,
                                                        DS4_ROPE_YARN_BETA_FAST,
                                                        DS4_ROPE_YARN_BETA_SLOW,
-                                                       DS4_RMS_EPS) != 0;
+                                                       DS4_RMS_EPS,
+                                                       mseq ? g->batch_positions : NULL) != 0;
         }
         if (!prefill_q_norm_rope_fused) {
             if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
@@ -666,7 +667,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                     ext_factor,
                                                     attn_factor,
                                                     DS4_ROPE_YARN_BETA_FAST,
-                                                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                                    DS4_ROPE_YARN_BETA_SLOW,
+                                                    mseq ? g->batch_positions : NULL) != 0;
         } else {
             DS4_CUDA_PROFILE_Q_STAGE("head_norm");
         }
@@ -718,7 +720,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                             ext_factor,
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                            DS4_ROPE_YARN_BETA_SLOW,
+                                            mseq ? g->batch_positions : NULL) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("KVrope", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -1260,7 +1263,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                     ext_factor,
                                                     attn_factor,
                                                     DS4_ROPE_YARN_BETA_FAST,
-                                                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                                    DS4_ROPE_YARN_BETA_SLOW,
+                                                    mseq ? g->batch_positions : NULL) != 0;
             if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
                                                           n_tokens * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
@@ -2053,7 +2057,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                             ext_factor,
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                            DS4_ROPE_YARN_BETA_SLOW,
+                                            mseq ? g->batch_positions : NULL) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);

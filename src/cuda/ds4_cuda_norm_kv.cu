@@ -117,6 +117,9 @@ __device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
 
 
 
+/* positions (both RoPE kernels): per-row absolute query positions for banked
+ * multi-session batches; NULL degenerates to the classic consecutive pos0+t
+ * rule bit-exactly (same arithmetic on the same value). */
 __global__ static void head_rms_norm_rope_tail_kernel(
         float *x,
         uint32_t n_tok,
@@ -132,10 +135,12 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float attn_factor,
         float beta_fast,
         float beta_slow,
-        float eps) {
+        float eps,
+        const int32_t * __restrict__ positions) {
     uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
     uint32_t t = row / n_head;
+    const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
     float *xr = x + (uint64_t)row * head_dim;
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
@@ -165,7 +170,7 @@ __global__ static void head_rms_norm_rope_tail_kernel(
     }
     for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
         uint32_t i = pair * 2u;
-        float theta_extrap = (float)(pos0 + t) * powf(freq_base, -((float)i) / (float)n_rot);
+        float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
         float theta_interp = freq_scale * theta_extrap;
         float theta = theta_interp;
         float mscale = attn_factor;
@@ -209,7 +214,8 @@ __global__ static void rope_tail_kernel(
         float ext_factor,
         float attn_factor,
         float beta_fast,
-        float beta_slow) {
+        float beta_slow,
+        const int32_t * __restrict__ positions) {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     if (gid >= pairs) return;
@@ -229,7 +235,8 @@ __global__ static void rope_tail_kernel(
         corr1 = fminf((float)(n_rot - 1), corr1);
     }
 
-    float theta_extrap = (float)(pos0 + t * pos_stride) * powf(freq_base, -((float)i) / (float)n_rot);
+    const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t * pos_stride;
+    float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
     float theta_interp = freq_scale * theta_extrap;
     float theta = theta_interp;
     float mscale = attn_factor;
@@ -1013,10 +1020,11 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
 }
 
 
-extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
+extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const ds4_gpu_tensor *positions) {
+    if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, positions ? (const int32_t *)positions->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 
@@ -1276,10 +1284,11 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_pack_tensor(ds4_gpu_tensor *x,
 }
 
 
-extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const ds4_gpu_tensor *positions) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
+    if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
-    rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 
@@ -1467,7 +1476,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     if (ok) ok = ds4_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
                                             pos + 1u - ratio, n_ctx_orig, false,
                                             freq_base, freq_scale, ext_factor, attn_factor,
-                                            beta_fast, beta_slow);
+                                            beta_fast, beta_slow, NULL);
     ds4_gpu_tensor_free(comp_row_view);
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;
@@ -1588,7 +1597,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
             rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
                     (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                     pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
+                    ext_factor, attn_factor, beta_fast, beta_slow, NULL);
             if (!cuda_ok(cudaGetLastError(), "compressor prefill rope launch")) return 0;
         }
         if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
@@ -1665,7 +1674,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
                 (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                 pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
+                ext_factor, attn_factor, beta_fast, beta_slow, NULL);
         if (!cuda_ok(cudaGetLastError(), "compressor replay rope launch")) return 0;
     }
     if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;

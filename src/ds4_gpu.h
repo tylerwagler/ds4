@@ -319,6 +319,16 @@ int ds4_gpu_head_rms_norm_tensor(
         uint32_t          head_dim,
         float             eps);
 
+/* positions (both RoPE entries below): optional int32 [n_tok] DEVICE array of
+ * per-row absolute positions for multi-session banked batches (rows of
+ * different sessions sit at unrelated positions).  NULL keeps the classic
+ * consecutive pos0+t rule bit-exactly — the multiseq degeneracy invariant.
+ * The launcher bounds-checks the array's SIZE; its VALUES are the caller's
+ * contract (they are device-side, and a per-step D2H scan to validate them
+ * would put host-visible work on the per-token path).  Values are used as
+ * uint32 rotation positions: a negative entry rotates at a garbage angle
+ * rather than faulting.  gpu_graph_multiseq_step_begin is the host-side
+ * validator that every position is > 0 before any launch sees the array. */
 int ds4_gpu_head_rms_norm_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
@@ -334,7 +344,8 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         float             attn_factor,
         float             beta_fast,
         float             beta_slow,
-        float             eps);
+        float             eps,
+        const ds4_gpu_tensor *positions);
 
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_tensor *x,
@@ -456,7 +467,8 @@ int ds4_gpu_rope_tail_tensor(
         float             ext_factor,
         float             attn_factor,
         float             beta_fast,
-        float             beta_slow);
+        float             beta_slow,
+        const ds4_gpu_tensor *positions);
 
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw

@@ -755,7 +755,8 @@ bool gpu_graph_encode_decode_layer(
                                                    attn_factor,
                                                    DS4_ROPE_YARN_BETA_FAST,
                                                    DS4_ROPE_YARN_BETA_SLOW,
-                                                   DS4_RMS_EPS) != 0;
+                                                   DS4_RMS_EPS,
+                                                   NULL) != 0;
     }
     if (!decode_q_norm_rope_fused) {
         if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
@@ -766,7 +767,8 @@ bool gpu_graph_encode_decode_layer(
                                                 DS4_N_ROT, pos,
                                                 compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                 false, freq_base, freq_scale, ext_factor, attn_factor,
-                                                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                                NULL) != 0;
     }
     DS4_CUDA_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
@@ -792,7 +794,8 @@ bool gpu_graph_encode_decode_layer(
                                             DS4_N_ROT, pos,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                            NULL) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("KVrope", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
@@ -1053,7 +1056,8 @@ bool gpu_graph_encode_decode_layer(
                                                         ext_factor,
                                                         attn_factor,
                                                         DS4_ROPE_YARN_BETA_FAST,
-                                                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                                        DS4_ROPE_YARN_BETA_SLOW,
+                                                        NULL) != 0;
                 if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->indexer_q,
                                                               DS4_N_INDEXER_HEAD,
                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
@@ -1269,7 +1273,8 @@ bool gpu_graph_encode_decode_layer(
                                             ext_factor,
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+                                            DS4_ROPE_YARN_BETA_SLOW,
+                                            NULL) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
@@ -1649,7 +1654,7 @@ void gpu_graph_dspark_seed_draft_kv(
             ds4_gpu_rope_tail_tensor(kv_rot, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                      pos, 0, false,
                                      (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-                                     DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+                                     DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, NULL);
             ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv_rot, 1, DS4_N_HEAD_DIM, DS4_N_ROT);
             ds4_gpu_tensor_copy(g->dspark_raw_cache[li],
                                 (uint64_t)row * kv_bytes,
@@ -1772,7 +1777,8 @@ bool gpu_graph_dspark_draft_forward(
             DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
             pos0, 0, false,
             (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, DS4_RMS_EPS) != 0;
+            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, DS4_RMS_EPS,
+            NULL) != 0;
 
         /* --- KV projection --- */
         if (ok) ok = ds4_gpu_matmul_mxfp8_tensor(
@@ -1790,7 +1796,7 @@ bool gpu_graph_dspark_draft_forward(
             DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
             pos0, 0, false,
             (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, NULL) != 0;
         if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(
             g->batch_kv, n_draft, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
 
@@ -1839,7 +1845,7 @@ bool gpu_graph_dspark_draft_forward(
             DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
             pos0, 0, true,
             (float)DS4_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, NULL) != 0;
         /* --- Attention output projection (LoRA grouped) --- */
         if (ok) ok = ds4_gpu_attention_output_batch_tensor(
             g->batch_attn_out, g->batch_attn_low,

@@ -733,26 +733,18 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
         return false;
     }
     const uint32_t n_banks = gpu_graph_bank_pool_count(g);
-    if (pos[0] <= 0) {
-        /* Admission (from-zero) prefill stays on the classic single-bank
-         * view path in v1 — a fresh bank must be populated there first.
-         * Negative first positions are equally out of contract (and would
-         * otherwise wrap through the uint32 casts below). */
-        fprintf(stderr, "ds4: multiseq step rejected: first position %d <= 0 "
-                        "(admission prefill is single-bank classic)\n", pos[0]);
-        return false;
-    }
-    /* v1 constraint: globally consecutive positions, contiguous per-bank
-     * runs, each bank at most one run (see the declaration comment). */
+    /* Constraint (relaxed for the batched-decode driver): contiguous per-bank
+     * runs (each bank at most one run), positions consecutive WITHIN each
+     * bank's run, and every run starting at a position > 0.  Banks may sit at
+     * unrelated positions — the multi-session shape; the upstream batch
+     * stages (RoPE q/kv/indexer-q/inverse, compressor loop, raw scatter,
+     * attention, indexer) are all per-row-position driven.  Position-0 rows
+     * stay rejected: admission (from-zero) prefill runs on the classic
+     * single-bank view path in v1, and negative positions would wrap the
+     * uint32 casts below. */
     bool bank_seen[DS4_MSEQ_MAX] = {false};
     int32_t prev_bank = -1;
     for (uint32_t t = 0; t < n_rows; t++) {
-        if (pos[t] != pos[0] + (int32_t)t) {
-            fprintf(stderr, "ds4: multiseq step rejected: non-consecutive "
-                            "positions (row %u: %d, want %d)\n",
-                    t, pos[t], pos[0] + (int32_t)t);
-            return false;
-        }
         if (seq[t] < 0 || (uint32_t)seq[t] >= n_banks ||
             (uint32_t)seq[t] >= DS4_MSEQ_MAX) {
             fprintf(stderr, "ds4: multiseq step rejected: row %u bank %d "
@@ -767,6 +759,17 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
             }
             bank_seen[seq[t]] = true;
             prev_bank = seq[t];
+            if (pos[t] <= 0) {
+                fprintf(stderr, "ds4: multiseq step rejected: bank %d first "
+                                "position %d <= 0 (admission prefill is "
+                                "single-bank classic)\n", seq[t], pos[t]);
+                return false;
+            }
+        } else if (pos[t] != pos[t - 1] + 1) {
+            fprintf(stderr, "ds4: multiseq step rejected: bank %d positions "
+                            "not consecutive within its run (row %u: %d, "
+                            "want %d)\n", seq[t], t, pos[t], pos[t - 1] + 1);
+            return false;
         }
     }
     /* capture_cur: the classic scalar counters are the CURRENT bank's truth
