@@ -1544,14 +1544,17 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                       n_raw);
             double index_stage_t0 = 0.0;
 
-            ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+            ok = ds4_gpu_store_raw_kv_batch_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
+                                                        : g->layer_raw_cache[il],
                                                      g->batch_kv,
                                                      g->raw_cap,
                                                      pos0,
                                                      n_tokens,
                                                      DS4_N_HEAD_DIM,
                                                      (uint32_t)gpu_graph_raw_f16_enabled(),
-                                                     NULL, NULL, 1) != 0;
+                                                     mseq ? g->batch_positions : NULL,
+                                                     mseq ? g->batch_seq_id : NULL,
+                                                     mseq ? nb : 1) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 /* DS4_PREFILL_SLICE: run [score -> top-k -> indexed attention]

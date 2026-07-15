@@ -796,7 +796,9 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
         }
     }
     /* Lazy descriptor storage: host mirrors + device arrays, prefill_cap
-     * entries (a few KB) — never allocated in single-session serving. */
+     * entries (a few KB) — never allocated in single-session serving.  On a
+     * (transient) device-alloc failure everything is released and reset so a
+     * later step re-attempts instead of failing forever. */
     if (!g->ms_positions) {
         g->ms_positions = xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
         g->ms_seq_id = xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
@@ -806,6 +808,14 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
             ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
         if (!g->batch_positions || !g->batch_seq_id) {
             fprintf(stderr, "ds4: multiseq descriptor alloc failed\n");
+            ds4_gpu_tensor_free(g->batch_positions);
+            ds4_gpu_tensor_free(g->batch_seq_id);
+            g->batch_positions = NULL;
+            g->batch_seq_id = NULL;
+            free(g->ms_positions);
+            free(g->ms_seq_id);
+            g->ms_positions = NULL;
+            g->ms_seq_id = NULL;
             return false;
         }
     }
@@ -822,23 +832,32 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
      * multiseq step (top of step, before any launch, never mid-forward).
      * The value is the step's emit-inclusive visibility bound: max over
      * rows of (pos+1)/ratio, which every batched bank's frontier reaches
-     * once its own emits land (verified by step_end). */
+     * once its own emits land (verified by step_end).  Validate EVERY
+     * layer's capacity before writing ANY scalar: a rejected begin must
+     * leave the graph's classic counters untouched (a partial overwrite
+     * would inflate the frontiers a recovering classic caller decodes
+     * with). */
+    uint32_t sup[DS4_MAX_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        sup[il] = 0;
+        if (ratio == 0) continue;
+        for (uint32_t t = 0; t < n_rows; t++) {
+            const uint32_t v = ((uint32_t)pos[t] + 1u) / ratio;
+            if (v > sup[il]) sup[il] = v;
+        }
+        if (sup[il] > g->layer_comp_cap[il]) {
+            fprintf(stderr,
+                    "ds4: multiseq step rejected: superset %u exceeds comp "
+                    "cap %u at layer %u\n", sup[il], g->layer_comp_cap[il], il);
+            return false;
+        }
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        uint32_t sup = 0;
-        for (uint32_t t = 0; t < n_rows; t++) {
-            const uint32_t v = ((uint32_t)pos[t] + 1u) / ratio;
-            if (v > sup) sup = v;
-        }
-        if (sup > g->layer_comp_cap[il]) {
-            fprintf(stderr,
-                    "ds4: multiseq step rejected: superset %u exceeds comp "
-                    "cap %u at layer %u\n", sup, g->layer_comp_cap[il], il);
-            return false;
-        }
-        g->layer_n_comp[il] = sup;
-        if (ratio == 4) g->layer_n_index_comp[il] = sup;
+        g->layer_n_comp[il] = sup[il];
+        if (ratio == 4) g->layer_n_index_comp[il] = sup[il];
     }
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;

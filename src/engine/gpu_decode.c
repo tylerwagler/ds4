@@ -805,6 +805,11 @@ bool gpu_graph_encode_decode_layer(
     double decode_index_stage_t0 = 0.0;
     static int decode_index_stage_env = -1;
     const bool decode_index_stage_profile = gpu_graph_env_flag("DS4_CUDA_INDEXER_STAGE_PROFILE", &decode_index_stage_env);
+    /* DS4_DECODE_DESCR diagnostic: refresh the 1-row descriptor arrays once
+     * per layer (both the banked indexer scan and the banked attention below
+     * read them). */
+    const int descr_diag = gpu_graph_decode_descr_enabled();
+    if (ok && descr_diag) ok = gpu_graph_decode_descr_prepare(g, pos);
     if (ok && compressed) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -1058,7 +1063,7 @@ bool gpu_graph_encode_decode_layer(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok && gpu_graph_decode_descr_enabled()) {
+                if (ok && descr_diag) {
                     /* DS4_DECODE_DESCR: route the single-token indexer scan
                      * through the banked entry (n_banks=1, bank 0 over the
                      * installed views).  Dispatches the SAME direct-one fast
@@ -1066,8 +1071,7 @@ bool gpu_graph_encode_decode_layer(
                      * equals layer_n_index_comp here (emit-before-read), so
                      * no row goes -INF and the scan is byte-exact vs classic
                      * — gated in the Tier-2 harness. */
-                    ok = gpu_graph_decode_descr_prepare(g, pos) &&
-                         ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
+                    ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
                                                                 g->indexer_q,
                                                                 g->indexer_weights,
                                                                 g->layer_index_comp_cache[il],
@@ -1167,9 +1171,8 @@ bool gpu_graph_encode_decode_layer(
          * per-row raw derivation (min(pos+1, raw_window) rows ending at pos)
          * matches gpu_graph_raw_span_for_batch/raw_start_for_span exactly,
          * and the per-row (pos+1)/ratio compressed visibility equals the
-         * n_comp this step just produced (emit-before-attention). */
-        const int descr_diag = gpu_graph_decode_descr_enabled();
-        if (descr_diag) ok = gpu_graph_decode_descr_prepare(g, pos);
+         * n_comp this step just produced (emit-before-attention).  The
+         * descriptor arrays were refreshed once at the top of this layer. */
         if (!ok) {
             /* fall through with ok == false */
         } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
