@@ -1788,7 +1788,18 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
  * 9587033), renamed. The plain sampling path carries the same full-vocab sort
  * as the speculative one and was rewritten the same way; this pins it. Note
  * its `sum` accumulates in VOCAB order BEFORE the sort, unlike dist_build's —
- * a difference the rewrite has to respect, so it is worth gating directly. */
+ * a difference the rewrite has to respect, so it is worth gating directly.
+ *
+ * Kept verbatim ON PURPOSE — including its qsort, whose tie order the C
+ * standard leaves unspecified. That is the point: this is the behaviour we
+ * claim to reproduce, so the reference must be the real thing. Note which
+ * side is fragile: glibc merge-sorts (stably) at this size today, but falls
+ * back to an unstable quicksort if its temp malloc fails, and upstream has
+ * been moving qsort toward introsort. If a future glibc lands that, the
+ * tie-sensitive shapes fail HERE while the shipped code stays correct — the
+ * radix sort is unconditionally stable, i.e. strictly MORE deterministic than
+ * the qsort it replaced. Fix that by giving this reference an explicit
+ * (logit, id) comparator; do not "fix" the sampler. */
 static float ref_rng_f32(uint64_t *state) {
     uint64_t x = *state;
     if (x == 0) x = 0x9e3779b97f4a7c15ULL;
@@ -2011,10 +2022,18 @@ static void samp_fill_shape(float *l, uint32_t n, int shape, const char **name) 
         for (uint32_t i = 0; i < n; i++) l[i] = 3.0f + (float)(samp_u01() * 1e-6);
         break;
     case 9: *name = "subnormals + zeros (FZ range)";
-        /* -ffast-math sets FPCR.FZ, so the comparator the radix key replaces
-         * flushed subnormal inputs and tied every pair drawn from
-         * {-0.0,+0.0,+/-subnormal}. The key must reproduce that. Written as
-         * raw bits: these values cannot survive the host FP value model. */
+        /* Pins that sample_desc_key ORDERS subnormals and ties ONLY +/-0.0 —
+         * i.e. that it must NOT flush subnormals. -ffast-math would set
+         * FPCR.FZ (making the replaced comparator tie them), but only via
+         * crtfastmath.o, which the LINKER pulls in, and every binary carrying
+         * this code links through nvcc. Measured in the real link config:
+         * FPCR = 0x0, FZ = 0, comparator orders subnormals. A gcc-linked
+         * probe of the same source reports FPCR = 0x1000000 and the opposite
+         * answer — so if this shape ever fails, suspect the LINKER, not this
+         * test. Adding an FZ flush to sample_desc_key fails here, by design.
+         *
+         * Written as raw bits: these values cannot survive the host FP value
+         * model (-ffast-math folds a -0.0f literal to +0.0f). */
         {
             static const uint32_t fz[6] = {
                 0x00000000u, 0x80000000u,   /* +0.0, -0.0                */
