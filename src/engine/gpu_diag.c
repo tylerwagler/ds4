@@ -428,8 +428,17 @@ static int gpu_graph_kv_managed_override(void) {
         } else if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
                    strcasecmp(v, "false") == 0) {
             cached = 0;
-        } else {
+        } else if (strcmp(v, "1") == 0 || strcasecmp(v, "on") == 0 ||
+                   strcasecmp(v, "true") == 0) {
             cached = 1;
+        } else {
+            /* Unrecognized values fall back to the size policy instead of
+             * silently force-flipping a measurement flag (a typo'd "of[f]"
+             * must not force-manage the KV of a 128 GB box). */
+            fprintf(stderr,
+                    "ds4: DS4_KV_MANAGED=\"%s\" not recognized "
+                    "(want 1/on/true or 0/off/false); using size policy\n", v);
+            cached = -1;
         }
     }
     return cached;

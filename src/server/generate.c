@@ -2714,9 +2714,21 @@ static bool worker_try_bind(server *s) {
         if (worker_eviction_could_help(s, j, protect)) {
             while ((!sl || clobbers) &&
                    (refusal == PROVISION_REFUSED_POOL_FULL ||
-                    refusal == PROVISION_REFUSED_ADMISSION) &&
-                   worker_evict_one(s, protect))
+                    refusal == PROVISION_REFUSED_ADMISSION))
             {
+                /* Refresh owner protection every iteration (2026-07-15
+                 * review): each pass through choose_slot_for_job can stall
+                 * for seconds inside ds4_session_create, and a live-tool
+                 * continuation enqueued during that stall would be invisible
+                 * to a one-shot snapshot — its owner could then be evicted
+                 * into an avoidable 409. Holes are re-derived from
+                 * sess == NULL (the refresh clears worker_evict_one's
+                 * hole marks). */
+                worker_protect_queued_owner_slots(s, protect);
+                for (int i = 0; i < s->n_slots; i++) {
+                    if (!s->slots[i].sess) protect[i] = true;
+                }
+                if (!worker_evict_one(s, protect)) break;
                 sl = choose_slot_for_job(s, j, &reject_ctx, &waiting_owner,
                                          &clobbers, &refusal);
             }
