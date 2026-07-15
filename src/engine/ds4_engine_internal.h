@@ -1086,6 +1086,40 @@ typedef struct {
      * token). */
     ds4_gpu_tensor *descr_diag_pos;
     ds4_gpu_tensor *descr_diag_seq;
+
+    /* Tier-2 banked multiseq step state (increment 2 — per-bank compressor
+     * frontiers).  The authoritative per-bank compressed-row counters are
+     * ms_n_comp / ms_n_index_comp (indexed by TRUE bank id, never a packed
+     * row ordinal); they are HOST bookkeeping owned by the multiseq driver:
+     * gpu_graph_bank_repoint swaps device views only, and classic
+     * single-session work against a repointed bank runs on the scalar
+     * layer_n_comp counters — use gpu_graph_bank_counters_install /
+     * _capture at the boundary.
+     *
+     * During a multiseq step (batch_multiseq armed by
+     * gpu_graph_multiseq_step_begin), the scalar layer_n_comp /
+     * layer_n_index_comp become CROSS-BANK SUPERSETS, written exactly once
+     * at step top — the step's emit-inclusive visibility bound,
+     * max over rows of (pos+1)/ratio — and never mutated mid-forward (the
+     * structural avoidance of the reference fork's context-killing race:
+     * cross-bank maxima are launch/scratch bounds only, never bank
+     * addresses or extents).  The batched emit loop writes each emitted row
+     * into seq_id[t]'s bank at that bank's frontier and bumps ONLY that
+     * bank's ms counter; per-row raw-ring state needs no bookkeeping at all
+     * (the ring is position-indexed: slot = pos % raw_cap per bank).
+     *
+     * ms_positions/ms_seq_id are the host mirrors the emit loop reads;
+     * batch_positions/batch_seq_id the device arrays the kernels read.
+     * All four are lazily allocated (prefill_cap entries) on the first
+     * multiseq step; NULL in production single-session serving. */
+    uint32_t ms_n_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
+    uint32_t ms_n_index_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
+    int32_t *ms_positions;
+    int32_t *ms_seq_id;
+    ds4_gpu_tensor *batch_positions;
+    ds4_gpu_tensor *batch_seq_id;
+    bool batch_multiseq;
+    uint32_t batch_multiseq_rows;
 } ds4_gpu_graph;
 
 /* =========================================================================
@@ -1826,6 +1860,53 @@ uint32_t gpu_graph_bank_pool_n(void);
  * spec-shadow contents) is the caller's to save/restore per bank.  On
  * failure the views may be mixed-bank — treat the graph as dead. */
 bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank);
+/* Effective pool size for banked kernel launches: banks.n_banks, or 1 when
+ * the pool is disabled (the classic tensors act as bank 0). */
+uint32_t gpu_graph_bank_pool_count(const ds4_gpu_graph *g);
+/* Whole-pool cache tensors for banked kernel operands: the bank slab when
+ * the pool is enabled, else the classic single-session tensor (== bank 0).
+ * NULL for layers without that cache kind. */
+ds4_gpu_tensor *gpu_graph_bank_raw_pool(ds4_gpu_graph *g, uint32_t il);
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_pool(ds4_gpu_graph *g, uint32_t il);
+ds4_gpu_tensor *gpu_graph_bank_index_comp_pool(ds4_gpu_graph *g, uint32_t il);
+/* Fresh single-bank views for the batched emit path (caller frees; when the
+ * pool is disabled, bank must be 0 and the view wraps the classic tensor).
+ * kind: the per-(bank,layer) comp caches and compressor state lanes. */
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank);
+ds4_gpu_tensor *gpu_graph_bank_index_comp_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank);
+ds4_gpu_tensor *gpu_graph_bank_attn_state_kv_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank);
+ds4_gpu_tensor *gpu_graph_bank_attn_state_score_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank);
+ds4_gpu_tensor *gpu_graph_bank_index_state_kv_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank);
+ds4_gpu_tensor *gpu_graph_bank_index_state_score_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank);
+/* Host counter hand-off between classic single-session work (scalar
+ * layer_n_comp/layer_n_index_comp) and the per-bank ms counters.  Capture
+ * after classic per-bank work (admission prefill, replay) so the ms arrays
+ * reflect that bank's committed frontier; install before classic per-bank
+ * work so the scalars are that bank's counts again. */
+void gpu_graph_bank_counters_capture(ds4_gpu_graph *g, uint32_t bank);
+void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank);
+/* Arm one banked multiseq batched step over n_rows packed rows: pos[t] is
+ * row t's absolute position, seq[t] its TRUE bank id.  Writes the host
+ * mirrors + device descriptor arrays (lazily allocated), verifies the
+ * DRIVER CONTRACT (each batched bank's ms frontier is position-true —
+ * ms_n_comp == first_pos/ratio — i.e. no mid-prefill bank is co-scheduled),
+ * and refreshes the scalar superset counters ONCE (the step's emit-inclusive
+ * bound, max over rows of (pos+1)/ratio).  capture_cur first captures the
+ * current bank's scalars into its ms row (single-session diagnostic use).
+ * v1 constraint (fail-loud): row positions must be globally consecutive
+ * (pos[t] == pos[0]+t) with each bank's rows contiguous — the batch upstream
+ * stages (RoPE, per-token compressor loop inputs) are keyed on pos0+t until
+ * the driver increment adds per-row-position variants.  Every rejection
+ * prints the reason.  Disarm + self-check with gpu_graph_multiseq_step_end
+ * after the layer sweep (it validates every batched bank's frontier advanced
+ * to its position-derived value and the superset equals max over banks). */
+bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
+                                   const int32_t *seq, uint32_t n_rows,
+                                   bool capture_cur);
+bool gpu_graph_multiseq_step_end(ds4_gpu_graph *g);
+/* DS4_DECODE_DESCR=1 (env, read once): Tier-2 descriptor-vs-classic byte
+ * diagnostic — see gpu_decode.c. */
+int gpu_graph_decode_descr_enabled(void);
 /* TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
  * graph state when enable_spec); the sizing side of the admission-control
  * single source of truth (see gpu_diag.c).  Includes the whole bank pool
@@ -1887,6 +1968,15 @@ uint32_t gpu_graph_attn_comp_update_row(uint32_t row);
 bool gpu_graph_commit_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
+        uint32_t       first_row,
+        uint32_t       rows);
+/* Bank-aware commit for the batched multiseq emit path: quantize+pack the
+ * staged f32 rows into BANK's comp cache at bank-local first_row.  Equals
+ * the classic commit when the pool is disabled (bank must be 0). */
+bool gpu_graph_commit_attn_comp_stage_bank(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       bank,
         uint32_t       first_row,
         uint32_t       rows);
 ds4_gpu_tensor *gpu_graph_attn_comp_row_view(

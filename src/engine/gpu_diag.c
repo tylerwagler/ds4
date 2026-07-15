@@ -631,6 +631,263 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank) {
 
 
 
+/* ===== Tier-2 banked multiseq step machinery (increment 2) ==============
+ *
+ * Pool/view accessors + per-bank frontier bookkeeping + the multiseq step
+ * arm/disarm pair.  Contracts at the declarations (ds4_engine_internal.h)
+ * and at the ms_* fields in ds4_gpu_graph. */
+
+uint32_t gpu_graph_bank_pool_count(const ds4_gpu_graph *g) {
+    return g->banks.n_banks ? g->banks.n_banks : 1u;
+}
+
+ds4_gpu_tensor *gpu_graph_bank_raw_pool(ds4_gpu_graph *g, uint32_t il) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    return g->banks.n_banks ? g->banks.raw[il] : g->layer_raw_cache[il];
+}
+
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_pool(ds4_gpu_graph *g, uint32_t il) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    return g->banks.n_banks ? g->banks.comp[il] : g->layer_attn_comp_cache[il];
+}
+
+ds4_gpu_tensor *gpu_graph_bank_index_comp_pool(ds4_gpu_graph *g, uint32_t il) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    return g->banks.n_banks ? g->banks.index[il] : g->layer_index_comp_cache[il];
+}
+
+/* One accessor body for all six per-(bank,layer) view kinds: a fresh view of
+ * the bank's lane in the slab, or (pool disabled) a fresh view wrapping the
+ * whole classic tensor — bank 0 only, so a stale bank id cannot silently
+ * alias the single session's state. */
+static ds4_gpu_tensor *bank_lane_view(ds4_gpu_graph *g,
+                                      ds4_gpu_tensor *slab,
+                                      const uint64_t *lane_bytes,
+                                      ds4_gpu_tensor *classic,
+                                      uint32_t il, uint32_t bank) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    if (g->banks.n_banks == 0) {
+        if (bank != 0 || !classic) return NULL;
+        return ds4_gpu_tensor_view(classic, 0, ds4_gpu_tensor_bytes(classic));
+    }
+    if (bank >= g->banks.n_banks || !slab) return NULL;
+    return ds4_gpu_tensor_view(slab, (uint64_t)bank * lane_bytes[il], lane_bytes[il]);
+}
+
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
+    return bank_lane_view(g, g->banks.comp[il], g->banks.comp_bank_bytes,
+                          g->layer_attn_comp_cache[il], il, bank);
+}
+
+ds4_gpu_tensor *gpu_graph_bank_index_comp_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
+    return bank_lane_view(g, g->banks.index[il], g->banks.index_bank_bytes,
+                          g->layer_index_comp_cache[il], il, bank);
+}
+
+ds4_gpu_tensor *gpu_graph_bank_attn_state_kv_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
+    return bank_lane_view(g, g->banks.askv[il], g->banks.astate_bank_bytes,
+                          g->layer_attn_state_kv[il], il, bank);
+}
+
+ds4_gpu_tensor *gpu_graph_bank_attn_state_score_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
+    return bank_lane_view(g, g->banks.assc[il], g->banks.astate_bank_bytes,
+                          g->layer_attn_state_score[il], il, bank);
+}
+
+ds4_gpu_tensor *gpu_graph_bank_index_state_kv_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
+    return bank_lane_view(g, g->banks.iskv[il], g->banks.istate_bank_bytes,
+                          g->layer_index_state_kv[il], il, bank);
+}
+
+ds4_gpu_tensor *gpu_graph_bank_index_state_score_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
+    return bank_lane_view(g, g->banks.issc[il], g->banks.istate_bank_bytes,
+                          g->layer_index_state_score[il], il, bank);
+}
+
+void gpu_graph_bank_counters_capture(ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || bank >= DS4_MSEQ_MAX) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->ms_n_comp[bank][il] = g->layer_n_comp[il];
+        g->ms_n_index_comp[bank][il] = g->layer_n_index_comp[il];
+    }
+}
+
+void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || bank >= DS4_MSEQ_MAX) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_n_comp[il] = g->ms_n_comp[bank][il];
+        g->layer_n_index_comp[il] = g->ms_n_index_comp[bank][il];
+    }
+}
+
+bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
+                                   const int32_t *seq, uint32_t n_rows,
+                                   bool capture_cur) {
+    if (!g || !pos || !seq || n_rows == 0 || n_rows > g->prefill_cap) {
+        fprintf(stderr, "ds4: multiseq step rejected: bad args (n_rows=%u)\n",
+                n_rows);
+        return false;
+    }
+    if (g->batch_multiseq) {
+        fprintf(stderr, "ds4: multiseq step rejected: step already armed\n");
+        return false;
+    }
+    const uint32_t n_banks = gpu_graph_bank_pool_count(g);
+    if (pos[0] == 0) {
+        /* Admission (from-zero) prefill stays on the classic single-bank
+         * view path in v1 — a fresh bank must be populated there first. */
+        fprintf(stderr, "ds4: multiseq step rejected: position-0 rows "
+                        "(admission prefill is single-bank classic)\n");
+        return false;
+    }
+    /* v1 constraint: globally consecutive positions, contiguous per-bank
+     * runs, each bank at most one run (see the declaration comment). */
+    bool bank_seen[DS4_MSEQ_MAX] = {false};
+    int32_t prev_bank = -1;
+    for (uint32_t t = 0; t < n_rows; t++) {
+        if (pos[t] != pos[0] + (int32_t)t) {
+            fprintf(stderr, "ds4: multiseq step rejected: non-consecutive "
+                            "positions (row %u: %d, want %d)\n",
+                    t, pos[t], pos[0] + (int32_t)t);
+            return false;
+        }
+        if (seq[t] < 0 || (uint32_t)seq[t] >= n_banks ||
+            (uint32_t)seq[t] >= DS4_MSEQ_MAX) {
+            fprintf(stderr, "ds4: multiseq step rejected: row %u bank %d "
+                            "out of pool (n_banks=%u)\n", t, seq[t], n_banks);
+            return false;
+        }
+        if (seq[t] != prev_bank) {
+            if (bank_seen[seq[t]]) {
+                fprintf(stderr, "ds4: multiseq step rejected: bank %d rows "
+                                "not contiguous\n", seq[t]);
+                return false;
+            }
+            bank_seen[seq[t]] = true;
+            prev_bank = seq[t];
+        }
+    }
+    if (capture_cur) {
+        gpu_graph_bank_counters_capture(
+                g, g->banks.n_banks ? g->banks.cur_bank : 0u);
+    }
+    /* DRIVER CONTRACT check: each batched bank's committed frontier is
+     * position-true at its first row — floor(first_pos / ratio) compressed
+     * rows.  A bank that lags (mid-admission-prefill) must never be
+     * co-scheduled: its rows would clamp against the superset and silently
+     * diverge from single-session output. */
+    for (uint32_t t = 0; t < n_rows; t++) {
+        if (t > 0 && seq[t] == seq[t - 1]) continue;
+        const uint32_t b = (uint32_t)seq[t];
+        const uint32_t p = (uint32_t)pos[t];
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            if (g->ms_n_comp[b][il] != p / ratio ||
+                (ratio == 4 && g->ms_n_index_comp[b][il] != p / ratio)) {
+                fprintf(stderr,
+                        "ds4: multiseq step rejected: bank %u frontier not "
+                        "position-true at layer %u (pos %u ratio %u: "
+                        "n_comp %u want %u, n_index_comp %u)\n",
+                        b, il, p, ratio, g->ms_n_comp[b][il], p / ratio,
+                        g->ms_n_index_comp[b][il]);
+                return false;
+            }
+        }
+    }
+    /* Lazy descriptor storage: host mirrors + device arrays, prefill_cap
+     * entries (a few KB) — never allocated in single-session serving. */
+    if (!g->ms_positions) {
+        g->ms_positions = xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
+        g->ms_seq_id = xmalloc((size_t)g->prefill_cap * sizeof(int32_t));
+        g->batch_positions =
+            ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
+        g->batch_seq_id =
+            ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
+        if (!g->batch_positions || !g->batch_seq_id) {
+            fprintf(stderr, "ds4: multiseq descriptor alloc failed\n");
+            return false;
+        }
+    }
+    memcpy(g->ms_positions, pos, (size_t)n_rows * sizeof(int32_t));
+    memcpy(g->ms_seq_id, seq, (size_t)n_rows * sizeof(int32_t));
+    if (!ds4_gpu_tensor_write(g->batch_positions, 0, pos,
+                              (uint64_t)n_rows * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->batch_seq_id, 0, seq,
+                              (uint64_t)n_rows * sizeof(int32_t))) {
+        fprintf(stderr, "ds4: multiseq descriptor upload failed\n");
+        return false;
+    }
+    /* Superset refresh — the ONLY write of the scalar counters during a
+     * multiseq step (top of step, before any launch, never mid-forward).
+     * The value is the step's emit-inclusive visibility bound: max over
+     * rows of (pos+1)/ratio, which every batched bank's frontier reaches
+     * once its own emits land (verified by step_end). */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        uint32_t sup = 0;
+        for (uint32_t t = 0; t < n_rows; t++) {
+            const uint32_t v = ((uint32_t)pos[t] + 1u) / ratio;
+            if (v > sup) sup = v;
+        }
+        if (sup > g->layer_comp_cap[il]) {
+            fprintf(stderr,
+                    "ds4: multiseq step rejected: superset %u exceeds comp "
+                    "cap %u at layer %u\n", sup, g->layer_comp_cap[il], il);
+            return false;
+        }
+        g->layer_n_comp[il] = sup;
+        if (ratio == 4) g->layer_n_index_comp[il] = sup;
+    }
+    g->batch_multiseq_rows = n_rows;
+    g->batch_multiseq = true;
+    return true;
+}
+
+bool gpu_graph_multiseq_step_end(ds4_gpu_graph *g) {
+    if (!g || !g->batch_multiseq) return false;
+    g->batch_multiseq = false;
+    const uint32_t n_rows = g->batch_multiseq_rows;
+    g->batch_multiseq_rows = 0;
+    /* Self-check (host ints only): every batched bank's frontier advanced to
+     * exactly its position-derived value — (last_pos+1)/ratio — and the
+     * scalar superset (untouched since step top) equals the max over the
+     * batched banks.  A miss here is the silent-KV-corruption class; fail
+     * loud so the driver aborts the session instead of serving garbage. */
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        uint32_t sup = 0;
+        for (uint32_t t = 0; t < n_rows && ok; t++) {
+            if (t + 1 < n_rows && g->ms_seq_id[t + 1] == g->ms_seq_id[t]) continue;
+            const uint32_t b = (uint32_t)g->ms_seq_id[t];
+            const uint32_t want = ((uint32_t)g->ms_positions[t] + 1u) / ratio;
+            if (want > sup) sup = want;
+            if (g->ms_n_comp[b][il] != want ||
+                (ratio == 4 && g->ms_n_index_comp[b][il] != want)) {
+                fprintf(stderr,
+                        "ds4: multiseq step_end FAILED: bank %u layer %u "
+                        "frontier %u/%u want %u (ratio %u)\n",
+                        b, il, g->ms_n_comp[b][il],
+                        g->ms_n_index_comp[b][il], want, ratio);
+                ok = false;
+            }
+        }
+        if (ok && g->layer_n_comp[il] != sup) {
+            fprintf(stderr,
+                    "ds4: multiseq step_end FAILED: layer %u superset %u "
+                    "mutated mid-step (want %u)\n",
+                    il, g->layer_n_comp[il], sup);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+
+
 /* Allocate the GPU graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
 bool gpu_graph_alloc_raw_cap(

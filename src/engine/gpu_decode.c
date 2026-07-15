@@ -298,7 +298,7 @@ int gpu_graph_raw_f16_enabled(void) {
  * path INCLUDING at compressor emit steps (the engine emits before
  * attention) — the Tier-2 descriptor-vs-classic gate.  Off (0) is the
  * default; this is not a production mode. */
-static int gpu_graph_decode_descr_enabled(void) {
+int gpu_graph_decode_descr_enabled(void) {
     static int cached = -1;
     if (cached < 0) cached = gpu_graph_env_default_flag("DS4_DECODE_DESCR", 0);
     return cached;
@@ -436,6 +436,34 @@ bool gpu_graph_commit_attn_comp_stage(
     /* Classic f32 storage: the compressor wrote the persistent cache directly
      * (gpu_graph_attn_comp_update_target returned it), nothing to commit. */
     return true;
+}
+
+
+
+bool gpu_graph_commit_attn_comp_stage_bank(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       bank,
+        uint32_t       first_row,
+        uint32_t       rows) {
+    if (!gpu_graph_attn_pack_enabled()) {
+        /* f32 storage: the multiseq emit loop pointed the compressor at the
+         * bank's comp view directly; nothing to commit (mirrors the classic
+         * helper). */
+        return true;
+    }
+    if (rows == 0) return true;
+    if (!g || il >= DS4_N_LAYER || !g->attn_comp_stage) return false;
+    if (first_row > g->layer_comp_cap[il] || rows > g->layer_comp_cap[il] - first_row) {
+        return false;
+    }
+    ds4_gpu_tensor *cache = gpu_graph_bank_attn_comp_view(g, il, bank);
+    if (!cache) return false;
+    const bool ok = ds4_gpu_attn_pack_quantize_store_tensor(
+            g->attn_comp_stage, cache, first_row, rows,
+            DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+    ds4_gpu_tensor_free(cache);
+    return ok;
 }
 
 

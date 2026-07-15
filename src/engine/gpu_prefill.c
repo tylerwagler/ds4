@@ -414,6 +414,20 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
+    /* Banked multiseq step (Tier-2): rows are independent sessions — per-row
+     * position/bank from the host mirrors (gpu_graph_multiseq_step_begin),
+     * per-bank compressor frontiers, banked kernel operands (whole pool +
+     * device descriptor arrays), scalar counters = read-only supersets.
+     * step_begin rejects position-0 rows, so zero_prefix is never multiseq. */
+    const bool mseq = g->batch_multiseq;
+    const uint32_t nb = gpu_graph_bank_pool_count(g);
+    if (mseq && (pos0 == 0 || n_tokens > g->batch_multiseq_rows ||
+                 (uint32_t)g->ms_positions[0] != pos0)) {
+        fprintf(stderr, "ds4: multiseq layer batch rejected: rows/pos0 do not "
+                        "match the armed step (pos0=%u n_tokens=%u rows=%u)\n",
+                pos0, n_tokens, g->batch_multiseq_rows);
+        return false;
+    }
     const bool zero_prefix = pos0 == 0;
     static int index_stage_env = -1, q_stage_env = -1;
     const bool index_stage_profile = gpu_graph_env_flag("DS4_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
@@ -764,14 +778,17 @@ bool gpu_graph_encode_layer_attention_batch(
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g,
                                                                   pos0 + n_tokens - 1u,
                                                                   n_raw);
-        ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+        ok = ds4_gpu_store_raw_kv_batch_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
+                                                    : g->layer_raw_cache[il],
                                                  g->batch_kv,
                                                  g->raw_cap,
                                                  pos0,
                                                  n_tokens,
                                                  DS4_N_HEAD_DIM,
                                                  (uint32_t)gpu_graph_raw_f16_enabled(),
-                                                 NULL, NULL, 1) != 0;
+                                                 mseq ? g->batch_positions : NULL,
+                                                 mseq ? g->batch_seq_id : NULL,
+                                                 mseq ? nb : 1) != 0;
         if (ok && !gpu_graph_raw_f16_enabled()) {
             /* diag-only dump; the dumper reads f32 and would misinterpret a
              * __half ring — skip it under DS4_RAW_F16. */
@@ -787,18 +804,22 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                    model->size,
                                                                    layer->attn_sinks->abs_offset,
                                                                    g->batch_q,
-                                                                   g->layer_raw_cache[il],
+                                                                   mseq ? gpu_graph_bank_raw_pool(g, il)
+                                                                        : g->layer_raw_cache[il],
                                                                    n_tokens,
                                                                    pos0,
-                                                                   n_raw,
+                                                                   mseq ? 0 : n_raw,
                                                                    g->raw_cap,
-                                                                   raw_start,
+                                                                   mseq ? 0 : raw_start,
                                                                     g->raw_window,
                                                                     DS4_N_HEAD,
                                                                     DS4_N_HEAD_DIM,
                                                                     0,
                                                                     (uint32_t)gpu_graph_raw_f16_enabled(),
-                                                                    NULL, NULL, 0, 1) != 0;
+                                                                    mseq ? g->batch_positions : NULL,
+                                                                    mseq ? g->batch_seq_id : NULL,
+                                                                    0,
+                                                                    mseq ? nb : 1) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -935,7 +956,12 @@ bool gpu_graph_encode_layer_attention_batch(
             }
             gpu_graph_attn_comp_prefill_target_free(attn_comp_target);
         } else {
-            const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+            /* Multiseq steps always take the per-row loop: the bulk
+             * aligned-chunk path assumes one bank and one contiguous position
+             * run (single-bank aligned batches could reuse it later via the
+             * bank views; verify batches never align, so nothing regresses). */
+            const bool aligned_chunk = !mseq &&
+                                       (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
             if (aligned_chunk) {
                 const uint32_t comp_before = g->layer_n_comp[il];
                 const uint32_t comp_chunk = n_tokens / ratio;
@@ -1048,23 +1074,49 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
                 gpu_graph_attn_comp_prefill_target_free(attn_comp_target);
             } else {
+                /* Per-row compressor loop.  Multiseq: row t belongs to bank
+                 * ms_seq_id[t] at absolute position ms_positions[t] — the
+                 * pool/emit run against THAT bank's state lanes and comp
+                 * cache at ITS frontier (ms_n_comp[bank][il]), and bump only
+                 * that bank's counter; the scalar layer_n_comp stays the
+                 * step-top superset (read-only here — the §6.1 race class is
+                 * structurally unreachable).  Per-bank ratio groups are
+                 * independent, and the pack-mode f32 stage row is safe to
+                 * share across banks: each iteration's emit packs it before
+                 * the next iteration's kernels run on the same stream. */
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
-                    const uint32_t pos = pos0 + t;
+                    const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
+                    const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
+                    uint32_t *const n_comp_slot = mseq ? &g->ms_n_comp[bank][il]
+                                                       : &g->layer_n_comp[il];
                     const bool emit = ((pos + 1u) % ratio) == 0u;
-                    if (emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
+                    if (emit && *n_comp_slot >= g->layer_comp_cap[il]) {
                         fprintf(stderr, "ds4: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                         break;
                     }
                     ds4_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
                     ds4_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
-                    const uint32_t comp_row = g->layer_n_comp[il];
+                    const uint32_t comp_row = *n_comp_slot;
+                    ds4_gpu_tensor *ms_st_kv = mseq
+                        ? gpu_graph_bank_attn_state_kv_view(g, il, bank) : NULL;
+                    ds4_gpu_tensor *ms_st_sc = mseq
+                        ? gpu_graph_bank_attn_state_score_view(g, il, bank) : NULL;
+                    /* f32 storage writes the persistent cache directly, so it
+                     * needs the bank's comp view; pack mode stages in the
+                     * shared f32 row and commits bank-aware below. */
+                    ds4_gpu_tensor *ms_target = (mseq && !gpu_graph_attn_pack_enabled())
+                        ? gpu_graph_bank_attn_comp_view(g, il, bank) : NULL;
                     ok = kv_view && sc_view &&
-                         ds4_gpu_compressor_update_tensor(kv_view,
+                         (!mseq || (ms_st_kv && ms_st_sc &&
+                                    (gpu_graph_attn_pack_enabled() || ms_target)));
+                    if (ok) {
+                        ok = ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
-                                                            g->layer_attn_state_kv[il],
-                                                            g->layer_attn_state_score[il],
-                                                            gpu_graph_attn_comp_update_target(g, il),
+                                                            mseq ? ms_st_kv : g->layer_attn_state_kv[il],
+                                                            mseq ? ms_st_sc : g->layer_attn_state_score[il],
+                                                            ms_target ? ms_target
+                                                                      : gpu_graph_attn_comp_update_target(g, il),
                                                             model->map,
                                                             model->size,
                                                             layer->attn_compressor_ape->abs_offset,
@@ -1084,8 +1136,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
+                    }
                     if (ok && emit) {
-                        ds4_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
+                        ds4_gpu_tensor *comp_row_view = ms_target
+                            ? ds4_gpu_tensor_view(ms_target,
+                                                  (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
+                                                  (uint64_t)DS4_N_HEAD_DIM * sizeof(float))
+                            : gpu_graph_attn_comp_row_view(g, il, comp_row);
                         if (gpu_graph_attn_pack_enabled()) {
                             /* comp_row_view aliases the f32 stage; commit below
                              * quantizes+packs and roundtrips the stage in place
@@ -1105,7 +1162,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           il,
                                                           pos);
                         }
-                        if (ok) ok = gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
+                        if (ok) {
+                            ok = mseq
+                                ? gpu_graph_commit_attn_comp_stage_bank(g, il, bank, comp_row, 1)
+                                : gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
+                        }
                         if (ok && gpu_graph_attn_pack_enabled()) {
                             gpu_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
@@ -1115,8 +1176,11 @@ bool gpu_graph_encode_layer_attention_batch(
                         }
                         ds4_gpu_tensor_free(comp_row_view);
                     }
-                    if (ok && emit) g->layer_n_comp[il]++;
-                    if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
+                    if (ok && emit) (*n_comp_slot)++;
+                    if (comp_counts) comp_counts[t] = *n_comp_slot;
+                    ds4_gpu_tensor_free(ms_target);
+                    ds4_gpu_tensor_free(ms_st_sc);
+                    ds4_gpu_tensor_free(ms_st_kv);
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
                 }
@@ -1282,7 +1346,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
             } else {
-                const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+                /* Multiseq: per-row loop only (see the attn emit section). */
+                const bool aligned_chunk = !mseq &&
+                                           (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
                 if (aligned_chunk) {
                     const uint32_t index_before = g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
@@ -1375,25 +1441,44 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     ds4_gpu_tensor_free(index_view);
                 } else {
+                    /* Per-row indexer compressor loop; multiseq semantics as
+                     * in the attn emit loop above (bank state lanes, bank
+                     * frontier row, bank counter bump; scalar = read-only
+                     * superset).  The fp4 stage rows are indexed by the
+                     * bank-LOCAL frontier: two banks at the same frontier
+                     * share a stage row safely because each iteration's emit
+                     * packs it before the next iteration's kernels run. */
                     for (uint32_t t = 0; ok && t < n_tokens; t++) {
-                        const uint32_t pos = pos0 + t;
+                        const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
+                        const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
+                        uint32_t *const n_index_slot = mseq ? &g->ms_n_index_comp[bank][il]
+                                                            : &g->layer_n_index_comp[il];
                         const bool emit = ((pos + 1u) % ratio) == 0u;
-                        if (emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
+                        if (emit && *n_index_slot >= g->layer_comp_cap[il]) {
                             fprintf(stderr, "ds4: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                             ok = false;
                             break;
                         }
                         ds4_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                         ds4_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
-                        const uint32_t index_row = g->layer_n_index_comp[il];
+                        const uint32_t index_row = *n_index_slot;
                         const int idx_fp4 = gpu_graph_idx_fp4_enabled();
+                        ds4_gpu_tensor *ms_st_kv = mseq
+                            ? gpu_graph_bank_index_state_kv_view(g, il, bank) : NULL;
+                        ds4_gpu_tensor *ms_st_sc = mseq
+                            ? gpu_graph_bank_index_state_score_view(g, il, bank) : NULL;
+                        ds4_gpu_tensor *ms_cache = mseq
+                            ? gpu_graph_bank_index_comp_view(g, il, bank) : NULL;
                         ok = kv_view && sc_view &&
-                             ds4_gpu_compressor_update_tensor(kv_view,
+                             (!mseq || (ms_st_kv && ms_st_sc && ms_cache));
+                        if (ok) {
+                            ok = ds4_gpu_compressor_update_tensor(kv_view,
                                                                 sc_view,
-                                                                g->layer_index_state_kv[il],
-                                                                g->layer_index_state_score[il],
+                                                                mseq ? ms_st_kv : g->layer_index_state_kv[il],
+                                                                mseq ? ms_st_sc : g->layer_index_state_score[il],
                                                                 idx_fp4 ? g->idx_comp_stage
-                                                                        : g->layer_index_comp_cache[il],
+                                                                        : (mseq ? ms_cache
+                                                                                : g->layer_index_comp_cache[il]),
                                                                 model->map,
                                                                 model->size,
                                                                 layer->indexer_compressor_ape->abs_offset,
@@ -1413,16 +1498,19 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                 DS4_ROPE_YARN_BETA_FAST,
                                                                 DS4_ROPE_YARN_BETA_SLOW,
                                                                 DS4_RMS_EPS) != 0;
+                        }
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
-                                    idx_fp4 ? g->idx_comp_stage : g->layer_index_comp_cache[il],
+                                    idx_fp4 ? g->idx_comp_stage
+                                            : (mseq ? ms_cache : g->layer_index_comp_cache[il]),
                                     (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                     (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                             if (!index_row_view) {
                                 ok = false;
                             } else if (idx_fp4) {
                                 ok = ds4_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,
-                                                                           g->layer_index_comp_cache[il],
+                                                                           mseq ? ms_cache
+                                                                                : g->layer_index_comp_cache[il],
                                                                            index_row,
                                                                            1,
                                                                            DS4_N_INDEXER_HEAD_DIM) != 0;
@@ -1434,8 +1522,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                 ds4_gpu_tensor_free(index_row_view);
                             }
                         }
-                        if (ok && emit) g->layer_n_index_comp[il]++;
-                        if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
+                        if (ok && emit) (*n_index_slot)++;
+                        if (index_counts) index_counts[t] = *n_index_slot;
+                        ds4_gpu_tensor_free(ms_cache);
+                        ds4_gpu_tensor_free(ms_st_sc);
+                        ds4_gpu_tensor_free(ms_st_kv);
                         ds4_gpu_tensor_free(sc_view);
                         ds4_gpu_tensor_free(kv_view);
                     }
@@ -1492,7 +1583,23 @@ bool gpu_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor *sh_view = ds4_gpu_tensor_view(g->batch_heads,
                             (uint64_t)s0 * q_dim * sizeof(float),
                             (uint64_t)sn * q_dim * sizeof(float));
-                    ok = iq_view && iw_view && sq_view && sh_view;
+                    /* Multiseq: per-span descriptor views (rows s0..s0+sn),
+                     * whole-pool cache operands, packed comp reads (decode
+                     * semantics — bit-identical to the f32 shadow by the
+                     * pack-dot contract in ds4_cuda_attention.cu), and the
+                     * scalar raw span/start ignored (per-row derived). */
+                    ds4_gpu_tensor *sp_view = mseq
+                        ? ds4_gpu_tensor_view(g->batch_positions,
+                                              (uint64_t)s0 * sizeof(int32_t),
+                                              (uint64_t)sn * sizeof(int32_t))
+                        : NULL;
+                    ds4_gpu_tensor *ss_view = mseq
+                        ? ds4_gpu_tensor_view(g->batch_seq_id,
+                                              (uint64_t)s0 * sizeof(int32_t),
+                                              (uint64_t)sn * sizeof(int32_t))
+                        : NULL;
+                    ok = iq_view && iw_view && sq_view && sh_view &&
+                         (!mseq || (sp_view && ss_view));
                     if (ok && index_stage_profile) {
                         ok = gpu_graph_indexer_stage_profile_boundary(NULL,
                                                                         il,
@@ -1504,7 +1611,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     if (ok) ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
                                                                               iq_view,
                                                                               iw_view,
-                                                                              g->layer_index_comp_cache[il],
+                                                                              mseq ? gpu_graph_bank_index_comp_pool(g, il)
+                                                                                   : g->layer_index_comp_cache[il],
                                                                               n_comp,
                                                                               sn,
                                                                               spos0,
@@ -1512,7 +1620,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               DS4_N_INDEXER_HEAD_DIM,
                                                                               ratio,
                                                                               index_scale,
-                                                                              NULL, NULL, 0, 1) != 0;
+                                                                              sp_view, ss_view,
+                                                                              mseq ? g->layer_comp_cap[il] : 0,
+                                                                              mseq ? nb : 1) != 0;
                     if (ok && index_stage_profile) {
                         ok = gpu_graph_indexer_stage_profile_boundary("score",
                                                                         il,
@@ -1556,16 +1666,19 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   model->size,
                                                                                   layer->attn_sinks->abs_offset,
                                                                                   sq_view,
-                                                                                  g->layer_raw_cache[il],
-                                                                                  gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                                  mseq ? gpu_graph_bank_raw_pool(g, il)
+                                                                                       : g->layer_raw_cache[il],
+                                                                                  mseq ? gpu_graph_bank_attn_comp_pool(g, il)
+                                                                                       : gpu_graph_attn_comp_read_cache(g, il, n_comp),
                                                                                   0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                                  0 /* shadow is f32 */,
+                                                                                  mseq ? gpu_graph_attn_comp_cache_is_pack()
+                                                                                       : 0 /* shadow is f32 */,
                                                                                   g->comp_selected,
                                                                                   sn,
                                                                                   spos0,
-                                                                                  s_n_raw,
+                                                                                  mseq ? 0 : s_n_raw,
                                                                                   g->raw_cap,
-                                                                                  s_raw_start,
+                                                                                  mseq ? 0 : s_raw_start,
                                                                                   n_comp,
                                                                                   DS4_N_INDEXER_TOP_K,
                                                                                   g->raw_window,
@@ -1573,7 +1686,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   DS4_N_HEAD,
                                                                                   DS4_N_HEAD_DIM,
                                                                                   (uint32_t)gpu_graph_raw_f16_enabled(),
-                                                                                  NULL, NULL, 0, 1) != 0;
+                                                                                  sp_view, ss_view,
+                                                                                  mseq ? g->layer_comp_cap[il] : 0,
+                                                                                  mseq ? nb : 1) != 0;
                         if (ok && index_stage_profile) {
                             ok = gpu_graph_indexer_stage_profile_boundary("attention",
                                                                             il,
@@ -1583,6 +1698,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                             &index_stage_t0);
                         }
                     }
+                    ds4_gpu_tensor_free(ss_view);
+                    ds4_gpu_tensor_free(sp_view);
                     ds4_gpu_tensor_free(sh_view);
                     ds4_gpu_tensor_free(sq_view);
                     ds4_gpu_tensor_free(iw_view);
@@ -1594,17 +1711,20 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          model->size,
                                                                          layer->attn_sinks->abs_offset,
                                                                          g->batch_q,
-                                                                         g->layer_raw_cache[il],
-                                                                         gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                         mseq ? gpu_graph_bank_raw_pool(g, il)
+                                                                              : g->layer_raw_cache[il],
+                                                                         mseq ? gpu_graph_bank_attn_comp_pool(g, il)
+                                                                              : gpu_graph_attn_comp_read_cache(g, il, n_comp),
                                                                          0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                         0 /* shadow is f32 */,
+                                                                         mseq ? gpu_graph_attn_comp_cache_is_pack()
+                                                                              : 0 /* shadow is f32 */,
                                                                          NULL,
                                                                          0,
                                                                          n_tokens,
                                                                          pos0,
-                                                                         n_raw,
+                                                                         mseq ? 0 : n_raw,
                                                                          g->raw_cap,
-                                                                         raw_start,
+                                                                         mseq ? 0 : raw_start,
                                                                          n_comp,
                                                                           g->raw_window,
                                                                           ratio,
@@ -1612,7 +1732,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           DS4_N_HEAD_DIM,
                                                                           0,
                                                                           (uint32_t)gpu_graph_raw_f16_enabled(),
-                                                                          NULL, NULL, 0, 1) != 0;
+                                                                          mseq ? g->batch_positions : NULL,
+                                                                          mseq ? g->batch_seq_id : NULL,
+                                                                          mseq ? g->layer_comp_cap[il] : 0,
+                                                                          mseq ? nb : 1) != 0;
             }
             if (ok) batch_attention_done = true;
         }
@@ -1763,6 +1886,15 @@ bool gpu_graph_encode_layer_attention_batch(
         }
     }
 
+    if (ok && mseq && !batch_attention_done) {
+        /* Every multiseq-legal shape is handled by the banked branches above;
+         * the fallback below is classic single-session (shadow reads, scalar
+         * spans).  Reaching it banked would silently compute the wrong rows. */
+        fprintf(stderr, "ds4: multiseq layer batch rejected: unsupported shape "
+                        "(layer %u n_tokens=%u raw_cap=%u)\n",
+                il, n_tokens, g->raw_cap);
+        ok = false;
+    }
     if (ok && !raw_batch_attention && !batch_attention_done) {
         uint32_t raw_prefix_tokens = 0;
         if (zero_prefix && ratio != 0 && n_tokens <= g->raw_cap && comp_counts != NULL) {

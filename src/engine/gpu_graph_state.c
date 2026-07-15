@@ -6,6 +6,12 @@
 void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->descr_diag_pos);
     ds4_gpu_tensor_free(g->descr_diag_seq);
+    ds4_gpu_tensor_free(g->batch_positions);
+    ds4_gpu_tensor_free(g->batch_seq_id);
+    free(g->ms_positions);
+    free(g->ms_seq_id);
+    g->ms_positions = NULL;
+    g->ms_seq_id = NULL;
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
