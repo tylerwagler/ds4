@@ -1,0 +1,332 @@
+/* Tier-2 MULTISEQ decode gate: co-scheduling neutrality + the first
+ * aggregate-throughput measurement (increment 3's headline).
+ *
+ * MODEL-DEPENDENT: run manually on the GB10 via `make cuda-multiseq-gate`
+ * (memory discipline in the Makefile target) — NOT part of `make test`.
+ *
+ * WHAT THIS GATE ASSERTS (and what it deliberately does not)
+ * ---------------------------------------------------------
+ * The batched multi-session sweep (gpu_graph_encode_layer_batch) is a
+ * DIFFERENT KERNEL PATH from classic single-token decode
+ * (gpu_graph_encode_decode_layer): different attention/indexer tiers,
+ * different GEMM shapes, different accumulation order.  The two paths are
+ * NOT bit-identical, and that predates this code: the batch sweep already
+ * diverged from classic decode on the increment-2 baseline (2c16d73) at the
+ * same step and the same token ids the 1-row multiseq path produces
+ * (control harness temp/t2i3_pathctl.c, which uses only the pre-existing
+ * gpu_graph_verify_suffix_tops: "batch-sweep DIVERGES from classic decode at
+ * step 18 (batch 979 vs classic 339)" — byte-identical verdict on the
+ * baseline and on this tree, and the same step/tokens this gate's N=1 run
+ * reports).  Greedy argmax turns any near-tie into a different token, and
+ * the streams walk apart from there.
+ *
+ * So "multiseq stream == classic-decode stream" is NOT a property this
+ * engine has, and gating on it would gate on the wrong thing.  The property
+ * that matters for multi-session serving — and the HARD gate here — is
+ * CO-SCHEDULING NEUTRALITY:
+ *
+ *   a session's emitted token stream must not depend on WHICH other sessions
+ *   share its batch, nor on how many: bank k's stream at N=2 must be
+ *   token-identical to bank k's stream at N=3.
+ *
+ * (N=1 is excluded from that comparison by construction: a 1-row batch
+ * dispatches the engine's dedicated single-row kernel tiers, so N=1 vs N>=2
+ * compares two kernel paths again rather than co-scheduling.)
+ *
+ * Bit-level bank addressing/isolation (bank-slot swap invariance,
+ * populate-order invariance, idle-bank bytes untouched) is the frontier
+ * gate's job (tests/multiseq_frontier_gate.c); this gate is its end-to-end
+ * token-stream complement.
+ *
+ * INFORMATIONAL (reported, never fatal): each bank's stream vs the same
+ * prompt decoded solo through classic decode — first divergence step and the
+ * logit gap between the two candidates at that step, measured on the live
+ * row of the real run.  A small gap is the near-tie signature of the
+ * two-path numerics above; the gap is printed so a systematic divergence
+ * (large gap, or divergence at step 1) stays visible instead of hidden.
+ *
+ * THROUGHPUT (informational): aggregate tokens/sec over the timed multi loop
+ * = N*STEPS/elapsed, vs the timed classic baseline.  Server wiring
+ * (increment 4) adds scheduling overhead on top.
+ *
+ * usage: DS4_MSEQ_BANKS=3 ./tests/multiseq_decode_gate MODEL [MAXN] [STEPS]
+ *        (from the repo root — reads tests/long_context_story_prompt.txt)
+ */
+#include "ds4.h"
+#include "ds4_engine_internal.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define GATE_MAX_N 8
+#define GATE_MAX_STEPS 2048
+
+static ds4_engine *g_e;
+static ds4_tokens g_toks;
+static int g_fail;
+
+/* Distinct prompts: different offsets AND different lengths so co-scheduled
+ * banks sit at unrelated positions from step one. */
+static const int g_prompt_off[GATE_MAX_N] = {0, 401, 907, 233, 601, 811, 101, 499};
+static const int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 158};
+
+#define CHECK(cond, ...) do { \
+        if (!(cond)) { \
+            fprintf(stderr, "MULTISEQ GATE FAIL: " __VA_ARGS__); \
+            fprintf(stderr, "\n"); \
+            g_fail = 1; \
+        } \
+    } while (0)
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static char *read_file(const char *path, size_t *len_out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *buf = malloc((size_t)n + 1);
+    if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
+    fclose(fp);
+    buf[n] = '\0';
+    if (len_out) *len_out = (size_t)n;
+    return buf;
+}
+
+static bool make_prompt(int k, ds4_tokens *p) {
+    memset(p, 0, sizeof(*p));
+    const int off = g_prompt_off[k], len = g_prompt_len[k];
+    if (off + len > g_toks.len) return false;
+    p->v = malloc((size_t)len * sizeof(int));
+    if (!p->v) return false;
+    memcpy(p->v, g_toks.v + off, (size_t)len * sizeof(int));
+    p->len = p->cap = len;
+    return true;
+}
+
+/* Classic greedy solo reference for prompt k: prefill + STEPS plain decode
+ * steps; stream[j] = argmax emitted at position len+j (stream[0] is the
+ * prefill continuation).  *secs = the timed classic decode loop. */
+static bool solo_stream(int k, int steps, int *stream, double *secs) {
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
+    ds4_tokens p;
+    bool ok = make_prompt(k, &p);
+    char err[256];
+    if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+        fprintf(stderr, "solo sync failed: %s\n", err);
+        ok = false;
+    }
+    if (ok) {
+        stream[0] = ds4_session_argmax(s);
+        const double t0 = now_s();
+        for (int j = 1; ok && j <= steps; j++) {
+            if (ds4_session_eval(s, stream[j - 1], err, sizeof(err)) != 0) {
+                fprintf(stderr, "solo eval failed at %d: %s\n", j, err);
+                ok = false;
+                break;
+            }
+            stream[j] = ds4_session_argmax(s);
+        }
+        if (secs) *secs = now_s() - t0;
+    }
+    ds4_tokens_free(&p);
+    ds4_session_free(s);
+    return ok;
+}
+
+/* One multi run at batch width n: populate banks 0..n-1 through the classic
+ * per-bank path, then run STEPS self-fed greedy steps through the engine
+ * entry.  streams[k] gets steps+1 tokens (aligned with solo_stream).
+ *
+ * solo (optional): the first step at which bank k's token differs from
+ * solo[k] is recorded in flip_step[k], and the LIVE logits row of that step
+ * yields flip_gap[k] = logit(multi's pick) - logit(solo's pick) — measured in
+ * the real run, at the real batch composition, with no re-decode. */
+static bool multi_run(int n, int steps, int **streams, int *const *solo,
+                      int *flip_step, float *flip_gap, double *secs) {
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, g_e, 4096) != 0) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if ((int)gpu_graph_bank_pool_count(g) < n) {
+        fprintf(stderr, "pool too small: %u < %d (set DS4_MSEQ_BANKS)\n",
+                gpu_graph_bank_pool_count(g), n);
+        ds4_session_free(s);
+        return false;
+    }
+    const int vocab = (int)DS4_N_VOCAB;   /* the engine's logits row width */
+    char err[256];
+    bool ok = true;
+    for (int k = 0; k < n; k++) {
+        if (flip_step) flip_step[k] = -1;
+        /* Repoint the graph's views at bank k, prefill THIS bank from zero
+         * through the classic path (invalidate: no prefix reuse across
+         * banks), and capture its frontier into the bank's ms counters. */
+        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
+        ds4_session_invalidate(s);
+        ds4_tokens p;
+        ok = make_prompt(k, &p);
+        if (ok && ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+            fprintf(stderr, "populate bank %d failed: %s\n", k, err);
+            ok = false;
+        }
+        if (ok) {
+            gpu_graph_bank_counters_capture(g, (uint32_t)k);
+            streams[k][0] = ds4_session_argmax(s);
+        }
+        ds4_tokens_free(&p);
+    }
+    float *logits = ok ? malloc((size_t)n * vocab * sizeof(float)) : NULL;
+    if (ok && !logits) ok = false;
+    if (ok) {
+        const double t0 = now_s();
+        for (int j = 1; ok && j <= steps; j++) {
+            ds4_multiseq_req reqs[GATE_MAX_N];
+            for (int k = 0; k < n; k++) {
+                reqs[k].bank = (uint32_t)k;
+                reqs[k].pos = g_prompt_len[k] + (j - 1);
+                reqs[k].token = streams[k][j - 1];
+            }
+            const int rc = ds4_session_decode_multiseq(s, reqs, (uint32_t)n,
+                                                       logits, n * vocab,
+                                                       err, sizeof(err));
+            if (rc != 0) {
+                fprintf(stderr, "multiseq step %d failed (rc=%d): %s\n", j, rc, err);
+                ok = false;
+                break;
+            }
+            for (int k = 0; k < n; k++) {
+                const float *row = logits + (size_t)k * vocab;
+                streams[k][j] = (int)argmax_f32(row, (uint64_t)vocab);
+                if (solo && flip_step && flip_step[k] < 0 &&
+                    streams[k][j] != solo[k][j]) {
+                    flip_step[k] = j;
+                    if (flip_gap) flip_gap[k] = row[streams[k][j]] - row[solo[k][j]];
+                }
+            }
+        }
+        if (secs) *secs = now_s() - t0;
+    }
+    free(logits);
+    ds4_session_free(s);
+    return ok;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s MODEL [MAXN] [STEPS]\n", argv[0]);
+        return 2;
+    }
+    const int maxn = argc > 2 ? atoi(argv[2]) : 3;
+    const int steps = argc > 3 ? atoi(argv[3]) : 512;
+    if (maxn < 1 || maxn > GATE_MAX_N || steps < 1 || steps > GATE_MAX_STEPS) {
+        fprintf(stderr, "bad MAXN/STEPS\n");
+        return 2;
+    }
+
+    ds4_engine_options opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.model_path = argv[1];
+    opt.backend = DS4_BACKEND_CUDA;
+    if (ds4_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+
+    size_t text_len = 0;
+    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
+    memset(&g_toks, 0, sizeof(g_toks));
+    ds4_tokenize_text(g_e, text, &g_toks);
+    free(text);
+    int need = 0;
+    for (int k = 0; k < maxn; k++) {
+        if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
+    }
+    if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d < %d)\n", g_toks.len, need); return 1; }
+
+    /* Classic-decode solo references + the single-session baseline rate. */
+    int *solo[GATE_MAX_N];
+    double solo_secs[GATE_MAX_N];
+    for (int k = 0; k < maxn; k++) {
+        solo[k] = malloc((size_t)(steps + 1) * sizeof(int));
+        if (!solo[k] || !solo_stream(k, steps, solo[k], &solo_secs[k])) {
+            fprintf(stderr, "solo reference %d failed\n", k);
+            return 1;
+        }
+        printf("solo[%d]: prompt off=%d len=%d, %d steps in %.1fs (%.2f tok/s classic plain)\n",
+               k, g_prompt_off[k], g_prompt_len[k], steps, solo_secs[k],
+               (double)steps / solo_secs[k]);
+    }
+
+    /* Multi runs at N = 1..maxn; every stream is kept for the cross-N gate. */
+    int *multi[GATE_MAX_N][GATE_MAX_N];   /* [n-1][bank] */
+    bool have[GATE_MAX_N];
+    memset(multi, 0, sizeof(multi));
+    memset(have, 0, sizeof(have));
+    for (int n = 1; n <= maxn; n++) {
+        int flip_step[GATE_MAX_N];
+        float flip_gap[GATE_MAX_N];
+        memset(flip_gap, 0, sizeof(flip_gap));
+        for (int k = 0; k < n; k++) multi[n - 1][k] = malloc((size_t)(steps + 1) * sizeof(int));
+        double secs = 0.0;
+        if (!multi_run(n, steps, multi[n - 1], solo, flip_step, flip_gap, &secs)) {
+            CHECK(0, "N=%d: multi run failed", n);
+            continue;
+        }
+        have[n - 1] = true;
+        printf("N=%d: %d steps x %d sessions in %.1fs -> aggregate %.2f tok/s "
+               "(%.2f tok/s/session)\n",
+               n, steps, n, secs, (double)n * steps / secs, (double)steps / secs);
+        /* INFORMATIONAL: divergence from classic decode (see the header). */
+        for (int k = 0; k < n; k++) {
+            if (flip_step[k] < 0) {
+                printf("  N=%d bank %d: vs classic-solo IDENTICAL over %d tokens\n",
+                       n, k, steps + 1);
+            } else {
+                printf("  N=%d bank %d: vs classic-solo diverges at step %d "
+                       "(batch %d vs classic %d, logit gap %.6f) — two-path "
+                       "numerics, informational\n",
+                       n, k, flip_step[k],
+                       multi[n - 1][k][flip_step[k]], solo[k][flip_step[k]],
+                       (double)flip_gap[k]);
+            }
+        }
+    }
+
+    /* HARD GATE: co-scheduling neutrality — bank k's stream must not depend
+     * on which/how many OTHER sessions share the batch (n >= 2; N=1 excluded,
+     * it dispatches the single-row kernel tiers). */
+    for (int n = 3; n <= maxn; n++) {
+        if (!have[n - 1] || !have[1]) continue;
+        for (int k = 0; k < 2; k++) {
+            int diff = -1;
+            for (int j = 0; j <= steps; j++) {
+                if (multi[n - 1][k][j] != multi[1][k][j]) { diff = j; break; }
+            }
+            CHECK(diff < 0,
+                  "co-scheduling NOT neutral: bank %d's stream at N=%d differs "
+                  "from its stream at N=2 at step %d (%d vs %d) — a batchmate "
+                  "changed another session's tokens",
+                  k, n, diff,
+                  diff >= 0 ? multi[n - 1][k][diff] : -1,
+                  diff >= 0 ? multi[1][k][diff] : -1);
+            if (diff < 0) {
+                printf("CO-SCHED NEUTRALITY: bank %d identical at N=2 and N=%d "
+                       "(%d tokens)\n", k, n, steps + 1);
+            }
+        }
+    }
+
+    for (int k = 0; k < maxn; k++) free(solo[k]);
+    for (int n = 0; n < GATE_MAX_N; n++)
+        for (int k = 0; k < GATE_MAX_N; k++) free(multi[n][k]);
+    ds4_engine_close(g_e);
+    if (g_fail) { fprintf(stderr, "MULTISEQ DECODE GATE: FAIL\n"); return 1; }
+    printf("MULTISEQ DECODE GATE: PASS\n");
+    return 0;
+}

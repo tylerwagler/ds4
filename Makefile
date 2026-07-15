@@ -35,7 +35,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate
 
 all: help
 
@@ -46,6 +46,8 @@ help:
 	@echo "  make cuda-regression     Kernel smokes vs synthetic slabs (modelless)"
 	@echo "  make cuda-frontier-gate  Multiseq frontier-isolation gate (needs the model;"
 	@echo "                           FRONTIER_MODEL=./ds4flash.gguf by default)"
+	@echo "  make cuda-multiseq-gate  Multiseq-vs-solo token-stream gate + aggregate"
+	@echo "                           throughput at N=1..3 (needs the model)"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -80,6 +82,12 @@ FRONTIER_MODEL ?= ./ds4flash.gguf
 cuda-frontier-gate: tests/multiseq_frontier_gate
 	DS4_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate $(FRONTIER_MODEL)
 
+# Multiseq-vs-solo token-stream gate + first aggregate-throughput measurement
+# (see the header of tests/multiseq_decode_gate.c).  MODEL-DEPENDENT — run
+# manually on the GB10 with the same memory discipline as the frontier gate.
+cuda-multiseq-gate: tests/multiseq_decode_gate
+	DS4_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 512
+
 src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
@@ -110,6 +118,9 @@ tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c src/ds4_gpu.h
 tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_frontier_gate.c
 
+tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.c
+
 src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
 
@@ -124,6 +135,9 @@ tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CU
 tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
@@ -134,4 +148,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate

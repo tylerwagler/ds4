@@ -28,6 +28,7 @@ __pycache__/
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
 /tests/multiseq_frontier_gate
+/tests/multiseq_decode_gate
 /gguf-tools/test_quants
 .claude/
 /data/

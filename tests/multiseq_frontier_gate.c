@@ -29,7 +29,9 @@
  *       written only at step top (structural; step_end re-verifies, and this
  *       gate re-asserts equality against the ms counters).
  *
- * Scenarios (positions must be globally consecutive — v1 constraint):
+ * Scenarios (S1-S3 keep the increment-2 globally-consecutive shape; S4-S5
+ * exercise the increment-3 relaxation — banks at UNRELATED positions, only
+ * per-bank runs consecutive — the actual multi-session decode shape):
  *   S1  A=62 toks, B=64: rows [A@62 A@63 B@64 B@65 B@66 B@67]
  *       -> BOTH banks emit ratio-4 (A row 15, B row 16), different
  *          pre-step frontiers (15 vs 16), multi-row-per-bank.
@@ -37,6 +39,12 @@
  *       bank A must be bit-untouched.
  *   S3  A=126, B=127: rows [A@126 B@127] -> B emits at ratio 4 (row 31)
  *       AND ratio 128 (row 0); bank A bit-untouched at both ratios.
+ *   S4  A=202, B=664 (positions ~460 apart): rows [A@202 A@203 B@664..667]
+ *       -> BOTH banks emit ratio-4 (A row 50, B row 166) with per-row
+ *          positions driving RoPE/ring/visibility; swap + solo checks as S1.
+ *   S5  A=126, B=639: rows [A@126 B@639] -> B emits at ratio 4 (row 159)
+ *       AND ratio 128 (row 4) while A (at an unrelated position) closes no
+ *       group; bank A bit-untouched at both ratios.
  *
  * TEETH (each seeded as a local engine edit, gate re-run, edit reverted;
  * all three verified caught on the increment-2 tree, 2026-07):
@@ -545,6 +553,78 @@ int main(int argc, char **argv) {
                 emit_rows_free(&solo_b);
             } else {
                 CHECK(0, "S3: solo reference failed");
+            }
+            emit_rows_free(&a);
+            emit_rows_free(&b);
+        }
+    }
+
+    /* ---- S4: banks at UNRELATED positions (increment-3 relaxation) ----
+     * Same checks as S1 (frontiers, superset, swap invariance, solo refs)
+     * but bank A sits ~460 positions behind bank B, so every per-row
+     * position-derived stage (RoPE q/kv/indexer-q/inverse, ring slots,
+     * visible-comp) computes different values per bank within one step. */
+    {
+        const step_row rows[6] = {
+            {0, 202, stream_tok(0, 202)}, {0, 203, stream_tok(0, 203)},
+            {1, 664, stream_tok(1, 664)}, {1, 665, stream_tok(1, 665)},
+            {1, 666, stream_tok(1, 666)}, {1, 667, stream_tok(1, 667)},
+        };
+        emit_rows mixed_a, mixed_b, swap_a, swap_b, solo_a, solo_b;
+        bool ok = mixed_scenario(0, 202, 1, 664, rows, 6,
+                                 50, -1, 166, -1, 203, 667,
+                                 "S4(mixed)", &mixed_a, &mixed_b, 0);
+        const step_row rows_sw[6] = {
+            {1, 202, stream_tok(0, 202)}, {1, 203, stream_tok(0, 203)},
+            {0, 664, stream_tok(1, 664)}, {0, 665, stream_tok(1, 665)},
+            {0, 666, stream_tok(1, 666)}, {0, 667, stream_tok(1, 667)},
+        };
+        bool ok_sw = ok && mixed_scenario(1, 202, 0, 664, rows_sw, 6,
+                                          50, -1, 166, -1, 203, 667,
+                                          "S4(swap)", &swap_a, &swap_b, 0);
+        if (ok_sw) {
+            CHECK(emit_rows_equal(&mixed_a, &swap_a, "S4 A mixed-vs-swap"),
+                  "S4: sequence A emitted rows depend on bank slot");
+            CHECK(emit_rows_equal(&mixed_b, &swap_b, "S4 B mixed-vs-swap"),
+                  "S4: sequence B emitted rows depend on bank slot");
+            printf("S4: different-position bank-slot invariance OK\n");
+        }
+        bool ok_solo = ok && solo_reference(0, 202, 2, 50, -1, &solo_a) &&
+                             solo_reference(1, 664, 4, 166, -1, &solo_b);
+        if (ok_solo) {
+            const int ea = emit_rows_equal(&mixed_a, &solo_a, "S4 A mixed-vs-solo");
+            const int eb = emit_rows_equal(&mixed_b, &solo_b, "S4 B mixed-vs-solo");
+            printf("S4: mixed(6-row, split positions) vs solo(1-row steps): A %s, B %s\n",
+                   ea ? "BYTE-EXACT" : "DIFFERS (batch-shape variance)",
+                   eb ? "BYTE-EXACT" : "DIFFERS (batch-shape variance)");
+            emit_rows_free(&solo_a);
+            emit_rows_free(&solo_b);
+        } else if (ok) {
+            CHECK(0, "S4: solo reference runs failed");
+        }
+        if (ok) { emit_rows_free(&mixed_a); emit_rows_free(&mixed_b); }
+        if (ok_sw) { emit_rows_free(&swap_a); emit_rows_free(&swap_b); }
+    }
+
+    /* ---- S5: unrelated positions, only B emits (ratio 4 AND 128) ---- */
+    {
+        const step_row rows[2] = {
+            {0, 126, stream_tok(0, 126)},
+            {1, 639, stream_tok(1, 639)},
+        };
+        emit_rows a, b, solo_b;
+        bool ok = mixed_scenario(0, 126, 1, 639, rows, 2,
+                                 -1, -1, 159, 4, 126, 639,
+                                 "S5", &a, &b, 1);
+        if (ok) {
+            printf("S5: different-position only-B-emit (r4+r128) — bank A untouched OK\n");
+            if (solo_reference(1, 639, 1, 159, 4, &solo_b)) {
+                const int eb = emit_rows_equal(&b, &solo_b, "S5 B mixed-vs-solo");
+                printf("S5: B emitted rows vs solo(1-row): %s\n",
+                       eb ? "BYTE-EXACT" : "DIFFERS (batch-shape variance)");
+                emit_rows_free(&solo_b);
+            } else {
+                CHECK(0, "S5: solo reference failed");
             }
             emit_rows_free(&a);
             emit_rows_free(&b);
