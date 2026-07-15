@@ -1784,6 +1784,172 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
 }
 
 
+/* Verbatim pre-radix sample_full_vocab / sample_top_p_min_p (tokenizer.c at
+ * 9587033), renamed. The plain sampling path carries the same full-vocab sort
+ * as the speculative one and was rewritten the same way; this pins it. Note
+ * its `sum` accumulates in VOCAB order BEFORE the sort, unlike dist_build's —
+ * a difference the rewrite has to respect, so it is worth gating directly. */
+static float ref_rng_f32(uint64_t *state) {
+    uint64_t x = *state;
+    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    *state = x;
+    const uint64_t r = x * 0x2545f4914f6cdd1dULL;
+    return (float)((r >> 40) & 0xffffffu) / 16777216.0f;
+}
+
+static int ref_full_vocab(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng) {
+    float max_logit = DS4_NEG_INF;
+    int best = 0;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        finite++;
+        if (v > max_logit) {
+            max_logit = v;
+            best = (int)i;
+        }
+    }
+    if (finite == 0) return ref_sample_argmax(logits, n_vocab);
+
+    if (top_p >= 1.0f) {
+        float sum = 0.0f;
+        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            const float p = expf((v - max_logit) / temperature);
+            if (p < min_rel) continue;
+            sum += p;
+        }
+        if (sum <= 0.0f || !isfinite(sum)) return best;
+        float r = ref_rng_f32(rng) * sum;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            const float p = expf((v - max_logit) / temperature);
+            if (p < min_rel) continue;
+            r -= p;
+            if (r <= 0.0f) return (int)i;
+        }
+        return best;
+    }
+
+    sample_candidate *cand = malloc((size_t)finite * sizeof(cand[0]));
+    uint32_t n = 0;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float p = expf((v - max_logit) / temperature);
+        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        free(cand);
+        return best;
+    }
+
+    qsort(cand, n, sizeof(cand[0]), ref_cand_cmp_desc);
+    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float p = cand[i].prob / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += cand[i].prob;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered == 0) {
+        free(cand);
+        return best;
+    }
+
+    float r = ref_rng_f32(rng) * filtered_sum;
+    for (uint32_t i = 0; i < filtered; i++) {
+        r -= cand[i].prob;
+        if (r <= 0.0f) {
+            const int id = cand[i].id;
+            free(cand);
+            return id;
+        }
+    }
+    const int id = cand[filtered - 1].id;
+    free(cand);
+    return id;
+}
+
+
+static int ref_top_p_min_p(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng) {
+    if (temperature <= 0.0f) return ref_sample_argmax(logits, n_vocab);
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (top_k <= 0) return ref_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
+    if (top_k > 1024) top_k = 1024;
+    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
+
+    int ids[1024];
+    float vals[1024];
+    int n = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        float v = logits[i];
+        if (!isfinite(v)) continue;
+        if (n == top_k && v <= vals[n - 1]) continue;
+        int j = n < top_k ? n++ : n - 1;
+        while (j > 0 && vals[j - 1] < v) {
+            vals[j] = vals[j - 1];
+            ids[j] = ids[j - 1];
+            j--;
+        }
+        vals[j] = v;
+        ids[j] = (int)i;
+    }
+    if (n == 0) return ref_sample_argmax(logits, n_vocab);
+
+    float probs[1024];
+    const float max_logit = vals[0];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        probs[i] = expf((vals[i] - max_logit) / temperature);
+        sum += probs[i];
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
+
+    const float min_prob = (probs[0] / sum) * min_p;
+    float filtered_sum = 0.0f;
+    int filtered = 0;
+    for (int i = 0; i < n; i++) {
+        float p = probs[i] / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += probs[i];
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered <= 0) return ids[0];
+
+    float r = ref_rng_f32(rng) * filtered_sum;
+    for (int i = 0; i < filtered; i++) {
+        r -= probs[i];
+        if (r <= 0.0f) return ids[i];
+    }
+    return ids[filtered - 1];
+}
+
 #define SAMP_N_VOCAB 129280u
 
 static uint64_t samp_rs;
@@ -1917,14 +2083,20 @@ static void test_sampler_dist_equivalence(void) {
                 TEST_ASSERT(ds4_sample_dist_prob(&ref, probe) == ds4_sample_dist_prob(&got, probe));
             }
 
-            /* (c) plain sampler path (sample_full_vocab), same seed */
+            /* (c) the PLAIN sampling path (sample_full_vocab), pinned against
+             * the pre-radix reference: same seed must draw the same token and
+             * leave the rng in the same state. */
             for (int trial = 0; trial < 16; trial++) {
                 uint64_t r1 = 0xABCD0000u + (uint64_t)trial, r2 = r1;
-                const int a = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
+                const int want = ref_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
                                                  cfg->top_p, cfg->min_p, &r1);
-                const int b = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
-                                                 cfg->top_p, cfg->min_p, &r2);
-                TEST_ASSERT(a == b && r1 == r2);
+                const int got_tok = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
+                                                       cfg->top_p, cfg->min_p, &r2);
+                if (want != got_tok)
+                    fprintf(stderr, "sampler: shape=%s cfg=%s plain draw %d != %d\n",
+                            sname, cfg->name, want, got_tok);
+                TEST_ASSERT(want == got_tok);
+                TEST_ASSERT(r1 == r2);
             }
 
             ds4_sample_dist_free(&ref);

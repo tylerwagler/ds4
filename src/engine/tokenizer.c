@@ -926,105 +926,6 @@ static float sample_rng_f32(uint64_t *state) {
 
 
 
-static int sample_candidate_cmp_desc(const void *a, const void *b) {
-    const sample_candidate *ca = a;
-    const sample_candidate *cb = b;
-    return (cb->logit > ca->logit) - (cb->logit < ca->logit);
-}
-
-
-
-static int sample_full_vocab(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng) {
-    float max_logit = DS4_NEG_INF;
-    int best = 0;
-    uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
-        }
-    }
-    if (finite == 0) return sample_argmax(logits, n_vocab);
-
-    if (top_p >= 1.0f) {
-        float sum = 0.0f;
-        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            sum += p;
-        }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
-        float r = sample_rng_f32(rng) * sum;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            r -= p;
-            if (r <= 0.0f) return (int)i;
-        }
-        return best;
-    }
-
-    sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
-    uint32_t n = 0;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
-        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
-        sum += p;
-    }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        free(cand);
-        return best;
-    }
-
-    qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
-    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const float p = cand[i].prob / sum;
-        if (i > 0 && p < min_prob) break;
-        filtered_sum += cand[i].prob;
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered == 0) {
-        free(cand);
-        return best;
-    }
-
-    float r = sample_rng_f32(rng) * filtered_sum;
-    for (uint32_t i = 0; i < filtered; i++) {
-        r -= cand[i].prob;
-        if (r <= 0.0f) {
-            const int id = cand[i].id;
-            free(cand);
-            return id;
-        }
-    }
-    const int id = cand[filtered - 1].id;
-    free(cand);
-    return id;
-}
-
-
-
 /* IEEE-754 float32 -> uint32 whose UNSIGNED ASCENDING order is the float's
  * DESCENDING order: flip negatives entirely, set the sign bit on
  * non-negatives (the standard monotonic transform, giving float-ascending),
@@ -1110,6 +1011,122 @@ void ds4_sample_scratch_free(ds4_sample_scratch *s) {
     free(s->keys);
     free(s->tmp);
     memset(s, 0, sizeof(*s));
+}
+
+
+
+static int sample_full_vocab(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng) {
+    float max_logit = DS4_NEG_INF;
+    int best = 0;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        finite++;
+        if (v > max_logit) {
+            max_logit = v;
+            best = (int)i;
+        }
+    }
+    if (finite == 0) return sample_argmax(logits, n_vocab);
+
+    if (top_p >= 1.0f) {
+        float sum = 0.0f;
+        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            const float p = expf((v - max_logit) / temperature);
+            if (p < min_rel) continue;
+            sum += p;
+        }
+        if (sum <= 0.0f || !isfinite(sum)) return best;
+        float r = sample_rng_f32(rng) * sum;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            const float p = expf((v - max_logit) / temperature);
+            if (p < min_rel) continue;
+            r -= p;
+            if (r <= 0.0f) return (int)i;
+        }
+        return best;
+    }
+
+    /* Same full-vocab qsort the speculative dist_build had (~10.6 ms a call),
+     * on the PLAIN per-token path — reached whenever a client sends top_p < 1
+     * without a top_k, which is a common shape. Radix-sorted for the same
+     * reason and with the same byte-exactness argument.
+     *
+     * `sum` here accumulates in VOCAB order, BEFORE the sort (unlike
+     * dist_build, which sums post-sort) — so this loop must stay exactly as it
+     * was. probs are therefore computed once and carried THROUGH the sort by
+     * packing the compaction index as the radix payload, rather than
+     * recomputed post-sort: a second expf loop could be vectorized differently
+     * from this one under -ffast-math and differ in the last ulp. */
+    sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
+    uint64_t *keys = xmalloc((size_t)finite * sizeof(keys[0]));
+    uint64_t *tmp = xmalloc((size_t)finite * sizeof(tmp[0]));
+    uint32_t n = 0;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float p = expf((v - max_logit) / temperature);
+        keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
+        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        free(cand);
+        free(keys);
+        free(tmp);
+        return best;
+    }
+
+    /* finite >= 1 here (checked above), so n >= 1 as sample_radix_sort_desc
+     * requires. Stable over an ascending fill => ties keep ascending vocab id,
+     * matching the qsort this replaces. */
+    sample_radix_sort_desc(keys, tmp, n);
+    sample_candidate *sorted = xmalloc((size_t)n * sizeof(sorted[0]));
+    for (uint32_t i = 0; i < n; i++) sorted[i] = cand[(uint32_t)keys[i]];
+    free(cand);
+    free(keys);
+    free(tmp);
+    cand = sorted;
+    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float p = cand[i].prob / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += cand[i].prob;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered == 0) {
+        free(cand);
+        return best;
+    }
+
+    float r = sample_rng_f32(rng) * filtered_sum;
+    for (uint32_t i = 0; i < filtered; i++) {
+        r -= cand[i].prob;
+        if (r <= 0.0f) {
+            const int id = cand[i].id;
+            free(cand);
+            return id;
+        }
+    }
+    const int id = cand[filtered - 1].id;
+    free(cand);
+    return id;
 }
 
 
