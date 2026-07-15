@@ -436,10 +436,20 @@ __global__ static void attention_decode_mixed_kernel(
         int raw_f16,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
-        uint32_t comp_cap) {
+        uint32_t comp_cap,
+        uint32_t n_banks) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
+    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
+        /* Dead/evicted row (stale or sentinel bank id — the host cannot audit
+         * a device array): fail-visible.  Zero this row's head output and
+         * read nothing; an out-of-pool id would otherwise be a silent wild
+         * read across the whole slab. */
+        float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) oh[d] = 0.0f;
+        return;
+    }
     const bool single_all = (n_tokens == 1u && ratio == 0u && positions == NULL);
     uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
     uint32_t eff_n_raw = n_raw;
@@ -668,10 +678,17 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t comp_kv_pack,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
-        uint32_t comp_cap) {
+        uint32_t comp_cap,
+        uint32_t n_banks) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
+    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
+        /* Dead/evicted row: see attention_decode_mixed_kernel. */
+        float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) oh[d] = 0.0f;
+        return;
+    }
     /* Descriptor preamble: see attention_decode_mixed_kernel.  comp_rows[]
      * keeps bank-LOCAL compressed ids (top-k ids are per-bank); the bank
      * offset is applied at read time via comp_base. */
@@ -1358,7 +1375,8 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         int raw_f16,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
-        uint32_t comp_cap) {
+        uint32_t comp_cap,
+        uint32_t n_banks) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1366,6 +1384,15 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
+    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
+        /* Dead/evicted row: see attention_decode_mixed_kernel.  All threads
+         * return together (no __syncthreads has run yet). */
+        if (valid_head) {
+            float *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
+            for (uint32_t d = lane; d < head_dim; d += 32u) oh[d] = 0.0f;
+        }
+        return;
+    }
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count_s;
@@ -1656,7 +1683,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               n_head,
                                                                               head_dim,
                                                                               raw_f16,
-                                                                              NULL, NULL, 0);
+                                                                              NULL, NULL, 0, 1);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -1673,7 +1700,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  0, comp_kv_fp8, comp_kv_pack,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim, raw_f16,
-                                                 NULL, NULL, 0);
+                                                 NULL, NULL, 0, 1);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
@@ -1840,11 +1867,17 @@ static int attention_decode_batch_launch(
          positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          (n_comp != 0 && comp_cap < n_comp) ||
+         /* Per-row derivation clamps the raw span to `window`, and the
+          * kernels' raw_rows scratch holds DS4_CUDA_ATTENTION_RAW_SCORE_CAP
+          * rows.  A zero (unbounded) or over-cap window would be silently
+          * truncated to the OLDEST rows — fail loud instead. */
+         window == 0u || window > DS4_CUDA_ATTENTION_RAW_SCORE_CAP ||
          (uint64_t)n_banks * raw_cap > 4294967296ull ||
          (uint64_t)n_banks * comp_cap > 4294967296ull)) {
         return 0;
     }
     const uint64_t kv_banks = descr ? n_banks : 1u;
+    const uint32_t kernel_n_banks = descr ? n_banks : 1u;
     const uint64_t comp_rows_min = descr ? (uint64_t)n_banks * comp_cap
                                          : (uint64_t)n_comp;
     if (comp_kv_f16 ||
@@ -1895,7 +1928,8 @@ static int attention_decode_batch_launch(
                                                                               raw_f16,
                                                                               positions_ptr,
                                                                               seq_id_ptr,
-                                                                              comp_cap);
+                                                                              comp_cap,
+                                                                              kernel_n_banks);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -1926,7 +1960,8 @@ static int attention_decode_batch_launch(
                                                                    raw_f16,
                                                                    positions_ptr,
                                                                    seq_id_ptr,
-                                                                   comp_cap);
+                                                                   comp_cap,
+                                                                   kernel_n_banks);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     dim3 grid(n_tokens, n_head, 1);
@@ -1938,7 +1973,7 @@ static int attention_decode_batch_launch(
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim, raw_f16,
-                                                 positions_ptr, seq_id_ptr, comp_cap);
+                                                 positions_ptr, seq_id_ptr, comp_cap, kernel_n_banks);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
@@ -2050,6 +2085,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          comp_cap < n_comp ||
+         /* raw_rows scratch bound — see attention_decode_batch_launch. */
+         window == 0u || window > DS4_CUDA_ATTENTION_RAW_SCORE_CAP ||
          (uint64_t)n_banks * raw_cap > 4294967296ull ||
          (uint64_t)n_banks * comp_cap > 4294967296ull)) {
         return 0;
@@ -2156,7 +2193,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   comp_kv_pack,
                                                   positions_ptr,
                                                   seq_id_ptr,
-                                                  comp_cap);
+                                                  comp_cap,
+                                                  descr ? n_banks : 1u);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 

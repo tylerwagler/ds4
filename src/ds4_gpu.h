@@ -631,8 +631,12 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
  * operands are then whole bank pools addressed at seq_id*raw_cap /
  * seq_id*comp_cap, with the raw window, ring start, and visible compressed
  * count derived per row from the position (scalar n_raw/raw_start are
- * ignored; scalar n_comp is the cross-bank superset clamp).  Pass
- * NULL/NULL/0/1 for the classic single-cache behavior — bit-exact. */
+ * ignored; scalar n_comp is the cross-bank superset clamp).  seq_id must
+ * carry TRUE bank ids in [0, n_banks): a row whose id is out of range
+ * (stale slot, -1 sentinel) reads nothing and gets zero head outputs —
+ * fail-visible, never a wild read.  Banked mode requires a nonzero window
+ * <= 256 (the kernels' per-row raw scratch bound).  Pass NULL/NULL/0/1
+ * for the classic single-cache behavior — bit-exact. */
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

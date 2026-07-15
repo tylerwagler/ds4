@@ -1812,7 +1812,10 @@ uint32_t gpu_graph_bank_pool_n(void);
 /* Re-install the graph's per-layer cache views onto `bank` (pool mode only).
  * Contract: call only between fully synchronized forwards — the previous
  * bank's enqueued work must be complete, because the graph pointers change
- * under every subsequent launch. */
+ * under every subsequent launch.  This swaps DEVICE views only: the host
+ * per-session state (layer_n_comp/layer_n_index_comp, ring fill, positions,
+ * spec-shadow contents) is the caller's to save/restore per bank.  On
+ * failure the views may be mixed-bank — treat the graph as dead. */
 bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank);
 /* TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
  * graph state when enable_spec); the sizing side of the admission-control

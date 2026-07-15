@@ -686,7 +686,10 @@ static int mb_run_case(const char *label,
     float *out_ref = (float *)malloc(row_f32 * sizeof(float));
     int32_t *pos_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
     int32_t *sid_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
-    if (!q_host || !out_batch || !out_ref || !pos_host || !sid_host) return 1;
+    if (!q_host || !out_batch || !out_ref || !pos_host || !sid_host) {
+        free(sid_host); free(pos_host); free(out_ref); free(out_batch); free(q_host);
+        return 1;
+    }
     mb_rng_state = 0xbeef1234u;
     for (uint64_t i = 0; i < q_count; i++) q_host[i] = mb_rand() * 0.25f;
     for (uint32_t r = 0; r < n_rows; r++) {
@@ -853,7 +856,10 @@ static int check_multibank_decode_attention(void) {
     const uint64_t comp_count = (uint64_t)n_banks * comp_cap * head_dim;
     float *raw_host = (float *)malloc(raw_count * sizeof(float));
     float *comp_host = (float *)malloc(comp_count * sizeof(float));
-    if (!raw_host || !comp_host) return 1;
+    if (!raw_host || !comp_host) {
+        free(comp_host); free(raw_host);
+        return 1;
+    }
     mb_rng_state = 0xace1u;
     for (uint64_t i = 0; i < raw_count; i++) raw_host[i] = mb_rand();
     for (uint64_t i = 0; i < comp_count; i++) comp_host[i] = mb_rand();
@@ -932,6 +938,53 @@ static int check_multibank_decode_attention(void) {
         ds4_gpu_tensor_free(big_slab);
         free(big_host);
         if (big_rc != 0) goto done;
+    }
+
+    /* Dead-row guard teeth: a row with an out-of-pool bank id (-1 sentinel)
+     * must produce zero head outputs (fail-visible) while its batchmate is
+     * still byte-identical to single-session. */
+    {
+        const uint64_t row_f32 = (uint64_t)n_head * head_dim;
+        const int32_t pos_host2[2] = {100, 37};
+        const int32_t sid_host2[2] = {-1, 1};
+        float *q_host2 = (float *)malloc(2 * row_f32 * sizeof(float));
+        float *out2 = (float *)malloc(2 * row_f32 * sizeof(float));
+        ds4_gpu_tensor *q2 = ds4_gpu_tensor_alloc(2 * row_f32 * sizeof(float));
+        ds4_gpu_tensor *h2 = ds4_gpu_tensor_alloc(2 * row_f32 * sizeof(float));
+        ds4_gpu_tensor *p2 = ds4_gpu_tensor_alloc(2 * sizeof(int32_t));
+        ds4_gpu_tensor *s2 = ds4_gpu_tensor_alloc(2 * sizeof(int32_t));
+        int dead_rc = 1;
+        if (q_host2 && out2 && q2 && h2 && p2 && s2) {
+            mb_rng_state = 0xbeef1234u;
+            for (uint64_t i = 0; i < 2 * row_f32; i++) q_host2[i] = mb_rand() * 0.25f;
+            if (ds4_gpu_tensor_write(q2, 0, q_host2, 2 * row_f32 * sizeof(float)) &&
+                ds4_gpu_tensor_write(p2, 0, pos_host2, sizeof(pos_host2)) &&
+                ds4_gpu_tensor_write(s2, 0, sid_host2, sizeof(sid_host2)) &&
+                ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+                        h2, sinks, (uint64_t)n_head * sizeof(float), 0,
+                        q2, raw_slab, comp_slab, 0, 0, 0, NULL, 0,
+                        2, 0, window, raw_cap, 0,
+                        25, window, ratio, n_head, head_dim, 0, 0,
+                        p2, s2, comp_cap, n_banks) &&
+                ds4_gpu_synchronize() &&
+                ds4_gpu_tensor_read(h2, 0, out2, 2 * row_f32 * sizeof(float))) {
+                dead_rc = 0;
+                for (uint64_t i = 0; i < row_f32; i++) {
+                    if (out2[i] != 0.0f) {
+                        fprintf(stderr, "multibank dead-row: nonzero output at %llu\n",
+                                (unsigned long long)i);
+                        dead_rc = 1;
+                        break;
+                    }
+                }
+                if (dead_rc == 0)
+                    printf("  multibank dead-row: out-of-pool seq_id -> zero heads\n");
+            }
+        }
+        ds4_gpu_tensor_free(s2); ds4_gpu_tensor_free(p2);
+        ds4_gpu_tensor_free(h2); ds4_gpu_tensor_free(q2);
+        free(out2); free(q_host2);
+        if (dead_rc != 0) goto done;
     }
     rc = 0;
 
