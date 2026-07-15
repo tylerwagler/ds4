@@ -256,6 +256,45 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+/* Tier-2 batched multi-session decode (bank pool, DS4_MSEQ_BANKS >= 2): one
+ * decode request per co-scheduled session, all advanced one token by ONE
+ * weight sweep.  reqs[k] = {TRUE bank id, absolute position of `token`,
+ * current input token}.
+ *
+ * logits (out): row k is bank[k]'s next-token distribution, rows strided by
+ * the engine's logits row width (the same width ds4_session_copy_logits
+ * returns); logits_cap is the TOTAL float capacity of the buffer and is
+ * rejected when it cannot hold n rows.  Sampling stays per-session on the
+ * host with each session's own sampler/rng state.
+ *
+ * DETERMINISM: a session's row is reproducible at a FIXED batch composition,
+ * and co-scheduling additional sessions does not perturb the existing rows
+ * (per-row math is batch-width invariant for n >= 2).  The batched sweep is
+ * NOT bit-identical to classic single-token decode, however — it is a
+ * different kernel path — so a session's greedy token stream can diverge
+ * from the same prompt decoded alone through ds4_session_eval once a
+ * near-tie tips.  That is the two-mode contract (plan §2.4), not a bug.
+ *
+ * Requirements: each bank prefilled to exactly `pos` through the classic
+ * single-bank path with its per-bank counters captured, one request per
+ * bank, no position-0 rows, and NO speculation co-scheduled (n >= 2 is
+ * plain decode by contract).
+ *
+ * On success the session's classic single-bank bookkeeping is INVALIDATED
+ * (the scalar frontier counters now hold a cross-bank superset and the
+ * checkpoint no longer describes any one bank): the caller owns per-bank
+ * histories, and classic per-bank work must re-establish state explicitly.
+ *
+ * Returns 0 on success; 1 on a recoverable rejection (bad args/contract; no
+ * state mutated); -1 on a fatal mid-sweep failure (tear the session down). */
+typedef struct {
+    uint32_t bank;   /* TRUE bank id in the session's pool */
+    int32_t  pos;    /* absolute position of `token` (bank's committed length) */
+    int      token;  /* input token id decoded at `pos` */
+} ds4_multiseq_req;
+int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
+                                uint32_t n, float *logits, int logits_cap,
+                                char *err, size_t errlen);
 int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,

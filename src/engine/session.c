@@ -2299,6 +2299,70 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
 
 
 
+/* Batched multi-session decode over the session's bank pool — see the ds4.h
+ * declaration for the caller contract and gpu_graph_decode_multiseq_batch
+ * (imatrix.c) for the step mechanics.
+ *
+ * The session's own single-bank bookkeeping is not merely un-advanced, it is
+ * INVALIDATED on success: a multiseq step leaves the scalar frontier
+ * counters holding a cross-bank superset (never any single bank's truth) and
+ * advances a bank's KV past s->checkpoint.  Leaving checkpoint_valid set
+ * would let a later ds4_session_sync take its prefix-resume path (it gates
+ * on checkpoint_valid alone) or ds4_session_eval decode against superset
+ * counters — silent KV corruption, exactly the class this code fails loud
+ * on everywhere else.  Invalidating makes the classic paths rebuild instead.
+ * The caller owns per-bank histories and must re-establish per-bank state
+ * explicitly (gpu_graph_bank_counters_install + a fresh sync) to resume
+ * classic work on a bank. */
+#define DS4_MULTISEQ_ERR(...) do { \
+        if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
+    } while (0)
+int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
+                                uint32_t n, float *logits, int logits_cap,
+                                char *err, size_t errlen) {
+    if (!s || !reqs || !logits || n == 0 || n > DS4_MSEQ_MAX) {
+        DS4_MULTISEQ_ERR("multiseq decode: bad args (n=%u)", n);
+        return 1;
+    }
+    /* The engine writes n rows of DS4_N_VOCAB floats; without a capacity the
+     * readback would overflow a caller buffer sized from a different vocab
+     * notion (ds4_engine_vocab_size is the tokenizer table length, which the
+     * loader never checks against the shape profile's n_vocab). */
+    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n * DS4_N_VOCAB) {
+        DS4_MULTISEQ_ERR("multiseq decode: logits capacity %d < %u rows x %u",
+                         logits_cap, n, (unsigned)DS4_N_VOCAB);
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    int32_t pos[DS4_MSEQ_MAX];
+    int32_t bank[DS4_MSEQ_MAX];
+    int tokens[DS4_MSEQ_MAX];
+    for (uint32_t k = 0; k < n; k++) {
+        pos[k] = reqs[k].pos;
+        bank[k] = (int32_t)reqs[k].bank;
+        tokens[k] = reqs[k].token;
+    }
+    const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
+                                                   &e->weights, tokens, pos,
+                                                   bank, n, logits);
+    if (rc == 0) {
+        DS4_MULTISEQ_ERR("multiseq decode step rejected (recoverable; "
+                         "reason on stderr)");
+        return 1;
+    }
+    /* Success and failure alike leave the classic single-bank view stale
+     * (see above); only the diagnosis differs. */
+    s->checkpoint_valid = false;
+    s->spec_carry_valid = false;
+    if (rc == 1) return 0;
+    DS4_MULTISEQ_ERR("multiseq decode step failed mid-sweep "
+                     "(session state fatal)");
+    return -1;
+}
+#undef DS4_MULTISEQ_ERR
+
+
+
 
 static float dspark_base_top1_prob(const float *logits, int n) {
     float m = logits[0];

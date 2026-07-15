@@ -1906,6 +1906,20 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
                                    const int32_t *seq, uint32_t n_rows,
                                    bool capture_cur);
 bool gpu_graph_multiseq_step_end(ds4_gpu_graph *g);
+/* Tier-2 batched multi-session decode: one token per live bank through ONE
+ * weight sweep (see the definition comment in imatrix.c for the full driver
+ * contract).  logits out = [n_active * DS4_N_VOCAB], row k = bank[k].
+ * Returns 1 ok / 0 recoverable rejection (nothing mutated) / -1 fatal (armed
+ * sweep or head failed — session state untrusted). */
+int gpu_graph_decode_multiseq_batch(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const int             *tokens,
+        const int32_t         *pos,
+        const int32_t         *bank,
+        uint32_t               n_active,
+        float                 *logits);
 /* DS4_DECODE_DESCR=1 (env, read once): Tier-2 descriptor-vs-classic byte
  * diagnostic — see gpu_decode.c. */
 int gpu_graph_decode_descr_enabled(void);

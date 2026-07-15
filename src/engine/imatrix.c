@@ -1033,6 +1033,122 @@ bool gpu_graph_verify_suffix_tops(
 
 
 
+/* Tier-2 batched multi-session decode step: one current token per live bank
+ * through ONE weight sweep (this is where the N-fold aggregate decode win
+ * comes from — decode is weight-bandwidth-bound, and the batch reads the
+ * weights once for all rows).  Structure mirrors gpu_graph_verify_suffix_tops
+ * (upload -> layer sweep -> output head -> readback), but the rows are
+ * independent sessions at unrelated positions rather than one session's
+ * speculative suffix, so the sweep runs armed as a banked multiseq step
+ * (per-row positions/seq_id descriptors, per-bank compressor frontiers,
+ * emit-before-attention per the driver contract in ds4_gpu.h).
+ *
+ * Inputs are packed row-major: row k carries session bank[k]'s current token
+ * tokens[k] at absolute position pos[k].  Rows must satisfy the step_begin
+ * contract (TRUE bank ids; per-bank runs contiguous with consecutive
+ * positions; every bank's frontier position-true; no position-0 rows — for
+ * plain decode each bank contributes exactly one row, trivially satisfying
+ * the run rules).  The caller owns per-bank host bookkeeping: ms counters
+ * current (gpu_graph_bank_counters_capture after any classic per-bank work),
+ * and after this step the scalar layer_n_comp counters hold the CROSS-BANK
+ * SUPERSET — gpu_graph_bank_counters_install(bank) before any classic
+ * single-bank work resumes.  NEVER co-schedule speculation with n_active >= 2
+ * (contract; the scheduler's alone->spec / shared->plain switch).
+ *
+ * logits: out [n_active * DS4_N_VOCAB] host rows, row k = bank[k]'s
+ * next-token distribution; sampling stays per-session on the host with that
+ * session's own sampler state.
+ *
+ * Returns 1 on success; 0 on a RECOVERABLE rejection (bad args, upload
+ * failure, or step_begin contract rejection — no persistent graph state was
+ * mutated, the caller may fix the batch and retry); -1 on a FATAL failure
+ * (the armed sweep, its frontier self-check, or the output head failed —
+ * per-bank KV state can no longer be trusted; the session must be torn
+ * down). */
+int gpu_graph_decode_multiseq_batch(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const int             *tokens,
+        const int32_t         *pos,
+        const int32_t         *bank,
+        uint32_t               n_active,
+        float                 *logits) {
+    if (!g || !model || !weights || !tokens || !pos || !bank || !logits ||
+        n_active == 0 || n_active > DS4_MSEQ_MAX ||
+        n_active > gpu_graph_bank_pool_count(g) ||
+        n_active > g->prefill_cap || !g->spec_logits) {
+        fprintf(stderr, "ds4: multiseq decode rejected: bad args (n_active=%u"
+                        " pool=%u)\n", n_active,
+                g ? gpu_graph_bank_pool_count(g) : 0u);
+        return 0;
+    }
+
+    /* Gather each session's current token into the batch input rows.  The
+     * token embedding is position/bank-independent, so the existing prompt
+     * uploader runs unmodified over a stack view of the caller's array
+     * (this is exactly how classic decode feeds the graph, batched). */
+    token_vec cur;
+    memset(&cur, 0, sizeof(cur));
+    cur.v = (int *)tokens;
+    cur.len = cur.cap = (int)n_active;
+    if (!gpu_graph_upload_prompt_tokens(g->prefill_tokens, &cur, 0, n_active) ||
+        !gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                               g->prefill_tokens,
+                                               model, weights, &cur,
+                                               0, n_active)) {
+        return 0;   /* scratch-only writes so far — recoverable */
+    }
+
+    /* Arm the banked step (validates the driver contract; a rejection here
+     * leaves the graph untouched — recoverable). */
+    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, false)) return 0;
+
+    /* Layer sweep + output head ride ONE command block: ds4_gpu_end_commands
+     * is a full device synchronize, and a second block would pay that twice
+     * per decoded token on the hot path this increment exists to speed up.
+     * The head is row-parallel and bank-agnostic (it reads no descriptor or
+     * frontier state), so it is safe to encode while the step is armed; the
+     * step_end self-check below is host-int only and needs no drained
+     * device.  Encoding stops at the first failure, so a failed sweep never
+     * enqueues the head. */
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = gpu_graph_encode_layer_batch(g,
+                                            model,
+                                            &weights->layer[il],
+                                            il,
+                                            (uint32_t)pos[0],
+                                            n_active);
+    }
+    if (ok) ok = gpu_graph_encode_output_head_batch(g,
+                                                      model,
+                                                      weights,
+                                                      n_active,
+                                                      weights->output->dim[1]);
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+    } else {
+        (void)ds4_gpu_synchronize();
+    }
+    /* Disarm + per-bank frontier self-check even when the sweep failed. */
+    const bool end_ok = gpu_graph_multiseq_step_end(g);
+    if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
+
+    /* Per-row logits readback: spec_logits row k = bank[k]. */
+    ok = ds4_gpu_tensor_read(g->spec_logits,
+                               0,
+                               logits,
+                               (uint64_t)n_active * DS4_N_VOCAB * sizeof(float)) != 0;
+    /* The banks' KV/frontiers committed correctly (step_end passed); a
+     * readback failure still leaves the caller without this step's logits,
+     * which desynchronizes its sampling from the committed KV — treat as
+     * fatal rather than guess. */
+    return ok ? 1 : -1;
+}
+
+
+
 bool gpu_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *logits) {
     if (!g || !g->spec_logits || !logits || row >= g->prefill_cap) return false;
     const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
