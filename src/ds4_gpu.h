@@ -630,13 +630,24 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
  * per-bank compressed-row stride and n_banks the pool size; the raw/comp KV
  * operands are then whole bank pools addressed at seq_id*raw_cap /
  * seq_id*comp_cap, with the raw window, ring start, and visible compressed
- * count derived per row from the position (scalar n_raw/raw_start are
- * ignored; scalar n_comp is the cross-bank superset clamp).  seq_id must
- * carry TRUE bank ids in [0, n_banks): a row whose id is out of range
- * (stale slot, -1 sentinel) reads nothing and gets zero head outputs —
- * fail-visible, never a wild read.  Banked mode requires a nonzero window
- * <= 256 (the kernels' per-row raw scratch bound).  Pass NULL/NULL/0/1
- * for the classic single-cache behavior — bit-exact. */
+ * count derived per row from the position.  Scalar n_raw/raw_start are
+ * ignored AND unvalidated in banked mode (pass 0); raw_cap must still be
+ * the true per-bank ring capacity.  The per-row visible compressed count is
+ * (qpos+1)/ratio — identical to the engine's classic single-session decode,
+ * which emits a step's compressed row BEFORE attention, so at an emit step
+ * (qpos ≡ ratio-1 mod ratio) the row sees the row emitted that same step.
+ * DRIVER CONTRACT: in banked mode every bank's compressed rows for the
+ * current step — including same-step emits — must be written before the
+ * attention launch.  Scalar n_comp is the cross-bank superset clamp, a
+ * SAFETY bound only: if it bites (a bank lagging behind its own frontier,
+ * e.g. mid-prefill), the row reads fewer rows instead of garbage but its
+ * output DIVERGES from single-session — never co-schedule such a bank.
+ * seq_id must carry TRUE bank ids in [0, n_banks): a row whose id is out
+ * of range (stale slot, -1 sentinel) reads nothing and gets zero head
+ * outputs — fail-visible, never a wild read.  Banked mode requires a
+ * nonzero window <= 256 (the kernels' per-row raw scratch bound); banked
+ * argument rejections return 0 and print the reason to stderr.  Pass
+ * NULL/NULL/0/1 for the classic single-cache behavior — bit-exact. */
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

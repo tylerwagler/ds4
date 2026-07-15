@@ -649,11 +649,16 @@ static int check_mxkv_gather(void) {
  * Two banks of a raw-ring + compressed-cache pool are filled with different
  * pseudorandom sequences, then the descriptor-aware decode attention runs
  * rows from both banks (mixed seq_ids, per-row positions incl. a wrapped
- * ring and a floor(qpos/ratio) comp boundary) in ONE launch.  Every row must
- * be BYTE-identical to the same computation run single-session (scalar mode
- * against that bank's slab view), and independent of batch composition (row
- * permutation).  Attention here is deterministic per row: one block per
- * (row, head), so per-row reduction order cannot depend on batchmates.
+ * ring and an EMIT-boundary row, qpos ≡ ratio-1 mod ratio) in ONE launch.
+ * Every row must be BYTE-identical to the same computation run
+ * single-session (scalar mode against that bank's slab view) with the
+ * ENGINE-TRUE scalar n_comp — the engine emits a step's compressed row
+ * BEFORE attention, so at position qpos the live engine passes
+ * (qpos+1)/ratio, and the banked per-row derivation must reproduce exactly
+ * that (a floor(qpos/ratio) derivation fails the emit-boundary rows below).
+ * Rows must also be independent of batch composition (row permutation).
+ * Attention here is deterministic per row: one block per (row, head), so
+ * per-row reduction order cannot depend on batchmates.
  * ------------------------------------------------------------------------- */
 
 static uint32_t mb_rng_state = 0x12345u;
@@ -665,7 +670,12 @@ static float mb_rand(void) {
 typedef struct {
     uint32_t bank;
     uint32_t qpos;
-    uint32_t ref_n_comp;   /* scalar n_comp for the single-session reference */
+    uint32_t ref_n_comp;   /* scalar n_comp for the single-session reference:
+                            * ENGINE-TRUE frontier at qpos, i.e. (qpos+1)/ratio
+                            * (emit-before-attention), capped by the bank's
+                            * comp capacity.  Exception: the heads8-online case
+                            * passes the cross-bank superset to pin kernel
+                            * selection (see the comment there). */
 } mb_row;
 
 /* One descriptor launch over `rows`, then per-row single-session reference
@@ -873,17 +883,20 @@ static int check_multibank_decode_attention(void) {
 
     {
         /* Generic mixed kernel: bank 0 with a WRAPPED ring (qpos 100 > raw_cap
-         * 64), bank 1 at qpos 39 — a position where floor(39/4) = 9 but
-         * (39+1)/4 = 10, proving the banked clamp — and bank 1 again at 37.
-         * References use that bank's true frontier floor(qpos/4) as scalar
-         * n_comp; the batch passes the cross-bank superset 25. */
-        const mb_row rows[3] = { {0, 100, 25}, {1, 39, 9}, {1, 37, 9} };
+         * 64), bank 1 at qpos 39 — an EMIT boundary (39 ≡ ratio-1 mod 4) where
+         * the engine-true frontier is (39+1)/4 = 10 while a floor(39/4)
+         * derivation would see only 9; this row FAILS under the old floor rule
+         * (regression teeth for the emit-step divergence bug) — and bank 1
+         * again at 37 (non-emit, frontier 9).  References use the engine-true
+         * (qpos+1)/4 as scalar n_comp; the batch passes the cross-bank
+         * superset 25. */
+        const mb_row rows[3] = { {0, 100, 25}, {1, 39, 10}, {1, 37, 9} };
         if (mb_run_case("mixed-generic", rows, 3, raw_slab, raw_cap,
                         comp_slab, comp_cap, 25, window, ratio, n_banks,
                         sinks, n_head, head_dim, 0, NULL, 0) != 0) goto done;
         /* Batch-composition independence: permuted rows, same per-row bytes
          * (mb_run_case re-verifies each row against its reference). */
-        const mb_row perm[3] = { {1, 37, 9}, {0, 100, 25}, {1, 39, 9} };
+        const mb_row perm[3] = { {1, 37, 9}, {0, 100, 25}, {1, 39, 10} };
         if (mb_run_case("mixed-generic-permuted", perm, 3, raw_slab, raw_cap,
                         comp_slab, comp_cap, 25, window, ratio, n_banks,
                         sinks, n_head, head_dim, 0, NULL, 0) != 0) goto done;
@@ -893,15 +906,18 @@ static int check_multibank_decode_attention(void) {
                         NULL, comp_cap, 0, window, ratio, n_banks,
                         sinks, n_head, head_dim, 0, NULL, 0) != 0) goto done;
         /* Indexed (top-k) entry: ids >= the row's visible frontier and -1
-         * sentinels must be dropped per row (bank 1 sees 9 visible rows, so
-         * ids 12/24 are in-superset but beyond ITS frontier). */
+         * sentinels must be dropped per row (bank 1 at qpos 39 sees the
+         * engine-true 10 visible rows, so ids 12/24 are in-superset but
+         * beyond ITS frontier).  Row 1's id 9 is the emit-boundary teeth:
+         * exactly the row emitted at step 39 — visible under the engine-true
+         * (39+1)/4 = 10 rule, dropped by the old floor(39/4) = 9 rule. */
         const uint32_t top_k = 8;
         const int32_t topk_host[3 * 8] = {
              3, 24,  0, 12, -1,  7, 19,  5,
-             8,  2, 12, -1, 24,  0,  6,  4,
+             8,  2, 12,  9, 24,  0,  6,  4,
              1,  8, -1,  5, 24,  3, 12,  2,
         };
-        const mb_row idx_rows[3] = { {0, 100, 25}, {1, 39, 9}, {1, 37, 9} };
+        const mb_row idx_rows[3] = { {0, 100, 25}, {1, 39, 10}, {1, 37, 9} };
         /* Banked mode forces the generic indexed kernel (heads8 variants stay
          * single-bank); pin the scalar reference to the same kernel. */
         setenv("DS4_CUDA_NO_INDEXED_HEADS8", "1", 1);
@@ -914,9 +930,15 @@ static int check_multibank_decode_attention(void) {
 
     /* heads8-online variant: a cross-bank superset n_comp too large for the
      * shared-memory score buffer forces the online kernel for the batch AND
-     * for the single-row references (which also get the superset scalar —
-     * their per-row visibility still comes from (qpos+1)/ratio == floor for
-     * these positions, so values match the banked floor derivation). */
+     * for the single-row references.  Bank 0 sits at qpos 45999, an EMIT
+     * boundary (45999 ≡ 3 mod 4): its engine-true frontier is 46000/4 =
+     * 11500 == the scalar, while floor(45999/4) = 11499 — teeth for the
+     * online kernel's per-row rule.  Bank 1 (qpos 20000, frontier 5000)
+     * must ALSO get the 11500 scalar in its reference: scalar n_comp picks
+     * the kernel (a 5000 scalar fits the score buffer and would take the
+     * generic kernel, whose reduction order differs), while the rows a
+     * reference actually reads come from the kernel's own (qpos+1)/ratio
+     * derivation, which caps at 5000 regardless of the larger scalar. */
     {
         const uint32_t big_comp_cap = 11504;
         const uint32_t big_n_comp = 11500;
@@ -928,7 +950,7 @@ static int check_multibank_decode_attention(void) {
             mb_rng_state = 0x5eed5u;
             for (uint64_t i = 0; i < big_count; i++) big_host[i] = mb_rand();
             if (ds4_gpu_tensor_write(big_slab, 0, big_host, big_count * sizeof(float))) {
-                const mb_row rows[2] = { {0, 46000, big_n_comp}, {1, 20000, big_n_comp} };
+                const mb_row rows[2] = { {0, 45999, big_n_comp}, {1, 20000, big_n_comp} };
                 big_rc = mb_run_case("mixed-online", rows, 2, raw_slab, raw_cap,
                                      big_slab, big_comp_cap, big_n_comp, window,
                                      ratio, n_banks, sinks, n_head, head_dim,

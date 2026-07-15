@@ -408,10 +408,19 @@ __global__ static void attention_prefill_unpack_heads_kernel(
  * read the raw ring at seq_id*raw_cap and compressed rows at seq_id*comp_cap
  * offsets; the scalar n_comp becomes a cross-bank superset used ONLY as a
  * clamp/scratch bound, never to address into a specific bank.  The per-row
- * count uses floor(qpos/ratio) — NOT (qpos+1)/ratio — so a row never reads
- * the compressed row emitted in its own step and a shallow bank never reads
- * past its own frontier.  positions == NULL && seq_id == NULL degenerates to
- * the classic single-cache scalar path bit-exactly. */
+ * visible count is (qpos+1)/ratio — the SAME rule the engine's classic
+ * single-session decode follows, because the engine emits a step's
+ * compressed row BEFORE attention (gpu_decode.c: layer_n_comp is
+ * incremented before the attention launch reads it), so at an emit step
+ * (qpos ≡ ratio-1 mod ratio) the row attends to the compressed row emitted
+ * that same step.  DRIVER CONTRACT (banked mode): every bank's compressed
+ * rows for the current step — including same-step emits — must be written
+ * before the attention launch; the scalar n_comp superset clamp is a safety
+ * bound only.  If the clamp ever bites, the row reads fewer rows than
+ * single-session would (fail-safe, not garbage) and its output DIVERGES
+ * from classic — that is the mid-prefill-bank case the driver must never
+ * co-schedule.  positions == NULL && seq_id == NULL degenerates to the
+ * classic single-cache scalar path bit-exactly. */
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -466,7 +475,6 @@ __global__ static void attention_decode_mixed_kernel(
     const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
     const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
-    if (positions && ratio != 0u && visible_comp > qpos / ratio) visible_comp = qpos / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     const uint32_t comp_row_bytes = comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
@@ -709,7 +717,6 @@ __global__ static void attention_indexed_mixed_kernel(
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
-        if (positions && visible_comp > qpos / ratio) visible_comp = qpos / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
@@ -1420,7 +1427,6 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             comp_count = n_comp;
         } else if (ratio != 0u) {
             comp_count = (qpos + 1u) / ratio;
-            if (positions && comp_count > qpos / ratio) comp_count = qpos / ratio;
             if (comp_count > n_comp) comp_count = n_comp;
         }
     }
@@ -1857,13 +1863,16 @@ static int attention_decode_batch_launch(
     /* Descriptor (banked) mode: both per-row arrays or neither; the KV
      * operands are whole bank pools, so byte bounds scale by n_banks and the
      * uint32 row ABI (seq*cap + local) must not overflow.  The scalar
-     * n_raw/raw_start still pass the single-cache checks below but are
-     * per-row derived in the kernels; scalar n_comp is the cross-bank
-     * superset clamp (comp_cap is the per-bank row stride, so it must cover
-     * it). */
+     * n_raw/raw_start are IGNORED and NOT validated in this mode (pass 0):
+     * the raw span and ring start are per-row derived in the kernels from
+     * positions[t].  raw_cap must still be the true per-bank ring capacity
+     * (it addresses the ring and sizes the byte bound); scalar n_comp is the
+     * cross-bank superset clamp (comp_cap is the per-bank row stride, so it
+     * must cover it).  All rejections here are fail-loud: a silent 0 return
+     * looks like a generic launch failure to the driver. */
     const int descr = positions != NULL || seq_id != NULL;
     if (descr &&
-        (!positions || !seq_id || n_banks == 0 ||
+        (!positions || !seq_id || n_banks == 0 || raw_cap == 0 ||
          positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          (n_comp != 0 && comp_cap < n_comp) ||
@@ -1874,6 +1883,10 @@ static int attention_decode_batch_launch(
          window == 0u || window > DS4_CUDA_ATTENTION_RAW_SCORE_CAP ||
          (uint64_t)n_banks * raw_cap > 4294967296ull ||
          (uint64_t)n_banks * comp_cap > 4294967296ull)) {
+        fprintf(stderr,
+                "ds4: banked decode attention rejected: bad descriptor args "
+                "(n_tokens=%u n_banks=%u raw_cap=%u comp_cap=%u n_comp=%u window=%u)\n",
+                n_tokens, n_banks, raw_cap, comp_cap, n_comp, window);
         return 0;
     }
     const uint64_t kv_banks = descr ? n_banks : 1u;
@@ -1882,7 +1895,7 @@ static int attention_decode_batch_launch(
                                          : (uint64_t)n_comp;
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
-        n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
+        (!descr && (n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap)) ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
@@ -2076,12 +2089,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *seq_id,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
-    /* Descriptor (banked) mode: same contract as attention_decode_batch_launch;
-     * additionally the heads8 fast variants stay single-bank-only, so banked
-     * rows are forced onto the generic per-(row,head) kernel below. */
+    /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
+     * (scalar n_raw/raw_start ignored and unvalidated, raw_cap must be the true
+     * per-bank ring capacity, rejections fail-loud); additionally the heads8
+     * fast variants stay single-bank-only, so banked rows are forced onto the
+     * generic per-(row,head) kernel below. */
     const int descr = positions != NULL || seq_id != NULL;
     if (descr &&
-        (!positions || !seq_id || n_banks == 0 || ratio == 0 ||
+        (!positions || !seq_id || n_banks == 0 || raw_cap == 0 || ratio == 0 ||
          positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
          comp_cap < n_comp ||
@@ -2089,6 +2104,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          window == 0u || window > DS4_CUDA_ATTENTION_RAW_SCORE_CAP ||
          (uint64_t)n_banks * raw_cap > 4294967296ull ||
          (uint64_t)n_banks * comp_cap > 4294967296ull)) {
+        fprintf(stderr,
+                "ds4: banked indexed attention rejected: bad descriptor args "
+                "(n_tokens=%u n_banks=%u raw_cap=%u comp_cap=%u n_comp=%u window=%u ratio=%u)\n",
+                n_tokens, n_banks, raw_cap, comp_cap, n_comp, window, ratio);
         return 0;
     }
     const uint64_t kv_banks = descr ? n_banks : 1u;
@@ -2096,7 +2115,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                          : (uint64_t)n_comp;
     if (comp_kv_f16 || comp_kv_fp8 ||
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
-        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
+        n_tokens == 0 ||
+        (!descr && (n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap)) ||
         n_comp == 0 || top_k == 0 ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||

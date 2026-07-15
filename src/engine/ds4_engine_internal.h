@@ -1077,6 +1077,15 @@ typedef struct {
      * the classic single-session layout; >= 2 makes the per-layer cache
      * pointers bank views into the slabs. */
     ds4_bank_slabs banks;
+
+    /* DS4_DECODE_DESCR diagnostic (gpu_decode.c): 1-row device descriptor
+     * arrays (positions=[pos], seq_id=[0]) for routing single-token decode
+     * attention through the banked entry points as an n_banks=1 pool over the
+     * bank-0 cache views.  Lazily allocated on first diagnostic step; NULL
+     * in production (the env flag is read once per process, never per
+     * token). */
+    ds4_gpu_tensor *descr_diag_pos;
+    ds4_gpu_tensor *descr_diag_seq;
 } ds4_gpu_graph;
 
 /* =========================================================================

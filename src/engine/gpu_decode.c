@@ -290,6 +290,37 @@ int gpu_graph_raw_f16_enabled(void) {
     return cached;
 }
 
+/* DS4_DECODE_DESCR=1: Tier-2 A/B diagnostic (env read once per process and
+ * cached — never a per-token getenv).  Routes single-token decode attention
+ * through the descriptor (banked) entry points as an n_banks=1 pool over the
+ * bank-0 cache views, with positions=[pos] and seq_id=[0].  Under the banked
+ * (qpos+1)/ratio visibility rule this is byte-exact vs the classic scalar
+ * path INCLUDING at compressor emit steps (the engine emits before
+ * attention) — the Tier-2 descriptor-vs-classic gate.  Off (0) is the
+ * default; this is not a production mode. */
+static int gpu_graph_decode_descr_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_DECODE_DESCR", 0);
+    return cached;
+}
+
+/* Lazily allocate the 1-row descriptor arrays and refresh positions[0] = pos
+ * (seq_id[0] stays 0: the single session lives in bank 0). */
+static bool gpu_graph_decode_descr_prepare(ds4_gpu_graph *g, uint32_t pos) {
+    if (!g->descr_diag_pos) {
+        g->descr_diag_pos = ds4_gpu_tensor_alloc(sizeof(int32_t));
+        g->descr_diag_seq = ds4_gpu_tensor_alloc(sizeof(int32_t));
+        const int32_t bank0 = 0;
+        if (!g->descr_diag_pos || !g->descr_diag_seq ||
+            !ds4_gpu_tensor_write(g->descr_diag_seq, 0, &bank0, sizeof(bank0))) {
+            fprintf(stderr, "ds4: DS4_DECODE_DESCR descriptor alloc failed\n");
+            return false;
+        }
+    }
+    const int32_t p = (int32_t)pos;
+    return ds4_gpu_tensor_write(g->descr_diag_pos, 0, &p, sizeof(p)) != 0;
+}
+
 /* DS4_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
  * work buffers (indexer_scores, comp_mask) are allocated with only N token
@@ -1063,7 +1094,17 @@ bool gpu_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
-        if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
+        /* DS4_DECODE_DESCR diagnostic (see gpu_graph_decode_descr_enabled):
+         * route this step through the banked entries as a 1-bank pool.  The
+         * per-row raw derivation (min(pos+1, raw_window) rows ending at pos)
+         * matches gpu_graph_raw_span_for_batch/raw_start_for_span exactly,
+         * and the per-row (pos+1)/ratio compressed visibility equals the
+         * n_comp this step just produced (emit-before-attention). */
+        const int descr_diag = gpu_graph_decode_descr_enabled();
+        if (descr_diag) ok = gpu_graph_decode_descr_prepare(g, pos);
+        if (!ok) {
+            /* fall through with ok == false */
+        } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
@@ -1087,7 +1128,10 @@ bool gpu_graph_encode_decode_layer(
                     DS4_N_HEAD,
                     DS4_N_HEAD_DIM,
                     raw_f16,
-                    NULL, NULL, 0, 1) != 0;
+                    descr_diag ? g->descr_diag_pos : NULL,
+                    descr_diag ? g->descr_diag_seq : NULL,
+                    descr_diag ? g->layer_comp_cap[il] : 0,
+                    1) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = gpu_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -1096,6 +1140,26 @@ bool gpu_graph_encode_decode_layer(
                                                                 n_comp,
                                                                 &decode_index_stage_t0);
             }
+        } else if (descr_diag) {
+            /* Non-indexed single-token attention through the banked batch
+             * entry (scalar n_raw/raw_start are ignored in banked mode). */
+            ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->heads,
+                    model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->q, raw_cache,
+                    n_comp ? comp_cache : NULL,
+                    0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
+                    gpu_graph_attn_comp_cache_is_pack(),
+                    NULL, 0,
+                    1, pos,
+                    0, raw_cap, 0, /* n_raw/raw_start unused (banked) */
+                    n_comp,
+                    g->raw_window,
+                    ds4_layer_compress_ratio(il),
+                    DS4_N_HEAD, DS4_N_HEAD_DIM,
+                    0, raw_f16,
+                    g->descr_diag_pos, g->descr_diag_seq,
+                    g->layer_comp_cap[il], 1) != 0;
         } else {
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
                                                          model->map, model->size,

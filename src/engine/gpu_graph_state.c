@@ -4,6 +4,8 @@
 
 /* Release every GPU tensor owned by the whole-model graph runtime. */
 void gpu_graph_free(ds4_gpu_graph *g) {
+    ds4_gpu_tensor_free(g->descr_diag_pos);
+    ds4_gpu_tensor_free(g->descr_diag_seq);
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);

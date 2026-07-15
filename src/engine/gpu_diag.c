@@ -468,6 +468,9 @@ uint32_t gpu_graph_bank_pool_n(void) {
         if (v && v[0]) {
             char *end = NULL;
             n = strtol(v, &end, 10);
+            /* Tolerate trailing whitespace (e.g. "2\n" from a shell here-doc),
+             * like the DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD parser. */
+            while (end && isspace((unsigned char)*end)) end++;
             if (end == v || (end && *end != '\0') || n < 1) {
                 fprintf(stderr,
                         "ds4: DS4_MSEQ_BANKS=\"%s\" not recognized (want 1..%u); "
