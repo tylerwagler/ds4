@@ -10,7 +10,150 @@ static long long wall_ms(void) {
 
 
 
+/* Thread-local: only the GPU worker installs a writer (around a job), so
+ * client threads always see NULL here and keep the classic bounded-blocking
+ * send_all behavior with zero contention. */
+static __thread slot_writer *g_slot_writer;
+
+
+
+void slot_writer_init(slot_writer *w, int fd) {
+    memset(w, 0, sizeof(*w));
+    w->fd = fd;
+}
+
+
+
+void slot_writer_install(slot_writer *w) {
+    g_slot_writer = w;
+}
+
+
+
+void slot_writer_free(slot_writer *w) {
+    if (!w) return;
+    if (g_slot_writer == w) g_slot_writer = NULL;
+    buf_free(&w->pending);
+    w->off = 0;
+    w->stall_deadline_ms = 0;
+}
+
+
+
+/* Push queued bytes without ever sleeping. Returns false once the writer has
+ * failed (hard socket error, stall timeout with bytes still queued, or pending
+ * overflow); bytes may legitimately remain queued on a true return. */
+bool slot_writer_flush(slot_writer *w) {
+    if (w->failed) return false;
+    while (w->off < w->pending.len) {
+        ssize_t r = send(w->fd, w->pending.ptr + w->off, w->pending.len - w->off, 0);
+        if (r > 0) {
+            w->off += (size_t)r;
+            w->stall_deadline_ms = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        w->failed = true;
+        return false;
+    }
+    if (w->off == w->pending.len) {
+        w->pending.len = 0;
+        w->off = 0;
+        w->stall_deadline_ms = 0;
+        return true;
+    }
+    if (w->off >= 65536) {
+        /* Compact the consumed prefix so a long slow stream cannot grow the
+         * queue by its full transferred size. */
+        memmove(w->pending.ptr, w->pending.ptr + w->off, w->pending.len - w->off);
+        w->pending.len -= w->off;
+        w->off = 0;
+    }
+    if (wall_ms() >= w->stall_deadline_ms) {
+        w->failed = true;
+        return false;
+    }
+    return true;
+}
+
+
+
+static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
+    if (w->failed) return false;
+    if (g_stop_requested) {
+        /* Match blocking send_all: any write during shutdown fails. */
+        w->failed = true;
+        return false;
+    }
+    const char *s = p;
+    if (w->off == w->pending.len) {
+        /* Nothing queued: try the wire directly so hard errors (EPIPE from a
+         * closed peer) surface on this call, exactly like the blocking path. */
+        while (n) {
+            ssize_t r = send(w->fd, s, n, 0);
+            if (r > 0) {
+                s += r;
+                n -= (size_t)r;
+                continue;
+            }
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            w->failed = true;
+            return false;
+        }
+        if (!n) return true;
+        w->pending.len = 0;
+        w->off = 0;
+    }
+    buf_append(&w->pending, s, n);
+    if (w->pending.len - w->off > DS4_SERVER_WRITER_MAX_PENDING_BYTES) {
+        w->failed = true;
+        return false;
+    }
+    if (!w->stall_deadline_ms) {
+        w->stall_deadline_ms = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+    }
+    return slot_writer_flush(w);
+}
+
+
+
+/* Blocking completion of all queued bytes, used once per job after the final
+ * response: same poll cadence and stall timeout as blocking send_all. */
+bool slot_writer_drain(slot_writer *w) {
+    while (!w->failed && w->off < w->pending.len) {
+        if (g_stop_requested) {
+            w->failed = true;
+            break;
+        }
+        if (!slot_writer_flush(w)) break;
+        if (w->off >= w->pending.len) break;
+        long long remaining = w->stall_deadline_ms - wall_ms();
+        if (remaining <= 0) {
+            w->failed = true;
+            break;
+        }
+        struct pollfd pfd = {.fd = w->fd, .events = POLLOUT};
+        int timeout = remaining > 50 ? 50 : (int)remaining;
+        int rc;
+        do {
+            rc = poll(&pfd, 1, timeout);
+        } while (rc < 0 && errno == EINTR);
+        if (rc < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            w->failed = true;
+            break;
+        }
+    }
+    return !w->failed;
+}
+
+
+
 bool send_all(int fd, const void *p, size_t n) {
+    if (g_slot_writer && g_slot_writer->fd == fd) {
+        return slot_writer_send(g_slot_writer, p, n);
+    }
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {

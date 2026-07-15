@@ -256,6 +256,14 @@ void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+/* Multi-session serving: prefill quantum policy. A server that time-slices
+ * prefill interrupts ds4_session_sync() at chunk boundaries (via the cancel
+ * callback) and re-issues the sync to resume. Returns the minimum remaining
+ * suffix (target minus checkpoint, in tokens) that must still be pending for
+ * an interruption to reproduce the uninterrupted chunk boundaries — hence
+ * bit-identical KV state — or 0 when interrupting this session is never
+ * exact and sync must run to completion. */
+uint32_t ds4_session_prefill_quantum_min_suffix(const ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_dspark(ds4_engine *e);

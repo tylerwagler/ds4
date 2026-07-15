@@ -3284,3 +3284,45 @@ int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
 
+
+
+/* Multi-session serving: is interrupting ds4_session_sync() at a chunk
+ * boundary (cancel callback) and re-issuing the sync bit-identical to letting
+ * it run to completion?
+ *
+ * Two conditions must hold, and the return value encodes both:
+ *
+ *   - gpu_graph_prefill_chunked_range caps resumed (start != 0) chunks at
+ *     raw_cap. If this session's cold chunks are larger (prefill_cap >
+ *     raw_cap), a resumed prefill would re-chunk on different boundaries,
+ *     changing batch shapes and therefore cuBLASLt algo selection; exact
+ *     replay is lost. Return 0: the caller must not interrupt at all.
+ *
+ *   - Below gpu_graph_resume_prefill_min_tokens() remaining tokens,
+ *     ds4_session_sync extends the checkpoint by single-token decode evals
+ *     instead of a final batched chunk. Interrupting with less than this left
+ *     would change which path evaluates the tail. Return that minimum, so the
+ *     caller only interrupts while (target - checkpoint) >= the returned
+ *     value. (When resume is disabled via DS4_CUDA_RESUME_PREFILL_MIN<=0 the
+ *     minimum is UINT32_MAX and the comparison never permits interruption.) */
+uint32_t ds4_session_prefill_quantum_min_suffix(const ds4_session *s) {
+    if (!s) return 0;
+    if (s->graph.prefill_cap > s->graph.raw_cap) return 0;
+    /* A cold (start==0) chunk loop trims each non-final chunk end DOWN to the
+     * compress-ratio LCM, while a resumed (start!=0) loop snaps to absolute
+     * prefill_cap boundaries. The two produce the same chunk ends only when
+     * prefill_cap itself is LCM-aligned (true for the 4096/8192 defaults; a
+     * hand-set --prefill-chunk may not be). */
+    uint32_t align = 1;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t r = ds4_layer_compress_ratio(il);
+        if (r > 1 && align % r != 0) {
+            uint32_t a = align, b = r;
+            while (b) { const uint32_t t = a % b; a = b; b = t; }
+            align *= r / a;
+        }
+    }
+    if (align > 1 && s->graph.prefill_cap % align != 0) return 0;
+    return gpu_graph_resume_prefill_min_tokens();
+}
+

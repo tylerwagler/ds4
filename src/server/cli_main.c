@@ -4695,8 +4695,115 @@ static void test_kv_admission_budget_math(void) {
 
 
 
+/* Multi-session increment 2: while a job is bound to a slot, the worker's
+ * send_all() routes through a slot_writer — writes that do not fit the socket
+ * buffer defer instead of blocking, and flushes deliver every byte in order.
+ * The wire stream must be identical to the blocking path. */
+static void test_slot_writer_defers_and_preserves_order(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    int small = 4096;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    set_client_socket_nonblocking(sv[0]);
+    set_client_socket_nonblocking(sv[1]);
+
+    slot_writer w;
+    slot_writer_init(&w, sv[0]);
+    slot_writer_install(&w);
+
+    const size_t total = 512 * 1024;
+    char *pattern = server_xmalloc(total);
+    for (size_t i = 0; i < total; i++) {
+        pattern[i] = (char)((i * 31u + (i >> 8)) & 0xff);
+    }
+    char *received = server_xmalloc(total);
+    size_t sent = 0, got = 0;
+    bool deferred = false;
+
+    /* The peer reads nothing during the sends, so the tiny kernel buffers fill
+     * and everything past them must defer into the writer queue. */
+    while (sent < total) {
+        size_t nchunk = 700 + (sent % 900); /* odd sizes straddle buffers */
+        if (nchunk > total - sent) nchunk = total - sent;
+        TEST_ASSERT(send_all(sv[0], pattern + sent, nchunk)); /* defers, never fails */
+        sent += nchunk;
+        if (w.pending.len > w.off) deferred = true;
+    }
+    TEST_ASSERT(deferred);
+
+    /* Drain: alternate the worker-side flush with peer reads. Bounded so a
+     * writer regression that stops delivering (without setting failed) shows
+     * up as an assertion instead of a hung test suite. */
+    int stagnant = 0;
+    while (got < total) {
+        TEST_ASSERT(slot_writer_flush(&w));
+        char tmp[8192];
+        ssize_t r = recv(sv[1], tmp, sizeof(tmp), MSG_DONTWAIT);
+        if (r > 0) {
+            TEST_ASSERT(got + (size_t)r <= total);
+            memcpy(received + got, tmp, (size_t)r);
+            got += (size_t)r;
+            stagnant = 0;
+        } else if (++stagnant >= 100000) {
+            TEST_ASSERT(!"slot_writer drain made no progress");
+            break;
+        }
+    }
+    TEST_ASSERT(!w.failed);
+    TEST_ASSERT(w.pending.len == w.off); /* everything reached the wire */
+    TEST_ASSERT(memcmp(pattern, received, total) == 0);
+
+    slot_writer_free(&w); /* also uninstalls */
+    free(pattern);
+    free(received);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+
+/* A peer that accepts no bytes past the stall deadline fails the stream, and
+ * every later write on the failed writer reports failure — matching the old
+ * blocking send_all semantics that the generation loop depends on. */
+static void test_slot_writer_stall_times_out(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    int small = 4096;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    set_client_socket_nonblocking(sv[0]);
+
+    slot_writer w;
+    slot_writer_init(&w, sv[0]);
+    slot_writer_install(&w);
+
+    char blob[8192];
+    memset(blob, 'q', sizeof(blob));
+    for (int i = 0; i < 64; i++) {
+        TEST_ASSERT(send_all(sv[0], blob, sizeof(blob))); /* peer never reads: defer */
+    }
+    TEST_ASSERT(w.pending.len > w.off);
+    /* Force the deadline instead of sleeping DS4_SERVER_SEND_STALL_TIMEOUT_MS. */
+    w.stall_deadline_ms = 1;
+    TEST_ASSERT(!slot_writer_flush(&w));
+    TEST_ASSERT(w.failed);
+    TEST_ASSERT(!send_all(sv[0], "x", 1));
+    TEST_ASSERT(!slot_writer_drain(&w));
+
+    slot_writer_free(&w);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+
 static void ds4_server_unit_tests_run(void) {
     test_kv_admission_budget_math();
+    test_slot_writer_defers_and_preserves_order();
+    test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

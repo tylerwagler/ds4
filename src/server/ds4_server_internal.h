@@ -59,6 +59,22 @@
 #define DS4_SERVER_MAX_CLIENTS 64
 #define DS4_SERVER_REQUEST_READ_DEADLINE_SEC 30
 
+/* Multi-session serving increment 2: the worker steps each job as a resumable
+ * state machine in bounded quanta instead of running it to completion. A
+ * decode quantum yields back to the worker loop once it has emitted at least
+ * this many tokens — the bound is checked between sampling iterations, so one
+ * speculative burst (up to 17 accepted tokens) can overshoot it (a prefill
+ * quantum is one engine chunk, bounded by the engine's chunked-prefill
+ * machinery). With one slot the quanta run back-to-back and behavior is
+ * identical to run-to-completion; increment 3 interleaves slots at these
+ * boundaries. */
+#define DS4_SERVER_DECODE_QUANTUM_TOKENS 16
+
+/* Ceiling for bytes queued in a slot_writer for a client that stops reading.
+ * The stall timeout is the real slow-client guard; this cap only bounds worst
+ * case memory if a client keeps draining just enough to defeat it. */
+#define DS4_SERVER_WRITER_MAX_PENDING_BYTES (64u * 1024u * 1024u)
+
 
 /* The request parser only understands the API fields we use and skips the
  * rest.  Skipping is recursive because JSON values nest, so keep an explicit
@@ -494,6 +510,33 @@ typedef struct {
 
 typedef struct job job;
 
+/* ---- deferred slot writer (multi-session increment 2) ----
+ *
+ * The GPU worker must never sleep in poll() waiting for a slow client while it
+ * could be advancing the model. While a job is bound to a slot, the worker
+ * installs a slot_writer for the job's (non-blocking) socket: send_all() on
+ * that fd becomes best-effort non-blocking — bytes that do not fit in the
+ * socket buffer are queued in order and flushed at every quantum boundary,
+ * then drained fully before the job is signalled done. Client threads never
+ * install a writer, so their send_all() keeps the bounded-blocking behavior.
+ * Failure semantics match the blocking path: a hard socket error fails
+ * immediately, and a peer that accepts no bytes for
+ * DS4_SERVER_SEND_STALL_TIMEOUT_MS (or overflows the pending cap) fails the
+ * stream, which the generation loop reports exactly as before. */
+typedef struct {
+    int fd;
+    buf pending;                 /* accepted-but-unsent bytes, in wire order */
+    size_t off;                  /* consumed prefix of pending */
+    long long stall_deadline_ms; /* 0 = disarmed (nothing pending) */
+    bool failed;
+} slot_writer;
+
+void slot_writer_init(slot_writer *w, int fd);
+void slot_writer_install(slot_writer *w);   /* thread-local; NULL uninstalls */
+bool slot_writer_flush(slot_writer *w);     /* non-blocking best effort */
+bool slot_writer_drain(slot_writer *w);     /* blocking, stall-timeout bounded */
+void slot_writer_free(slot_writer *w);
+
 typedef ds4_kvstore_entry kv_entry;
 
 typedef ds4_kvstore_options kv_cache_options;
@@ -578,9 +621,10 @@ typedef struct {
  * until the worker finishes (http_server.c handle path); they never touch a
  * ds4_session_* or ds4_gpu_* entry point. Verified by grepping every
  * ds4_session_/ds4_gpu_ call site in src/server/*.c: all of them are reached
- * only from generate_job / worker_main (or from cli_main startup/shutdown,
- * before the worker starts and after it joins). No CUDA call is made off the
- * worker thread. This is a correctness invariant, not an accident.
+ * only from the generation state machine (gen_* in generate.c) driven by
+ * worker_main (or from cli_main startup/shutdown, before the worker starts and
+ * after it joins). No CUDA call is made off the worker thread. This is a
+ * correctness invariant, not an accident.
  *
  * It matters because the CUDA layer keeps process-global, NON-thread-safe state
  * that all sessions share:
@@ -598,13 +642,18 @@ typedef struct {
  * caches. Any future concurrency stays on the single GPU lane (batched kernels),
  * not multiple GPU threads, until these globals are made per-context.
  *
- * Increment 1 is pure structural plumbing: the pool has capacity 1, the worker
- * owns slot 0 and runs each job to completion exactly as the old single-session
- * server did. Scheduling, re-entrancy, eviction, and batched decode are later
+ * Increment 1 was pure structural plumbing (pool of capacity 1). Increment 2
+ * makes the generation path re-entrant: each job runs as a per-slot resumable
+ * state machine (gen_state in generate.c) that the worker steps in bounded
+ * quanta — one prefill chunk, or up to DS4_SERVER_DECODE_QUANTUM_TOKENS decode
+ * tokens, per step. All GPU work still happens on the single worker thread;
+ * with one slot the quanta run back-to-back, so output is identical to the old
+ * run-to-completion generate_job. The scheduler that interleaves multiple
+ * slots at these quantum boundaries, eviction, and batched decode are later
  * increments. */
 
 /* Pool capacity. 1 keeps behavior bit-identical to the single-session server;
- * later increments raise this once generate_job is slot-scoped/re-entrant. */
+ * increment 3's scheduler raises this now that generation is slot-scoped. */
 #define DS4_SESSION_POOL_CAP 1
 
 /* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
@@ -621,18 +670,25 @@ typedef enum {
     SLOT_EVICTED,      /* graph freed, KV held only in evicted_payload */
 } slot_state;
 
-/* A pool slot owns one logical session's GPU state. In increment 1 only slot 0
- * is provisioned and the scheduler/eviction fields are inert (documented so the
- * shape is stable for later increments). */
+/* Resumable per-job generation state (defined in generate.c). Owns everything
+ * that used to be a local of the run-to-completion generate_job: prompt/cache
+ * resolution results, prefill progress, stream writers for all four API
+ * surfaces, decode-loop trackers, and the deferred socket writer. */
+typedef struct gen_state gen_state;
+
+/* A pool slot owns one logical session's GPU state. Only slot 0 is provisioned
+ * until increment 3; the eviction fields are inert (documented so the shape is
+ * stable for later increments). */
 typedef struct {
     ds4_session *sess;                    /* live session; NULL until admitted */
     struct job  *active_job;              /* request bound to this slot, or NULL */
+    gen_state   *gen;                     /* resumable state for active_job */
     slot_state   state;
     int          ctx_size;                /* context this slot was admitted for */
     uint64_t     est_cost_bytes;          /* admission-accounted packed KV+scratch cost */
-    uint64_t     tokens_emitted;          /* decode bookkeeping (scheduler; unused in inc 1) */
-    uint64_t     last_serviced_us;        /* last quantum wall-clock (scheduler; unused) */
-    ds4_session_snapshot *evicted_payload; /* host KV when SLOT_EVICTED (unused in inc 1) */
+    uint64_t     tokens_emitted;          /* decode bookkeeping for the scheduler */
+    uint64_t     last_serviced_us;        /* last quantum wall-clock (scheduler) */
+    ds4_session_snapshot *evicted_payload; /* host KV when SLOT_EVICTED (unused in inc 2) */
 } session_slot;
 
 struct server {
@@ -1172,7 +1228,6 @@ char *build_responses_visible_assistant_suffix(const request *r,
 char *build_toolless_thinking_visible_text(const request *r,
                                                   const char *content);
 bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls);
-void generate_job(server *s, job *j);
 bool enqueue(server *s, job *j);
 void *worker_main(void *arg);
 void append_model_json_values(buf *b, const char *id, const char *name,
