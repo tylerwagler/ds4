@@ -1086,7 +1086,8 @@ bool gpu_graph_encode_decode_layer(
                     ds4_layer_compress_ratio(il),
                     DS4_N_HEAD,
                     DS4_N_HEAD_DIM,
-                    raw_f16) != 0;
+                    raw_f16,
+                    NULL, NULL, 0, 1) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = gpu_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -1676,7 +1677,8 @@ bool gpu_graph_dspark_draft_forward(
             0,
             DS4_N_HEAD, DS4_N_HEAD_DIM,
             1,
-            0 /* drafter ring is always f32 */) != 0;
+            0 /* drafter ring is always f32 */,
+            NULL, NULL, 0, 1) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
                                              (uint64_t)n_draft * DS4_N_HEAD * DS4_N_HEAD_DIM, li, pos0);

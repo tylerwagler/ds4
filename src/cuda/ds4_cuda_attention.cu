@@ -397,6 +397,21 @@ __global__ static void attention_prefill_unpack_heads_kernel(
 
 
 
+/* positions/seq_id/comp_cap (all descriptor-aware decode kernels): per-row
+ * multi-session banking (design adapted from the MIT-licensed Entrpi/ds4
+ * fork, v0.2 c71a49a — see ds4_bank_slabs in the engine; reimplemented, no
+ * code copied).  positions[t] is row t's absolute query position, seq_id[t]
+ * its TRUE bank id (never a packed row ordinal); raw window, ring start and
+ * the visible compressed count are derived per row from the position because
+ * the raw ring is position-indexed (slot = pos % raw_cap per bank) and
+ * compression closes one ratio group every `ratio` positions.  Banked rows
+ * read the raw ring at seq_id*raw_cap and compressed rows at seq_id*comp_cap
+ * offsets; the scalar n_comp becomes a cross-bank superset used ONLY as a
+ * clamp/scratch bound, never to address into a specific bank.  The per-row
+ * count uses floor(qpos/ratio) — NOT (qpos+1)/ratio — so a row never reads
+ * the compressed row emitted in its own step and a shallow bank never reads
+ * past its own frontier.  positions == NULL && seq_id == NULL degenerates to
+ * the classic single-cache scalar path bit-exactly. */
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -418,14 +433,30 @@ __global__ static void attention_decode_mixed_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        int raw_f16) {
+        int raw_f16,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
-    const bool single_all = (n_tokens == 1u && ratio == 0u);
-    uint32_t qpos = pos0 + t;
-    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    const bool single_all = (n_tokens == 1u && ratio == 0u && positions == NULL);
+    uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t eff_n_raw = n_raw;
+    uint32_t eff_raw_start = raw_start;
+    uint32_t first_raw_pos;
+    if (positions) {
+        eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
+        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+        first_raw_pos = qpos + 1u - eff_n_raw;
+    } else {
+        first_raw_pos = pos0 + n_tokens - n_raw;
+    }
+    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (positions && ratio != 0u && visible_comp > qpos / ratio) visible_comp = qpos / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     const uint32_t comp_row_bytes = comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
@@ -441,10 +472,10 @@ __global__ static void attention_decode_mixed_kernel(
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
-        if (n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (eff_n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
             if (single_all) {
-                raw_count = n_raw > 256u ? 256u : n_raw;
+                raw_count = eff_n_raw > 256u ? 256u : eff_n_raw;
             } else if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0 && qpos + 1u > window) {
@@ -462,7 +493,7 @@ __global__ static void attention_decode_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
     }
     __syncthreads();
     uint32_t n_score = raw_count + visible_comp;
@@ -481,14 +512,14 @@ __global__ static void attention_decode_mixed_kernel(
             if (add > -1.0e20f) {
                 float dot = 0.0f;
                 if (comp_kv_fp8) {
-                    const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c * comp_row_bytes;
+                    const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (comp_base + c) * comp_row_bytes;
                     const float *sc = (const float *)(kv_u8 + head_dim);
                     for (uint32_t d = 0; d < head_dim; d++)
                         dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
                 } else if (comp_kv_pack) {
-                    dot = attn_pack_dot_full(qh, comp_kv, c, head_dim, dot);
+                    dot = attn_pack_dot_full(qh, comp_kv, comp_base + c, head_dim, dot);
                 } else {
-                    const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                    const float *kvrow = comp_kv + (comp_base + c) * head_dim;
                     for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
                 }
                 s = dot * scale + add;
@@ -519,13 +550,13 @@ __global__ static void attention_decode_mixed_kernel(
                         const uint64_t rbase = (uint64_t)raw_rows[row] * head_dim;
                         for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * raw_kv_ld(raw_kv, raw_f16, rbase + d);
                     } else if (comp_kv_fp8) {
-                        const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c_idx * comp_row_bytes;
+                        const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (comp_base + c_idx) * comp_row_bytes;
                         const float *sc = (const float *)(kv_u8 + head_dim);
                         for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
                     } else if (comp_kv_pack) {
-                        dot = attn_pack_dot_lane8(qh, comp_kv, c_idx, qlane, head_dim, dot);
+                        dot = attn_pack_dot_lane8(qh, comp_kv, comp_base + c_idx, qlane, head_dim, dot);
                     } else {
-                        const float *kvrow = comp_kv + (uint64_t)c_idx * head_dim;
+                        const float *kvrow = comp_kv + (comp_base + c_idx) * head_dim;
                         for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
                     }
                     const uint32_t mask = 0xffu << (threadIdx.x & 24u);
@@ -578,15 +609,15 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
             if (comp_kv_fp8) {
-                const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c * comp_row_bytes;
+                const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (comp_base + c) * comp_row_bytes;
                 const float *sc = (const float *)(kv_u8 + head_dim);
                 acc0 += ds4a_fp8_kv_dequant(kv_u8[d0], sc[d0 >> 6]) * s;
                 acc1 += ds4a_fp8_kv_dequant(kv_u8[d1], sc[d1 >> 6]) * s;
             } else if (comp_kv_pack) {
-                acc0 += attn_comp_pack_ld(comp_kv, c, d0, head_dim) * s;
-                acc1 += attn_comp_pack_ld(comp_kv, c, d1, head_dim) * s;
+                acc0 += attn_comp_pack_ld(comp_kv, comp_base + c, d0, head_dim) * s;
+                acc1 += attn_comp_pack_ld(comp_kv, comp_base + c, d1, head_dim) * s;
             } else {
-                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                const float *kv = comp_kv + (comp_base + c) * head_dim;
                 acc0 += kv[d0] * s;
                 acc1 += kv[d1] * s;
             }
@@ -599,13 +630,13 @@ __global__ static void attention_decode_mixed_kernel(
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv_ld(raw_kv, raw_f16, (uint64_t)raw_rows[r] * head_dim + d) * scores[r];
             for (uint32_t c = 0; c < visible_comp; c++) {
                 if (comp_kv_fp8) {
-                    const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)c * comp_row_bytes;
+                    const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (comp_base + c) * comp_row_bytes;
                     const float *sc = (const float *)(kv_u8 + head_dim);
                     acc += ds4a_fp8_kv_dequant(kv_u8[d], sc[d >> 6]) * scores[raw_count + c];
                 } else if (comp_kv_pack) {
-                    acc += attn_comp_pack_ld(comp_kv, c, d, head_dim) * scores[raw_count + c];
+                    acc += attn_comp_pack_ld(comp_kv, comp_base + c, d, head_dim) * scores[raw_count + c];
                 } else {
-                    acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+                    acc += comp_kv[(comp_base + c) * head_dim + d] * scores[raw_count + c];
                 }
             }
             oh[d] = acc / denom;
@@ -634,15 +665,34 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t n_head,
         uint32_t head_dim,
         int raw_f16,
-        uint32_t comp_kv_pack) {
+        uint32_t comp_kv_pack,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
-    uint32_t qpos = pos0 + t;
-    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    /* Descriptor preamble: see attention_decode_mixed_kernel.  comp_rows[]
+     * keeps bank-LOCAL compressed ids (top-k ids are per-bank); the bank
+     * offset is applied at read time via comp_base. */
+    uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t eff_n_raw = n_raw;
+    uint32_t eff_raw_start = raw_start;
+    uint32_t first_raw_pos;
+    if (positions) {
+        eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
+        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+        first_raw_pos = qpos + 1u - eff_n_raw;
+    } else {
+        first_raw_pos = pos0 + n_tokens - n_raw;
+    }
+    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
+        if (positions && visible_comp > qpos / ratio) visible_comp = qpos / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
@@ -660,8 +710,8 @@ __global__ static void attention_indexed_mixed_kernel(
         raw_count = 0;
         raw_first_idx = 0;
         comp_count = 0;
-        if (n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (eff_n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
             if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0 && qpos + 1u > window) {
@@ -679,7 +729,7 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
     }
     /* Deterministic ordered compaction (was an atomicAdd slot race): the
      * ORDER of comp_rows fixes the float accumulation order of the indexed
@@ -733,9 +783,9 @@ __global__ static void attention_indexed_mixed_kernel(
                     const uint64_t rbase = (uint64_t)raw_rows[row] * head_dim;
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * raw_kv_ld(raw_kv, raw_f16, rbase + d);
                 } else if (comp_kv_pack) {
-                    dot = attn_pack_dot_lane8(qh, comp_kv, (uint64_t)comp_rows[row - raw_count], qlane, head_dim, dot);
+                    dot = attn_pack_dot_lane8(qh, comp_kv, comp_base + comp_rows[row - raw_count], qlane, head_dim, dot);
                 } else {
-                    const float *kvrow = comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
+                    const float *kvrow = comp_kv + (comp_base + comp_rows[row - raw_count]) * head_dim;
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
                 }
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
@@ -786,10 +836,10 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t c = 0; c < comp_count; c++) {
             float s = scores[raw_count + c];
             if (comp_kv_pack) {
-                acc0 += attn_comp_pack_ld(comp_kv, comp_rows[c], d0, head_dim) * s;
-                acc1 += attn_comp_pack_ld(comp_kv, comp_rows[c], d1, head_dim) * s;
+                acc0 += attn_comp_pack_ld(comp_kv, comp_base + comp_rows[c], d0, head_dim) * s;
+                acc1 += attn_comp_pack_ld(comp_kv, comp_base + comp_rows[c], d1, head_dim) * s;
             } else {
-                const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
+                const float *kv = comp_kv + (comp_base + comp_rows[c]) * head_dim;
                 acc0 += kv[d0] * s;
                 acc1 += kv[d1] * s;
             }
@@ -801,8 +851,8 @@ __global__ static void attention_indexed_mixed_kernel(
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv_ld(raw_kv, raw_f16, (uint64_t)raw_rows[r] * head_dim + d) * scores[r];
             for (uint32_t s = 0; s < comp_count; s++) {
-                acc += (comp_kv_pack ? attn_comp_pack_ld(comp_kv, comp_rows[s], d, head_dim)
-                                     : comp_kv[(uint64_t)comp_rows[s] * head_dim + d]) * scores[raw_count + s];
+                acc += (comp_kv_pack ? attn_comp_pack_ld(comp_kv, comp_base + comp_rows[s], d, head_dim)
+                                     : comp_kv[(comp_base + comp_rows[s]) * head_dim + d]) * scores[raw_count + s];
             }
             oh[d] = acc / denom;
         }
@@ -1305,7 +1355,10 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        int raw_f16) {
+        int raw_f16,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1319,22 +1372,36 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     __shared__ uint32_t raw_first_idx_s;
     __shared__ float4 kv_shared[4 * 128];
 
-    const uint32_t qpos = pos0 + t;
-    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    /* Descriptor preamble: see attention_decode_mixed_kernel. */
+    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t eff_n_raw = n_raw;
+    uint32_t eff_raw_start = raw_start;
+    uint32_t first_raw_pos;
+    if (positions) {
+        eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
+        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+        first_raw_pos = qpos + 1u - eff_n_raw;
+    } else {
+        first_raw_pos = pos0 + n_tokens - n_raw;
+    }
+    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t comp_count = 0;
     if (n_comp != 0u) {
-        if (n_tokens == 1u && ratio == 0u) {
+        if (n_tokens == 1u && ratio == 0u && positions == NULL) {
             comp_count = n_comp;
         } else if (ratio != 0u) {
             comp_count = (qpos + 1u) / ratio;
+            if (positions && comp_count > qpos / ratio) comp_count = qpos / ratio;
             if (comp_count > n_comp) comp_count = n_comp;
         }
     }
     if (threadIdx.x == 0) {
         uint32_t raw_count = 0;
         uint32_t raw_first_idx = 0;
-        if (n_raw != 0u) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (eff_n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
             if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0u && qpos + 1u > window) {
@@ -1356,7 +1423,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t raw_count = raw_count_s;
     const uint32_t raw_first_idx = raw_first_idx_s;
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
     }
     __syncthreads();
 
@@ -1389,7 +1456,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             if (sr < raw_count) {
                 kv_shared[off] = raw_kv_ld4(raw_kv, raw_f16, (uint64_t)raw_rows[sr] * head_dim, c4);
             } else if (comp_kv_fp8) {
-                const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (uint64_t)(sr - raw_count) * comp_row_bytes;
+                const uint8_t *kv_u8 = (const uint8_t *)comp_kv + (comp_base + (sr - raw_count)) * comp_row_bytes;
                 const float *sc = (const float *)(kv_u8 + head_dim);
                 uint32_t base = c4 << 2;
                 float4 v;
@@ -1401,7 +1468,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             } else if (comp_kv_pack) {
                 const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
                 const uint8_t *pr = (const uint8_t *)comp_kv +
-                    (uint64_t)(sr - raw_count) * DS4_ATTN_PACK_ROWBYTES(head_dim);
+                    (comp_base + (sr - raw_count)) * DS4_ATTN_PACK_ROWBYTES(head_dim);
                 const uint32_t base = c4 << 2;
                 float4 v;
                 if (base < n_nope) {
@@ -1422,7 +1489,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                 }
                 kv_shared[off] = v;
             } else {
-                const float4 *src = (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
+                const float4 *src = (const float4 *)(comp_kv + (comp_base + (sr - raw_count)) * head_dim);
                 kv_shared[off] = src[c4];
             }
         }
@@ -1588,7 +1655,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               0,
                                                                               n_head,
                                                                               head_dim,
-                                                                              raw_f16);
+                                                                              raw_f16,
+                                                                              NULL, NULL, 0);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -1604,7 +1672,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  use_mask,
                                                  0, comp_kv_fp8, comp_kv_pack,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
-                                                 0, 0, n_head, head_dim, raw_f16);
+                                                 0, 0, n_head, head_dim, raw_f16,
+                                                 NULL, NULL, 0);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
@@ -1753,7 +1822,31 @@ static int attention_decode_batch_launch(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        uint32_t                raw_f16) {
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks) {
+    /* Descriptor (banked) mode: both per-row arrays or neither; the KV
+     * operands are whole bank pools, so byte bounds scale by n_banks and the
+     * uint32 row ABI (seq*cap + local) must not overflow.  The scalar
+     * n_raw/raw_start still pass the single-cache checks below but are
+     * per-row derived in the kernels; scalar n_comp is the cross-bank
+     * superset clamp (comp_cap is the per-bank row stride, so it must cover
+     * it). */
+    const int descr = positions != NULL || seq_id != NULL;
+    if (descr &&
+        (!positions || !seq_id || n_banks == 0 ||
+         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         (n_comp != 0 && comp_cap < n_comp) ||
+         (uint64_t)n_banks * raw_cap > 4294967296ull ||
+         (uint64_t)n_banks * comp_cap > 4294967296ull)) {
+        return 0;
+    }
+    const uint64_t kv_banks = descr ? n_banks : 1u;
+    const uint64_t comp_rows_min = descr ? (uint64_t)n_banks * comp_cap
+                                         : (uint64_t)n_comp;
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -1762,10 +1855,10 @@ static int attention_decode_batch_launch(
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
+        raw_kv->bytes < kv_banks * raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         (comp_kv_pack && (comp_kv_f16 || comp_kv_fp8 || head_dim <= DS4_ATTN_PACK_NROT ||
          ((head_dim - DS4_ATTN_PACK_NROT) % DS4_FP8_KV_BLOCK) != 0)) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp *
+        (n_comp && comp_kv->bytes < comp_rows_min *
          (comp_kv_fp8 ? DS4_FP8_KV_ROWBYTES(head_dim)
                       : comp_kv_pack ? DS4_ATTN_PACK_ROWBYTES(head_dim)
                                      : head_dim * sizeof(float))) ||
@@ -1773,6 +1866,8 @@ static int attention_decode_batch_launch(
         return 0;
     }
     if (n_comp != 0 && ratio == 0) return 0;
+    const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -1797,7 +1892,10 @@ static int attention_decode_batch_launch(
                                                                               ratio,
                                                                               n_head,
                                                                               head_dim,
-                                                                              raw_f16);
+                                                                              raw_f16,
+                                                                              positions_ptr,
+                                                                              seq_id_ptr,
+                                                                              comp_cap);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -1825,7 +1923,10 @@ static int attention_decode_batch_launch(
                                                                    ratio,
                                                                    n_head,
                                                                    head_dim,
-                                                                   raw_f16);
+                                                                   raw_f16,
+                                                                   positions_ptr,
+                                                                   seq_id_ptr,
+                                                                   comp_cap);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     dim3 grid(n_tokens, n_head, 1);
@@ -1836,7 +1937,8 @@ static int attention_decode_batch_launch(
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
-                                                 raw_start, n_comp, window, ratio, n_head, head_dim, raw_f16);
+                                                 raw_start, n_comp, window, ratio, n_head, head_dim, raw_f16,
+                                                 positions_ptr, seq_id_ptr, comp_cap);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
@@ -1858,11 +1960,16 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                non_causal,
-        uint32_t                raw_f16) {
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, 0, 0, NULL, 0, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
-                                      n_head, head_dim, raw_f16);
+                                      n_head, head_dim, raw_f16,
+                                      positions, seq_id, comp_cap, n_banks);
 }
 
 
@@ -1891,12 +1998,17 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                non_causal,
-        uint32_t                raw_f16) {
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_kv_fp8, comp_kv_pack, comp_mask, use_comp_mask, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
-                                      n_comp, window, ratio, n_head, head_dim, raw_f16);
+                                      n_comp, window, ratio, n_head, head_dim, raw_f16,
+                                      positions, seq_id, comp_cap, n_banks);
 }
 
 
@@ -1924,7 +2036,27 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        uint32_t                raw_f16) {
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks) {
+    /* Descriptor (banked) mode: same contract as attention_decode_batch_launch;
+     * additionally the heads8 fast variants stay single-bank-only, so banked
+     * rows are forced onto the generic per-(row,head) kernel below. */
+    const int descr = positions != NULL || seq_id != NULL;
+    if (descr &&
+        (!positions || !seq_id || n_banks == 0 || ratio == 0 ||
+         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         comp_cap < n_comp ||
+         (uint64_t)n_banks * raw_cap > 4294967296ull ||
+         (uint64_t)n_banks * comp_cap > 4294967296ull)) {
+        return 0;
+    }
+    const uint64_t kv_banks = descr ? n_banks : 1u;
+    const uint64_t comp_rows_min = descr ? (uint64_t)n_banks * comp_cap
+                                         : (uint64_t)n_comp;
     if (comp_kv_f16 || comp_kv_fp8 ||
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -1933,11 +2065,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
+        raw_kv->bytes < kv_banks * raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         (comp_kv_pack && (head_dim <= DS4_ATTN_PACK_NROT ||
          ((head_dim - DS4_ATTN_PACK_NROT) % DS4_FP8_KV_BLOCK) != 0)) ||
-        comp_kv->bytes < (uint64_t)n_comp * (comp_kv_pack ? DS4_ATTN_PACK_ROWBYTES(head_dim)
-                                                          : head_dim * sizeof(float)) ||
+        comp_kv->bytes < comp_rows_min * (comp_kv_pack ? DS4_ATTN_PACK_ROWBYTES(head_dim)
+                                                       : head_dim * sizeof(float)) ||
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
@@ -1945,6 +2077,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
@@ -1955,7 +2089,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u && !comp_kv_pack &&
+    if (!descr && n_tokens > 1 && head_dim == 512 && top_k <= 512u && !comp_kv_pack &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
@@ -2019,7 +2153,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   n_head,
                                                   head_dim,
                                                   raw_f16,
-                                                  comp_kv_pack);
+                                                  comp_kv_pack,
+                                                  positions_ptr,
+                                                  seq_id_ptr,
+                                                  comp_cap);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 

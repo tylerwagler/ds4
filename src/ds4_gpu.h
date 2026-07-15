@@ -624,6 +624,15 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                head_dim,
         uint32_t                raw_f16);
 
+/* Batched decode attention.  The trailing descriptor quad enables multi-
+ * session banked mode: positions/seq_id are int32 [n_tokens] DEVICE arrays
+ * (row t's absolute query position and TRUE bank id), comp_cap is the
+ * per-bank compressed-row stride and n_banks the pool size; the raw/comp KV
+ * operands are then whole bank pools addressed at seq_id*raw_cap /
+ * seq_id*comp_cap, with the raw window, ring start, and visible compressed
+ * count derived per row from the position (scalar n_raw/raw_start are
+ * ignored; scalar n_comp is the cross-bank superset clamp).  Pass
+ * NULL/NULL/0/1 for the classic single-cache behavior — bit-exact. */
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -640,7 +649,11 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                non_causal,
-        uint32_t                raw_f16);
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -666,7 +679,11 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                non_causal,
-        uint32_t                raw_f16);
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks);
 
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -691,7 +708,11 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        uint32_t                raw_f16);
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

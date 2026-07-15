@@ -795,7 +795,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     DS4_N_HEAD,
                                                                     DS4_N_HEAD_DIM,
                                                                     0,
-                                                                    (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                                    (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                    NULL, NULL, 0, 1) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -1567,7 +1568,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   ratio,
                                                                                   DS4_N_HEAD,
                                                                                   DS4_N_HEAD_DIM,
-                                                                                  (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                                                  (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                                  NULL, NULL, 0, 1) != 0;
                         if (ok && index_stage_profile) {
                             ok = gpu_graph_indexer_stage_profile_boundary("attention",
                                                                             il,
@@ -1605,7 +1607,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           DS4_N_HEAD,
                                                                           DS4_N_HEAD_DIM,
                                                                           0,
-                                                                          (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                                          (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                          NULL, NULL, 0, 1) != 0;
             }
             if (ok) batch_attention_done = true;
         }
@@ -1717,7 +1720,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                                              (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                              NULL, NULL, 0, 1) != 0;
                     if (ok && index_stage_profile) {
                         ok = gpu_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -1854,7 +1858,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                                              (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                              NULL, NULL, 0, 1) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,
