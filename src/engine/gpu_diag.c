@@ -270,9 +270,19 @@ static void gpu_graph_compute_dims(
  * The server reconciles this estimate against the measured allocation delta
  * after every session create and logs a loud warning on >10% drift, so a
  * missed buffer surfaces on the first live run instead of as an
- * under-admission OOM.  Excluded as intentionally unaccounted: the lazy
- * gpu_graph_ensure_ffn_out/gpu_graph_ensure_batch_ffn_out buffers (only
- * allocated under steering/diagnostics) and directional-steering dirs. */
+ * under-admission OOM.
+ *
+ * EXCLUSION LIST — intentionally unaccounted per-session allocations (each
+ * negligible, absorbed by DS4_SERVER_MEM_FLOOR_BYTES; do not re-derive):
+ *   - the lazy gpu_graph_ensure_ffn_out/gpu_graph_ensure_batch_ffn_out
+ *     buffers (only allocated under steering/diagnostics);
+ *   - directional-steering dirs (gpu_graph_load_directional_steering,
+ *     ~DS4_N_LAYER*DS4_N_EMBD floats — these ARE inside the measured create
+ *     delta, so they show up in reconciliation but never in this estimate);
+ *   - the spec snapshot/restore descriptor tables that
+ *     ds4_gpu_batched_copy_prepare lazily cudaMallocs on the first fused
+ *     spec step (~KBs; raw cudaMalloc, outside both this estimate and the
+ *     ds4_gpu_tensor byte counter that reconciliation measures). */
 uint64_t gpu_graph_session_bytes(
         const ds4_weights       *weights,
         const ds4_layer_weights *layer,

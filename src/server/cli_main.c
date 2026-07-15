@@ -415,6 +415,13 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
+    /* Seed the /metrics snapshots (slot-0 position, spec-decode config like
+     * max_draft) before any client thread can scrape: send_metrics never
+     * calls into the engine (CUDA-state audit, ds4_server_internal.h). This
+     * runs before the worker thread starts, so it is still single-threaded
+     * engine access. */
+    server_publish_metrics_snapshot(&s);
+
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 
@@ -4692,6 +4699,25 @@ static void test_kv_admission_budget_math(void) {
     TEST_ASSERT(server_kv_admits(26ull * GiB, 20ull * GiB, 6ull * GiB));   /* exact fit */
     TEST_ASSERT(!server_kv_admits(26ull * GiB, 20ull * GiB, 7ull * GiB));  /* over by 1 GiB */
     TEST_ASSERT(!server_kv_admits(26ull * GiB, 0, 27ull * GiB));           /* lone over-budget */
+
+    /* GB10 production shape (2026-07-14, 18 GiB measured process overhead):
+     * usable 121 GiB − weights ~85.4 GiB − overhead 18 GiB − floor 6 GiB
+     * ⇒ budget ~11.6 GiB. Slot 0 at ctx=65536/pc=4096 costs ~4.6 GiB
+     * (measured) and must admit at startup; a doubled ~9.2 GiB session (the
+     * ctx=131072 upper bound) must also admit alone; the THIRD 4.6 GiB slot
+     * (13.8 GiB committed) must be refused — the 2026-07-13 incident shape
+     * admitted three. */
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t gb10_weights = 87450ull * MiB;              /* ~85.4 GiB */
+    const uint64_t gb10_budget = server_kv_budget_bytes(gb10_weights);
+    TEST_ASSERT(gb10_budget == DS4_SERVER_USABLE_BYTES - gb10_weights -
+                DS4_SERVER_PROCESS_OVERHEAD_BYTES - DS4_SERVER_MEM_FLOOR_BYTES);
+    TEST_ASSERT(gb10_budget > 11ull * GiB && gb10_budget < 12ull * GiB);   /* ~11.6 GiB */
+    const uint64_t slot64k = 4710ull * MiB;                    /* ~4.6 GiB @ ctx 64k */
+    TEST_ASSERT(server_kv_admits(gb10_budget, 0, slot64k));               /* slot 0, 64k */
+    TEST_ASSERT(server_kv_admits(gb10_budget, 0, 2ull * slot64k));        /* slot 0, 128k bound */
+    TEST_ASSERT(server_kv_admits(gb10_budget, slot64k, slot64k));         /* second slot */
+    TEST_ASSERT(!server_kv_admits(gb10_budget, 2ull * slot64k, slot64k)); /* third refused */
 
     /* Packed estimate vs the sizeof(float) upper bound. The raw SWA ring packs
      * to f16 regardless of a loaded model (it depends only on the static shape),

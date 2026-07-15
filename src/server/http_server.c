@@ -186,15 +186,24 @@ static bool send_models(server *s, int fd) {
  * rate, acceptance length, and the per-position waterfall unchanged. All
  * counters are cumulative since engine open; gauges are point-in-time. */
 static bool send_metrics(server *s, int fd) {
-    ds4_spec_metrics m;
-    ds4_engine_spec_metrics(s->engine, &m);
+    /* This runs on a client thread: it must not call into the engine
+     * (CUDA-state audit, ds4_server_internal.h). Everything below reads the
+     * snapshots the worker publishes under mu (m_spec/m_slot_pos/m_slot_ctx,
+     * server_publish_metrics_snapshot — refreshed at bind time and once per
+     * quantum, so gauges lag live state by at most one quantum). */
     const char *model = server_model_id_from_engine(s->engine);
-    const int pos = ds4_session_pos(s->slots[0].sess);
-    const int ctx = ds4_session_ctx(s->slots[0].sess);
-    double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
-    if (kv > 1.0) kv = 1.0;
-    /* Scheduler gauges + prefill counters (single worker -> running is 0/1). */
+    ds4_spec_metrics m;
+    int n_slots;
+    double slot_kv[DS4_SESSION_POOL_CAP];
     pthread_mutex_lock(&s->mu);
+    m = s->m_spec;
+    n_slots = s->n_slots;
+    for (int i = 0; i < n_slots; i++) {
+        const int pos = s->m_slot_pos[i];
+        const int ctx = s->m_slot_ctx[i];
+        double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
+        slot_kv[i] = kv > 1.0 ? 1.0 : kv;
+    }
     int running = s->n_generating;
     int waiting = s->n_queued;
     unsigned long long prompt_toks = (unsigned long long)s->m_prompt_tokens;
@@ -203,6 +212,10 @@ static bool send_metrics(server *s, int fd) {
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
+    double kv = 0.0; /* unlabeled gauge: max across provisioned slots */
+    for (int i = 0; i < n_slots; i++) {
+        if (slot_kv[i] > kv) kv = slot_kv[i];
+    }
 
     buf b = {0};
     /* Spec-decode counters (the core of --spec-live). model_name label lets the
@@ -244,10 +257,16 @@ static bool send_metrics(server *s, int fd) {
     buf_puts(&b, "# HELP vllm:prefix_cache_hits_total Cumulative prompt tokens served from the prefix cache.\n");
     buf_puts(&b, "# TYPE vllm:prefix_cache_hits_total counter\n");
     buf_printf(&b, "vllm:prefix_cache_hits_total %llu\n", pfx_hits);
-    /* Scheduler + KV gauges. */
-    buf_puts(&b, "# HELP vllm:kv_cache_usage_perc KV cache utilization (0-1).\n");
+    /* Scheduler + KV gauges. The unlabeled kv_cache_usage_perc series is the
+     * MAX across provisioned slots (single-gauge scrapers keep working and
+     * see the most-loaded session); the slot-labeled series break it out
+     * per session. */
+    buf_puts(&b, "# HELP vllm:kv_cache_usage_perc KV cache utilization (0-1); unlabeled = max across slots.\n");
     buf_puts(&b, "# TYPE vllm:kv_cache_usage_perc gauge\n");
     buf_printf(&b, "vllm:kv_cache_usage_perc %.6f\n", kv);
+    for (int i = 0; i < n_slots; i++) {
+        buf_printf(&b, "vllm:kv_cache_usage_perc{slot=\"%d\"} %.6f\n", i, slot_kv[i]);
+    }
     buf_puts(&b, "# HELP vllm:num_requests_running Requests currently generating.\n");
     buf_puts(&b, "# TYPE vllm:num_requests_running gauge\n");
     buf_printf(&b, "vllm:num_requests_running %d\n", running);

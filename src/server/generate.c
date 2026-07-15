@@ -695,6 +695,13 @@ bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *call
  * chunk likewise always completes within its quantum — the engine's cancel
  * check only interrupts when enough suffix remains for a bit-exact resume
  * (ds4_session_prefill_quantum_min_suffix).
+ *
+ * The largest quantum overshoot in the system is none of the above: it is
+ * lazy slot provisioning (provision_slot in the scheduler below), whose
+ * ds4_session_create is a multi-GiB allocation that can take SECONDS and
+ * stalls every bound slot for its duration — larger than the DSpark fused
+ * step's ≤17-token burst. Deliberate: all GPU work stays on this one thread
+ * (CUDA-state audit, ds4_server_internal.h).
  */
 
 typedef enum {
@@ -2162,7 +2169,10 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
     {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: SESSION COST DRIFT >10%%: est=%.2f GiB vs actual=%.2f GiB "
-                   "— gpu_graph_session_bytes is out of sync with gpu_graph_alloc_raw_cap; "
+                   "— gpu_graph_session_bytes is out of sync with gpu_graph_alloc_raw_cap "
+                   "(or a deliberately unaccounted allocation is enabled: directional-"
+                   "steering dirs are in the measured delta but excluded from the "
+                   "estimate — see the exclusion list in gpu_diag.c); "
                    "fix the sizing code (gpu_diag.c) before trusting admission control",
                    (double)est_bytes / gib, (double)actual_bytes / gib);
     }
@@ -2171,11 +2181,12 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
 
 
 
-/* MemAvailable from /proc/meminfo, in bytes (0 on parse failure). One read
- * per slot-provisioning attempt — never on a token/layer hot path. Coarse by
- * design: driver 610's UVM accounting lags MemAvailable, and under UVM
- * pressure MemTotal itself shrinks, so this is a belt-and-suspenders floor
- * check on top of the ledger, not a precise gauge. */
+/* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — the caller
+ * fails closed and refuses provisioning). One read per slot-provisioning
+ * attempt — never on a token/layer hot path. Coarse by design: driver 610's
+ * UVM accounting lags MemAvailable, and under UVM pressure MemTotal itself
+ * shrinks, so this is a belt-and-suspenders floor check on top of the
+ * ledger, not a precise gauge. */
 static uint64_t server_mem_available_bytes(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return 0;
@@ -2225,9 +2236,22 @@ static session_slot *provision_slot(server *s, int ctx) {
         return NULL;
     }
     /* Belt and suspenders: whatever the ledger says, do not start a create
-     * unless the kernel still reports room for it plus the free floor. */
+     * unless the kernel still reports room for it plus the free floor. A
+     * /proc/meminfo parse failure REFUSES provisioning (fail closed): this
+     * guard exists precisely for when other accounting is wrong, so it must
+     * not silently disarm itself. */
     const uint64_t avail = server_mem_available_bytes();
-    if (avail > 0 && avail < est + DS4_SERVER_MEM_FLOOR_BYTES) {
+    if (avail == 0) {
+        static bool warned_meminfo_unreadable; /* log once; single worker thread */
+        if (!warned_meminfo_unreadable) {
+            warned_meminfo_unreadable = true;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: /proc/meminfo MemAvailable unreadable; "
+                       "refusing slot provisioning (jobs queue for existing slots)");
+        }
+        return NULL;
+    }
+    if (avail < est + DS4_SERVER_MEM_FLOOR_BYTES) {
         if (last_rejected_reason != 2 ||
             est != last_rejected_est || committed != last_rejected_committed) {
             last_rejected_reason = 2;
@@ -2280,14 +2304,24 @@ static session_slot *provision_slot(server *s, int ctx) {
 /* Route the job to a slot. Preferences, in order:
  *   1. A live-tool-state continuation binds to the slot that owns its call
  *      ids (waiting for it if busy — running it elsewhere could only 409).
+ *      A continuation whose prompt cannot fit its owner slot's context can
+ *      never run: it must not run elsewhere (the live tool state exists only
+ *      on the owner), and leaving it queued would wedge the FIFO forever
+ *      behind an unbindable head — so it is failed explicitly through
+ *      *reject_ctx with the same context_length_exceeded client error the
+ *      front door sends (http_server.c / request_exceeds_context; the front
+ *      door checks against slot 0's ctx and cannot see the owner's smaller
+ *      one).
  *   2. Among free slots with enough context, the longest common token prefix
  *      wins, keeping a client's follow-ups on their warm KV.
  *   3. A job with no matching prefix anywhere prefers a fresh lazily
  *      provisioned slot over clobbering another conversation's warm state
  *      (budget permitting); with the pool exhausted it falls back to the
  *      warmest free slot exactly like the single-session server did.
- * Returns NULL when the job must wait for a slot to free. */
-static session_slot *choose_slot_for_job(server *s, job *j) {
+ * Returns NULL when the job must wait for a slot to free — except when
+ * *reject_ctx is set nonzero (the owner slot's ctx_size), which means the
+ * job can never run and must be failed, not left queued. */
+static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx) {
     session_slot *owner = NULL;
     if (j->req.api == API_RESPONSES && j->req.responses_live_call_ids.len > 0) {
         owner = responses_live_slot_for_ids(s, &j->req.responses_live_call_ids);
@@ -2295,7 +2329,13 @@ static session_slot *choose_slot_for_job(server *s, job *j) {
                j->req.anthropic_live_call_ids.len > 0) {
         owner = anthropic_live_slot_for_ids(s, &j->req.anthropic_live_call_ids);
     }
-    if (owner) return owner->active_job ? NULL : owner;
+    if (owner) {
+        if (request_exceeds_context(&j->req, owner->ctx_size)) {
+            *reject_ctx = owner->ctx_size;
+            return NULL;
+        }
+        return owner->active_job ? NULL : owner;
+    }
 
     const int needed = job_needed_ctx(s, j);
     session_slot *best = NULL;
@@ -2326,15 +2366,36 @@ static session_slot *choose_slot_for_job(server *s, job *j) {
 
 /* Bind the head job to a slot if routing allows it. Strict FIFO: when the
  * head must wait (its owner slot is busy, or no fitting slot is free), later
- * jobs wait behind it — simple and starvation-free. Returns true when a job
- * was bound. */
+ * jobs wait behind it — simple and starvation-free. Returns true when the
+ * head was consumed: bound to a slot, or failed explicitly (a continuation
+ * that cannot fit its owner slot — see choose_slot_for_job). */
 static bool worker_try_bind(server *s) {
     pthread_mutex_lock(&s->mu);
     job *j = s->head; /* peek: only the worker pops */
     pthread_mutex_unlock(&s->mu);
     if (!j) return false;
 
-    session_slot *sl = choose_slot_for_job(s, j);
+    int reject_ctx = 0;
+    session_slot *sl = choose_slot_for_job(s, j, &reject_ctx);
+    if (!sl && reject_ctx > 0) {
+        /* The job can never run: pop it and send the front door's
+         * context_length_exceeded client error (against the owner slot's
+         * context), then wake the client thread exactly like
+         * worker_finish_slot does for a completed job. */
+        pthread_mutex_lock(&s->mu);
+        s->head = j->next;
+        if (!s->head) s->tail = NULL;
+        if (s->n_queued > 0) s->n_queued--;
+        pthread_mutex_unlock(&s->mu);
+        j->next = NULL;
+        http_error_context_length_exceeded(j->fd, s->enable_cors, &j->req,
+                                           j->req.prompt.len, reject_ctx);
+        pthread_mutex_lock(&j->mu);
+        j->done = true;
+        pthread_cond_signal(&j->cv);
+        pthread_mutex_unlock(&j->mu);
+        return true;
+    }
     if (!sl) return false;
 
     pthread_mutex_lock(&s->mu);
@@ -2347,6 +2408,26 @@ static bool worker_try_bind(server *s) {
 
     generate_job_begin(s, sl, j);
     return true;
+}
+
+
+
+/* Publish the /metrics snapshots — per-slot KV position/context and the
+ * engine spec-decode counters — into plain server fields under mu. Client
+ * threads must never call into the engine (CUDA-state audit,
+ * ds4_server_internal.h), so the worker exports these at startup (cli_main,
+ * before the worker thread runs), after binds, and once per quantum;
+ * send_metrics reads only the snapshots. Host-int copies, no GPU work. */
+void server_publish_metrics_snapshot(server *s) {
+    ds4_spec_metrics m;
+    ds4_engine_spec_metrics(s->engine, &m);
+    pthread_mutex_lock(&s->mu);
+    for (int i = 0; i < s->n_slots; i++) {
+        s->m_slot_pos[i] = s->slots[i].sess ? ds4_session_pos(s->slots[i].sess) : 0;
+        s->m_slot_ctx[i] = s->slots[i].ctx_size;
+    }
+    s->m_spec = m;
+    pthread_mutex_unlock(&s->mu);
 }
 
 
@@ -2376,12 +2457,21 @@ static void worker_finish_slot(server *s, session_slot *sl) {
  * output is byte-identical. All ds4_session_* and CUDA work stays on this
  * thread. On shutdown the scheduler keeps stepping bound jobs (the decode
  * loop observes g_stop_requested) and drains the queue, exactly like the
- * increment-2 worker. */
+ * increment-2 worker.
+ *
+ * Quantum overshoot: binding may lazily provision a slot, and
+ * provision_slot's ds4_session_create is a multi-GiB allocation that can
+ * take SECONDS — every bound slot stalls for its duration. That is the
+ * largest quantum overshoot in the system (larger than the DSpark ≤17-token
+ * fused burst) and is deliberate single-thread design: the CUDA-state audit
+ * (ds4_server_internal.h) rules out a second GPU thread. */
 void *worker_main(void *arg) {
     server *s = arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */
     for (;;) {
-        while (worker_try_bind(s)) {}
+        bool bound = false;
+        while (worker_try_bind(s)) bound = true;
+        if (bound) server_publish_metrics_snapshot(s);
 
         int n_active = 0;
         for (int i = 0; i < s->n_slots; i++) {
@@ -2419,6 +2509,7 @@ void *worker_main(void *arg) {
         if (!sl->gen || sl->gen->phase == GEN_DONE) {
             worker_finish_slot(s, sl);
         }
+        server_publish_metrics_snapshot(s); /* /metrics: once per quantum */
     }
     return NULL;
 }

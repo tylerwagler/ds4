@@ -623,10 +623,17 @@ typedef struct {
  * ds4_session_/ds4_gpu_ call site under src/server: all of them are reached
  * only from the generation state machine (gen_* in generate.c) driven by
  * worker_main (or from cli_main startup/shutdown, before the worker starts and
- * after it joins) — with one deliberate exception: http_server.c reads
- * ds4_session_ctx(slots[0].sess) on client threads, a plain load of a field
- * immutable after startup (no CUDA behind it). No CUDA call is made off the
- * worker thread. This is a correctness invariant, not an accident.
+ * after it joins) — with two deliberate exceptions, both plain loads of data
+ * immutable after startup (no CUDA behind them): http_server.c reads
+ * ds4_session_ctx(slots[0].sess) on client threads, and client paths read the
+ * model id via server_model_id_from_engine (ds4_engine_model_id, a static
+ * shape constant). Nothing else: /metrics in particular makes NO engine
+ * calls — the worker publishes per-slot KV positions and the spec-decode
+ * counters into plain server fields under mu (m_slot_pos/m_slot_ctx/m_spec,
+ * server_publish_metrics_snapshot in generate.c, refreshed at bind time and
+ * once per quantum) and send_metrics reads only those snapshots. No CUDA
+ * call is made off the worker thread. This is a correctness invariant, not
+ * an accident.
  *
  * It matters because the CUDA layer keeps process-global, NON-thread-safe state
  * that all sessions share:
@@ -671,11 +678,14 @@ typedef struct {
 
 /* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
  * usable; weights are queried at runtime (ds4_engine_weights_resident_bytes).
- * The overhead reserve covers the CUDA context, cuBLASLt workspaces
- * (~32 MiB/GEMM), process-global CUDA scratch (MXFP4 expert staging, GEMV
- * activation buffers), and model-mmap page-cache slack. */
+ * The overhead reserve is the fixed process footprint measured on the GB10
+ * (2026-07-14), independent of session count: ~9.4 GiB at startup (CUDA
+ * context, GPU page tables, pinned staging buffers) plus ~8.7 GiB on the
+ * first request (cuBLASLt workspaces at ~32 MiB/GEMM, FP8 workspaces, and
+ * other lazy CUDA allocations — MXFP4 expert staging, GEMV activation
+ * buffers) — ~18 GiB total. */
 #define DS4_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
-#define DS4_SERVER_PROCESS_OVERHEAD_BYTES (4ull * 1024ull * 1024ull * 1024ull)
+#define DS4_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
 
 /* Free-memory floor (2026-07-13 lockup postmortem): the budget arithmetic and
  * every slot provisioning must leave at least this much of the machine free.
@@ -766,6 +776,14 @@ struct server {
     uint64_t m_prompt_tokens;     /* cumulative prompt tokens prefilled */
     uint64_t m_prefix_queries;    /* cumulative prompt tokens seen (hit-rate denom) */
     uint64_t m_prefix_hits;       /* cumulative prompt tokens served from prefix cache */
+    /* Worker-published /metrics snapshots (under mu). The CUDA-state audit
+     * above forbids engine calls on client threads, so the worker exports
+     * per-slot KV positions/contexts and the engine spec-decode counters here
+     * (server_publish_metrics_snapshot, at bind time and once per quantum);
+     * send_metrics reads only these. */
+    int m_slot_pos[DS4_SESSION_POOL_CAP];  /* ds4_session_pos per provisioned slot */
+    int m_slot_ctx[DS4_SESSION_POOL_CAP];  /* ctx_size per provisioned slot */
+    ds4_spec_metrics m_spec;               /* engine spec-decode counters */
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -1307,6 +1325,7 @@ char *build_toolless_thinking_visible_text(const request *r,
 bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls);
 bool enqueue(server *s, job *j);
 void *worker_main(void *arg);
+void server_publish_metrics_snapshot(server *s);
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens);
 void *client_main(void *arg);
