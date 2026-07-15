@@ -932,15 +932,26 @@ static float sample_rng_f32(uint64_t *state) {
  * then complement to reverse it. Only finite values reach here — the callers
  * filter !isfinite — so NaN ordering is not a concern.
  *
- * -0.0f is canonicalized to +0.0f first: they are distinct bit patterns but
- * compare EQUAL as floats, so the comparator this replaces calls them a tie.
- * Without this they would sort into a fixed order instead. Logits arrive by
- * memcpy from the GPU, so a negative zero really can appear here — this
- * file's own -ffast-math (=> -fno-signed-zeros) does not constrain them. */
+ * -0.0f is canonicalized to +0.0f first: it is a distinct bit pattern but
+ * compares EQUAL to +0.0f, so the comparator this replaces called them a
+ * tie, and by the tie note below, ordering what it tied can change the
+ * nucleus. Real, not hypothetical: logits arrive by memcpy from the GPU, and
+ * device code is built --use_fast_math (FTZ), so it writes exactly this.
+ *
+ * Subnormals are deliberately NOT flushed, and the reasoning is worth
+ * recording because it is a trap. -ffast-math would set FPCR.FZ (flushing
+ * subnormal FCMP inputs, making the comparator tie them) — but ONLY via
+ * crtfastmath.o, which the LINKER pulls in, and every binary carrying this
+ * code (ds4, ds4-server, ds4_test) is linked by nvcc, not by gcc -ffast-math.
+ * Measured in the real link config: FPCR = 0x0, FZ = 0, and the comparator
+ * ORDERS subnormals. So keying them strictly is what matches. A gcc-linked
+ * probe of the same source reports FPCR = 0x1000000 and the opposite answer —
+ * do not test this outside the real linkage. tests/ds4_test.c --sampler
+ * covers it (shape "subnormals + zeros (FZ range)"). */
 static inline uint32_t sample_desc_key(float f) {
     uint32_t u;
     memcpy(&u, &f, sizeof(u));
-    if (u == 0x80000000u) u = 0u;
+    if (u == 0x80000000u) u = 0u;   /* -0.0 == +0.0 to the comparator */
     const uint32_t asc = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
     return ~asc;
 }
@@ -952,13 +963,24 @@ static inline uint32_t sample_desc_key(float f) {
  * whole 129k-entry vocab that cost ~10.6 ms per call (~97% of dist_build) and
  * ran once per accepted position in the sampled speculative walk.
  *
- * Order is bit-for-bit what the qsort produced. Ties: the caller fills `a` in
- * ascending-id order and this sort is stable, so equal logits stay ascending
- * by id. That matches the qsort it replaces (glibc merge-sorts at this size),
- * but the property does not rest on that: permuting tied candidates permutes
- * IDENTICAL prob values, so `sum`, `min_prob`, `filtered`, `filtered_sum` and
- * every out->probs entry are bit-invariant under any tie order. Tie order can
- * only pick between equal-probability ids, and only inside the nucleus.
+ * Order is bit-for-bit what the qsort produced, ties included.
+ *
+ * STABILITY IS LOAD-BEARING — do not swap in an unstable sort (parallel,
+ * in-place, MSD) on the theory that ties are harmless. They are not. It is
+ * true that permuting tied candidates permutes IDENTICAL prob values, so
+ * `sum`, `min_prob`, `filtered`, `filtered_sum` and every out->probs entry
+ * are bit-invariant under any tie order. But `filtered` is a COUNT, and a tie
+ * group straddling the cutoff changes which ids fall inside it — i.e. nucleus
+ * MEMBERSHIP, not just order within the nucleus. Concretely, all-equal logits
+ * with top_p=0.5 give filtered=64640 of 129280: ascending ties yield
+ * ids [0..64639], descending ties yield ids [64640..129279] — disjoint.
+ * ds4_sample_dist_prob returns 0 for an id outside the nucleus, so
+ * ds4_sample_dist_accept would then REJECT a draft the other order ACCEPTS,
+ * changing the emitted token stream.
+ *
+ * So: the caller fills `a` in ascending-id order and this sort is stable,
+ * which reproduces the stable merge sort glibc's qsort uses at this size.
+ * tests/ds4_test.c --sampler pins it (and catches a tie-order flip).
  *
  * Requires n >= 1. */
 static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {

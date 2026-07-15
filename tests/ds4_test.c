@@ -2010,6 +2010,29 @@ static void samp_fill_shape(float *l, uint32_t n, int shape, const char **name) 
     case 8: *name = "near-flat (tiny spread)";
         for (uint32_t i = 0; i < n; i++) l[i] = 3.0f + (float)(samp_u01() * 1e-6);
         break;
+    case 9: *name = "subnormals + zeros (FZ range)";
+        /* -ffast-math sets FPCR.FZ, so the comparator the radix key replaces
+         * flushed subnormal inputs and tied every pair drawn from
+         * {-0.0,+0.0,+/-subnormal}. The key must reproduce that. Written as
+         * raw bits: these values cannot survive the host FP value model. */
+        {
+            static const uint32_t fz[6] = {
+                0x00000000u, 0x80000000u,   /* +0.0, -0.0                */
+                0x00000001u, 0x80000001u,   /* smallest +/- subnormal    */
+                0x007fffffu, 0x80400000u,   /* largest / mid subnormal   */
+            };
+            for (uint32_t i = 0; i < n; i++)
+                memcpy(&l[i], &fz[i % 6u], sizeof(l[i]));
+            for (int i = 0; i < 8; i++) l[(uint32_t)(samp_u01() * n)] = 0.25f;
+        }
+        break;
+    case 10: *name = "tie group straddling the cutoff";
+        /* All-equal logits + top_p<1 make `filtered` cut THROUGH one tie
+         * group, so tie order decides nucleus MEMBERSHIP (ascending ->
+         * ids[0..filtered-1], descending -> a disjoint set). This is the case
+         * that makes sort stability load-bearing rather than cosmetic. */
+        for (uint32_t i = 0; i < n; i++) l[i] = 1.25f;
+        break;
     default: *name = "?"; break;
     }
 }
@@ -2040,7 +2063,7 @@ static void test_sampler_dist_equivalence(void) {
     memset(&scratch, 0, sizeof(scratch));
 
     int checked = 0;
-    for (int shape = 0; shape <= 8; shape++) {
+    for (int shape = 0; shape <= 10; shape++) {
         const char *sname = "?";
         samp_fill_shape(logits, n, shape, &sname);
         for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
