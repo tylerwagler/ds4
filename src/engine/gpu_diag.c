@@ -172,6 +172,234 @@ bool gpu_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
  * GPU Release Graph Allocation.
  * ========================================================================= */
 
+/* Derived capacities and tensor dimensions for one session's GPU graph.
+ * Computed by gpu_graph_compute_dims and shared by the allocator
+ * (gpu_graph_alloc_raw_cap) and the sizing estimate (gpu_graph_session_bytes)
+ * so admission control and the allocator can never disagree about the derived
+ * quantities.  The per-buffer byte expressions still appear in both functions;
+ * the server's estimate-vs-actual reconciliation (>10% drift warning) is the
+ * enforcement that they stay in sync. */
+typedef struct {
+    uint32_t raw_cap;
+    uint32_t raw_window;
+    uint32_t ctx_size;
+    uint32_t prefill_cap;
+    uint32_t comp_cap;
+    uint32_t attn_comp_stage_cap;          /* only meaningful under DS4_ATTN_PACK */
+    uint32_t layer_comp_cap[DS4_MAX_LAYER];
+    uint64_t hc_dim;
+    uint64_t mix_hc;
+    uint64_t q_rank;
+    uint64_t q_dim;
+    uint64_t low_dim;
+    uint64_t shared_dim;
+    uint64_t routed_mid_dim;
+    uint64_t vocab_dim;
+    uint64_t comp_width_max;
+    uint64_t indexer_q_dim;
+} gpu_graph_dims;
+
+static void gpu_graph_compute_dims(
+        gpu_graph_dims *d,
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap) {
+    memset(d, 0, sizeof(*d));
+    if (raw_cap == 0) raw_cap = 1;
+    if (ctx_size == 0) ctx_size = raw_cap;
+    if (prefill_cap == 0) prefill_cap = 1;
+    uint32_t raw_window = DS4_N_SWA;
+    if (raw_window > ctx_size) raw_window = ctx_size;
+    if (raw_window == 0) raw_window = 1;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+    if (raw_cap > ctx_size) raw_cap = ctx_size;
+    if (raw_cap == 0) raw_cap = 1;
+    d->raw_cap = raw_cap;
+    d->raw_window = raw_window;
+    d->ctx_size = ctx_size;
+    d->prefill_cap = prefill_cap;
+
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
+    d->comp_cap = ctx_size / min_ratio + 2u;
+    if (d->comp_cap < 2u) d->comp_cap = 2u;
+    d->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
+    if (d->attn_comp_stage_cap < 2u) d->attn_comp_stage_cap = 2u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) {
+            d->layer_comp_cap[il] = 0;
+        } else {
+            d->layer_comp_cap[il] = ctx_size / ratio + 2u;
+            if (d->layer_comp_cap[il] < 2u) d->layer_comp_cap[il] = 2u;
+        }
+    }
+
+    d->hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    d->mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    d->q_rank = layer->attn_q_a->dim[1];
+    d->q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    d->low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    d->shared_dim = layer->ffn_gate_shexp->dim[1];
+    d->routed_mid_dim = layer->ffn_gate_exps->dim[1];
+    d->vocab_dim = weights->output ? weights->output->dim[1] : DS4_N_VOCAB;
+    d->comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+        ? DS4_N_HEAD_DIM
+        : DS4_N_INDEXER_HEAD_DIM);
+    d->indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+}
+
+
+
+/* TRUE total per-session GPU byte cost: the sum of every ds4_gpu_tensor that
+ * gpu_graph_alloc_raw_cap (and, when enable_spec, gpu_graph_init_dspark_target)
+ * allocates for one session.  This is what admission control must price a
+ * session at — the packed KV estimate (ds4_context_memory_estimate_packed)
+ * covers only the persistent KV rows plus the indexer score/mask scratch and
+ * undercounts the real cost by roughly an order of magnitude (2026-07-13
+ * incident: three ctx=65536 slots admitted at 0.5 GiB each consumed the whole
+ * GB10 and hard-locked the machine).
+ *
+ * KEEP IN SYNC with the two allocators below (same order, same expressions).
+ * The server reconciles this estimate against the measured allocation delta
+ * after every session create and logs a loud warning on >10% drift, so a
+ * missed buffer surfaces on the first live run instead of as an
+ * under-admission OOM.  Excluded as intentionally unaccounted: the lazy
+ * gpu_graph_ensure_ffn_out/gpu_graph_ensure_batch_ffn_out buffers (only
+ * allocated under steering/diagnostics) and directional-steering dirs. */
+uint64_t gpu_graph_session_bytes(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_spec) {
+    gpu_graph_dims dz;
+    gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
+    const uint64_t pc = dz.prefill_cap;
+    const uint64_t f32 = sizeof(float);
+
+    /* Persistent KV caches (raw ring, packed attn comp, indexer comp) plus the
+     * indexer_scores/comp_mask working pair — shared with the managed-vs-device
+     * KV placement policy the allocator itself uses. */
+    uint64_t kv_cache_bytes = 0;
+    uint64_t total = gpu_graph_context_bytes_for_kv_policy(
+            dz.ctx_size, dz.raw_cap, dz.prefill_cap, &kv_cache_bytes);
+
+    /* Per-layer attention/indexer state (and their spec shadows). */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint64_t attn_state = (uint64_t)coff * DS4_N_HEAD_DIM *
+                                    coff * ratio * f32;
+        total += 2ull * attn_state;                       /* layer_attn_state_kv/score */
+        if (enable_spec) total += 2ull * attn_state;      /* spec_attn_state_kv/score */
+        if (ratio == 4) {
+            const uint64_t index_state = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM *
+                                         coff * ratio * f32;
+            total += 2ull * index_state;                  /* layer_index_state_kv/score */
+            if (enable_spec) total += 2ull * index_state; /* spec_index_state_kv/score */
+        }
+    }
+
+    /* Single-token graph buffers. */
+    total += 2ull * dz.hc_dim * f32;                      /* cur_hc, flat_hc */
+    total += 2ull * dz.mix_hc * f32;                      /* hc_mix, hc_split (views free) */
+    total += 2ull * DS4_N_EMBD * f32;                     /* attn_cur, attn_norm */
+    total += 2ull * dz.q_rank * f32;                      /* qr, qr_norm */
+    total += dz.q_dim * f32;                              /* q */
+    total += 2ull * DS4_N_HEAD_DIM * f32;                 /* kv_raw, kv */
+    total += 2ull * dz.comp_width_max * f32;              /* comp_kv_cur, comp_sc_cur */
+    if (gpu_graph_attn_pack_enabled()) {
+        total += (uint64_t)dz.attn_comp_stage_cap * DS4_N_HEAD_DIM * f32; /* attn_comp_stage */
+        total += (uint64_t)dz.comp_cap * DS4_N_HEAD_DIM * f32;            /* attn_comp_dequant */
+    }
+    if (gpu_graph_idx_fp4_enabled()) {
+        total += (uint64_t)dz.comp_cap * DS4_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
+    }
+    total += dz.indexer_q_dim * f32;                      /* indexer_q */
+    total += (uint64_t)DS4_N_INDEXER_HEAD * f32;          /* indexer_weights */
+    total += (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
+             pc * sizeof(uint32_t);                       /* comp_selected */
+    total += dz.q_dim * f32;                              /* heads */
+    total += dz.low_dim * f32;                            /* attn_low */
+    total += (uint64_t)DS4_N_EMBD * f32;                  /* attn_out */
+    total += dz.hc_dim * f32;                             /* after_attn_hc */
+    total += 2ull * DS4_N_EMBD * f32;                     /* ffn_cur, ffn_norm */
+    total += 3ull * dz.shared_dim * f32;                  /* shared_gate/up/mid */
+    total += (uint64_t)DS4_N_EMBD * f32;                  /* shared_out */
+    total += 2ull * DS4_N_EXPERT * f32;                   /* router_logits, router_probs */
+    total += (uint64_t)DS4_N_EXPERT_USED * (sizeof(int) + f32); /* router_selected/weights */
+    total += 3ull * DS4_N_EXPERT_USED * dz.routed_mid_dim * f32; /* routed_gate/up/mid */
+    total += (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * f32;     /* routed_down */
+    total += (uint64_t)DS4_N_EMBD * f32;                  /* routed_out */
+    total += dz.hc_dim * f32;                             /* after_ffn_hc */
+    total += 2ull * DS4_N_HC * f32;                       /* output_pre, output_weights */
+    total += 2ull * DS4_N_EMBD * f32;                     /* output_embd, output_norm */
+    total += dz.vocab_dim * f32;                          /* logits */
+    total += pc * sizeof(int32_t);                        /* prefill_tokens */
+
+    /* Batch (prefill working set) buffers — the pc-scaled bulk that dominates
+     * the non-KV cost (~4 GiB at pc=4096 on Flash). */
+    total += 3ull * pc * dz.hc_dim * f32;                 /* batch_cur/next/flat_hc */
+    total += 2ull * pc * dz.mix_hc * f32;                 /* batch_hc_mix/split */
+    total += 2ull * pc * DS4_N_EMBD * f32;                /* batch_attn_cur/norm */
+    total += 2ull * pc * dz.q_rank * f32;                 /* batch_qr/qr_norm */
+    total += pc * dz.q_dim * f32;                         /* batch_q */
+    total += 2ull * pc * DS4_N_HEAD_DIM * f32;            /* batch_kv_raw/kv */
+    total += 2ull * pc * dz.comp_width_max * f32;         /* batch_comp_kv/sc */
+    total += pc * dz.indexer_q_dim * f32;                 /* batch_indexer_q */
+    total += pc * DS4_N_INDEXER_HEAD * f32;               /* batch_indexer_weights */
+    total += pc * dz.q_dim * f32;                         /* batch_heads */
+    total += pc * dz.low_dim * f32;                       /* batch_attn_low */
+    total += pc * DS4_N_EMBD * f32;                       /* batch_attn_out */
+    total += pc * dz.hc_dim * f32;                        /* batch_after_attn_hc */
+    total += 2ull * pc * DS4_N_EMBD * f32;                /* batch_ffn_cur/norm */
+    total += 3ull * pc * dz.shared_dim * f32;             /* batch_shared_gate/up/mid */
+    total += pc * DS4_N_EMBD * f32;                       /* batch_shared_out */
+    total += 2ull * pc * DS4_N_EXPERT * f32;              /* batch_router_logits/probs */
+    total += pc * DS4_N_EXPERT_USED * (sizeof(int) + f32); /* batch_router_selected/weights */
+    total += 3ull * pc * DS4_N_EXPERT_USED * dz.routed_mid_dim * f32; /* batch_routed_gate/up/mid */
+    total += pc * DS4_N_EXPERT_USED * DS4_N_EMBD * f32;   /* batch_routed_down */
+    total += pc * DS4_N_EMBD * f32;                       /* batch_routed_out */
+
+    /* DSpark drafter graph state (gpu_graph_init_dspark_target), allocated by
+     * ds4_session_create whenever the engine has a drafter loaded — the
+     * production merged GGUF auto-enables it. */
+    if (enable_spec) {
+        total += 3ull * DS4_N_EMBD * f32;                 /* dspark_target_h[3] */
+        total += 3ull * 17 * DS4_N_EMBD * f32;            /* dspark_target_h_batch[3] */
+        total += 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * f32; /* dspark_raw_cache[3] */
+        total += (uint64_t)DS4_N_EMBD * f32;              /* dspark_main_x */
+        total += 3ull * pc * DS4_N_EMBD * f32;            /* dspark_bulk_h[3] */
+        total += 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * f32; /* dspark_prompt_h[3] */
+        const uint64_t attn_w = 2ull * DS4_N_HEAD_DIM;
+        const uint64_t idx_w = 2ull * DS4_N_INDEXER_HEAD_DIM;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            total += 2ull * 17 * attn_w * f32;            /* spec_comp_kv/sc_save */
+            if (ratio == 4) total += 2ull * 17 * idx_w * f32; /* spec_icomp_kv/sc_save */
+        }
+        total += (uint64_t)DS4_N_HEAD_DIM * f32;          /* spec_comp_scratch_row */
+        total += 3ull * DS4_N_EMBD * f32;                 /* dspark_concat */
+        total += (uint64_t)DS4_N_EMBD * f32;              /* dspark_proj_out */
+        total += 3ull * DS4_N_HEAD_DIM * f32;             /* dspark_seed_kv/norm/rot */
+        total += (uint64_t)DS4_N_VOCAB * f32;             /* dspark_markov_logits */
+        total += 16ull * DS4_N_VOCAB * f32;               /* spec_logits */
+    }
+    return total;
+}
+
+
+
 /* Allocate the GPU graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
 bool gpu_graph_alloc_raw_cap(
@@ -184,18 +412,14 @@ bool gpu_graph_alloc_raw_cap(
         bool                    enable_spec) {
     memset(g, 0, sizeof(*g));
     g->comp_ratio_override = -1;
-    if (raw_cap == 0) raw_cap = 1;
-    if (ctx_size == 0) ctx_size = raw_cap;
-    if (prefill_cap == 0) prefill_cap = 1;
-    uint32_t raw_window = DS4_N_SWA;
-    if (raw_window > ctx_size) raw_window = ctx_size;
-    if (raw_window == 0) raw_window = 1;
-    if (raw_cap < raw_window) raw_cap = raw_window;
-    if (raw_cap > ctx_size) raw_cap = ctx_size;
-    if (raw_cap == 0) raw_cap = 1;
-    g->raw_cap = raw_cap;
-    g->raw_window = raw_window;
-    g->prefill_cap = prefill_cap;
+    gpu_graph_dims dz;
+    gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
+    raw_cap = dz.raw_cap;
+    ctx_size = dz.ctx_size;
+    prefill_cap = dz.prefill_cap;
+    g->raw_cap = dz.raw_cap;
+    g->raw_window = dz.raw_window;
+    g->prefill_cap = dz.prefill_cap;
 
     /* DS4_ATTN_PACK validation lives up here: no allocations have happened
      * yet, so these early returns need no cleanup. */
@@ -216,40 +440,24 @@ bool gpu_graph_alloc_raw_cap(
                 (unsigned)DS4_N_HEAD_DIM, (unsigned)DS4_N_ROT);
         return false;
     }
-    uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
-    }
-    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
-    g->comp_cap = ctx_size / min_ratio + 2u;
-    if (g->comp_cap < 2u) g->comp_cap = 2u;
+    g->comp_cap = dz.comp_cap;
     if (gpu_graph_attn_pack_enabled()) {
-        g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
-        if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
+        g->attn_comp_stage_cap = dz.attn_comp_stage_cap;
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) {
-            g->layer_comp_cap[il] = 0;
-        } else {
-            g->layer_comp_cap[il] = ctx_size / ratio + 2u;
-            if (g->layer_comp_cap[il] < 2u) g->layer_comp_cap[il] = 2u;
-        }
+        g->layer_comp_cap[il] = dz.layer_comp_cap[il];
     }
 
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-    const uint64_t q_rank = layer->attn_q_a->dim[1];
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
-    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t vocab_dim = weights->output ? weights->output->dim[1] : DS4_N_VOCAB;
-    const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
-        ? DS4_N_HEAD_DIM
-        : DS4_N_INDEXER_HEAD_DIM);
-    const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t hc_dim = dz.hc_dim;
+    const uint64_t mix_hc = dz.mix_hc;
+    const uint64_t q_rank = dz.q_rank;
+    const uint64_t q_dim = dz.q_dim;
+    const uint64_t low_dim = dz.low_dim;
+    const uint64_t shared_dim = dz.shared_dim;
+    const uint64_t routed_mid_dim = dz.routed_mid_dim;
+    const uint64_t vocab_dim = dz.vocab_dim;
+    const uint64_t comp_width_max = dz.comp_width_max;
+    const uint64_t indexer_q_dim = dz.indexer_q_dim;
     const uint64_t pc = prefill_cap;
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =

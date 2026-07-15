@@ -1808,6 +1808,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
+    /* Measure the true GPU cost of this session (allocator delta across the
+     * create) so callers can reconcile admission estimates against reality. */
+    const uint64_t alloc_before = ds4_gpu_tensor_alloc_bytes_current();
     if (!gpu_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    e->dspark_ready))
@@ -1834,8 +1837,37 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
     }
+    s->resident_bytes = ds4_gpu_tensor_alloc_bytes_current() - alloc_before;
     *out = s;
     return 0;
+}
+
+
+
+uint64_t ds4_session_resident_bytes(const ds4_session *s) {
+    return s ? s->resident_bytes : 0;
+}
+
+
+
+/* TRUE total per-session GPU byte cost of ds4_session_create at this context
+ * size — the admission-control price of a session.  Derives prefill/raw caps
+ * exactly like ds4_session_create and includes the DSpark drafter graph state
+ * when the engine has a drafter loaded, so callers cannot pass mismatched
+ * parameters.  Built on the same sizing code as the allocator
+ * (gpu_graph_session_bytes, gpu_diag.c); reconcile against
+ * ds4_session_resident_bytes after the create. */
+uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size) {
+    if (!e || ctx_size <= 0) return 0;
+    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
+                                                                  e->prefill_chunk);
+    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
+    if (!shape_layer) return 0;
+    return gpu_graph_session_bytes(&e->weights, shape_layer, raw_cap,
+                                   (uint32_t)ctx_size, prefill_cap,
+                                   e->dspark_ready);
 }
 
 

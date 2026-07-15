@@ -148,14 +148,28 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
         uint32_t prefill_chunk);
 /* Like ds4_context_memory_estimate_with_prefill, but the persistent KV caches
  * are sized with their real packed element/row widths (f16 raw + DS4_ATTN_PACK
- * attn comp + MXFP4 indexer) instead of the sizeof(float) upper bound.  This is
- * the number to use for admission accounting: it reflects actual residency,
- * which is materially smaller (~4x attn KV, ~8x indexer) than the f32 estimate.
- * The f32 scratch working set is carried through unchanged. */
+ * attn comp + MXFP4 indexer) instead of the sizeof(float) upper bound.
+ * WARNING: this covers ONLY the persistent KV rows plus a small scratch term —
+ * NOT the full per-session graph (prefill batch buffers, drafter state, …).
+ * For admission accounting use ds4_engine_session_cost_bytes, which prices the
+ * whole session; pricing sessions with this estimate under-admitted by ~10x
+ * and hard-locked the GB10 (2026-07-13). */
 ds4_context_memory ds4_context_memory_estimate_packed(
         ds4_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
+/* TRUE total per-session GPU byte cost of ds4_session_create(e, ctx_size):
+ * persistent KV caches + the full prefill working set (scaled by the engine's
+ * prefill chunk) + speculative/DSpark drafter state when the engine has a
+ * drafter loaded.  Shares sizing code with the graph allocator; this is the
+ * number admission control must use.  Returns 0 if no session could be
+ * created (no graph backend / weights not loaded). */
+uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size);
+/* GPU bytes the session's create actually allocated (allocator delta measured
+ * across ds4_session_create).  Reconcile against
+ * ds4_engine_session_cost_bytes after each create; commit this actual to any
+ * memory ledger. */
+uint64_t ds4_session_resident_bytes(const ds4_session *s);
 /* Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
  * GGUF plus an external drafter and expert overlay when mapped separately.
  * This competes with per-session KV for the unified-memory budget. */

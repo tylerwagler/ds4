@@ -23,6 +23,10 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
+/* Running total of live tensor-alloc bytes (owned allocations only, views
+ * excluded).  Snapshot around a session create to measure its true resident
+ * cost; the server ledger commits that actual. */
+uint64_t ds4_gpu_tensor_alloc_bytes_current(void);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);

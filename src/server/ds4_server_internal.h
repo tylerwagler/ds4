@@ -620,11 +620,13 @@ typedef struct {
  * generate.c). Client threads only parse HTTP and block on a per-job condvar
  * until the worker finishes (http_server.c handle path); they never touch a
  * ds4_session_* or ds4_gpu_* entry point. Verified by grepping every
- * ds4_session_/ds4_gpu_ call site in src/server/*.c: all of them are reached
+ * ds4_session_/ds4_gpu_ call site under src/server: all of them are reached
  * only from the generation state machine (gen_* in generate.c) driven by
  * worker_main (or from cli_main startup/shutdown, before the worker starts and
- * after it joins). No CUDA call is made off the worker thread. This is a
- * correctness invariant, not an accident.
+ * after it joins) — with one deliberate exception: http_server.c reads
+ * ds4_session_ctx(slots[0].sess) on client threads, a plain load of a field
+ * immutable after startup (no CUDA behind it). No CUDA call is made off the
+ * worker thread. This is a correctness invariant, not an accident.
  *
  * It matters because the CUDA layer keeps process-global, NON-thread-safe state
  * that all sessions share:
@@ -643,25 +645,51 @@ typedef struct {
  * not multiple GPU threads, until these globals are made per-context.
  *
  * Increment 1 was pure structural plumbing (pool of capacity 1). Increment 2
- * makes the generation path re-entrant: each job runs as a per-slot resumable
+ * made the generation path re-entrant: each job runs as a per-slot resumable
  * state machine (gen_state in generate.c) that the worker steps in bounded
  * quanta — one prefill chunk, or up to DS4_SERVER_DECODE_QUANTUM_TOKENS decode
- * tokens, per step. All GPU work still happens on the single worker thread;
- * with one slot the quanta run back-to-back, so output is identical to the old
- * run-to-completion generate_job. The scheduler that interleaves multiple
- * slots at these quantum boundaries, eviction, and batched decode are later
- * increments. */
+ * tokens, per step. All GPU work still happens on the single worker thread.
+ * Increment 3 adds the scheduler: the worker binds queued jobs to free slots
+ * (FIFO, warmest-prefix slot choice, lazily provisioning extra slots under the
+ * KV admission budget) and round-robins one quantum at a time over the bound
+ * slots. Eviction and batched decode are later increments. */
 
-/* Pool capacity. 1 keeps behavior bit-identical to the single-session server;
- * increment 3's scheduler raises this now that generation is slot-scoped. */
-#define DS4_SESSION_POOL_CAP 1
+/* Pool capacity (increment 3). Slot 0 is provisioned at startup with the
+ * configured --ctx-size; the rest are provisioned lazily, only when a job
+ * arrives while every provisioned slot is busy (or would clobber another
+ * conversation's warm KV) AND the packed-KV admission budget still has room.
+ * A single client therefore always runs on slot 0, byte-identical to the
+ * increment-2 single-session server. */
+#define DS4_SESSION_POOL_CAP 4
+
+/* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
+ * keep the default per-session context far below the lone-session maximum;
+ * compressed-KV cost scales with ctx, so concurrency is bounded by the sum of
+ * context sizes). A request that needs more than this gets a slot sized to
+ * its need (capped at slot 0's ctx), admission permitting. */
+#define DS4_SERVER_EXTRA_SLOT_CTX_TOKENS 65536
 
 /* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
  * usable; weights are queried at runtime (ds4_engine_weights_resident_bytes).
  * The overhead reserve covers the CUDA context, cuBLASLt workspaces
- * (~32 MiB/GEMM), and model-mmap page-cache slack. */
+ * (~32 MiB/GEMM), process-global CUDA scratch (MXFP4 expert staging, GEMV
+ * activation buffers), and model-mmap page-cache slack. */
 #define DS4_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
 #define DS4_SERVER_PROCESS_OVERHEAD_BYTES (4ull * 1024ull * 1024ull * 1024ull)
+
+/* Free-memory floor (2026-07-13 lockup postmortem): the budget arithmetic and
+ * every slot provisioning must leave at least this much of the machine free.
+ * Two guards use it:
+ *   - server_kv_budget_bytes subtracts it from the admission budget, so the
+ *     ledger can never legally commit the machine to zero free;
+ *   - provision_slot additionally refuses to create a session unless
+ *     MemAvailable >= estimated cost + this floor.
+ * The MemAvailable read is a coarse belt-and-suspenders guard: driver 610's
+ * UVM accounting lags MemAvailable (and under UVM pressure MemTotal itself
+ * SHRINKS — the incident box reported MemTotal 866 MiB — so percentage-based
+ * monitors like earlyoom are useless here).  One /proc/meminfo read per
+ * provisioning attempt, never on a hot path. */
+#define DS4_SERVER_MEM_FLOOR_BYTES        (6ull * 1024ull * 1024ull * 1024ull)
 
 typedef enum {
     SLOT_IDLE = 0,     /* no live job; sess may be warm and reusable */
@@ -676,8 +704,9 @@ typedef enum {
  * surfaces, decode-loop trackers, and the deferred socket writer. */
 typedef struct gen_state gen_state;
 
-/* A pool slot owns one logical session's GPU state. Only slot 0 is provisioned
- * until increment 3; the eviction fields are inert (documented so the shape is
+/* A pool slot owns one logical session's GPU state. Slot 0 is provisioned at
+ * startup; slots 1..cap-1 lazily by the scheduler (worker thread only). The
+ * eviction fields are inert until increment 4 (documented so the shape is
  * stable for later increments). */
 typedef struct {
     ds4_session *sess;                    /* live session; NULL until admitted */
@@ -685,26 +714,38 @@ typedef struct {
     gen_state   *gen;                     /* resumable state for active_job */
     slot_state   state;
     int          ctx_size;                /* context this slot was admitted for */
-    uint64_t     est_cost_bytes;          /* admission-accounted packed KV+scratch cost */
+    uint64_t     est_cost_bytes;          /* ledger-committed session cost (ACTUAL
+                                             resident bytes once the session exists;
+                                             the true-cost estimate only gates
+                                             admission before the create) */
     uint64_t     tokens_emitted;          /* decode bookkeeping for the scheduler */
     uint64_t     last_serviced_us;        /* last quantum wall-clock (scheduler) */
-    ds4_session_snapshot *evicted_payload; /* host KV when SLOT_EVICTED (unused in inc 2) */
+    /* Per-conversation continued-store frontier (see kv_cache_tracker_bind):
+     * the shared ds4_kvstore keeps one continued_last_store_tokens field, but
+     * the schedule it tracks belongs to this slot's conversation. */
+    int          continued_last_store_tokens;
+    ds4_session_snapshot *evicted_payload; /* host KV when SLOT_EVICTED (unused in inc 3) */
+    /* Protocol live bindings for THIS slot's sampled KV frontier (guarded by
+     * server.tool_mu — client threads read them at parse time). They bind
+     * tool-call ids / visible transcripts to the session they were sampled on,
+     * so a continuation can never match another slot's frontier. */
+    live_tool_state responses_live;
+    live_tool_state anthropic_live;
+    visible_live_state thinking_live;
 } session_slot;
 
 struct server {
     ds4_engine *engine;
-    /* Session pool. Capacity DS4_SESSION_POOL_CAP (currently 1). The worker
-     * uses slot 0 exactly as the old single `session` field. */
+    /* Session pool. slots[0..n_slots) are provisioned; the worker thread is
+     * the only mutator of slot fields and n_slots (n_slots additionally
+     * published under mu for readers on client threads). */
     session_slot slots[DS4_SESSION_POOL_CAP];
-    int          n_slots;            /* provisioned slots */
+    int          n_slots;            /* provisioned slots (worker-owned; published under mu) */
     uint64_t     kv_budget_bytes;    /* admission ceiling computed at startup */
     uint64_t     kv_committed_bytes; /* sum of est_cost_bytes over live slots (under mu) */
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
-    live_tool_state responses_live;
-    live_tool_state anthropic_live;
-    visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -716,9 +757,10 @@ struct server {
     bool stopping;
     int clients;
     /* /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
-     * enqueued not yet started; n_generating = jobs the single worker is
-     * actively decoding (0/1). m_* are cumulative prefill counters feeding the
-     * Prometheus prompt-throughput and prefix-cache-hit metrics. */
+     * enqueued not yet bound to a slot; n_generating = jobs bound to slots
+     * (0..n_slots, time-sliced by the single worker). m_* are cumulative
+     * prefill counters feeding the Prometheus prompt-throughput and
+     * prefix-cache-hit metrics. */
     int n_queued;
     int n_generating;
     uint64_t m_prompt_tokens;     /* cumulative prompt tokens prefilled */
@@ -763,6 +805,7 @@ typedef struct {
 
 typedef struct {
     server *srv;
+    session_slot *slot; /* slot whose session is prefilling (worker thread) */
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
@@ -1062,19 +1105,28 @@ tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
 void tool_memory_free(tool_memory *m);
 void live_tool_state_free(live_tool_state *st);
 void visible_live_free(visible_live_state *st);
-void thinking_live_clear(server *s);
-void thinking_live_remember(server *s, const char *visible_text);
-void responses_live_remember(server *s, const char *visible_text,
+/* Live protocol bindings are per-slot (they describe one session's sampled
+ * frontier); has_call_id scans every provisioned slot because request parsing
+ * runs before the job is bound to a slot. */
+void thinking_live_clear(server *s, session_slot *sl);
+void thinking_live_remember(server *s, session_slot *sl, const char *visible_text);
+void responses_live_remember(server *s, session_slot *sl, const char *visible_text,
                                     const tool_calls *calls);
-void anthropic_live_remember(server *s, const tool_calls *calls);
-void responses_live_clear(server *s);
-void anthropic_live_clear(server *s);
+void anthropic_live_remember(server *s, session_slot *sl, const tool_calls *calls);
+void responses_live_clear(server *s, session_slot *sl);
+void anthropic_live_clear(server *s, session_slot *sl);
 bool responses_live_has_call_id(server *s, const char *id);
 bool anthropic_live_has_call_id(server *s, const char *id);
-bool responses_live_matches_request(server *s, const stop_list *ids,
+bool responses_live_matches_request(server *s, const session_slot *sl,
+                                           const stop_list *ids,
                                            int live_tokens);
-bool anthropic_live_matches_request(server *s, const stop_list *ids,
+bool anthropic_live_matches_request(server *s, const session_slot *sl,
+                                           const stop_list *ids,
                                            int live_tokens);
+/* Slots whose live binding contains all of the request's continuation ids
+ * (worker thread; used to route a continuation to the session that owns it). */
+session_slot *responses_live_slot_for_ids(server *s, const stop_list *ids);
+session_slot *anthropic_live_slot_for_ids(server *s, const stop_list *ids);
 bool tool_memory_has_id(server *s, const char *id);
 void tool_memory_remember(server *s, const tool_calls *calls);
 void tool_memory_put_source(server *s, const char *id, const char *dsml,
@@ -1134,43 +1186,68 @@ bool kv_cache_file_size_fits(const kv_disk_cache *kc,
                                     uint64_t tool_map_bytes,
                                     uint64_t *file_bytes_out,
                                     uint64_t *required_bytes_out);
-bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
+bool kv_cache_store_live_prefix(server *s, session_slot *sl,
+                                       const ds4_tokens *tokens,
                                        int store_len, const char *reason);
-void kv_cache_store_current(server *s, const char *reason);
+void kv_cache_store_current(server *s, session_slot *sl, const char *reason);
+/* The continued-store frontier (lib field kc->continued_last_store_tokens) is
+ * per-conversation state on a kvstore shared by every slot. Every
+ * tracker-touching operation brackets itself with these on the single worker
+ * thread: bind loads the acting slot's frontier into the shared struct, flush
+ * writes it back (2026-07-14 review: without this, slot A's high-water mark
+ * suppressed slot B's continued checkpoints, and a cold request on B reset
+ * A's schedule). */
+void kv_cache_tracker_bind(server *s, session_slot *sl);
+void kv_cache_tracker_flush(server *s, session_slot *sl);
 void kv_cache_note_store(kv_disk_cache *kc, int tokens);
 int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens);
 void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
                                                   int old_tokens,
                                                   int suppressed_tokens);
-void kv_cache_discard_failed_disk_entry(server *s, const char *path);
-void kv_cache_maybe_store_continued(server *s);
+void kv_cache_discard_failed_disk_entry(server *s, session_slot *sl,
+                                               const char *path);
+void kv_cache_maybe_store_continued(server *s, session_slot *sl);
 int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size);
-int kv_cache_try_load_text(server *s, const char *prompt_text,
+int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol);
-int kv_cache_try_load(server *s, const request *req,
+int kv_cache_try_load(server *s, session_slot *sl, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out);
-int live_text_prefix_prompt(server *s, const request *req,
+int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
                                    ds4_tokens *effective_prompt);
-int responses_live_continuation_prompt(server *s, const request *req,
+int responses_live_continuation_prompt(server *s, session_slot *sl,
+                                              const request *req,
                                               int live_pos,
                                               ds4_tokens *effective_prompt,
                                               int *matched_ids);
-int anthropic_live_continuation_prompt(server *s, const request *req,
+int anthropic_live_continuation_prompt(server *s, session_slot *sl,
+                                              const request *req,
                                               int live_pos,
                                               ds4_tokens *effective_prompt,
                                               int *matched_ids);
-int responses_live_visible_prefix_prompt(server *s, const request *req,
+int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
+                                                const request *req,
                                                 int live_pos,
                                                 ds4_tokens *effective_prompt);
-int thinking_live_visible_prefix_prompt(server *s, const request *req,
+int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
+                                               const request *req,
                                                int live_pos,
                                                ds4_tokens *effective_prompt);
+/* Admission predicate (defined in cli_main.c; unit-tested there). */
+bool server_kv_admits(uint64_t kv_budget_bytes,
+                             uint64_t committed_bytes,
+                             uint64_t incoming_bytes);
+/* Log estimate-vs-actual for a freshly created session, warn loudly on >10%
+ * drift (sizing code out of sync with the allocator), and return the value
+ * the ledger must commit — the actual (defined in generate.c). */
+uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
+                                               uint64_t est_bytes,
+                                               uint64_t actual_bytes);
 void trace_cache_capture(
         trace_cache_diag *d,
         const ds4_tokens *live,

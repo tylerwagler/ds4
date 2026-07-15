@@ -1158,6 +1158,9 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    /* GPU bytes this session's create actually allocated (tensor-allocator
+     * delta across ds4_session_create); the server ledger commits this. */
+    uint64_t resident_bytes;
     /* Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
      * position's hidden, pending verification in THIS step's single batched
      * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
@@ -1754,6 +1757,16 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_spec);
+/* TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
+ * graph state when enable_spec); the sizing side of the admission-control
+ * single source of truth (see gpu_diag.c). */
+uint64_t gpu_graph_session_bytes(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_spec);
 bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
 bool gpu_graph_alloc(
         ds4_gpu_graph *g,

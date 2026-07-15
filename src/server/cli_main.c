@@ -67,21 +67,25 @@ static void log_context_memory(ds4_backend backend,
 
 
 
-/* Admission-control budget (Tier 1 §1.4). The KV budget is the unified-memory
- * headroom left for per-session KV after the shared resident weights and a
- * fixed process-overhead reserve. Returns 0 if weights already exceed usable. */
+/* Admission-control budget (Tier 1 §1.4). The session budget is the
+ * unified-memory headroom left for per-session GPU state after the shared
+ * resident weights, a fixed process-overhead reserve, and the free-memory
+ * floor (DS4_SERVER_MEM_FLOOR_BYTES) — committing the full budget must still
+ * leave the floor free. Returns 0 if the reserves already exceed usable. */
 static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
-    uint64_t reserved = weights_resident_bytes + DS4_SERVER_PROCESS_OVERHEAD_BYTES;
+    uint64_t reserved = weights_resident_bytes +
+                        DS4_SERVER_PROCESS_OVERHEAD_BYTES +
+                        DS4_SERVER_MEM_FLOOR_BYTES;
     if (reserved >= DS4_SERVER_USABLE_BYTES) return 0;
     return DS4_SERVER_USABLE_BYTES - reserved;
 }
 
 /* Admission rule: the already-committed live-session cost plus this request's
- * estimated cost must fit under the budget. With pool capacity 1 this gates the
- * single startup session; the same predicate gates request-time admission once
- * the pool grows (an over-budget create then maps to an HTTP 503, mirroring the
- * shutdown 503 in http_server.c). */
-static bool server_kv_admits(uint64_t kv_budget_bytes,
+ * estimated cost must fit under the budget. Gates the startup session here and
+ * every lazy slot provisioning in the scheduler (generate.c); an over-budget
+ * provisioning attempt leaves the job queued until a slot frees (plan Tier 1
+ * §1.4). Non-static: the scheduler calls it; unit tests live in this TU. */
+bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
                              uint64_t incoming_bytes) {
     if (incoming_bytes > kv_budget_bytes) return false;      /* guards overflow + lone fit */
@@ -97,15 +101,15 @@ static void server_close_resources(server *s) {
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
-    live_tool_state_free(&s->responses_live);
-    live_tool_state_free(&s->anthropic_live);
-    visible_live_free(&s->thinking_live);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
     for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) {
+        live_tool_state_free(&s->slots[i].responses_live);
+        live_tool_state_free(&s->slots[i].anthropic_live);
+        visible_live_free(&s->slots[i].thinking_live);
         ds4_session_free(s->slots[i].sess);
         s->slots[i].sess = NULL;
     }
@@ -326,37 +330,31 @@ int main(int argc, char **argv) {
                        cfg.ctx_size,
                        cfg.engine.prefill_chunk);
 
-    /* Admission control (Tier 1 §1.4): compute the KV budget from the real
-     * resident weight footprint and the packed per-session estimate, then gate
-     * the slot's graph allocation on it. With DS4_SESSION_POOL_CAP==1 this is a
-     * startup check on the single session; later increments run the same
-     * predicate per request. */
+    /* Admission control (Tier 1 §1.4): compute the session budget from the
+     * real resident weight footprint and the TRUE per-session cost (full graph
+     * + prefill working set + drafter state, ds4_engine_session_cost_bytes),
+     * then gate the slot's graph allocation on it. The scheduler runs the same
+     * predicate for every lazily provisioned slot. */
     const uint64_t weights_resident = ds4_engine_weights_resident_bytes(engine);
     const uint64_t kv_budget = server_kv_budget_bytes(weights_resident);
-    const ds4_context_memory est =
-        ds4_context_memory_estimate_packed(cfg.engine.backend,
-                                           cfg.ctx_size,
-                                           cfg.engine.prefill_chunk);
+    const uint64_t session_est = ds4_engine_session_cost_bytes(engine, cfg.ctx_size);
     server_log(DS4_LOG_DEFAULT,
-               "ds4-server: KV admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
-               "overhead=%.1f GiB, KV_budget=%.1f GiB",
+               "ds4-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
+               "overhead=%.1f GiB, floor=%.1f GiB, budget=%.1f GiB",
                (double)DS4_SERVER_USABLE_BYTES / (1024.0 * 1024.0 * 1024.0),
                (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
                (double)DS4_SERVER_PROCESS_OVERHEAD_BYTES / (1024.0 * 1024.0 * 1024.0),
+               (double)DS4_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
                (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
     server_log(DS4_LOG_DEFAULT,
-               "ds4-server: KV admission: per-session est=%.2f GiB (packed: raw=%.2f + "
-               "compressed=%.2f + scratch=%.2f GiB, ctx=%d)",
-               (double)est.total_bytes / (1024.0 * 1024.0 * 1024.0),
-               (double)est.raw_bytes / (1024.0 * 1024.0 * 1024.0),
-               (double)est.compressed_bytes / (1024.0 * 1024.0 * 1024.0),
-               (double)est.scratch_bytes / (1024.0 * 1024.0 * 1024.0),
+               "ds4-server: session admission: per-session true cost est=%.2f GiB (ctx=%d)",
+               (double)session_est / (1024.0 * 1024.0 * 1024.0),
                cfg.ctx_size);
-    if (!server_kv_admits(kv_budget, 0, est.total_bytes)) {
+    if (session_est == 0 || !server_kv_admits(kv_budget, 0, session_est)) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: KV admission REJECTED: est %.2f GiB exceeds KV_budget %.2f GiB "
+                   "ds4-server: session admission REJECTED: est %.2f GiB exceeds budget %.2f GiB "
                    "(reduce --ctx-size)",
-                   (double)est.total_bytes / (1024.0 * 1024.0 * 1024.0),
+                   (double)session_est / (1024.0 * 1024.0 * 1024.0),
                    (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
         ds4_engine_close(engine);
         return 1;
@@ -369,17 +367,25 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+    /* Reconcile the estimate with what the allocator really did and commit the
+     * ACTUAL to the ledger (>10% drift means the sizing code in gpu_diag.c has
+     * fallen out of sync with the allocator — fix that, not the ledger). */
+    const uint64_t session_actual =
+        server_reconciled_session_cost(0, cfg.ctx_size, session_est,
+                                       ds4_session_resident_bytes(session));
 
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
-    s.n_slots = DS4_SESSION_POOL_CAP;
+    /* Slot 0 is provisioned here at the configured --ctx-size; the scheduler
+     * provisions slots 1..cap-1 lazily under the same admission predicate. */
+    s.n_slots = 1;
     s.kv_budget_bytes = kv_budget;
-    s.kv_committed_bytes = est.total_bytes;
+    s.kv_committed_bytes = session_actual;
     s.slots[0].sess = session;
     s.slots[0].state = SLOT_IDLE;
     s.slots[0].ctx_size = cfg.ctx_size;
-    s.slots[0].est_cost_bytes = est.total_bytes;
+    s.slots[0].est_cost_bytes = session_actual;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -479,12 +485,16 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.slots[0].sess);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: persisting current KV cache before shutdown tokens=%d",
-                   tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+    for (int i = 0; i < s.n_slots; i++) {
+        session_slot *sl = &s.slots[i];
+        if (!sl->sess) continue;
+        const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
+        if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: persisting slot %d KV cache before shutdown tokens=%d",
+                       i, tokens->len);
+            kv_cache_store_current(&s, sl, "shutdown");
+        }
     }
     server_close_resources(&s);
     return 0;
@@ -2693,9 +2703,10 @@ static void test_anthropic_tool_result_id_validation(void) {
     TEST_ASSERT(strstr(err, "Anthropic continuation state is not available") != NULL);
 
     pthread_mutex_lock(&s.tool_mu);
-    s.anthropic_live.valid = true;
-    s.anthropic_live.live_tokens = 10;
-    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_missing");
+    s.n_slots = 1; /* live bindings are per-slot; has_call_id scans slots */
+    s.slots[0].anthropic_live.valid = true;
+    s.slots[0].anthropic_live.live_tokens = 10;
+    id_list_push_unique(&s.slots[0].anthropic_live.call_ids, "toolu_missing");
     pthread_mutex_unlock(&s.tool_mu);
     bool needs_live_tool_state = false;
     err[0] = '\0';
@@ -2705,7 +2716,7 @@ static void test_anthropic_tool_result_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.anthropic_live);
+    live_tool_state_free(&s.slots[0].anthropic_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -2754,9 +2765,10 @@ static void test_anthropic_tool_use_parses_before_role(void) {
      * tool_result blocks are mistaken for live-only continuations and rejected
      * once the live frontier has moved on to newer tool calls. */
     pthread_mutex_lock(&s.tool_mu);
-    s.anthropic_live.valid = true;
-    s.anthropic_live.live_tokens = 100;
-    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_current");
+    s.n_slots = 1;
+    s.slots[0].anthropic_live.valid = true;
+    s.slots[0].anthropic_live.live_tokens = 100;
+    id_list_push_unique(&s.slots[0].anthropic_live.call_ids, "toolu_current");
     pthread_mutex_unlock(&s.tool_mu);
 
     const char *json =
@@ -2786,7 +2798,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
     TEST_ASSERT(!needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.anthropic_live);
+    live_tool_state_free(&s.slots[0].anthropic_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -2879,9 +2891,10 @@ static void test_responses_tool_output_id_validation(void) {
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
     pthread_mutex_lock(&s.tool_mu);
-    s.responses_live.valid = true;
-    s.responses_live.live_tokens = 10;
-    id_list_push_unique(&s.responses_live.call_ids, "call_missing");
+    s.n_slots = 1;
+    s.slots[0].responses_live.valid = true;
+    s.slots[0].responses_live.live_tokens = 10;
+    id_list_push_unique(&s.slots[0].responses_live.call_ids, "call_missing");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     bool needs_live_tool_state = false;
@@ -2891,7 +2904,7 @@ static void test_responses_tool_output_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.responses_live);
+    live_tool_state_free(&s.slots[0].responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -2928,9 +2941,10 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(needs_live_reasoning);
 
     pthread_mutex_lock(&s.tool_mu);
-    s.responses_live.valid = true;
-    s.responses_live.live_tokens = 123;
-    id_list_push_unique(&s.responses_live.call_ids, "call_replay");
+    s.n_slots = 1;
+    s.slots[0].responses_live.valid = true;
+    s.slots[0].responses_live.live_tokens = 123;
+    id_list_push_unique(&s.slots[0].responses_live.call_ids, "call_replay");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     needs_live_reasoning = false;
@@ -2967,7 +2981,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(!needs_live_reasoning);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.responses_live);
+    live_tool_state_free(&s.slots[0].responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -4663,10 +4677,15 @@ static void test_unterminated_think_stays_off_content(void) {
 static void test_kv_admission_budget_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
 
-    /* Budget = usable - weights - overhead, clamped at 0. */
+    /* Budget = usable - weights - overhead - free floor, clamped at 0 (the
+     * floor term is the 2026-07-13 lockup fix: a fully committed budget must
+     * still leave DS4_SERVER_MEM_FLOOR_BYTES of the machine free). */
     TEST_ASSERT(server_kv_budget_bytes(91ull * GiB) ==
-                DS4_SERVER_USABLE_BYTES - 91ull * GiB - DS4_SERVER_PROCESS_OVERHEAD_BYTES);
+                DS4_SERVER_USABLE_BYTES - 91ull * GiB -
+                DS4_SERVER_PROCESS_OVERHEAD_BYTES - DS4_SERVER_MEM_FLOOR_BYTES);
     TEST_ASSERT(server_kv_budget_bytes(200ull * GiB) == 0);  /* weights > usable: no underflow */
+    /* Reserves alone (no weights) must also clamp, not underflow. */
+    TEST_ASSERT(server_kv_budget_bytes(DS4_SERVER_USABLE_BYTES) == 0);
 
     /* Admission: committed + incoming <= budget, with overflow-safe compare. */
     TEST_ASSERT(server_kv_admits(26ull * GiB, 0, 20ull * GiB));

@@ -1164,6 +1164,19 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 
 
 
+/* Running total of live ds4_gpu_tensor_alloc/_managed bytes (views excluded:
+ * they don't own memory).  This is the ground truth the server's per-session
+ * memory ledger reconciles against (ds4_session_create snapshots it around the
+ * graph allocation), catching drift between the sizing estimate and what the
+ * allocator really did.  Atomic because drafter conf/token staging tensors are
+ * allocated per spec step; one relaxed add is noise next to the cudaMalloc it
+ * accompanies. */
+static uint64_t g_tensor_alloc_bytes;
+
+extern "C" uint64_t ds4_gpu_tensor_alloc_bytes_current(void) {
+    return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1174,6 +1187,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    __atomic_add_fetch(&g_tensor_alloc_bytes, bytes, __ATOMIC_RELAXED);
     return t;
 }
 
@@ -1189,6 +1203,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    __atomic_add_fetch(&g_tensor_alloc_bytes, bytes, __ATOMIC_RELAXED);
     return t;
 }
 
@@ -1248,7 +1263,10 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        (void)cudaFree(tensor->ptr);
+        __atomic_sub_fetch(&g_tensor_alloc_bytes, tensor->bytes, __ATOMIC_RELAXED);
+    }
     free(tensor);
 }
 

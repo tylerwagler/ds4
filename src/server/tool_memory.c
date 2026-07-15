@@ -246,13 +246,16 @@ void tool_memory_free(tool_memory *m) {
 
 
 
-/* Single live protocol-tool state.
+/* Per-slot live protocol-tool state.
  *
  * This is not an implementation of durable remote conversation storage.  It is
- * only an in-memory binding from protocol tool-call IDs to the current sampled
- * KV frontier.  If it does not match, DS4 falls back to the same prefix and
- * disk-cache machinery used by chat/completions, or returns a clear error for
- * tool-result-only requests that have no replayable prefix. */
+ * only an in-memory binding from protocol tool-call IDs to one slot's current
+ * sampled KV frontier.  If it does not match, DS4 falls back to the same prefix
+ * and disk-cache machinery used by chat/completions, or returns a clear error
+ * for tool-result-only requests that have no replayable prefix.  The states
+ * live on the session_slot (they describe that session, and move with it);
+ * server.tool_mu guards them all because request parsing reads call-ids on
+ * client threads before a job is bound to a slot. */
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
@@ -293,84 +296,102 @@ void visible_live_free(visible_live_state *st) {
 
 
 
-void thinking_live_clear(server *s) {
-    if (!s) return;
+void thinking_live_clear(server *s, session_slot *sl) {
+    if (!s || !sl) return;
     pthread_mutex_lock(&s->tool_mu);
-    visible_live_clear_locked(&s->thinking_live);
+    visible_live_clear_locked(&sl->thinking_live);
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void thinking_live_remember(server *s, const char *visible_text) {
-    if (!s || !visible_text || !visible_text[0]) return;
+void thinking_live_remember(server *s, session_slot *sl, const char *visible_text) {
+    if (!s || !sl || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
-    visible_live_clear_locked(&s->thinking_live);
-    s->thinking_live.visible_text = xstrdup(visible_text);
-    s->thinking_live.visible_len = strlen(visible_text);
-    s->thinking_live.live_tokens = ds4_session_pos(s->slots[0].sess);
-    s->thinking_live.valid = true;
+    visible_live_clear_locked(&sl->thinking_live);
+    sl->thinking_live.visible_text = xstrdup(visible_text);
+    sl->thinking_live.visible_len = strlen(visible_text);
+    sl->thinking_live.live_tokens = ds4_session_pos(sl->sess);
+    sl->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void responses_live_remember(server *s, const char *visible_text,
+void responses_live_remember(server *s, session_slot *sl, const char *visible_text,
                                     const tool_calls *calls) {
-    if (!s || !visible_text || !visible_text[0]) return;
+    if (!s || !sl || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&s->responses_live);
-    s->responses_live.visible_text = xstrdup(visible_text);
-    s->responses_live.visible_len = strlen(visible_text);
+    live_tool_state_clear_locked(&sl->responses_live);
+    sl->responses_live.visible_text = xstrdup(visible_text);
+    sl->responses_live.visible_len = strlen(visible_text);
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
-            id_list_push_unique(&s->responses_live.call_ids, calls->v[i].id);
+            id_list_push_unique(&sl->responses_live.call_ids, calls->v[i].id);
         }
     }
-    s->responses_live.live_tokens = ds4_session_pos(s->slots[0].sess);
-    s->responses_live.valid = true;
+    sl->responses_live.live_tokens = ds4_session_pos(sl->sess);
+    sl->responses_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void anthropic_live_remember(server *s, const tool_calls *calls) {
-    if (!s || !calls || calls->len == 0) return;
+void anthropic_live_remember(server *s, session_slot *sl, const tool_calls *calls) {
+    if (!s || !sl || !calls || calls->len == 0) return;
     pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&s->anthropic_live);
+    live_tool_state_clear_locked(&sl->anthropic_live);
     for (int i = 0; i < calls->len; i++) {
-        id_list_push_unique(&s->anthropic_live.call_ids, calls->v[i].id);
+        id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
-    s->anthropic_live.live_tokens = ds4_session_pos(s->slots[0].sess);
-    s->anthropic_live.valid = s->anthropic_live.call_ids.len > 0;
+    sl->anthropic_live.live_tokens = ds4_session_pos(sl->sess);
+    sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void responses_live_clear(server *s) {
-    if (!s) return;
+void responses_live_clear(server *s, session_slot *sl) {
+    if (!s || !sl) return;
     pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&s->responses_live);
+    live_tool_state_clear_locked(&sl->responses_live);
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void anthropic_live_clear(server *s) {
-    if (!s) return;
+void anthropic_live_clear(server *s, session_slot *sl) {
+    if (!s || !sl) return;
     pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&s->anthropic_live);
+    live_tool_state_clear_locked(&sl->anthropic_live);
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+
+
+/* Parse-time id lookups run on client threads before the request is bound to
+ * a slot, so they scan every provisioned slot's live binding. n_slots is
+ * published under mu (its owning lock) — take mu for the snapshot rather than
+ * asserting cross-lock visibility. A momentarily stale snapshot would only
+ * miss a slot provisioned this instant, whose bindings are still empty. */
+static int server_n_slots_snapshot(server *s) {
+    pthread_mutex_lock(&s->mu);
+    const int n = s->n_slots;
+    pthread_mutex_unlock(&s->mu);
+    return n;
 }
 
 
 
 bool responses_live_has_call_id(server *s, const char *id) {
     if (!s || !id || !id[0]) return false;
+    const int n = server_n_slots_snapshot(s);
     pthread_mutex_lock(&s->tool_mu);
-    bool found = s->responses_live.valid &&
-                 id_list_contains(&s->responses_live.call_ids, id);
+    bool found = false;
+    for (int i = 0; i < n && !found; i++) {
+        const live_tool_state *st = &s->slots[i].responses_live;
+        found = st->valid && id_list_contains(&st->call_ids, id);
+    }
     pthread_mutex_unlock(&s->tool_mu);
     return found;
 }
@@ -379,43 +400,86 @@ bool responses_live_has_call_id(server *s, const char *id) {
 
 bool anthropic_live_has_call_id(server *s, const char *id) {
     if (!s || !id || !id[0]) return false;
+    const int n = server_n_slots_snapshot(s);
     pthread_mutex_lock(&s->tool_mu);
-    bool found = s->anthropic_live.valid &&
-                 id_list_contains(&s->anthropic_live.call_ids, id);
+    bool found = false;
+    for (int i = 0; i < n && !found; i++) {
+        const live_tool_state *st = &s->slots[i].anthropic_live;
+        found = st->valid && id_list_contains(&st->call_ids, id);
+    }
     pthread_mutex_unlock(&s->tool_mu);
     return found;
 }
 
 
 
-bool responses_live_matches_request(server *s, const stop_list *ids,
-                                           int live_tokens) {
-    if (!s || !ids || ids->len == 0) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = s->responses_live.valid &&
-              s->responses_live.live_tokens == live_tokens &&
-              s->responses_live.call_ids.len == ids->len;
+static bool live_state_matches_ids_locked(const live_tool_state *st,
+                                          const stop_list *ids,
+                                          int live_tokens) {
+    bool ok = st->valid &&
+              st->live_tokens == live_tokens &&
+              st->call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
-        ok = id_list_contains(&s->responses_live.call_ids, ids->v[i]);
+        ok = id_list_contains(&st->call_ids, ids->v[i]);
     }
+    return ok;
+}
+
+
+
+bool responses_live_matches_request(server *s, const session_slot *sl,
+                                           const stop_list *ids,
+                                           int live_tokens) {
+    if (!s || !sl || !ids || ids->len == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = live_state_matches_ids_locked(&sl->responses_live, ids, live_tokens);
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
 }
 
 
 
-bool anthropic_live_matches_request(server *s, const stop_list *ids,
+bool anthropic_live_matches_request(server *s, const session_slot *sl,
+                                           const stop_list *ids,
                                            int live_tokens) {
-    if (!s || !ids || ids->len == 0) return false;
+    if (!s || !sl || !ids || ids->len == 0) return false;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = s->anthropic_live.valid &&
-              s->anthropic_live.live_tokens == live_tokens &&
-              s->anthropic_live.call_ids.len == ids->len;
-    for (int i = 0; ok && i < ids->len; i++) {
-        ok = id_list_contains(&s->anthropic_live.call_ids, ids->v[i]);
-    }
+    bool ok = live_state_matches_ids_locked(&sl->anthropic_live, ids, live_tokens);
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
+}
+
+
+
+/* Scheduler routing (worker thread): find the slot whose live binding holds
+ * ALL of the request's continuation ids at that slot's current frontier, so
+ * the job can be bound to the session that owns its conversation. */
+static session_slot *live_slot_for_ids(server *s, const stop_list *ids,
+                                       bool anthropic) {
+    if (!s || !ids || ids->len == 0) return NULL;
+    session_slot *found = NULL;
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < s->n_slots && !found; i++) {
+        session_slot *sl = &s->slots[i];
+        const live_tool_state *st = anthropic ? &sl->anthropic_live
+                                              : &sl->responses_live;
+        const int pos = sl->sess ? ds4_session_pos(sl->sess) : -1;
+        if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return found;
+}
+
+
+
+session_slot *responses_live_slot_for_ids(server *s, const stop_list *ids) {
+    return live_slot_for_ids(s, ids, false);
+}
+
+
+
+session_slot *anthropic_live_slot_for_ids(server *s, const stop_list *ids) {
+    return live_slot_for_ids(s, ids, true);
 }
 
 

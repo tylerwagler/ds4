@@ -285,8 +285,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv);
+        if (p->srv && p->slot && current > p->cached_tokens) {
+            kv_cache_maybe_store_continued(p->srv, p->slot);
         }
         return;
     }
@@ -326,8 +326,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv);
+    if (p->srv && p->slot && current > p->cached_tokens) {
+        kv_cache_maybe_store_continued(p->srv, p->slot);
     }
 }
 
@@ -443,7 +443,7 @@ static void remember_thinking_checkpoint(server *s, session_slot *sl,
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, visible);
+    thinking_live_remember(s, sl, visible);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(sl->sess), strlen(visible));
@@ -476,7 +476,7 @@ static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
     buf_puts(&visible, j->req.prompt_text);
     buf_puts(&visible, suffix);
     if (visible.ptr) {
-        thinking_live_remember(s, visible.ptr);
+        thinking_live_remember(s, sl, visible.ptr);
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
                    ctx, ds4_session_pos(sl->sess), visible.len);
@@ -551,7 +551,7 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
          * a very long conversation from token zero. */
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+        int loaded = kv_cache_try_load_text(s, sl, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
         if (loaded == 0) ds4_session_invalidate(sl->sess);
 
@@ -583,6 +583,7 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
                    path ? path : "");
         server_prefill_progress rebuild_progress = {
             .srv = s,
+            .slot = sl,
             .kind = j->req.kind,
             .prompt_tokens = sync_prompt->len,
             .cached_tokens = loaded,
@@ -685,10 +686,15 @@ bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *call
  * rng stay valid; with one slot the quanta run back-to-back and the output is
  * byte-identical to the old function.
  *
- * Bounded exceptions that intentionally stay run-to-completion inside one
- * quantum: the tool-error recovery syncs (short model-visible suffix append)
- * and canonicalize_tool_checkpoint's rebuild in GEN_FINISH. Both are rare
- * repair paths; slot-scoping them is increment 3 work if they ever matter.
+ * Bounded exceptions that INTENTIONALLY stay run-to-completion inside one
+ * quantum (kept in increment 3's scheduler by design): the tool-error
+ * recovery syncs (short model-visible suffix append) and
+ * canonicalize_tool_checkpoint's rebuild in GEN_FINISH. Both are rare repair
+ * paths that must observe a consistent session frontier; a co-scheduled slot
+ * simply waits out the (bounded) repair. The final logits-writing prefill
+ * chunk likewise always completes within its quantum — the engine's cancel
+ * check only interrupts when enough suffix remains for a bit-exact resume
+ * (ds4_session_prefill_quantum_min_suffix).
  */
 
 typedef enum {
@@ -813,9 +819,11 @@ static void gen_prefill_fail(server *s, session_slot *sl) {
     ds4_session_set_cancel(sl->sess, NULL, NULL);
     ds4_session_set_progress(sl->sess, NULL, NULL);
     ds4_session_set_display_progress(sl->sess, NULL, NULL);
+    kv_cache_tracker_bind(s, sl);
     kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
                                           g->cold_store_len);
-    kv_cache_discard_failed_disk_entry(s, g->disk_cache_path);
+    kv_cache_tracker_flush(s, sl);
+    kv_cache_discard_failed_disk_entry(s, sl, g->disk_cache_path);
     trace_event(s, g->trace_id, "prefill failed: %s", g->err);
     send_prefill_failure_response(s, g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err);
@@ -859,19 +867,19 @@ static void gen_begin(server *s, session_slot *sl) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
+    int cached = responses_live_visible_prefix_prompt(s, sl, &j->req, old_pos,
                                                       &effective_prompt);
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
     if (cached > 0) {
         responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, &j->req.responses_live_call_ids,
+        if (responses_live_matches_request(s, sl, &j->req.responses_live_call_ids,
                                            old_pos))
         {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
     if (cached == 0) {
-        cached = responses_live_continuation_prompt(s, &j->req, old_pos,
+        cached = responses_live_continuation_prompt(s, sl, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
         cache_source = cached > 0 ? "responses-tool-output" : "none";
@@ -881,7 +889,7 @@ static void gen_begin(server *s, session_slot *sl) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
     } else {
-        cached = anthropic_live_continuation_prompt(s, &j->req, old_pos,
+        cached = anthropic_live_continuation_prompt(s, sl, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
         if (cached > 0) {
@@ -916,7 +924,7 @@ static void gen_begin(server *s, session_slot *sl) {
     }
     if (cached == 0) {
         int thinking_cached =
-            thinking_live_visible_prefix_prompt(s, &j->req, old_pos,
+            thinking_live_visible_prefix_prompt(s, sl, &j->req, old_pos,
                                                 &effective_prompt);
         if (thinking_cached > 0) {
             cached = thinking_cached;
@@ -928,7 +936,7 @@ static void gen_begin(server *s, session_slot *sl) {
     int disk_cached = 0;
     uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
-        int text_cached = live_text_prefix_prompt(s, &j->req, &effective_prompt);
+        int text_cached = live_text_prefix_prompt(s, sl, &j->req, &effective_prompt);
         if (text_cached > 0) {
             cached = text_cached;
             cache_source = "memory-text";
@@ -942,15 +950,15 @@ static void gen_begin(server *s, session_slot *sl) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (cached == 0) s->kv.continued_last_store_tokens = 0;
+    if (cached == 0) sl->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live GPU session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, "evict");
+        kv_cache_store_current(s, sl, "evict");
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
+        disk_cached = kv_cache_try_load(s, sl, &j->req, &effective_prompt,
                                         &g->disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
@@ -990,6 +998,7 @@ static void gen_begin(server *s, session_slot *sl) {
     request_ctx_span(g->ctx_span, sizeof(g->ctx_span), cached, prompt_tokens);
     g->progress = (server_prefill_progress){
         .srv = s,
+        .slot = sl,
         .kind = j->req.kind,
         .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
@@ -1070,8 +1079,10 @@ static void gen_begin(server *s, session_slot *sl) {
          * write it as "cold".  Mark the frontier as already handled before the
          * sync reaches it; if the cold write fails, restore the old schedule so
          * a later continued write can still try. */
+        kv_cache_tracker_bind(s, sl);
         g->suppressed_continued_last =
             kv_cache_suppress_continued_store(&s->kv, cold_store_len);
+        kv_cache_tracker_flush(s, sl);
     }
 
     /* Transfer prompt ownership into the slot state; the prefill phases run in
@@ -1127,7 +1138,8 @@ static void gen_step_prefill(server *s, session_slot *sl) {
     }
 
     if (cold) {
-        if (kv_cache_store_live_prefix(s, g->prompt_for_sync, g->cold_store_len, "cold")) {
+        kv_cache_tracker_bind(s, sl);
+        if (kv_cache_store_live_prefix(s, sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, g->cold_store_len);
             g->suppressed_continued_last = -1;
         } else {
@@ -1135,6 +1147,7 @@ static void gen_step_prefill(server *s, session_slot *sl) {
                                                   g->cold_store_len);
             g->suppressed_continued_last = -1;
         }
+        kv_cache_tracker_flush(s, sl);
         ds4_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
         return; /* the cold store is a quantum boundary of its own */
@@ -1154,12 +1167,12 @@ static void gen_stream_begin(server *s, session_slot *sl) {
     g->disk_cache_path = NULL;
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
-    if (!g->responses_live_continuation) responses_live_clear(s);
-    if (!g->anthropic_live_continuation) anthropic_live_clear(s);
-    if (!g->thinking_live_continuation) thinking_live_clear(s);
+    if (!g->responses_live_continuation) responses_live_clear(s, sl);
+    if (!g->anthropic_live_continuation) anthropic_live_clear(s, sl);
+    if (!g->thinking_live_continuation) thinking_live_clear(s, sl);
     ds4_session_set_progress(sl->sess, NULL, NULL);
     ds4_session_set_display_progress(sl->sess, NULL, NULL);
-    kv_cache_maybe_store_continued(s);
+    kv_cache_maybe_store_continued(s, sl);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -1168,13 +1181,15 @@ static void gen_stream_begin(server *s, session_slot *sl) {
                g->req_flags,
                server_now_sec() - g->t0);
     if (g->cold_store_len == g->prompt_for_sync->len) {
-        if (kv_cache_store_live_prefix(s, g->prompt_for_sync, g->cold_store_len, "cold")) {
+        kv_cache_tracker_bind(s, sl);
+        if (kv_cache_store_live_prefix(s, sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, g->cold_store_len);
             g->suppressed_continued_last = -1;
         } else {
             kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
                                                   g->cold_store_len);
         }
+        kv_cache_tracker_flush(s, sl);
     }
     snprintf(g->id, sizeof(g->id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
@@ -1320,7 +1335,7 @@ static void gen_step_decode(server *s, session_slot *sl) {
             g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (g->saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s);
+            kv_cache_maybe_store_continued(s, sl);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -1785,7 +1800,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
         } else if (j->req.api == API_RESPONSES) {
-            responses_live_clear(s);
+            responses_live_clear(s, sl);
         }
     }
     log_tool_calls_summary(g->ctx_span, &parsed_calls,
@@ -1810,21 +1825,21 @@ static void gen_step_finish(server *s, session_slot *sl) {
             buf visible = {0};
             buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, visible.ptr ? visible.ptr : "",
+            responses_live_remember(s, sl, visible.ptr ? visible.ptr : "",
                                     parsed_calls.len ? &parsed_calls : NULL);
             buf_free(&visible);
             free(visible_suffix);
         } else {
-            responses_live_clear(s);
+            responses_live_clear(s, sl);
         }
     }
     if (j->req.api == API_ANTHROPIC) {
         if (parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
-            anthropic_live_remember(s, &parsed_calls);
+            anthropic_live_remember(s, sl, &parsed_calls);
         } else {
-            anthropic_live_clear(s);
+            anthropic_live_clear(s, sl);
         }
     }
 
@@ -1854,15 +1869,15 @@ static void gen_step_finish(server *s, session_slot *sl) {
         canonicalize_tool_checkpoint(s, sl, j, g->ctx_span, g->trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s);
+        thinking_live_clear(s, sl);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s);
+        thinking_live_clear(s, sl);
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &g->thinking, final_finish)) {
         remember_thinking_checkpoint(s, sl, j, g->ctx_span, g->trace_id,
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
-        thinking_live_clear(s);
+        thinking_live_clear(s, sl);
     }
 
     if (j->req.stream) {
@@ -2040,6 +2055,11 @@ static void generate_job_begin(server *s, session_slot *sl, job *j) {
 /* Advance the job by one quantum. */
 static void generate_job_step(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
+    /* The installed slot writer is worker-thread-local and shared across
+     * slots; re-install this slot's writer so send_all() routes through the
+     * right deferral queue after another slot (or a fresh bind) was serviced
+     * in between. */
+    slot_writer_install(&g->writer);
     /* Push any bytes a slow client deferred before spending GPU time. */
     slot_writer_flush(&g->writer);
     switch (g->phase) {
@@ -2096,50 +2116,309 @@ bool enqueue(server *s, job *j) {
 
 
 
-static job *dequeue(server *s) {
-    pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-    if (!s->head) {
-        pthread_mutex_unlock(&s->mu);
-        return NULL;
-    }
-    job *j = s->head;
-    s->head = j->next;
-    if (!s->head) s->tail = NULL;
-    if (s->n_queued > 0) s->n_queued--;
-    pthread_mutex_unlock(&s->mu);
-    j->next = NULL;
-    return j;
+/* =========================================================================
+ * Increment 3: job→slot binding + round-robin scheduler.
+ *
+ * Everything below runs on the single GPU worker thread. Client threads only
+ * enqueue jobs (enqueue above, under mu) and block on the per-job condvar;
+ * they never touch a slot or a ds4_session. Over-capacity requests stay in
+ * the FIFO queue until a slot frees (plan Tier 1 §1.4 "queue them until a
+ * slot frees"); the queue is bounded by DS4_SERVER_MAX_CLIENTS, since every
+ * queued job is one connected client thread.
+ * ========================================================================= */
+
+/* Context a request needs from a slot: prompt plus generation budget (plus a
+ * small allowance for tool-error recovery injections), capped at the largest
+ * (startup) slot so every request can always run on slot 0. */
+static int job_needed_ctx(const server *s, const job *j) {
+    int64_t need = (int64_t)j->req.prompt.len +
+                   (int64_t)(j->req.max_tokens > 0 ? j->req.max_tokens
+                                                   : s->default_tokens) +
+                   64;
+    if (need > s->slots[0].ctx_size) need = s->slots[0].ctx_size;
+    if (need < 1) need = 1;
+    return (int)need;
 }
 
 
 
-/* The single GPU worker. Increment 2: each job is a resumable state machine
- * stepped in bounded quanta. With one slot the loop below runs the quanta
- * back-to-back (identical to the old run-to-completion behavior); increment
- * 3 replaces the inner loop with a scheduler that picks a runnable slot per
- * quantum. */
+/* Reconcile a session's admission estimate with the bytes the allocator
+ * actually committed (2026-07-13 lockup postmortem: the ledger must track
+ * reality, not a formula). Logs the pair, warns loudly on >10% drift — that
+ * means gpu_graph_session_bytes (gpu_diag.c) has fallen out of sync with
+ * gpu_graph_alloc_raw_cap — and returns the value to commit to the ledger
+ * (the actual, unless the engine could not measure one). */
+uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
+                                        uint64_t est_bytes,
+                                        uint64_t actual_bytes) {
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: slot %d session cost: est=%.2f GiB actual=%.2f GiB (ctx=%d)",
+               slot_idx, (double)est_bytes / gib, (double)actual_bytes / gib, ctx);
+    if (actual_bytes == 0) return est_bytes;
+    if (est_bytes > 0 &&
+        (actual_bytes > est_bytes + est_bytes / 10 ||
+         est_bytes > actual_bytes + actual_bytes / 10))
+    {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: SESSION COST DRIFT >10%%: est=%.2f GiB vs actual=%.2f GiB "
+                   "— gpu_graph_session_bytes is out of sync with gpu_graph_alloc_raw_cap; "
+                   "fix the sizing code (gpu_diag.c) before trusting admission control",
+                   (double)est_bytes / gib, (double)actual_bytes / gib);
+    }
+    return actual_bytes;
+}
+
+
+
+/* MemAvailable from /proc/meminfo, in bytes (0 on parse failure). One read
+ * per slot-provisioning attempt — never on a token/layer hot path. Coarse by
+ * design: driver 610's UVM accounting lags MemAvailable, and under UVM
+ * pressure MemTotal itself shrinks, so this is a belt-and-suspenders floor
+ * check on top of the ledger, not a precise gauge. */
+static uint64_t server_mem_available_bytes(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char line[256];
+    unsigned long long kib = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
+    }
+    fclose(fp);
+    return (uint64_t)kib * 1024ull;
+}
+
+
+
+/* Lazily provision a fresh slot under the session admission budget (plan
+ * Tier 1 §1.4), pricing the session with the TRUE per-session cost
+ * (ds4_engine_session_cost_bytes: full graph + prefill working set + drafter
+ * state — the packed-KV estimate under-counted ~10x and hard-locked the
+ * machine, 2026-07-13). Returns NULL when the pool is at capacity, admission
+ * fails, MemAvailable would drop below the floor, or session creation fails —
+ * the job then waits in the queue, exactly like an admission rejection. */
+static session_slot *provision_slot(server *s, int ctx) {
+    if (s->n_slots >= DS4_SESSION_POOL_CAP) return NULL;
+    const uint64_t est = ds4_engine_session_cost_bytes(s->engine, ctx);
+    pthread_mutex_lock(&s->mu);
+    const uint64_t committed = s->kv_committed_bytes;
+    pthread_mutex_unlock(&s->mu);
+    /* Retried at every scheduling pass while the head job waits; log only when
+     * the rejected shape (or the refusing guard) changes, and re-arm after any
+     * successful provisioning (single worker thread). */
+    static uint64_t last_rejected_est, last_rejected_committed;
+    static int last_rejected_reason; /* 0 none, 1 admission, 2 mem floor */
+    if (est == 0 || !server_kv_admits(s->kv_budget_bytes, committed, est)) {
+        if (last_rejected_reason != 1 ||
+            est != last_rejected_est || committed != last_rejected_committed) {
+            last_rejected_reason = 1;
+            last_rejected_est = est;
+            last_rejected_committed = committed;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: slot admission rejected: ctx=%d est=%.2f GiB "
+                       "committed=%.2f GiB budget=%.2f GiB (job queued)",
+                       ctx,
+                       (double)est / (1024.0 * 1024.0 * 1024.0),
+                       (double)committed / (1024.0 * 1024.0 * 1024.0),
+                       (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+        return NULL;
+    }
+    /* Belt and suspenders: whatever the ledger says, do not start a create
+     * unless the kernel still reports room for it plus the free floor. */
+    const uint64_t avail = server_mem_available_bytes();
+    if (avail > 0 && avail < est + DS4_SERVER_MEM_FLOOR_BYTES) {
+        if (last_rejected_reason != 2 ||
+            est != last_rejected_est || committed != last_rejected_committed) {
+            last_rejected_reason = 2;
+            last_rejected_est = est;
+            last_rejected_committed = committed;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: slot provisioning refused: MemAvailable %.2f GiB "
+                       "< est %.2f GiB + floor %.2f GiB (ctx=%d; job queued)",
+                       (double)avail / (1024.0 * 1024.0 * 1024.0),
+                       (double)est / (1024.0 * 1024.0 * 1024.0),
+                       (double)DS4_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
+                       ctx);
+        }
+        return NULL;
+    }
+    last_rejected_reason = 0; /* provisioning proceeds: re-arm rejection logs */
+    last_rejected_est = 0;
+    last_rejected_committed = 0;
+    ds4_session *sess = NULL;
+    if (ds4_session_create(&sess, s->engine, ctx) != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: slot session create failed (ctx=%d); job queued",
+                   ctx);
+        return NULL;
+    }
+    const uint64_t actual =
+        server_reconciled_session_cost(s->n_slots, ctx, est,
+                                       ds4_session_resident_bytes(sess));
+    session_slot *sl = &s->slots[s->n_slots];
+    sl->sess = sess;
+    sl->state = SLOT_IDLE;
+    sl->ctx_size = ctx;
+    sl->est_cost_bytes = actual; /* ledger commits ACTUALS */
+    pthread_mutex_lock(&s->mu);
+    s->kv_committed_bytes += actual;
+    s->n_slots++; /* publish only after the slot is fully initialized */
+    pthread_mutex_unlock(&s->mu);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: provisioned slot %d ctx=%d committed(actual)=%.2f GiB "
+               "total committed=%.2f GiB / %.2f GiB",
+               s->n_slots - 1, ctx,
+               (double)actual / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_committed_bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+    return sl;
+}
+
+
+
+/* Route the job to a slot. Preferences, in order:
+ *   1. A live-tool-state continuation binds to the slot that owns its call
+ *      ids (waiting for it if busy — running it elsewhere could only 409).
+ *   2. Among free slots with enough context, the longest common token prefix
+ *      wins, keeping a client's follow-ups on their warm KV.
+ *   3. A job with no matching prefix anywhere prefers a fresh lazily
+ *      provisioned slot over clobbering another conversation's warm state
+ *      (budget permitting); with the pool exhausted it falls back to the
+ *      warmest free slot exactly like the single-session server did.
+ * Returns NULL when the job must wait for a slot to free. */
+static session_slot *choose_slot_for_job(server *s, job *j) {
+    session_slot *owner = NULL;
+    if (j->req.api == API_RESPONSES && j->req.responses_live_call_ids.len > 0) {
+        owner = responses_live_slot_for_ids(s, &j->req.responses_live_call_ids);
+    } else if (j->req.api == API_ANTHROPIC &&
+               j->req.anthropic_live_call_ids.len > 0) {
+        owner = anthropic_live_slot_for_ids(s, &j->req.anthropic_live_call_ids);
+    }
+    if (owner) return owner->active_job ? NULL : owner;
+
+    const int needed = job_needed_ctx(s, j);
+    session_slot *best = NULL;
+    int best_common = -1;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *sl = &s->slots[i];
+        if (sl->active_job || !sl->sess) continue;
+        if (sl->ctx_size < needed) continue;
+        const int common = ds4_session_common_prefix(sl->sess, &j->req.prompt);
+        if (common > best_common) {
+            best_common = common;
+            best = sl;
+        }
+    }
+    const bool best_clobbers_warm_state =
+        best && best_common == 0 && ds4_session_pos(best->sess) > 0;
+    if (!best || best_clobbers_warm_state) {
+        int ctx = DS4_SERVER_EXTRA_SLOT_CTX_TOKENS;
+        if (ctx > s->slots[0].ctx_size) ctx = s->slots[0].ctx_size;
+        if (ctx < needed) ctx = needed;
+        session_slot *fresh = provision_slot(s, ctx);
+        if (fresh) return fresh;
+    }
+    return best;
+}
+
+
+
+/* Bind the head job to a slot if routing allows it. Strict FIFO: when the
+ * head must wait (its owner slot is busy, or no fitting slot is free), later
+ * jobs wait behind it — simple and starvation-free. Returns true when a job
+ * was bound. */
+static bool worker_try_bind(server *s) {
+    pthread_mutex_lock(&s->mu);
+    job *j = s->head; /* peek: only the worker pops */
+    pthread_mutex_unlock(&s->mu);
+    if (!j) return false;
+
+    session_slot *sl = choose_slot_for_job(s, j);
+    if (!sl) return false;
+
+    pthread_mutex_lock(&s->mu);
+    s->head = j->next;
+    if (!s->head) s->tail = NULL;
+    if (s->n_queued > 0) s->n_queued--;
+    s->n_generating++;
+    pthread_mutex_unlock(&s->mu);
+    j->next = NULL;
+
+    generate_job_begin(s, sl, j);
+    return true;
+}
+
+
+
+/* Detach a finished job from its slot and wake its client thread. */
+static void worker_finish_slot(server *s, session_slot *sl) {
+    job *j = sl->active_job;
+    generate_job_end(s, sl);
+    pthread_mutex_lock(&s->mu);
+    if (s->n_generating > 0) s->n_generating--;
+    pthread_mutex_unlock(&s->mu);
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+
+
+/* The single GPU worker (increment 3): a round-robin scheduler over the slot
+ * pool. Each pass binds queued jobs to free slots (FIFO), then advances ONE
+ * runnable slot by one quantum — a prefill chunk, or up to
+ * DS4_SERVER_DECODE_QUANTUM_TOKENS decode tokens — and flushes that slot's
+ * deferred client bytes. With a single active job this degenerates to the
+ * increment-2 loop (quantum after quantum on one slot, with only a queue
+ * peek — one mutex op, no GPU work — between quanta), so single-client
+ * output is byte-identical. All ds4_session_* and CUDA work stays on this
+ * thread. On shutdown the scheduler keeps stepping bound jobs (the decode
+ * loop observes g_stop_requested) and drains the queue, exactly like the
+ * increment-2 worker. */
 void *worker_main(void *arg) {
     server *s = arg;
-    session_slot *slot = &s->slots[0];
+    int rr = 0; /* round-robin cursor: first slot index to consider next */
     for (;;) {
-        job *j = dequeue(s);
-        if (!j) break;
-        pthread_mutex_lock(&s->mu);
-        s->n_generating++;
-        pthread_mutex_unlock(&s->mu);
-        generate_job_begin(s, slot, j);
-        while (slot->gen && slot->gen->phase != GEN_DONE) {
-            generate_job_step(s, slot);
+        while (worker_try_bind(s)) {}
+
+        int n_active = 0;
+        for (int i = 0; i < s->n_slots; i++) {
+            if (s->slots[i].active_job) n_active++;
         }
-        generate_job_end(s, slot);
-        pthread_mutex_lock(&s->mu);
-        if (s->n_generating > 0) s->n_generating--;
-        pthread_mutex_unlock(&s->mu);
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        if (n_active == 0) {
+            /* With every slot free, choose_slot_for_job never returns NULL
+             * (slot 0 always fits), so an unbound head cannot reach this
+             * wait: sleeping on the condvar until new work or shutdown is
+             * safe. */
+            pthread_mutex_lock(&s->mu);
+            while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+            const bool quit = !s->head && s->stopping;
+            pthread_mutex_unlock(&s->mu);
+            if (quit) break;
+            continue;
+        }
+
+        session_slot *sl = NULL;
+        for (int k = 0; k < s->n_slots; k++) {
+            session_slot *c = &s->slots[(rr + k) % s->n_slots];
+            if (c->active_job) {
+                sl = c;
+                rr = (int)(c - s->slots) + 1;
+                break;
+            }
+        }
+        if (!sl) continue; /* unreachable: n_active > 0 */
+
+        if (sl->gen && sl->gen->phase != GEN_DONE) {
+            generate_job_step(s, sl);
+            if (sl->gen) slot_writer_flush(&sl->gen->writer);
+            sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+        }
+        if (!sl->gen || sl->gen->phase == GEN_DONE) {
+            worker_finish_slot(s, sl);
+        }
     }
     return NULL;
 }
