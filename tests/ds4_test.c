@@ -14,6 +14,9 @@
 #include "../src/server/generate.c"
 #include "../src/server/http_server.c"
 #include "../src/server/cli_main.c"
+/* engine internals: the sampler byte-exactness gate builds distributions
+ * directly and pins them against a copy of the pre-radix implementation. */
+#include "../src/engine/ds4_engine_internal.h"
 #ifndef DS4_NO_GPU
 #include "../src/ds4_gpu.h"
 #include <math.h>
@@ -1658,6 +1661,309 @@ static void test_tool_call_quality(void) {
 
 #endif
 
+/* ===== Sampler byte-exactness gate =============================================
+ * ds4_sample_dist_build's full-vocab path replaced a qsort over the whole
+ * 129k vocab with a stable radix sort + reused scratch (it ran once per
+ * accepted position in the sampled speculative walk, ~10.6 ms a call). The
+ * rewrite claims BYTE-EXACT equivalence, which is subtle: the sort's result
+ * feeds max_logit, `sum` is accumulated over ALL candidates in sorted order,
+ * and both cutoffs are relative to that sum — so sort order and summation
+ * order jointly decide which token a given seed draws.
+ *
+ * This gate pins that claim against a verbatim copy of the pre-rewrite
+ * implementation (HEAD~ tokenizer.c), across adversarial logit shapes
+ * (all-equal, heavy ties, +/-0.0, non-finites) x the sampling configs that
+ * reach production. It compares the built distribution bit-for-bit AND the
+ * rng-driven accept/draw/draw-excluding sequences the spec path actually
+ * consumes.
+ * ============================================================================ */
+
+static int ref_sample_argmax(const float *logits, uint32_t n_vocab) {
+    float best_v = -INFINITY;
+    int best = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        if (v > best_v) { best_v = v; best = (int)i; }
+    }
+    return best;
+}
+
+static int ref_cand_cmp_desc(const void *a, const void *b) {
+    const sample_candidate *ca = a;
+    const sample_candidate *cb = b;
+    return (cb->logit > ca->logit) - (cb->logit < ca->logit);
+}
+
+static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
+                                 float temperature, int top_k, float top_p, float min_p,
+                                 ds4_sample_dist *out) {
+    memset(out, 0, sizeof(*out));
+    if (temperature <= 0.0f) {
+        out->ids = malloc(sizeof(int));
+        out->probs = malloc(sizeof(float));
+        out->ids[0] = ref_sample_argmax(logits, n_vocab);
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        return 1;
+    }
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
+
+    /* collect candidates: full vocab, or top-k preselect like the sampler */
+    uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
+    sample_candidate *cand = malloc((size_t)cap * sizeof(cand[0]));
+    uint32_t n = 0;
+    if (top_k > 0) {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            if (n == (uint32_t)top_k && v <= cand[n - 1].logit) continue;
+            uint32_t j = n < (uint32_t)top_k ? n++ : n - 1;
+            while (j > 0 && cand[j - 1].logit < v) {
+                cand[j] = cand[j - 1];
+                j--;
+            }
+            cand[j].id = (int)i;
+            cand[j].logit = v;
+        }
+    } else {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = 0.0f};
+        }
+        if (n) qsort(cand, n, sizeof(cand[0]), ref_cand_cmp_desc);
+    }
+    if (n == 0) {
+        free(cand);
+        out->ids = malloc(sizeof(int));
+        out->probs = malloc(sizeof(float));
+        out->ids[0] = ref_sample_argmax(logits, n_vocab);
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        return 1;
+    }
+
+    const float max_logit = cand[0].logit;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        cand[i].prob = expf((cand[i].logit - max_logit) / temperature);
+        sum += cand[i].prob;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        out->ids = malloc(sizeof(int));
+        out->probs = malloc(sizeof(float));
+        out->ids[0] = cand[0].id;
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        free(cand);
+        return 1;
+    }
+    const float min_prob = (cand[0].prob / sum) * min_p;
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float pr = cand[i].prob / sum;
+        if (i > 0 && pr < min_prob) break;
+        filtered_sum += cand[i].prob;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered == 0) filtered = 1;
+    out->ids = malloc((size_t)filtered * sizeof(int));
+    out->probs = malloc((size_t)filtered * sizeof(float));
+    out->n = filtered;
+    for (uint32_t i = 0; i < filtered; i++) {
+        out->ids[i] = cand[i].id;
+        out->probs[i] = cand[i].prob / filtered_sum;   /* renormalized nucleus */
+    }
+    free(cand);
+    return 1;
+}
+
+
+#define SAMP_N_VOCAB 129280u
+
+static uint64_t samp_rs;
+static void samp_seed(uint64_t s) { samp_rs = s ? s : 1; }
+static double samp_u01(void) {
+    samp_rs ^= samp_rs >> 12; samp_rs ^= samp_rs << 25; samp_rs ^= samp_rs >> 27;
+    return (double)((samp_rs * 0x2545f4914f6cdd1dULL) >> 11) / 9007199254740992.0;
+}
+
+/* Adversarial logit shapes. Ties and signed zeros are the cases where sort
+ * order is observable at all; non-finites exercise the compaction path. */
+static void samp_fill_shape(float *l, uint32_t n, int shape, const char **name) {
+    samp_seed(0xC0FFEE00u + (uint64_t)shape);
+    switch (shape) {
+    case 0: *name = "realistic-peaked";
+        for (uint32_t i = 0; i < n; i++) {
+            double u1 = samp_u01(), u2 = samp_u01();
+            l[i] = (float)(sqrt(-2.0 * log(u1 + 1e-12)) * cos(2 * M_PI * u2) * 2.0);
+        }
+        for (int i = 0; i < 40; i++) l[(uint32_t)(samp_u01() * n)] = 8.0f + (float)samp_u01() * 6.0f;
+        break;
+    case 1: *name = "uniform-wide";
+        for (uint32_t i = 0; i < n; i++) l[i] = (float)(samp_u01() * 40.0 - 20.0);
+        break;
+    case 2: *name = "all-equal (degenerate)";
+        for (uint32_t i = 0; i < n; i++) l[i] = 1.25f;
+        break;
+    case 3: *name = "heavy-ties (64 distinct)";
+        for (uint32_t i = 0; i < n; i++) l[i] = (float)((i * 2654435761u) % 64u) * 0.5f;
+        break;
+    case 4: *name = "signed-zeros + ties";
+        /* BOTH zeros must be stored as raw bits. This file is compiled
+         * -ffast-math (=> -fno-signed-zeros): a -0.0f literal folds to +0.0f,
+         * and even a memcpy-built -0.0 gets substituted for a +0.0f literal on
+         * the other arm of a ternary, collapsing the mix. Writing the bit
+         * patterns keeps the FP value model out of it entirely. The engine's
+         * logits arrive by memcpy from the GPU, so a +/-0.0 mix really can
+         * occur there regardless of host flags. */
+        {
+            static const uint32_t zbits[2] = {0x80000000u, 0x00000000u};
+            for (uint32_t i = 0; i < n; i++)
+                memcpy(&l[i], &zbits[i & 1u], sizeof(l[i]));
+            for (int i = 0; i < 8; i++) l[(uint32_t)(samp_u01() * n)] = 0.5f;
+        }
+        break;
+    case 5: *name = "with -inf/NaN holes";
+        for (uint32_t i = 0; i < n; i++) l[i] = (float)(samp_u01() * 10.0 - 5.0);
+        for (uint32_t i = 0; i < n; i += 3) l[i] = -INFINITY;
+        for (uint32_t i = 1; i < n; i += 997) l[i] = NAN;
+        break;
+    case 6: *name = "single finite";
+        for (uint32_t i = 0; i < n; i++) l[i] = -INFINITY;
+        l[n / 3] = 2.0f;
+        break;
+    case 7: *name = "all non-finite";
+        for (uint32_t i = 0; i < n; i++) l[i] = -INFINITY;
+        break;
+    case 8: *name = "near-flat (tiny spread)";
+        for (uint32_t i = 0; i < n; i++) l[i] = 3.0f + (float)(samp_u01() * 1e-6);
+        break;
+    default: *name = "?"; break;
+    }
+}
+
+typedef struct { float temp; int top_k; float top_p; float min_p; const char *name; } samp_cfg;
+
+static const samp_cfg samp_cfgs[] = {
+    {1.0f,    0, 1.0f,  0.05f, "server defaults (top_k=0,top_p=1,min_p=0.05)"},
+    {1.0f,    0, 1.0f,  0.0f,  "no cutoffs"},
+    {1.0f,   40, 1.0f,  0.05f, "top_k=40"},
+    {1.0f, 2048, 1.0f,  0.05f, "top_k=2048 (clamped to 1024)"},
+    {1.0f,    0, 0.9f,  0.0f,  "top_p=0.9"},
+    {1.0f,    0, 0.5f,  0.05f, "top_p=0.5 + min_p"},
+    {1.0f,    0, 1.0f,  0.5f,  "min_p=0.5 (aggressive)"},
+    {0.01f,   0, 1.0f,  0.05f, "temp=0.01 (very low)"},
+    {0.1f,    0, 0.95f, 0.02f, "temp=0.1 combined"},
+    {5.0f,    0, 1.0f,  0.05f, "temp=5 (high)"},
+    {100.0f,  0, 0.99f, 0.01f, "temp=100 (extreme)"},
+    {0.0f,    0, 1.0f,  0.05f, "temp=0 (greedy early-out)"},
+    {-1.0f,   0, 1.0f,  0.05f, "temp<0 (greedy early-out)"},
+};
+
+static void test_sampler_dist_equivalence(void) {
+    const uint32_t n = SAMP_N_VOCAB;
+    float *logits = malloc((size_t)n * sizeof(float));
+    TEST_ASSERT(logits != NULL);
+    ds4_sample_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+
+    int checked = 0;
+    for (int shape = 0; shape <= 8; shape++) {
+        const char *sname = "?";
+        samp_fill_shape(logits, n, shape, &sname);
+        for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
+            const samp_cfg *cfg = &samp_cfgs[c];
+            ds4_sample_dist ref, got;
+            ref_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p, &ref);
+            ds4_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p,
+                                  &scratch, &got);
+
+            /* (a) the distribution itself, bit-for-bit */
+            if (ref.n != got.n)
+                fprintf(stderr, "sampler: shape=%s cfg=%s n %u != %u\n",
+                        sname, cfg->name, ref.n, got.n);
+            TEST_ASSERT(ref.n == got.n);
+            for (uint32_t i = 0; i < ref.n; i++) {
+                if (ref.ids[i] != got.ids[i])
+                    fprintf(stderr, "sampler: shape=%s cfg=%s rank %u id %d != %d\n",
+                            sname, cfg->name, i, ref.ids[i], got.ids[i]);
+                TEST_ASSERT(ref.ids[i] == got.ids[i]);
+                /* memcmp, not ==: this must be bit-exact, not merely equal */
+                TEST_ASSERT(memcmp(&ref.probs[i], &got.probs[i], sizeof(float)) == 0);
+            }
+
+            /* (b) the rng-driven sequences the spec acceptance walk consumes:
+             * same seed must select the same tokens through accept / draw /
+             * draw_excluding. This is the property that actually decides the
+             * emitted token stream. */
+            for (int trial = 0; trial < 64; trial++) {
+                const uint64_t seed = 0x5EED0000u + (uint64_t)trial * 7919u;
+                uint64_t r1 = seed, r2 = seed;
+                const int probe = ref.ids[(uint32_t)trial % ref.n];
+                TEST_ASSERT(ds4_sample_dist_accept(&ref, probe, &r1) ==
+                            ds4_sample_dist_accept(&got, probe, &r2));
+                TEST_ASSERT(r1 == r2);
+                TEST_ASSERT(ds4_sample_dist_draw(&ref, &r1) == ds4_sample_dist_draw(&got, &r2));
+                TEST_ASSERT(r1 == r2);
+                TEST_ASSERT(ds4_sample_dist_draw_excluding(&ref, probe, &r1) ==
+                            ds4_sample_dist_draw_excluding(&got, probe, &r2));
+                TEST_ASSERT(r1 == r2);
+                TEST_ASSERT(ds4_sample_dist_prob(&ref, probe) == ds4_sample_dist_prob(&got, probe));
+            }
+
+            /* (c) plain sampler path (sample_full_vocab), same seed */
+            for (int trial = 0; trial < 16; trial++) {
+                uint64_t r1 = 0xABCD0000u + (uint64_t)trial, r2 = r1;
+                const int a = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
+                                                 cfg->top_p, cfg->min_p, &r1);
+                const int b = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
+                                                 cfg->top_p, cfg->min_p, &r2);
+                TEST_ASSERT(a == b && r1 == r2);
+            }
+
+            ds4_sample_dist_free(&ref);
+            ds4_sample_dist_free(&got);
+            checked++;
+        }
+    }
+
+    /* scratch reuse must be order-independent: a fresh scratch and a hot one
+     * (already grown by a full-vocab call) must produce identical results. */
+    {
+        const char *sname = "?";
+        samp_fill_shape(logits, n, 0, &sname);
+        ds4_sample_dist hot, cold;
+        ds4_sample_scratch fresh;
+        memset(&fresh, 0, sizeof(fresh));
+        ds4_sample_dist_build(logits, n, 1.0f, 40, 1.0f, 0.05f, &fresh, &cold);
+        ds4_sample_dist_free(&cold);
+        /* now a full-vocab build on a scratch previously sized for top_k=40 */
+        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.05f, &fresh, &hot);
+        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.05f, &scratch, &cold);
+        TEST_ASSERT(hot.n == cold.n);
+        for (uint32_t i = 0; i < hot.n; i++) {
+            TEST_ASSERT(hot.ids[i] == cold.ids[i]);
+            TEST_ASSERT(memcmp(&hot.probs[i], &cold.probs[i], sizeof(float)) == 0);
+        }
+        ds4_sample_dist_free(&hot);
+        ds4_sample_dist_free(&cold);
+        ds4_sample_scratch_free(&fresh);
+    }
+
+    ds4_sample_scratch_free(&scratch);
+    free(logits);
+    printf("  sampler: %d shape x config combinations byte-exact vs pre-rewrite reference\n",
+           checked);
+}
+
+
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -1682,6 +1988,7 @@ static const ds4_test_entry test_entries[] = {
     {"--f16-kernels", "f16-kernels", "isolated F16 matmul kernel numeric regressions", test_f16_kernel_group},
     {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
 #endif
+    {"--sampler", "sampler", "sampler byte-exactness vs pre-radix reference", test_sampler_dist_equivalence},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

@@ -1887,6 +1887,7 @@ void ds4_session_free(ds4_session *s) {
     if (!s) return;
     gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
+    ds4_sample_scratch_free(&s->sample_scratch);
     free(s->logits);
     free(s);
 }
@@ -2653,7 +2654,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
             }
             ds4_sample_dist dist;
             ds4_sample_dist_build(row_logits, DS4_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, &dist);
+                                  top_p, min_p, &s->sample_scratch, &dist);
             if (ds4_sample_dist_accept(&dist, (int)pend[commit], rng)) {
                 ds4_sample_dist_free(&dist);
                 commit++;
@@ -2723,7 +2724,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         } else {
             ds4_sample_dist bonus;
             ds4_sample_dist_build(s->logits, DS4_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, &bonus);
+                                  top_p, min_p, &s->sample_scratch, &bonus);
             carry_tok = ds4_sample_dist_draw(&bonus, rng);
             ds4_sample_dist_free(&bonus);
         }

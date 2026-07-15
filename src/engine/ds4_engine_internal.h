@@ -1241,11 +1241,33 @@ typedef struct {
     float prob;
 } sample_candidate;
 
+/* Reusable working set for ds4_sample_dist_build's full-vocab (top_k <= 0)
+ * path, which sorts all n_vocab candidates. Zero-initialize before first use;
+ * grows on demand and is reused across calls, so the sampled speculative walk
+ * does not malloc/free ~1.5 MB per accepted position. Free with
+ * ds4_sample_scratch_free.
+ *
+ * Caller-owned and NOT shared: each concurrent session runs its own sampled
+ * acceptance walk, so this lives on ds4_session, never on ds4_engine. */
+typedef struct {
+    sample_candidate *cand;   /* sorted candidates              */
+    uint64_t *keys;           /* packed (sort key << 32 | id)   */
+    uint64_t *tmp;            /* radix ping-pong buffer         */
+    uint32_t cap;             /* elements reserved in each      */
+} ds4_sample_scratch;
+
+void ds4_sample_scratch_free(ds4_sample_scratch *s);
+
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_gpu_graph graph;
     token_vec checkpoint;
     float *logits;
+    /* Reused working set for the sampled speculative acceptance walk's
+     * full-vocab distribution builds (one per accepted position). Per-session,
+     * never shared: concurrent sessions each run their own walk. */
+    ds4_sample_scratch sample_scratch;
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -2284,9 +2306,11 @@ typedef struct {
     uint32_t n;
 } ds4_sample_dist;
 
+/* `scratch` is required (non-NULL) and must outlive nothing: it is pure
+ * working memory, reusable across calls and independent of `out`. */
 int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
-                          ds4_sample_dist *out);
+                          ds4_sample_scratch *scratch, ds4_sample_dist *out);
 void ds4_sample_dist_free(ds4_sample_dist *d);
 float ds4_sample_dist_prob(const ds4_sample_dist *d, int token);
 int ds4_sample_dist_accept(const ds4_sample_dist *d, int token, uint64_t *rng);

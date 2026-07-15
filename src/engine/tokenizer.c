@@ -1025,6 +1025,95 @@ static int sample_full_vocab(
 
 
 
+/* IEEE-754 float32 -> uint32 whose UNSIGNED ASCENDING order is the float's
+ * DESCENDING order: flip negatives entirely, set the sign bit on
+ * non-negatives (the standard monotonic transform, giving float-ascending),
+ * then complement to reverse it. Only finite values reach here — the callers
+ * filter !isfinite — so NaN ordering is not a concern.
+ *
+ * -0.0f is canonicalized to +0.0f first: they are distinct bit patterns but
+ * compare EQUAL as floats, so the comparator this replaces calls them a tie.
+ * Without this they would sort into a fixed order instead. Logits arrive by
+ * memcpy from the GPU, so a negative zero really can appear here — this
+ * file's own -ffast-math (=> -fno-signed-zeros) does not constrain them. */
+static inline uint32_t sample_desc_key(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    if (u == 0x80000000u) u = 0u;
+    const uint32_t asc = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ~asc;
+}
+
+
+
+/* Stable LSD radix sort of packed (sample_desc_key << 32 | id) on the key
+ * half — 4 byte passes, O(n), no comparator calls. Replaces a qsort over the
+ * whole 129k-entry vocab that cost ~10.6 ms per call (~97% of dist_build) and
+ * ran once per accepted position in the sampled speculative walk.
+ *
+ * Order is bit-for-bit what the qsort produced. Ties: the caller fills `a` in
+ * ascending-id order and this sort is stable, so equal logits stay ascending
+ * by id. That matches the qsort it replaces (glibc merge-sorts at this size),
+ * but the property does not rest on that: permuting tied candidates permutes
+ * IDENTICAL prob values, so `sum`, `min_prob`, `filtered`, `filtered_sum` and
+ * every out->probs entry are bit-invariant under any tie order. Tie order can
+ * only pick between equal-probability ids, and only inside the nucleus.
+ *
+ * Requires n >= 1. */
+static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
+    uint32_t hist[4][256];
+    memset(hist, 0, sizeof(hist));
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t k = (uint32_t)(a[i] >> 32);
+        hist[0][k & 0xffu]++;
+        hist[1][(k >> 8) & 0xffu]++;
+        hist[2][(k >> 16) & 0xffu]++;
+        hist[3][(k >> 24) & 0xffu]++;
+    }
+    uint64_t *src = a;
+    uint64_t *dst = tmp;
+    for (int pass = 0; pass < 4; pass++) {
+        const int sh = 32 + pass * 8;
+        /* Whole pass is a no-op when every element shares this key byte —
+         * e.g. the all-equal-logits degenerate case skips all four. */
+        if (hist[pass][(uint32_t)(src[0] >> sh) & 0xffu] == n) continue;
+        uint32_t off[256];
+        uint32_t run = 0;
+        for (int b = 0; b < 256; b++) {
+            off[b] = run;
+            run += hist[pass][b];
+        }
+        for (uint32_t i = 0; i < n; i++)
+            dst[off[(uint32_t)(src[i] >> sh) & 0xffu]++] = src[i];
+        uint64_t *swap = src;
+        src = dst;
+        dst = swap;
+    }
+    if (src != a) memcpy(a, src, (size_t)n * sizeof(*a));
+}
+
+
+
+static void sample_scratch_reserve(ds4_sample_scratch *s, uint32_t cap) {
+    if (s->cap >= cap) return;
+    ds4_sample_scratch_free(s);
+    s->cand = xmalloc((size_t)cap * sizeof(*s->cand));
+    s->keys = xmalloc((size_t)cap * sizeof(*s->keys));
+    s->tmp = xmalloc((size_t)cap * sizeof(*s->tmp));
+    s->cap = cap;
+}
+
+
+
+void ds4_sample_scratch_free(ds4_sample_scratch *s) {
+    free(s->cand);
+    free(s->keys);
+    free(s->tmp);
+    memset(s, 0, sizeof(*s));
+}
+
+
+
 /* =====
  * Filtered-distribution object for speculative sampling.
  *
@@ -1035,10 +1124,19 @@ static int sample_full_vocab(
  * token — the exact residual rule for deterministic-proposal speculative
  * sampling. Mirrors the sampler branch-for-branch; the spec_sampling harness
  * chi-square-checks the equivalence.
+ *
+ * NOTE on optimizing this: `sum` is taken over ALL n candidates in sorted
+ * order BEFORE any cutoff, and both cutoffs are relative to it (min_prob =
+ * (cand[0].prob/sum)*min_p; the top_p test is filtered_sum/sum). Dropping
+ * candidates up front — e.g. a min-p logit pre-filter — therefore changes
+ * `sum`, hence `filtered`, hence `filtered_sum`, hence EVERY output
+ * probability. It is not an equivalent rewrite; tests/ds4_test.c --sampler
+ * catches it. The full descending sort and the full-vocab sum are both
+ * load-bearing; only their cost is negotiable.
  */
 int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
-                          ds4_sample_dist *out) {
+                          ds4_sample_scratch *scratch, ds4_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
         out->ids = xmalloc(sizeof(int));
@@ -1052,9 +1150,12 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
     if (min_p < 0.0f) min_p = 0.0f;
     if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
 
-    /* collect candidates: full vocab, or top-k preselect like the sampler */
+    /* collect candidates: full vocab, or top-k preselect like the sampler.
+     * Buffers come from the caller's scratch and are reused across calls —
+     * the sampled speculative walk calls this per accepted position. */
     uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
-    sample_candidate *cand = xmalloc((size_t)cap * sizeof(cand[0]));
+    sample_scratch_reserve(scratch, cap);
+    sample_candidate *cand = scratch->cand;
     uint32_t n = 0;
     if (top_k > 0) {
         for (uint32_t i = 0; i < n_vocab; i++) {
@@ -1070,15 +1171,22 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
             cand[j].logit = v;
         }
     } else {
+        uint64_t *keys = scratch->keys;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             if (!isfinite(v)) continue;
-            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = 0.0f};
+            keys[n++] = ((uint64_t)sample_desc_key(v) << 32) | (uint32_t)i;
         }
-        if (n) qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
+        if (n) {
+            sample_radix_sort_desc(keys, scratch->tmp, n);
+            for (uint32_t i = 0; i < n; i++) {
+                const uint32_t id = (uint32_t)keys[i];
+                cand[i] = (sample_candidate){
+                    .id = (int)id, .logit = logits[id], .prob = 0.0f};
+            }
+        }
     }
     if (n == 0) {
-        free(cand);
         out->ids = xmalloc(sizeof(int));
         out->probs = xmalloc(sizeof(float));
         out->ids[0] = sample_argmax(logits, n_vocab);
@@ -1099,7 +1207,6 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
         out->ids[0] = cand[0].id;
         out->probs[0] = 1.0f;
         out->n = 1;
-        free(cand);
         return 1;
     }
     const float min_prob = (cand[0].prob / sum) * min_p;
@@ -1120,7 +1227,6 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
         out->ids[i] = cand[i].id;
         out->probs[i] = cand[i].prob / filtered_sum;   /* renormalized nucleus */
     }
-    free(cand);
     return 1;
 }
 
