@@ -290,17 +290,31 @@ int gpu_graph_raw_f16_enabled(void) {
     return cached;
 }
 
-/* DS4_DECODE_DESCR=1: Tier-2 A/B diagnostic (env read once per process and
- * cached — never a per-token getenv).  Routes single-token decode attention
- * through the descriptor (banked) entry points as an n_banks=1 pool over the
- * bank-0 cache views, with positions=[pos] and seq_id=[0].  Under the banked
- * (qpos+1)/ratio visibility rule this is byte-exact vs the classic scalar
- * path INCLUDING at compressor emit steps (the engine emits before
- * attention) — the Tier-2 descriptor-vs-classic gate.  Off (0) is the
- * default; this is not a production mode. */
+/* DS4_DECODE_DESCR: Tier-2 A/B diagnostic level (env read once per process
+ * and cached — never a per-token getenv).  Not a production mode.
+ *
+ * Level 1: single-token decode attention AND indexer scan route through the
+ * descriptor (banked) entry points as an n_banks=1 pool over the installed
+ * cache views (positions=[pos], seq_id=[0]).  At n_tokens==1 the banked
+ * dispatch selects the SAME kernels as classic, so this level is byte-exact
+ * vs classic under the default configuration — the descriptor-vs-classic
+ * gate.
+ *
+ * Level 2: additionally arms the banked MULTISEQ machinery for the
+ * spec-verify batch (imatrix.c: one-bank batch over the current bank —
+ * per-bank frontier bookkeeping, banked emit loop, banked raw scatter,
+ * banked multi-token attention/indexer with packed-native comp reads).
+ * Banked multi-token rows force the generic kernel tiers (WMMA / indexed
+ * heads8 stay single-bank), so level 2 is byte-exact vs classic ONLY when
+ * both runs pin those tiers off (DS4_CUDA_NO_INDEXER_WMMA=1 and
+ * DS4_CUDA_NO_INDEXED_HEADS8=1) — how the Tier-2 gate runs it. */
 int gpu_graph_decode_descr_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_DECODE_DESCR", 0);
+    if (cached < 0) {
+        const char *v = getenv("DS4_DECODE_DESCR");
+        if (v && strcmp(v, "2") == 0) cached = 2;
+        else cached = gpu_graph_env_default_flag("DS4_DECODE_DESCR", 0);
+    }
     return cached;
 }
 
@@ -1044,7 +1058,32 @@ bool gpu_graph_encode_decode_layer(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_score_one_tensor(g->indexer_scores,
+                if (ok && gpu_graph_decode_descr_enabled()) {
+                    /* DS4_DECODE_DESCR: route the single-token indexer scan
+                     * through the banked entry (n_banks=1, bank 0 over the
+                     * installed views).  Dispatches the SAME direct-one fast
+                     * tier as score_one; the banked causal clamp (pos+1)/ratio
+                     * equals layer_n_index_comp here (emit-before-read), so
+                     * no row goes -INF and the scan is byte-exact vs classic
+                     * — gated in the Tier-2 harness. */
+                    ok = gpu_graph_decode_descr_prepare(g, pos) &&
+                         ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
+                                                                g->indexer_q,
+                                                                g->indexer_weights,
+                                                                g->layer_index_comp_cache[il],
+                                                                g->layer_n_index_comp[il],
+                                                                1,
+                                                                pos,
+                                                                DS4_N_INDEXER_HEAD,
+                                                                DS4_N_INDEXER_HEAD_DIM,
+                                                                ds4_layer_compress_ratio(il),
+                                                                index_scale,
+                                                                g->descr_diag_pos,
+                                                                g->descr_diag_seq,
+                                                                g->layer_comp_cap[il],
+                                                                1) != 0;
+                } else if (ok) {
+                    ok = ds4_gpu_indexer_score_one_tensor(g->indexer_scores,
                                                                 g->indexer_q,
                                                                 g->indexer_weights,
                                                                 g->layer_index_comp_cache[il],
@@ -1052,6 +1091,7 @@ bool gpu_graph_encode_decode_layer(
                                                                 DS4_N_INDEXER_HEAD,
                                                                 DS4_N_INDEXER_HEAD_DIM,
                                                                 index_scale) != 0;
+                }
                 if (ok && decode_index_stage_profile) {
                     ok = gpu_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
