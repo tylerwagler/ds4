@@ -2283,7 +2283,7 @@ static session_slot *provision_slot(server *s, int ctx,
         *refusal = PROVISION_REFUSED_MEM_FLOOR;
         return NULL;
     }
-    if (avail < est + DS4_SERVER_MEM_FLOOR_BYTES) {
+    if (!server_mem_floor_admits(avail, est)) {
         if (last_rejected_reason != 2 ||
             est != last_rejected_est || committed != last_rejected_committed) {
             last_rejected_reason = 2;
@@ -2577,7 +2577,7 @@ static bool worker_eviction_could_help(server *s, const job *j,
      * after the eviction too; skip. Fail closed on an unreadable gauge,
      * matching provision_slot. One /proc read per failed bind attempt. */
     const uint64_t avail = server_mem_available_bytes();
-    if (avail < est + DS4_SERVER_MEM_FLOOR_BYTES) return false;
+    if (!server_mem_floor_admits(avail, est)) return false;
     uint64_t reclaimable = 0;
     bool any = false;
     for (int i = 1; i < s->n_slots; i++) {

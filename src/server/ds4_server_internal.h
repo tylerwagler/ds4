@@ -686,28 +686,57 @@ typedef struct {
 
 /* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
  * usable; weights are queried at runtime (ds4_engine_weights_resident_bytes).
- * The overhead reserve is the fixed process footprint measured on the GB10
- * (2026-07-14), independent of session count: ~9.4 GiB at startup (CUDA
- * context, GPU page tables, pinned staging buffers) plus ~8.7 GiB on the
- * first request (cuBLASLt workspaces at ~32 MiB/GEMM, FP8 workspaces, and
- * other lazy CUDA allocations — MXFP4 expert staging, GEMV activation
- * buffers) — ~18 GiB total. */
+ * The overhead reserve is the fixed process footprint measured on the GB10,
+ * independent of session count. Re-measured 2026-07-15 over three clean
+ * server restarts (production v5mx gguf, ctx=98304, prefill_chunk=2048,
+ * drop_caches before each load; MemAvailable deltas net of weights_resident
+ * 85.04 GiB and slot 0's 2.68 GiB ledgered cost):
+ *   - startup component (CUDA context, GPU page tables, pinned staging
+ *     buffers): 8.54 / 9.87 / 9.41 GiB;
+ *   - lazy first-request component (cuBLASLt workspaces at ~32 MiB/GEMM,
+ *     FP8 workspaces, MXFP4 expert staging, GEMV activation buffers):
+ *     8.71 / 8.71 / 8.72 GiB — stable to 10 MiB across restarts;
+ *   - total steady state: 17.25 / 18.59 / 18.13 GiB, mean 17.99.
+ * No further erosion after the first generation (MemAvailable flat within
+ * ±0.01 GiB over subsequent generations and minutes of idle), so 18 GiB IS
+ * the steady-state reserve; MemAvailable-based checks made after warm-up
+ * must not re-reserve any part of it (see DS4_SERVER_MEM_FLOOR_BYTES). */
 #define DS4_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
 #define DS4_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
 
-/* Free-memory floor (2026-07-13 lockup postmortem): the budget arithmetic and
- * every slot provisioning must leave at least this much of the machine free.
+/* Free-memory floor (2026-07-13 lockup postmortem; re-sized 2026-07-15):
+ * kernel/OS breathing room ONLY — the last-resort backstop for when other
+ * accounting is wrong. It deliberately does NOT cover any process overhead:
+ * that is DS4_SERVER_PROCESS_OVERHEAD_BYTES' job. The original 6 GiB was
+ * sized before the 18 GiB overhead constant existed and double-counted
+ * caution on a warmed box: the ~8.7 GiB lazy first-request allocations
+ * erode MemAvailable inside the reserve the ledger already subtracted, so
+ * the live floor check vetoed sessions the ledger legally admitted
+ * (measured 2026-07-14: third 2.5 GiB session refused at 8.39 GiB avail vs
+ * the 8.50 the 6 GiB floor demanded, with ~5.9 GiB genuinely free at full
+ * commit). 4 GiB backstop sizing (2026-07-15): the incident kernel died
+ * near 0 and watchdogs fire at ~5; the measured warmed-box steady state
+ * with three live sessions is 5.96 GiB avail, so 4 GiB re-admits the
+ * incident shape (needs 2.5 + 4 = 6.5 <= 8.39) while still refusing a
+ * further session at that 5.96 steady state (would leave ~3.4). Measured
+ * per-session fault-in overshoot beyond the ledgered estimate is ~0.13 GiB
+ * (2.63 actual vs 2.50 committed), so the realized post-admission floor
+ * stays >= ~3.8 GiB.
  * Two guards use it:
  *   - server_kv_budget_bytes subtracts it from the admission budget, so the
  *     ledger can never legally commit the machine to zero free;
- *   - provision_slot additionally refuses to create a session unless
+ *   - server_mem_floor_admits: provision_slot (and the eviction precheck)
+ *     additionally refuse to create a session unless
  *     MemAvailable >= estimated cost + this floor.
  * The MemAvailable read is a coarse belt-and-suspenders guard: driver 610's
  * UVM accounting lags MemAvailable (and under UVM pressure MemTotal itself
  * SHRINKS — the incident box reported MemTotal 866 MiB — so percentage-based
- * monitors like earlyoom are useless here).  One /proc/meminfo read per
- * provisioning attempt, never on a hot path. */
-#define DS4_SERVER_MEM_FLOOR_BYTES        (6ull * 1024ull * 1024ull * 1024ull)
+ * monitors like earlyoom are useless here). Sessions also fault in AFTER
+ * the check (measured: two sessions provisioned within 1 s both passed at
+ * 11.23 GiB avail before either faulted), so the floor bounds intent, not
+ * the instantaneous worst case. One /proc/meminfo read per provisioning
+ * attempt, never on a hot path. */
+#define DS4_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
 
 typedef enum {
     SLOT_IDLE = 0,     /* no live job; sess may be warm and reusable */
@@ -1275,6 +1304,10 @@ int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
                              uint64_t incoming_bytes);
+/* Live MemAvailable floor predicate: kernel-breathing-room backstop applied
+ * at provisioning time on top of the ledger (defined in cli_main.c;
+ * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
+bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
 /* Log estimate-vs-actual for a freshly created session, warn loudly on >10%
  * drift (sizing code out of sync with the allocator), and return the value
  * the ledger must commit — the actual (defined in generate.c). */

@@ -92,6 +92,21 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
     return committed_bytes <= kv_budget_bytes - incoming_bytes;
 }
 
+/* Live MemAvailable floor: refuse a session create unless the kernel still
+ * reports room for the estimated cost plus the free floor. The floor is
+ * kernel/OS breathing room only — process-fixed costs live in the overhead
+ * reserve the ledger already subtracted (see DS4_SERVER_MEM_FLOOR_BYTES in
+ * ds4_server_internal.h for the 2026-07-15 sizing). avail == 0 means
+ * /proc/meminfo was unreadable: fail closed — this guard exists precisely
+ * for when other accounting is wrong, so it must not silently disarm
+ * itself. Non-static: provision_slot and the eviction precheck (generate.c)
+ * call it; unit tests live in this TU. */
+bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
+    if (avail_bytes == 0) return false;
+    if (est_bytes > UINT64_MAX - DS4_SERVER_MEM_FLOOR_BYTES) return false;
+    return avail_bytes >= est_bytes + DS4_SERVER_MEM_FLOOR_BYTES;
+}
+
 
 
 static void server_close_resources(server *s) {
@@ -4700,9 +4715,10 @@ static void test_kv_admission_budget_math(void) {
     TEST_ASSERT(!server_kv_admits(26ull * GiB, 20ull * GiB, 7ull * GiB));  /* over by 1 GiB */
     TEST_ASSERT(!server_kv_admits(26ull * GiB, 0, 27ull * GiB));           /* lone over-budget */
 
-    /* GB10 production shape (2026-07-14, 18 GiB measured process overhead):
-     * usable 121 GiB − weights ~85.4 GiB − overhead 18 GiB − floor 6 GiB
-     * ⇒ budget ~11.6 GiB. Slot 0 at ctx=65536/pc=4096 costs ~4.6 GiB
+    /* GB10 production shape (2026-07-15 re-measure: 18 GiB steady-state
+     * process overhead, 4 GiB kernel-breathing-room floor):
+     * usable 121 GiB − weights ~85.4 GiB − overhead 18 GiB − floor 4 GiB
+     * ⇒ budget ~13.6 GiB. Slot 0 at ctx=65536/pc=4096 costs ~4.6 GiB
      * (measured) and must admit at startup; a doubled ~9.2 GiB session (the
      * ctx=131072 upper bound) must also admit alone; the THIRD 4.6 GiB slot
      * (13.8 GiB committed) must be refused — the 2026-07-13 incident shape
@@ -4712,7 +4728,7 @@ static void test_kv_admission_budget_math(void) {
     const uint64_t gb10_budget = server_kv_budget_bytes(gb10_weights);
     TEST_ASSERT(gb10_budget == DS4_SERVER_USABLE_BYTES - gb10_weights -
                 DS4_SERVER_PROCESS_OVERHEAD_BYTES - DS4_SERVER_MEM_FLOOR_BYTES);
-    TEST_ASSERT(gb10_budget > 11ull * GiB && gb10_budget < 12ull * GiB);   /* ~11.6 GiB */
+    TEST_ASSERT(gb10_budget > 13ull * GiB && gb10_budget < 14ull * GiB);   /* ~13.6 GiB */
     const uint64_t slot64k = 4710ull * MiB;                    /* ~4.6 GiB @ ctx 64k */
     TEST_ASSERT(server_kv_admits(gb10_budget, 0, slot64k));               /* slot 0, 64k */
     TEST_ASSERT(server_kv_admits(gb10_budget, 0, 2ull * slot64k));        /* slot 0, 128k bound */
@@ -4740,6 +4756,42 @@ static void test_kv_admission_budget_math(void) {
 
 
 
+/* MemAvailable floor backstop (2026-07-15 re-measure). The floor is kernel
+ * breathing room ONLY: process-fixed costs are the ledger's 18 GiB overhead
+ * reserve, and the ~8.7 GiB lazy first-request CUDA allocations erode
+ * MemAvailable INSIDE that already-subtracted reserve. The old 6 GiB floor
+ * double-counted that caution and vetoed sessions the ledger legally
+ * admitted. */
+static void test_mem_floor_admits_warmed_box_shape(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t GiB = 1024ull * MiB;
+
+    /* The 2026-07-14 Tier-1 exit-gate incident: warmed box, two sessions
+     * live, third 2.5 GiB session sees MemAvailable 8.39 GiB. The 6 GiB
+     * floor demanded 8.50 and refused (a 0.11 GiB miss with ~5.9 GiB truly
+     * free at full commit); the 4 GiB floor must admit — post-admission
+     * MemAvailable stays >= ~5.89 GiB, well above the backstop. */
+    const uint64_t est = 2560ull * MiB;                     /* 2.5 GiB session */
+    TEST_ASSERT(server_mem_floor_admits(8590ull * MiB, est));  /* 8.39 GiB avail */
+
+    /* Warmed-box full-commit steady state measured 2026-07-15: 5.96 GiB
+     * avail with three live sessions. A further session would leave ~3.4,
+     * below the backstop: refuse. */
+    TEST_ASSERT(!server_mem_floor_admits(6103ull * MiB, est)); /* 5.96 GiB avail */
+
+    /* A genuinely tight box must always refuse. */
+    TEST_ASSERT(!server_mem_floor_admits(4ull * GiB, est));
+    /* Exact boundary: est + floor. */
+    TEST_ASSERT(server_mem_floor_admits(est + DS4_SERVER_MEM_FLOOR_BYTES, est));
+    TEST_ASSERT(!server_mem_floor_admits(est + DS4_SERVER_MEM_FLOOR_BYTES - 1, est));
+    /* Unreadable /proc/meminfo (avail == 0) fails closed. */
+    TEST_ASSERT(!server_mem_floor_admits(0, est));
+    /* Overflow guard: absurd estimate must refuse, not wrap. */
+    TEST_ASSERT(!server_mem_floor_admits(UINT64_MAX, UINT64_MAX - 1ull * GiB));
+}
+
+
+
 /* Multi-session increment 4: eviction is the first runtime session-free path,
  * so the ledger must balance EXACTLY across provision→evict→provision cycles
  * — each provisioning commits the session's ACTUAL allocator bytes and each
@@ -4747,19 +4799,20 @@ static void test_kv_admission_budget_math(void) {
 static void test_session_eviction_ledger_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     const uint64_t MiB = 1024ull * 1024ull;
-    const uint64_t budget = server_kv_budget_bytes(87450ull * MiB); /* ~11.6 GiB */
+    const uint64_t budget = server_kv_budget_bytes(87450ull * MiB); /* ~13.6 GiB */
     const uint64_t slot0 = 4710ull * MiB;   /* startup slot, ctx 64k measured */
     const uint64_t a = 2560ull * MiB;       /* lazy 64k slot (pc 2048 shape) */
     const uint64_t b = 2571ull * MiB;       /* same shape, distinct actual */
 
-    /* provision slot0 + a + b, filling the budget */
+    /* provision slot0 + a + b, filling most of the budget */
     uint64_t committed = slot0;
     TEST_ASSERT(server_kv_admits(budget, committed, a));
     committed += a;
     TEST_ASSERT(server_kv_admits(budget, committed, b));
     committed += b;
-    /* pool full for another a-sized session: admission refuses */
-    TEST_ASSERT(!server_kv_admits(budget, committed, 2560ull * MiB));
+    /* budget full for another slot0-sized session: admission refuses
+     * (9841 + 4710 = 14551 MiB > ~13.6 GiB budget) */
+    TEST_ASSERT(!server_kv_admits(budget, committed, slot0));
 
     /* evict a: the exact committed value comes back, and the freed budget
      * admits an equal-shape provisioning again */
@@ -4928,6 +4981,7 @@ static void test_slot_writer_stall_times_out(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_kv_admission_budget_math();
+    test_mem_floor_admits_warmed_box_shape();
     test_session_eviction_ledger_math();
     test_session_eviction_victim_selection();
     test_slot_writer_defers_and_preserves_order();
