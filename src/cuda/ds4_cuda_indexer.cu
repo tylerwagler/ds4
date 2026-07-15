@@ -39,6 +39,23 @@ __device__ static inline float idx_comp_load_dev(const float *index_comp, int fp
 
 
 
+/* positions/seq_id/comp_cap/n_banks (descriptor-aware indexer kernels): the
+ * same per-row multi-session banking as the decode attention kernels
+ * (ds4_cuda_attention.cu — design adapted from the MIT-licensed Entrpi/ds4
+ * fork, v0.2 c71a49a; reimplemented, no code copied).  positions[t] is row
+ * t's absolute query position, seq_id[t] its TRUE bank id; the row's visible
+ * compressed count derives per row as (qpos+1)/ratio — the SAME emit-
+ * inclusive rule the classic scalar path uses ((pos0+t+1)/ratio), because
+ * the engine emits a step's compressed rows BEFORE the indexer scan reads
+ * them.  Banked rows read the compressed cache at seq_id*comp_cap offsets;
+ * the scalar n_comp is a cross-bank superset used only as the scan/grid
+ * bound, never to address into a bank.  Rows past the row's own visible
+ * frontier score -INFINITY so top-k never selects an unprimed or foreign
+ * slot (the shallow-bank rows of a mixed batch see -INF for the superset
+ * tail).  Dead rows (out-of-pool seq_id) fail visible: the whole score row
+ * is -INFINITY, and the consuming attention kernel's own dead-row guard
+ * zeroes that row's head outputs.  positions == NULL && seq_id == NULL
+ * degenerates to the classic single-cache scalar path bit-exactly. */
 __global__ static void indexer_scores_kernel(
         float *scores,
         const float *q,
@@ -52,23 +69,34 @@ __global__ static void indexer_scores_kernel(
         uint32_t ratio,
         float scale,
         int causal,
-        int fp4) {
+        int fp4,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap,
+        uint32_t n_banks) {
     uint32_t c = blockIdx.x;
     uint32_t t = blockIdx.y;
     if (c >= n_comp || t >= n_tokens) return;
+    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
+        /* Dead/evicted row: fail-visible -INF score row (see header note). */
+        if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = -INFINITY;
+        return;
+    }
+    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
     if (causal) {
-        uint32_t n_visible = (pos0 + t + 1u) / ratio;
+        uint32_t n_visible = (qpos + 1u) / ratio;
         if (c >= n_visible) {
             if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = -INFINITY;
             return;
         }
     }
+    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
         float dot = 0.0f;
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
-            dot += qh[d] * idx_comp_load_dev(index_comp, fp4, c, d, head_dim);
+            dot += qh[d] * idx_comp_load_dev(index_comp, fp4, comp_base + c, d, head_dim);
         __shared__ float partial[256];
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -84,6 +112,14 @@ __global__ static void indexer_scores_kernel(
 
 
 
+/* Descriptor-aware variant of the single-token fast tier: the banked entry
+ * keeps this kernel (rather than forcing the generic per-(row,comp) kernel)
+ * because its reduction order is what the classic single-token decode uses —
+ * the DS4_DECODE_DESCR byte-gate and any per-session solo/banked comparison
+ * depend on the banked n_tokens==1 scan being bit-identical to classic.
+ * (Documented deviation from the Tier-2 spec's "generic only" note; the WMMA
+ * multi-token tier does stay single-bank.)  Descriptor semantics match
+ * indexer_scores_kernel (one row, so positions[0]/seq_id[0]). */
 __global__ static void indexer_score_one_direct_kernel(
         float *scores,
         const float *q,
@@ -94,23 +130,34 @@ __global__ static void indexer_score_one_direct_kernel(
         uint32_t ratio,
         float scale,
         int causal,
-        int fp4) {
+        int fp4,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap,
+        uint32_t n_banks) {
     const uint32_t c = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     if (c >= n_comp || tid >= 128u) return;
+    if (seq_id && (uint32_t)seq_id[0] >= n_banks) {
+        /* Dead/evicted row: fail-visible (see indexer_scores_kernel). */
+        if (tid == 0) scores[c] = -INFINITY;
+        return;
+    }
+    const uint32_t qpos = positions ? (uint32_t)positions[0] : pos0;
     if (causal) {
-        const uint32_t visible = ratio ? (pos0 + 1u) / ratio : n_comp;
+        const uint32_t visible = ratio ? (qpos + 1u) / ratio : n_comp;
         if (c >= visible) {
             if (tid == 0) scores[c] = -INFINITY;
             return;
         }
     }
+    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[0] * comp_cap : 0u;
 
     __shared__ float krow[128];
     __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_comp, fp4, c, tid, 128u);
+    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_comp, fp4, comp_base + c, tid, 128u);
     __syncthreads();
 
     /* Per-warp accumulation: warp w owns heads w, w+4, ..., w+60 and keeps a
@@ -809,11 +856,38 @@ static int indexer_scores_launch(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale,
-        uint32_t                causal) {
+        uint32_t                causal,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks) {
     const int fp4 = g_indexer_fp4;
+    /* Descriptor (banked) mode: both per-row arrays or neither; the comp
+     * cache operand is the whole bank pool, so the byte bound scales by
+     * n_banks * comp_cap rows and the uint32 row ABI (seq*cap + local) must
+     * not overflow.  Banked scans are always causal with a real ratio (the
+     * per-row visible count derives from position).  The scalar n_comp is
+     * the cross-bank superset: scan/grid bound and scores-row stride only,
+     * never a bank address.  Rejections are fail-loud: a silent 0 return
+     * looks like a generic launch failure to the driver. */
+    const int descr = positions != NULL || seq_id != NULL;
+    if (descr &&
+        (!positions || !seq_id || n_banks == 0 || ratio == 0 || !causal ||
+         comp_cap < n_comp ||
+         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         (uint64_t)n_banks * comp_cap > 4294967296ull)) {
+        fprintf(stderr,
+                "ds4: banked indexer scores rejected: bad descriptor args "
+                "(n_tokens=%u n_banks=%u comp_cap=%u n_comp=%u ratio=%u causal=%u)\n",
+                n_tokens, n_banks, comp_cap, n_comp, ratio, causal);
+        return 0;
+    }
+    const uint64_t comp_rows_min = descr ? (uint64_t)n_banks * comp_cap
+                                         : (uint64_t)n_comp;
     const uint64_t comp_bytes = fp4
-        ? (uint64_t)n_comp * DS4_MXKV_FP4_ROWBYTES(128u)
-        : (uint64_t)n_comp * head_dim * sizeof(float);
+        ? comp_rows_min * DS4_MXKV_FP4_ROWBYTES(128u)
+        : comp_rows_min * head_dim * sizeof(float);
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
         (fp4 && head_dim != 128u) ||
@@ -824,6 +898,9 @@ static int indexer_scores_launch(
         return 0;
     }
     if (causal && ratio == 0) return 0;
+    const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
+    const uint32_t kernel_n_banks = descr ? n_banks : 1u;
     static const int no_direct_one = getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") != NULL;
     static const int no_wmma = getenv("DS4_CUDA_NO_INDEXER_WMMA") != NULL;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u && !no_direct_one) {
@@ -832,10 +909,14 @@ static int indexer_scores_launch(
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
                                                          n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0, fp4);
+                                                         scale, causal ? 1 : 0, fp4,
+                                                         positions_ptr, seq_id_ptr,
+                                                         comp_cap, kernel_n_banks);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
-    if (!g_quality_mode && head_dim == 128u && n_head == 64u && !no_wmma) {
+    /* The WMMA tier stays single-bank (like the reference design): banked
+     * multi-token rows are forced onto the generic per-(comp,row) kernel. */
+    if (!descr && !g_quality_mode && head_dim == 128u && n_head == 64u && !no_wmma) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                      (const float *)q->ptr,
@@ -851,7 +932,9 @@ static int indexer_scores_launch(
                                          (const float *)weights->ptr,
                                          (const float *)index_comp->ptr,
                                          n_comp, n_tokens, pos0, n_head,
-                                         head_dim, ratio, scale, causal ? 1 : 0, fp4);
+                                         head_dim, ratio, scale, causal ? 1 : 0, fp4,
+                                         positions_ptr, seq_id_ptr,
+                                         comp_cap, kernel_n_banks);
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
 }
 
@@ -867,7 +950,8 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
-                                 n_head, head_dim, 1, scale, 0);
+                                 n_head, head_dim, 1, scale, 0,
+                                 NULL, NULL, 0, 1);
 }
 
 
@@ -884,7 +968,8 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                ratio,
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
-                                 n_head, head_dim, ratio, scale, 1);
+                                 n_head, head_dim, ratio, scale, 1,
+                                 NULL, NULL, 0, 1);
 }
 
 
@@ -900,9 +985,14 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale) {
+        float                   scale,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
-                                 n_head, head_dim, ratio, scale, 1);
+                                 n_head, head_dim, ratio, scale, 1,
+                                 positions, seq_id, comp_cap, n_banks);
 }
 
 

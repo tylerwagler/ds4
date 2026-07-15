@@ -694,14 +694,28 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
 /* raw_f16: per-call flag describing the storage format of the PASSED raw
  * cache (__half when set, f32 otherwise).  The value stored is the same
  * __float2half rounding the f32 path roundtrips through, so read-back (as
- * __half2float) is bit-identical in both modes. */
-__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, int raw_f16) {
+ * __half2float) is bit-identical in both modes.
+ *
+ * positions/seq_id/n_banks: per-row multi-session banking (same descriptor
+ * contract as the decode attention kernels, ds4_cuda_attention.cu).  Row t
+ * stores to bank seq_id[t]'s ring at slot positions[t] % raw_cap — the ring
+ * is position-indexed, so one scatter launch stores all rows across all
+ * banks.  Dead rows (out-of-pool seq_id) store NOTHING: a wild id must not
+ * scribble another bank's ring (the read-side dead-row guard zeroes the
+ * row's outputs).  NULL/NULL/1 degenerates to the classic single-cache
+ * consecutive store bit-exactly. */
+__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, int raw_f16,
+                                                 const int32_t * __restrict__ positions,
+                                                 const int32_t * __restrict__ seq_id,
+                                                 uint32_t n_banks) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t t = gid / head_dim;
-    uint32_t row = (pos0 + t) % raw_cap;
+    if (seq_id && (uint32_t)seq_id[t] >= n_banks) return;
+    const uint32_t p = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t row = (seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u) + p % raw_cap;
     const __half h = __float2half(kv[(uint64_t)t * head_dim + d]);
     if (raw_f16) ((__half *)raw)[(uint64_t)row * head_dim + d] = h;
     else         raw[(uint64_t)row * head_dim + d] = __half2float(h);
@@ -1294,17 +1308,39 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim, (int)raw_f16);
+    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim, (int)raw_f16,
+                                                               NULL, NULL, 1u);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 
 
-extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_f16) {
+extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_f16,
+                                                 const ds4_gpu_tensor *positions, const ds4_gpu_tensor *seq_id, uint32_t n_banks) {
+    /* Descriptor (banked) mode: both arrays or neither; the raw cache operand
+     * is the whole bank pool (byte bound scales by n_banks) and the uint32
+     * row ABI (seq*raw_cap + slot) must not overflow.  pos0 is ignored when
+     * positions != NULL.  Fail-loud, like the banked attention launchers. */
+    const int descr = positions != NULL || seq_id != NULL;
+    if (descr &&
+        (!positions || !seq_id || n_banks == 0 ||
+         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         (uint64_t)n_banks * raw_cap > 4294967296ull)) {
+        fprintf(stderr,
+                "ds4: banked raw store rejected: bad descriptor args "
+                "(n_tokens=%u n_banks=%u raw_cap=%u)\n",
+                n_tokens, n_banks, raw_cap);
+        return 0;
+    }
+    const uint64_t kv_banks = descr ? n_banks : 1u;
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
+        raw_cache->bytes < kv_banks * raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     uint64_t n = (uint64_t)n_tokens * head_dim;
-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim, (int)raw_f16);
+    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim, (int)raw_f16,
+                                                        descr ? (const int32_t *)positions->ptr : NULL,
+                                                        descr ? (const int32_t *)seq_id->ptr : NULL,
+                                                        descr ? n_banks : 1u);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
 

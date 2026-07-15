@@ -122,6 +122,16 @@ int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                ratio,
         float                   scale);
 
+/* Banked (multi-session) mode: positions/seq_id are per-row int32 device
+ * arrays (row t's absolute position and TRUE bank id), comp_cap the per-bank
+ * compressed-row stride, n_banks the pool size; the comp cache operand is
+ * the whole bank pool.  Per-row visible count = (qpos+1)/ratio (the engine's
+ * emit-before-read rule); rows past it (and dead rows, seq_id out of pool)
+ * score -INF.  Scalar n_comp = cross-bank superset (scan bound + scores-row
+ * stride only).  NULL/NULL/0/1 = classic single-cache behavior bit-exactly.
+ * Banked multi-token rows run the generic kernel (the WMMA tier stays
+ * single-bank); banked n_tokens==1 keeps the direct-one fast tier so the
+ * scan is bit-identical to classic single-token decode. */
 int ds4_gpu_indexer_scores_decode_batch_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -133,7 +143,11 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale);
+        float                   scale,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                comp_cap,
+        uint32_t                n_banks);
 
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
@@ -467,6 +481,10 @@ int ds4_gpu_store_raw_kv_tensor(
         uint32_t                head_dim,
         uint32_t                raw_f16);
 
+/* Banked mode (positions/seq_id non-NULL): row t stores to bank seq_id[t]'s
+ * ring at slot positions[t] %% raw_cap over the whole pool (raw_cache = the
+ * bank slab, byte-bounded by n_banks); pos0 is ignored.  Dead rows (seq_id
+ * out of pool) store nothing.  NULL/NULL/1 = classic consecutive store. */
 int ds4_gpu_store_raw_kv_batch_tensor(
         ds4_gpu_tensor       *raw_cache,
         const ds4_gpu_tensor *kv,
@@ -474,7 +492,10 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens,
         uint32_t                head_dim,
-        uint32_t                raw_f16);
+        uint32_t                raw_f16,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                n_banks);
 
 /* =========================================================================
  * KV Compression and Attention.

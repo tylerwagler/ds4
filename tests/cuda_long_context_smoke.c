@@ -1018,6 +1018,373 @@ done:
     return rc;
 }
 
+/* ---------------------------------------------------------------------------
+ * Multi-bank descriptor indexer smoke (Tier-2 step 3).
+ *
+ * The banked indexer scan (generic per-(comp,row) kernel and the n_tokens==1
+ * direct-one fast tier) must score each row byte-identically to the same
+ * (bank, qpos) scored single-session against that bank's slab view, with the
+ * per-row ENGINE-TRUE visible frontier (qpos+1)/ratio — emit-boundary rows
+ * (qpos ≡ ratio-1 mod ratio) are the regression teeth for the visibility
+ * rule, and the -INF tail beyond a shallow bank's frontier must keep top-k
+ * selection inside that bank's own rows.  Dead rows (out-of-pool seq_id)
+ * must score -INF everywhere (fail-visible).  Covers both the f32 and the
+ * MXFP4-packed (68 B/row) cache formats.
+ * ------------------------------------------------------------------------- */
+
+static int mb_idx_run_case(const char *label,
+                           const mb_row *rows, uint32_t n_rows,
+                           ds4_gpu_tensor *index_slab, uint32_t comp_cap,
+                           uint32_t n_comp_superset, uint32_t ratio,
+                           uint32_t n_banks, uint32_t n_head, uint32_t head_dim,
+                           uint64_t index_bank_bytes, uint32_t top_k) {
+    const uint64_t q_row = (uint64_t)n_head * head_dim;
+    const float scale = 0.125f;
+    float *q_host = (float *)malloc((uint64_t)n_rows * q_row * sizeof(float));
+    float *w_host = (float *)malloc((uint64_t)n_rows * n_head * sizeof(float));
+    float *out_batch = (float *)malloc((uint64_t)n_rows * n_comp_superset * sizeof(float));
+    float *out_ref = (float *)malloc((uint64_t)n_comp_superset * sizeof(float));
+    uint32_t *sel_batch = (uint32_t *)malloc((uint64_t)n_rows * top_k * sizeof(uint32_t));
+    uint32_t *sel_ref = (uint32_t *)malloc((uint64_t)top_k * sizeof(uint32_t));
+    int32_t *pos_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
+    int32_t *sid_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc((uint64_t)n_rows * q_row * sizeof(float));
+    ds4_gpu_tensor *w = ds4_gpu_tensor_alloc((uint64_t)n_rows * n_head * sizeof(float));
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc((uint64_t)n_rows * n_comp_superset * sizeof(float));
+    ds4_gpu_tensor *scores_ref = ds4_gpu_tensor_alloc((uint64_t)n_comp_superset * sizeof(float));
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc((uint64_t)n_rows * top_k * sizeof(uint32_t));
+    ds4_gpu_tensor *sel_ref_t = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
+    ds4_gpu_tensor *positions = ds4_gpu_tensor_alloc(n_rows * sizeof(int32_t));
+    ds4_gpu_tensor *seq_id = ds4_gpu_tensor_alloc(n_rows * sizeof(int32_t));
+    int rc = 1;
+    if (!q_host || !w_host || !out_batch || !out_ref || !sel_batch || !sel_ref ||
+        !pos_host || !sid_host || !q || !w || !scores || !scores_ref || !sel ||
+        !sel_ref_t || !positions || !seq_id) goto done;
+    mb_rng_state = 0x1d0b5u;
+    for (uint64_t i = 0; i < (uint64_t)n_rows * q_row; i++) q_host[i] = mb_rand() * 0.5f;
+    for (uint64_t i = 0; i < (uint64_t)n_rows * n_head; i++) w_host[i] = mb_rand() * 0.5f + 0.75f;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        pos_host[r] = (int32_t)rows[r].qpos;
+        sid_host[r] = (int32_t)rows[r].bank;
+    }
+    if (!ds4_gpu_tensor_write(q, 0, q_host, (uint64_t)n_rows * q_row * sizeof(float)) ||
+        !ds4_gpu_tensor_write(w, 0, w_host, (uint64_t)n_rows * n_head * sizeof(float)) ||
+        !ds4_gpu_tensor_write(positions, 0, pos_host, n_rows * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(seq_id, 0, sid_host, n_rows * sizeof(int32_t))) goto done;
+
+    /* Banked launch: all rows, mixed banks, one call. */
+    if (!ds4_gpu_indexer_scores_decode_batch_tensor(scores, q, w, index_slab,
+                                                    n_comp_superset, n_rows, 0,
+                                                    n_head, head_dim, ratio, scale,
+                                                    positions, seq_id, comp_cap, n_banks) ||
+        !ds4_gpu_indexer_topk_tensor(sel, scores, n_comp_superset, n_rows, top_k) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(scores, 0, out_batch,
+                             (uint64_t)n_rows * n_comp_superset * sizeof(float)) ||
+        !ds4_gpu_tensor_read(sel, 0, sel_batch,
+                             (uint64_t)n_rows * top_k * sizeof(uint32_t))) {
+        fprintf(stderr, "multibank indexer %s: banked launch failed\n", label);
+        goto done;
+    }
+
+    /* Per-row single-session references against the bank's slab view: the
+     * classic scalar path (NULL descriptors) with pos0 = qpos and the SAME
+     * superset n_comp (the scalar-path causal clamp is already per-row
+     * (pos0+t+1)/ratio, so the -INF tail pattern must match exactly).  A
+     * 1-row launch with these head counts stays on the same generic kernel
+     * (the direct-one tier requires n_head 64). */
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const mb_row *row = &rows[r];
+        ds4_gpu_tensor *bank_view = ds4_gpu_tensor_view(
+                index_slab, (uint64_t)row->bank * index_bank_bytes, index_bank_bytes);
+        ds4_gpu_tensor *q_view = ds4_gpu_tensor_view(q, (uint64_t)r * q_row * sizeof(float),
+                                                     q_row * sizeof(float));
+        ds4_gpu_tensor *w_view = ds4_gpu_tensor_view(w, (uint64_t)r * n_head * sizeof(float),
+                                                     (uint64_t)n_head * sizeof(float));
+        int ok = bank_view && q_view && w_view &&
+                 ds4_gpu_indexer_scores_decode_batch_tensor(scores_ref, q_view, w_view,
+                                                            bank_view, n_comp_superset, 1,
+                                                            row->qpos, n_head, head_dim,
+                                                            ratio, scale,
+                                                            NULL, NULL, 0, 1) &&
+                 ds4_gpu_indexer_topk_tensor(sel_ref_t, scores_ref, n_comp_superset, 1, top_k) &&
+                 ds4_gpu_synchronize() &&
+                 ds4_gpu_tensor_read(scores_ref, 0, out_ref,
+                                     (uint64_t)n_comp_superset * sizeof(float)) &&
+                 ds4_gpu_tensor_read(sel_ref_t, 0, sel_ref,
+                                     (uint64_t)top_k * sizeof(uint32_t));
+        ds4_gpu_tensor_free(w_view);
+        ds4_gpu_tensor_free(q_view);
+        ds4_gpu_tensor_free(bank_view);
+        if (!ok) {
+            fprintf(stderr, "multibank indexer %s: reference launch failed (row %u)\n", label, r);
+            goto done;
+        }
+        if (memcmp(out_ref, out_batch + (uint64_t)r * n_comp_superset,
+                   (uint64_t)n_comp_superset * sizeof(float)) != 0) {
+            fprintf(stderr, "multibank indexer %s: scores row %u (bank %u pos %u) != single-session\n",
+                    label, r, row->bank, row->qpos);
+            goto done;
+        }
+        if (memcmp(sel_ref, sel_batch + (uint64_t)r * top_k,
+                   (uint64_t)top_k * sizeof(uint32_t)) != 0) {
+            fprintf(stderr, "multibank indexer %s: top-k row %u (bank %u pos %u) != single-session\n",
+                    label, r, row->bank, row->qpos);
+            goto done;
+        }
+        /* Top-k must stay inside the row's own visible frontier whenever it
+         * has at least top_k visible rows (shorter rows legitimately carry
+         * -INF losers, which the consuming attention kernel drops per row). */
+        const uint32_t visible = (row->qpos + 1u) / ratio < n_comp_superset
+            ? (row->qpos + 1u) / ratio : n_comp_superset;
+        if (visible >= top_k) {
+            for (uint32_t k = 0; k < top_k; k++) {
+                if (sel_batch[(uint64_t)r * top_k + k] >= visible) {
+                    fprintf(stderr, "multibank indexer %s: top-k row %u selected id %u >= visible %u\n",
+                            label, r, sel_batch[(uint64_t)r * top_k + k], visible);
+                    goto done;
+                }
+            }
+        }
+    }
+    printf("  multibank indexer %s: %u rows across %u banks -> byte-identical (scores + top-k)\n",
+           label, n_rows, n_banks);
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(seq_id); ds4_gpu_tensor_free(positions);
+    ds4_gpu_tensor_free(sel_ref_t); ds4_gpu_tensor_free(sel);
+    ds4_gpu_tensor_free(scores_ref); ds4_gpu_tensor_free(scores);
+    ds4_gpu_tensor_free(w); ds4_gpu_tensor_free(q);
+    free(sid_host); free(pos_host); free(sel_ref); free(sel_batch);
+    free(out_ref); free(out_batch); free(w_host); free(q_host);
+    return rc;
+}
+
+static int check_multibank_indexer(void) {
+    const uint32_t n_banks = 2, comp_cap = 32, ratio = 4;
+    const uint32_t n_comp_sup = 25;   /* cross-bank superset */
+    const uint32_t head_dim = 128;
+    int rc = 1;
+
+    /* Rows: bank 0 deep (qpos 100 -> visible 25 == superset), bank 1 at the
+     * EMIT boundary qpos 39 (visible (39+1)/4 = 10; a floor(39/4) = 9 bug
+     * loses score row 9 -> teeth), bank 1 at qpos 37 (visible 9), and bank 1
+     * at qpos 17 (visible 4 < top_k 8: the -INF losers case). */
+    const mb_row rows[4] = { {0, 100, 0}, {1, 39, 0}, {1, 37, 0}, {1, 17, 0} };
+
+    /* MXFP4-packed cache (production format): synthetic packed rows — 64
+     * nibble bytes + 4 E8M0 scale bytes constrained to a sane exponent range
+     * (the dequant is well-defined for any codes; references and banked
+     * launches read the same bytes). */
+    {
+        const uint64_t row_bytes = 68;   /* DS4_MXKV_FP4_ROWBYTES(128) */
+        const uint64_t bank_bytes = comp_cap * row_bytes;
+        const uint64_t total = (uint64_t)n_banks * bank_bytes;
+        uint8_t *host = (uint8_t *)malloc(total);
+        ds4_gpu_tensor *slab = ds4_gpu_tensor_alloc(total);
+        int case_rc = 1;
+        if (host && slab) {
+            mb_rng_state = 0xf4f4f4u;
+            for (uint64_t i = 0; i < total; i++) {
+                const uint64_t in_row = i % row_bytes;
+                const uint32_t r8 = (uint32_t)(mb_rng_state >> 16) & 0xffu;
+                mb_rng_state = mb_rng_state * 1664525u + 1013904223u;
+                host[i] = in_row < 64 ? (uint8_t)r8 : (uint8_t)(115u + (r8 & 15u));
+            }
+            ds4_gpu_indexer_set_fp4(1);
+            if (ds4_gpu_tensor_write(slab, 0, host, total)) {
+                case_rc = mb_idx_run_case("fp4", rows, 4, slab, comp_cap,
+                                          n_comp_sup, ratio, n_banks, 4, head_dim,
+                                          bank_bytes, 8);
+            }
+            ds4_gpu_indexer_set_fp4(0);
+        }
+        ds4_gpu_tensor_free(slab);
+        free(host);
+        if (case_rc != 0) goto done;
+    }
+
+    /* f32 cache format. */
+    {
+        const uint64_t bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
+        const uint64_t count = (uint64_t)n_banks * comp_cap * head_dim;
+        float *host = (float *)malloc(count * sizeof(float));
+        ds4_gpu_tensor *slab = ds4_gpu_tensor_alloc(count * sizeof(float));
+        int case_rc = 1;
+        if (host && slab) {
+            mb_rng_state = 0x0f320f3u;
+            for (uint64_t i = 0; i < count; i++) host[i] = mb_rand();
+            if (ds4_gpu_tensor_write(slab, 0, host, count * sizeof(float))) {
+                case_rc = mb_idx_run_case("f32", rows, 4, slab, comp_cap,
+                                          n_comp_sup, ratio, n_banks, 4, head_dim,
+                                          bank_bytes, 8);
+            }
+        }
+        ds4_gpu_tensor_free(slab);
+        free(host);
+        if (case_rc != 0) goto done;
+    }
+
+    /* Direct-one fast tier (n_tokens == 1, n_head 64): the banked entry must
+     * keep the classic single-token reduction order — reference is the SAME
+     * scalar-mode dispatch on the bank's view.  Emit-boundary row (qpos 39)
+     * as visibility teeth, f32 format. */
+    {
+        const uint32_t n_head = 64;
+        const uint64_t bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
+        const uint64_t count = (uint64_t)n_banks * comp_cap * head_dim;
+        float *host = (float *)malloc(count * sizeof(float));
+        ds4_gpu_tensor *slab = ds4_gpu_tensor_alloc(count * sizeof(float));
+        int case_rc = 1;
+        if (host && slab) {
+            mb_rng_state = 0xd12ec7u;
+            for (uint64_t i = 0; i < count; i++) host[i] = mb_rand();
+            if (ds4_gpu_tensor_write(slab, 0, host, count * sizeof(float))) {
+                const mb_row one[1] = { {1, 39, 0} };
+                case_rc = mb_idx_run_case("direct-one", one, 1, slab, comp_cap,
+                                          n_comp_sup, ratio, n_banks, n_head, head_dim,
+                                          bank_bytes, 8);
+            }
+        }
+        ds4_gpu_tensor_free(slab);
+        free(host);
+        if (case_rc != 0) goto done;
+    }
+
+    /* Dead-row guard: an out-of-pool seq_id must produce an all -INF score
+     * row (fail-visible) while its batchmate row scores normally. */
+    {
+        const uint32_t n_head = 4;
+        const uint64_t q_row = (uint64_t)n_head * head_dim;
+        const uint64_t bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
+        const uint64_t count = (uint64_t)n_banks * comp_cap * head_dim;
+        float *host = (float *)malloc(count * sizeof(float));
+        float *q_host = (float *)malloc(2 * q_row * sizeof(float));
+        float *w_host = (float *)malloc(2 * n_head * sizeof(float));
+        float *out = (float *)malloc(2 * (uint64_t)n_comp_sup * sizeof(float));
+        const int32_t pos_host[2] = {100, 37};
+        const int32_t sid_host[2] = {-1, 1};
+        ds4_gpu_tensor *slab = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(2 * q_row * sizeof(float));
+        ds4_gpu_tensor *w = ds4_gpu_tensor_alloc(2 * n_head * sizeof(float));
+        ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(2 * (uint64_t)n_comp_sup * sizeof(float));
+        ds4_gpu_tensor *p = ds4_gpu_tensor_alloc(2 * sizeof(int32_t));
+        ds4_gpu_tensor *s = ds4_gpu_tensor_alloc(2 * sizeof(int32_t));
+        int dead_rc = 1;
+        (void)bank_bytes;
+        if (host && q_host && w_host && out && slab && q && w && scores && p && s) {
+            mb_rng_state = 0xdeadf00u;
+            for (uint64_t i = 0; i < count; i++) host[i] = mb_rand();
+            for (uint64_t i = 0; i < 2 * q_row; i++) q_host[i] = mb_rand() * 0.5f;
+            for (uint64_t i = 0; i < 2 * n_head; i++) w_host[i] = 1.0f;
+            if (ds4_gpu_tensor_write(slab, 0, host, count * sizeof(float)) &&
+                ds4_gpu_tensor_write(q, 0, q_host, 2 * q_row * sizeof(float)) &&
+                ds4_gpu_tensor_write(w, 0, w_host, 2 * n_head * sizeof(float)) &&
+                ds4_gpu_tensor_write(p, 0, pos_host, sizeof(pos_host)) &&
+                ds4_gpu_tensor_write(s, 0, sid_host, sizeof(sid_host)) &&
+                ds4_gpu_indexer_scores_decode_batch_tensor(scores, q, w, slab,
+                                                           n_comp_sup, 2, 0,
+                                                           n_head, head_dim, ratio, 0.125f,
+                                                           p, s, comp_cap, n_banks) &&
+                ds4_gpu_synchronize() &&
+                ds4_gpu_tensor_read(scores, 0, out, 2 * (uint64_t)n_comp_sup * sizeof(float))) {
+                dead_rc = 0;
+                for (uint32_t c = 0; c < n_comp_sup; c++) {
+                    if (!(out[c] == -INFINITY)) {
+                        fprintf(stderr, "multibank indexer dead-row: finite score at %u\n", c);
+                        dead_rc = 1;
+                        break;
+                    }
+                }
+                if (dead_rc == 0)
+                    printf("  multibank indexer dead-row: out-of-pool seq_id -> all -INF scores\n");
+            }
+        }
+        ds4_gpu_tensor_free(s); ds4_gpu_tensor_free(p); ds4_gpu_tensor_free(scores);
+        ds4_gpu_tensor_free(w); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(slab);
+        free(out); free(w_host); free(q_host); free(host);
+        if (dead_rc != 0) goto done;
+    }
+    rc = 0;
+done:
+    return rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * Multi-bank raw-store scatter smoke: one banked launch storing rows into
+ * two banks' rings (incl. a wrapped slot and a dead row that must store
+ * NOTHING) must leave the pool byte-identical to per-bank classic stores.
+ * Covers the f16 and f32 ring formats.
+ * ------------------------------------------------------------------------- */
+static int check_multibank_raw_store(void) {
+    const uint32_t n_banks = 2, raw_cap = 64, head_dim = 32, n_rows = 4;
+    const int32_t pos_host[4] = {100, 5, 6, 7};    /* 100 % 64 = 36 (wrap) */
+    const int32_t sid_host[4] = {0, 1, 1, -1};     /* row 3 dead */
+    int rc = 1;
+    for (uint32_t f16 = 0; f16 <= 1; f16++) {
+        const uint64_t elem = f16 ? 2 : 4;
+        const uint64_t bank_bytes = (uint64_t)raw_cap * head_dim * elem;
+        const uint64_t total = (uint64_t)n_banks * bank_bytes;
+        const uint64_t kv_count = (uint64_t)n_rows * head_dim;
+        uint8_t *fill = (uint8_t *)malloc(total);
+        uint8_t *got = (uint8_t *)malloc(total);
+        uint8_t *want = (uint8_t *)malloc(total);
+        float *kv_host = (float *)malloc(kv_count * sizeof(float));
+        ds4_gpu_tensor *slab = ds4_gpu_tensor_alloc(total);
+        ds4_gpu_tensor *slab_ref = ds4_gpu_tensor_alloc(total);
+        ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+        ds4_gpu_tensor *positions = ds4_gpu_tensor_alloc(n_rows * sizeof(int32_t));
+        ds4_gpu_tensor *seq_id = ds4_gpu_tensor_alloc(n_rows * sizeof(int32_t));
+        int ok = fill && got && want && kv_host && slab && slab_ref && kv &&
+                 positions && seq_id;
+        if (ok) {
+            memset(fill, 0x55, total);   /* poison: untouched slots must match */
+            mb_rng_state = 0x5708eu + f16;
+            for (uint64_t i = 0; i < kv_count; i++) kv_host[i] = mb_rand();
+            ok = ds4_gpu_tensor_write(slab, 0, fill, total) &&
+                 ds4_gpu_tensor_write(slab_ref, 0, fill, total) &&
+                 ds4_gpu_tensor_write(kv, 0, kv_host, kv_count * sizeof(float)) &&
+                 ds4_gpu_tensor_write(positions, 0, pos_host, sizeof(pos_host)) &&
+                 ds4_gpu_tensor_write(seq_id, 0, sid_host, sizeof(sid_host));
+        }
+        /* Banked scatter: one launch, all rows. */
+        if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(slab, kv, raw_cap, 0, n_rows,
+                                                       head_dim, f16,
+                                                       positions, seq_id, n_banks);
+        /* Reference: classic per-row stores into the bank views (dead row
+         * skipped — it must store nothing). */
+        for (uint32_t r = 0; ok && r < n_rows; r++) {
+            if (sid_host[r] < 0) continue;
+            ds4_gpu_tensor *bank_view = ds4_gpu_tensor_view(
+                    slab_ref, (uint64_t)sid_host[r] * bank_bytes, bank_bytes);
+            ds4_gpu_tensor *kv_view = ds4_gpu_tensor_view(
+                    kv, (uint64_t)r * head_dim * sizeof(float),
+                    (uint64_t)head_dim * sizeof(float));
+            ok = bank_view && kv_view &&
+                 ds4_gpu_store_raw_kv_tensor(bank_view, kv_view, raw_cap,
+                                             (uint32_t)pos_host[r] % raw_cap,
+                                             head_dim, f16);
+            ds4_gpu_tensor_free(kv_view);
+            ds4_gpu_tensor_free(bank_view);
+        }
+        ok = ok && ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(slab, 0, got, total) &&
+             ds4_gpu_tensor_read(slab_ref, 0, want, total);
+        if (ok && memcmp(got, want, total) != 0) {
+            fprintf(stderr, "multibank raw-store (f16=%u): banked scatter != per-bank stores\n", f16);
+            ok = 0;
+        }
+        ds4_gpu_tensor_free(seq_id); ds4_gpu_tensor_free(positions);
+        ds4_gpu_tensor_free(kv); ds4_gpu_tensor_free(slab_ref); ds4_gpu_tensor_free(slab);
+        free(kv_host); free(want); free(got); free(fill);
+        if (!ok) return 1;
+        printf("  multibank raw-store (f16=%u): banked scatter == per-bank stores (dead row stored nothing)\n", f16);
+    }
+    rc = 0;
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
@@ -1029,6 +1396,8 @@ int main(void) {
     if (check_dspark_non_causal_attention() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_multibank_decode_attention() != 0) rc = 1;
+    if (check_multibank_indexer() != 0) rc = 1;
+    if (check_multibank_raw_store() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;

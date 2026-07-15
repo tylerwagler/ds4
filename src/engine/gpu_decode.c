@@ -1722,7 +1722,8 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(
             g->dspark_raw_cache[li], g->batch_kv,
             raw_cap, kv_store_pos, n_draft, DS4_N_HEAD_DIM,
-            0 /* drafter ring is always f32 */) != 0;
+            0 /* drafter ring is always f32 */,
+            NULL, NULL, 1) != 0;
         const uint32_t vis_raw = saved_n_raw + n_draft;
         const uint32_t cap_raw = vis_raw < raw_cap ? vis_raw : raw_cap;
         const uint32_t raw_start = vis_raw > raw_cap

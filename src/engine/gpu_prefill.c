@@ -732,7 +732,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     pos0,
                                                                     n_tokens,
                                                                     DS4_N_HEAD_DIM,
-                                                                    (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                                    (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                    NULL, NULL, 1) != 0;
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
 
@@ -769,7 +770,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                  pos0,
                                                  n_tokens,
                                                  DS4_N_HEAD_DIM,
-                                                 (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                 (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                 NULL, NULL, 1) != 0;
         if (ok && !gpu_graph_raw_f16_enabled()) {
             /* diag-only dump; the dumper reads f32 and would misinterpret a
              * __half ring — skip it under DS4_RAW_F16. */
@@ -1457,7 +1459,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      pos0,
                                                      n_tokens,
                                                      DS4_N_HEAD_DIM,
-                                                     (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                     (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                     NULL, NULL, 1) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 /* DS4_PREFILL_SLICE: run [score -> top-k -> indexed attention]
@@ -1508,7 +1511,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               DS4_N_INDEXER_HEAD,
                                                                               DS4_N_INDEXER_HEAD_DIM,
                                                                               ratio,
-                                                                              index_scale) != 0;
+                                                                              index_scale,
+                                                                              NULL, NULL, 0, 1) != 0;
                     if (ok && index_stage_profile) {
                         ok = gpu_graph_indexer_stage_profile_boundary("score",
                                                                         il,
@@ -1660,7 +1664,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           DS4_N_INDEXER_HEAD,
                                                                           DS4_N_INDEXER_HEAD_DIM,
                                                                           ratio,
-                                                                          index_scale) != 0;
+                                                                          index_scale,
+                                                                          NULL, NULL, 0, 1) != 0;
                 if (ok && index_stage_profile) {
                     ok = gpu_graph_indexer_stage_profile_boundary("score",
                                                                     il,
