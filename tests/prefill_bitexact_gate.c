@@ -28,18 +28,29 @@
  *
  * WHAT THE DEPTHS BUY.  With opt.prefill_chunk pinned to 4096,
  * ds4_session_create computes prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
- * 4096) = 4096 (src/engine/session.c, src/engine/layers.c:14); ds4_session_sync
- * then tests `prefill_cap < prompt->len`, which is FALSE for all three depths
- * (4096 included, at the boundary) and so takes the NON-chunked one-shot
- * gpu_graph_prefill_raw_swa path.  Either way the effect is what the coverage
- * argument needs: depth D is a single routed-MoE call at n_tokens == D.  All
- * three depths clear the `use_big_batch = ... && n_tokens >= 128` bar in
- * routed_moe (src/cuda/ds4_cuda_moe.cu), i.e. they all exercise the expert-tiled
- * rowspan/tile16 kernels that D2R replaces — NOT the per-pair qwarp32 decode
- * path.  Every routed layer runs on every token, so all three depths cover BOTH
- * the 12 MXFP4 (type-39) promoted layers AND the 31 IQ2_XXS (type-16) floor
- * layers of v5mx in every run; the depths vary the tile occupancy and the
- * expert-tile remainder shapes, not the format coverage.
+ * 4096) = 4096 (src/engine/session.c:1813, src/engine/layers.c:14) — note it is
+ * derived from ctx_size at CREATE, so it is 4096 for every depth here, not a
+ * function of the prompt.  ds4_session_sync then tests `prefill_cap <
+ * prompt->len` (session.c:2063):
+ *   - 512/2048/4096  -> FALSE (4096 included, at the boundary): the NON-chunked
+ *     one-shot gpu_graph_prefill_raw_swa path.  Depth D is a single routed-MoE
+ *     call at n_tokens == D.
+ *   - 6144           -> TRUE: gpu_graph_prefill_chunked, i.e. SEVERAL routed-MoE
+ *     calls whose batch shapes are set by the chunk loop rather than by D.
+ * The 6144 row is why the chunked path is not a blind spot: production chunks
+ * every prompt > 4096, the cold chunk loop trims each non-final chunk to the
+ * compress-ratio LCM and leaves a REMAINDER chunk (session.c:3476), and resumed
+ * chunks re-shape batches and thereby change cuBLASLt algo selection
+ * (session.c:3460).  A D2R re-tiling bug confined to chunk-remainder shapes
+ * would pass a three-depth {512,2048,4096} gate and ship.
+ * All four depths clear the `use_big_batch = ... && n_tokens >= 128` bar in
+ * routed_moe (src/cuda/ds4_cuda_moe.cu) — including every chunk of the 6144 row —
+ * i.e. they all exercise the expert-tiled rowspan/tile16 kernels that D2R
+ * replaces, NOT the per-pair qwarp32 decode path.  Every routed layer runs on
+ * every token, so all four depths cover BOTH the 12 MXFP4 (type-39) promoted
+ * layers AND the 31 IQ2_XXS (type-16) floor layers of v5mx in every run; the
+ * depths vary the tile occupancy and the expert-tile remainder shapes, not the
+ * format coverage.
  *
  * ...WHICH IS WHY THE ENV IS SCRUBBED.  That coverage claim is only true at the
  * DEFAULT env.  DS4_MOE_FP4_TILED=0 (src/cuda/ds4_cuda_moe.cu, static-cached
@@ -47,11 +58,14 @@
  * layers fall back to the per-pair qwarp32 path.  Exported for BOTH the dump and
  * the check, that would make the gate agree with itself having never run the
  * MXFP4 tiled kernels at all — a vacuous PASS.  scrub_numerics_env() below
- * unsets that whole class of knob and says so loudly.  (Differing env between
- * dump and check fails LOUD, which is the safe direction; the danger is only the
- * SAME wrong env on both sides.)
+ * unsets that whole class of knob and says so loudly — the whole DS4_ namespace,
+ * plus the numerics knobs that live OUTSIDE it and are read by cuBLAS/the CUDA
+ * runtime rather than by our code (NVIDIA_TF32_OVERRIDE, CUBLAS_WORKSPACE_CONFIG),
+ * which no namespace sweep could find.  (Differing env between dump and check
+ * fails LOUD, which is the safe direction; the danger is only the SAME wrong env
+ * on both sides.)
  *
- * Checks, per depth D in {512, 2048, 4096}:
+ * Checks, per depth D in {512, 2048, 4096, 6144}:
  *   (a) full-vocab frontier logits after a from-scratch prefill of D tokens
  *       byte-match the baseline blob's row for D.  ZERO tolerance.
  *   (b) the blob header (logits width, depth list, FNV-1a of the token ids)
@@ -120,7 +134,7 @@
  * Measured 2026-07-15 on v5mx (ds4flash.gguf), baseline dev @ 8aa9d35:
  *   T1 -> 129280/129280 logits differ at depth 512, worst |delta| 1.50
  *   T2 -> 129279/129280 logits differ at depth 512, worst |delta| 1.66
- *   PC -> byte-identical at all three depths
+ *   PC -> byte-identical at all depths
  * Liveness was cross-checked with a GROSS seed (scale the block8 result by 2):
  * it FAILS for both tiled kernels, while the same seed in the single-block
  * dev_dot_mxfp4_q8_K_block (the per-pair qwarp32 dot) PASSES — i.e. prefill at
@@ -169,9 +183,10 @@
 #define DS4_GATE_BUILD_REF "unknown"
 #endif
 
-/* Depths: all single-chunk (prefill_chunk pinned to 4096) and all >= 128, so
- * every one lands on the expert-tiled big-batch MoE path that D2R replaces. */
-static const uint32_t g_depths[] = { 512u, 2048u, 4096u };
+/* Depths: all >= 128, so every one lands on the expert-tiled big-batch MoE path
+ * that D2R replaces.  512/2048/4096 are single-chunk; 6144 exceeds the pinned
+ * 4096 prefill_cap and so takes the CHUNKED path (see the header). */
+static const uint32_t g_depths[] = { 512u, 2048u, 4096u, 6144u };
 #define N_DEPTHS ((uint32_t)(sizeof(g_depths) / sizeof(g_depths[0])))
 #define MAX_DEPTHS 8u
 #define GATE_CTX 8192
@@ -205,10 +220,37 @@ static ds4_tokens g_toks;
  * does not scale and silently rots, so scrub the whole namespace and keep only
  * what selects WHERE things are rather than WHAT is computed.
  * (DS4_CUDA_PREFILL_CHUNK needs no entry here: opt.prefill_chunk is pinned and
- * takes precedence over the env.) */
+ * takes precedence over the env.)
+ *
+ * Keep this list SHORT and re-verify each entry against THIS binary's link graph
+ * (tests/prefill_bitexact_gate = the gate .o + src/lib/ds4_help.o + CORE_OBJS —
+ * engine + cuda, NO server objects).  It already rotted once: DS4_MODEL_DIR sat
+ * here until a 2026-07 review found it dead — it is read only by
+ * src/server/cli_main.c, which this binary does not link, and the gate takes the
+ * model as argv[1] anyway.  A hand-maintained keep-list is exactly the thing this
+ * scrub exists to avoid, so anything added here owes a reason it is not numerics. */
 static const char *const g_env_keep[] = {
-    "DS4_LOCK_FILE",   /* infrastructure: lock path */
-    "DS4_MODEL_DIR",   /* infrastructure: model path resolution */
+    /* Infrastructure: the lock PATH, not any numeric.  Read by
+     * src/engine/engine_api.c, which this binary does link. */
+    "DS4_LOCK_FILE",
+};
+
+/* Numerics knobs OUTSIDE the DS4_ namespace.  The scrub below sweeps DS4_* by
+ * prefix, which is exactly the wrong shape for these: they are read by the CUDA
+ * runtime and by cuBLAS themselves, not by our code, so they appear nowhere in
+ * this tree and no namespace sweep can find them — yet they change the arithmetic
+ * the gate certifies:
+ *   - NVIDIA_TF32_OVERRIDE=0 disables TF32 GLOBALLY, overriding the driver's
+ *     default regardless of what cublasSetMathMode() asks for.  That is the same
+ *     effect as DS4_CUDA_NO_TF32, one namespace over — the very knob this scrub
+ *     was written to close.
+ *   - CUBLAS_WORKSPACE_CONFIG changes cuBLAS workspace sizing and with it
+ *     reduction split/determinism.
+ * Exported identically to both the dump and the check, either makes the gate
+ * agree with itself while certifying a configuration we do not ship. */
+static const char *const g_env_scrub_foreign[] = {
+    "NVIDIA_TF32_OVERRIDE",
+    "CUBLAS_WORKSPACE_CONFIG",
 };
 
 static int env_kept(const char *name) {
@@ -217,30 +259,64 @@ static int env_kept(const char *name) {
     return 0;
 }
 
+static void scrub_one(const char *name, const char *value) {
+    fprintf(stderr,
+            "PREFILL GATE: ignoring %s=%s from the environment — this gate only "
+            "certifies the DEFAULT configuration (a knob set identically on both "
+            "sides of the compare would agree with itself vacuously)\n",
+            name, value ? value : "");
+    if (unsetenv(name) != 0) {
+        /* Leaving a numerics knob live is precisely the failure this function
+         * exists to prevent; never continue past it. */
+        fprintf(stderr, "PREFILL GATE FAIL: unsetenv(%s) failed — refusing to run "
+                        "with a numerics knob still set\n", name);
+        exit(2);
+    }
+}
+
 static void scrub_numerics_env(void) {
     /* Collect first: unsetenv() invalidates `environ` mid-iteration. */
     char *names[256];
+    const size_t cap = sizeof(names) / sizeof(names[0]);
     size_t n = 0;
-    for (char **e = environ; *e && n < sizeof(names) / sizeof(names[0]); e++) {
+    for (char **e = environ; *e; e++) {
         if (strncmp(*e, "DS4_", 4) != 0) continue;
         const char *eq = strchr(*e, '=');
         if (!eq) continue;
         const size_t len = (size_t)(eq - *e);
+        /* Both of the following would otherwise leave a knob SET while the gate
+         * reported nothing and went on to print PASS.  The engine reads ~90 DS4_*
+         * knobs, so neither is reachable today — but "unreachable" is what this
+         * whole file refuses to take on faith.  Fail loud instead. */
+        if (n == cap) {
+            fprintf(stderr,
+                    "PREFILL GATE FAIL: more than %zu DS4_* variables in the "
+                    "environment — the scrub list is full, so the remainder would "
+                    "stay SET and silently steer the numerics this gate claims to "
+                    "certify.  Raise the cap in scrub_numerics_env().\n", cap);
+            exit(2);
+        }
         char *nm = malloc(len + 1);
-        if (!nm) continue;
+        if (!nm) {
+            fprintf(stderr,
+                    "PREFILL GATE FAIL: out of memory collecting the env scrub list "
+                    "at '%.*s' — cannot prove it is unset, refusing to run\n",
+                    (int)len, *e);
+            exit(2);
+        }
         memcpy(nm, *e, len);
         nm[len] = '\0';
         if (env_kept(nm)) { free(nm); continue; }
         names[n++] = nm;
     }
     for (size_t i = 0; i < n; i++) {
-        fprintf(stderr,
-                "PREFILL GATE: ignoring %s=%s from the environment — this gate only "
-                "certifies the DEFAULT configuration (a knob set identically on both "
-                "sides of the compare would agree with itself vacuously)\n",
-                names[i], getenv(names[i]) ? getenv(names[i]) : "");
-        unsetenv(names[i]);
+        scrub_one(names[i], getenv(names[i]));
         free(names[i]);
+    }
+    /* Named explicitly: these are not DS4_* and the sweep above cannot see them. */
+    for (size_t i = 0; i < sizeof(g_env_scrub_foreign) / sizeof(g_env_scrub_foreign[0]); i++) {
+        const char *v = getenv(g_env_scrub_foreign[i]);
+        if (v) scrub_one(g_env_scrub_foreign[i], v);
     }
 }
 

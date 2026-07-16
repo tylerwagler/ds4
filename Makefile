@@ -126,13 +126,30 @@ PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_REF) 2>/dev/null || echo $(PREFILL_BASELINE_REF))
 
 # Both sides of a byte-compare must be built for the SAME arch, so pin sm_120f
-# here exactly as the baseline sub-make does.  (Objects do not encode the arch,
-# so a tree previously built at another arch needs a `make clean` first — the
-# same caveat cuda-spark sidesteps with -B.)  The .o is forced so the embedded
-# DS4_GATE_BUILD_REF always reflects the current HEAD.
+# here exactly as the baseline sub-make does.  CUDA_ARCH ?= defaults to EMPTY
+# (top of this file), so only an explicit sm_120f produces the objects the gate
+# must measure; passing it on the sub-make command line also overrides any
+# CUDA_ARCH inherited from the caller's environment.
+#
+# -B COVERS THE WHOLE LINK, NOT JUST THE HARNESS, AND THAT IS THE POINT.  There
+# is no -MMD/-MP anywhere in this Makefile: src/cuda/%.o hand-lists its headers.
+# That list is complete today, but D2R is expected to land a new header (e.g.
+# src/cuda/ds4_cuda_d2r.cuh) included by ds4_cuda_moe.cu; make would then see
+# moe.o as up to date after a .cuh-only edit, relink the OLD kernel, and print
+# PASS — the gate would certify a kernel it never compiled.  Forcing the whole
+# tree costs a rebuild per run, which is acceptable: the gate is manual and
+# spends ~3 GPU-minutes regardless, and an acceptance gate must never certify
+# stale objects.  Forcing the link also rebuilds every object at the sm_120f
+# pinned above, which retires the old "make clean first" arch caveat FOR THIS
+# TARGET: a tree previously built at another arch can no longer leak a
+# mismatched object into the compare.
+#
+# Project-wide `-MMD -MP` dependency tracking is the better long-term fix and is
+# deliberately OUT OF SCOPE here (this Makefile is shared with a parallel branch;
+# restructuring it would collide).  Until it lands, -B is what keeps the gate
+# honest.
 cuda-prefill-gate:
-	$(MAKE) -B tests/prefill_bitexact_gate.o CUDA_ARCH=sm_120f
-	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
+	$(MAKE) -B tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
 		$(PREFILL_BASELINE_REF_SHORT)
 
