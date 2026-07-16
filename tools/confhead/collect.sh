@@ -32,6 +32,14 @@ if pgrep -x ds4-server >/dev/null; then
 fi
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 free -g | sed -n 2p
+# GB10 model-load gate: the 91 GB load fails (or worse, lands and immediately
+# watchdogs) if something else still holds unified memory -- which is often
+# invisible to RSS and survives drop_caches.
+avail_gb=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
+if [ "$avail_gb" -lt 100 ]; then
+    echo "FATAL: only ${avail_gb} GiB available after drop_caches; box not clean" >&2
+    exit 1
+fi
 
 export DS4_DSPARK_STATS=1
 export DS4_DSPARK_CONF_SCHED=off       # unbiased labels: verify all n_draft
