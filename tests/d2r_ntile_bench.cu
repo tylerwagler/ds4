@@ -221,6 +221,13 @@ __global__ static void gate_up_ntile_kernel(
         slot[i] = pair[i] - tok[i] * n_expert;
         xqb[i] = xq + (uint64_t)tok[i] * xq_blocks;
     }
+    /* STAGE=0 global; STAGE=1 staged with the compute pointer REASSIGNED into
+     * xqb (which also held the global staging source, so it is generic -> the
+     * activation reads lower to generic LD: this is the SHIPPED kernel); STAGE=2
+     * staged with a SEPARATE pure-shared-provenance compute base csrc, which lets
+     * nvcc infer the shared space and emit LDS.  csrc is assigned exactly one
+     * address space per instantiation, never both -- the whole LDS trick. */
+    const cuda_block_q8_K *csrc[NT];
     if (STAGE) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
@@ -228,8 +235,18 @@ __global__ static void gate_up_ntile_kernel(
             sxq_dyn[p * xq_blocks + b] = xqb[p][b];
         }
         __syncthreads();
+        if (STAGE == 2) {
+            #pragma unroll
+            for (uint32_t p = 0; p < NT; p++) csrc[p] = sxq_dyn + p * xq_blocks;
+        } else {
+            #pragma unroll
+            for (uint32_t p = 0; p < NT; p++) { if (p >= np) break; xqb[p] = sxq_dyn + p * xq_blocks; }
+            #pragma unroll
+            for (uint32_t p = 0; p < NT; p++) csrc[p] = xqb[p];
+        }
+    } else {
         #pragma unroll
-        for (uint32_t p = 0; p < NT; p++) { if (p >= np) break; xqb[p] = sxq_dyn + p * xq_blocks; }
+        for (uint32_t p = 0; p < NT; p++) csrc[p] = xqb[p];
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
@@ -242,7 +259,7 @@ __global__ static void gate_up_ntile_kernel(
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
             const cuda_block_q8_K *yb[NT];
             #pragma unroll
-            for (uint32_t p = 0; p < NT; p++) { if (p >= np) break; yb[p] = xqb[p] + b; }
+            for (uint32_t p = 0; p < NT; p++) { if (p >= np) break; yb[p] = csrc[p] + b; }
             dev_dot_mxfp4_q8_K_blockN<NT, DECODE>(gr + (uint64_t)b * 8u * 17u, yb, np, gate);
             dev_dot_mxfp4_q8_K_blockN<NT, DECODE>(ur + (uint64_t)b * 8u * 17u, yb, np, up);
         }
@@ -378,6 +395,55 @@ static void build_routing(Routing *r, uint32_t n_tokens) {
     CHECK(cudaMemcpy(r->d_sorted_pairs, h_pairs, r->pair_count * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(r->d_offsets, h_offsets, (N_EXPERT_TOTAL + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(r->d_counts, h_counts, N_EXPERT_TOTAL * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    free(h_pairs); free(h_counts); free(h_offsets); free(cursor); free(exp_of_pair);
+}
+
+static uint32_t xrand(void);   /* fwd: defined below with rng_state */
+
+/* IMBALANCED routing: each pair independently routed to a random expert, so
+ * per-expert counts are uneven and NOT multiples of the tile width -> real
+ * PARTIAL tiles (np < NT).  The d2r-microbench post-mortem records that BALANCED
+ * routing (exactly 64 pairs/expert, every tile full) systematically OVERSTATES a
+ * wide tile -- 2.30x microbench collapsed to 1.90x in-engine.  Partial tiles are
+ * where the LDS win is smallest (fewer activation reads to convert per tile), so
+ * this is the honest routing for the LD->LDS delta. */
+static void build_routing_imbalanced(Routing *r, uint32_t n_tokens) {
+    r->n_tokens = n_tokens;
+    r->pair_count = n_tokens * N_EXPERT_USED;
+    uint32_t *h_pairs = (uint32_t *)malloc(r->pair_count * sizeof(uint32_t));
+    uint32_t *h_counts = (uint32_t *)calloc(N_EXPERT_TOTAL, sizeof(uint32_t));
+    uint32_t *h_offsets = (uint32_t *)calloc(N_EXPERT_TOTAL + 1, sizeof(uint32_t));
+    uint32_t *exp_of_pair = (uint32_t *)malloc(r->pair_count * sizeof(uint32_t));
+    for (uint32_t t = 0; t < n_tokens; t++)
+        for (uint32_t s = 0; s < N_EXPERT_USED; s++) {
+            uint32_t p = t * N_EXPERT_USED + s;
+            uint32_t e = xrand() % N_EXPERT_TOTAL;   /* independent random route */
+            exp_of_pair[p] = e;
+            h_counts[e]++;
+        }
+    for (uint32_t e = 0; e < N_EXPERT_TOTAL; e++) h_offsets[e + 1] = h_offsets[e] + h_counts[e];
+    uint32_t *cursor = (uint32_t *)calloc(N_EXPERT_TOTAL, sizeof(uint32_t));
+    for (uint32_t t = 0; t < n_tokens; t++)
+        for (uint32_t s = 0; s < N_EXPERT_USED; s++) {
+            uint32_t p = t * N_EXPERT_USED + s;
+            uint32_t e = exp_of_pair[p];
+            h_pairs[h_offsets[e] + cursor[e]++] = t * N_EXPERT_USED + s;
+        }
+    CHECK(cudaMalloc(&r->d_sorted_pairs, r->pair_count * sizeof(uint32_t)));
+    CHECK(cudaMalloc(&r->d_offsets, (N_EXPERT_TOTAL + 1) * sizeof(uint32_t)));
+    CHECK(cudaMalloc(&r->d_counts, N_EXPERT_TOTAL * sizeof(uint32_t)));
+    CHECK(cudaMemcpy(r->d_sorted_pairs, h_pairs, r->pair_count * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(r->d_offsets, h_offsets, (N_EXPERT_TOTAL + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(r->d_counts, h_counts, N_EXPERT_TOTAL * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    /* partial-tile diagnostics at width 16 */
+    uint32_t full = 0, partial = 0, empty = 0;
+    for (uint32_t e = 0; e < N_EXPERT_TOTAL; e++) {
+        if (h_counts[e] == 0) { empty++; continue; }
+        full += h_counts[e] / 16u;
+        if (h_counts[e] % 16u) partial++;
+    }
+    printf("# imbalanced routing @width16: %u full tiles, %u partial (np<16), %u empty experts\n\n",
+           full, partial, empty);
     free(h_pairs); free(h_counts); free(h_offsets); free(cursor); free(exp_of_pair);
 }
 
@@ -633,9 +699,11 @@ int main(int argc, char **argv) {
     free_tiles(&tl);                                                                              \
 } while (0)
 
-    RUN_GU(8, 1, 0);     /* <- the shipped kernel: NT=8, staged, arithmetic decode */
+    RUN_GU(8, 1, 0);     /* <- the shipped kernel: NT=8, staged (generic LD), arith decode */
+    RUN_GU(8, 2, 0);     /* NT=8, staged, LDS activation reads */
     RUN_GU(8, 0, 0);
-    RUN_GU(16, 1, 0);
+    RUN_GU(16, 1, 0);    /* NT=16 staged, generic LD -- the CURRENTLY SHIPPED gate/up */
+    RUN_GU(16, 2, 0);    /* NT=16 staged, LDS activation reads -- THE LEVER */
     RUN_GU(16, 0, 0);
     RUN_GU(32, 1, 0);
     RUN_GU(32, 0, 0);
@@ -645,6 +713,18 @@ int main(int argc, char **argv) {
     RUN_GU(8, 1, 1);
     RUN_GU(16, 0, 1);
     RUN_GU(16, 1, 1);
+
+    /* ---- the honest LD->LDS delta, under IMBALANCED routing (partial tiles) ---- */
+    printf("\n=== GATE/UP, IMBALANCED routing (partial tiles; the honest LDS delta) ===\n");
+    printf("%-6s %-7s %-7s %-9s %-10s %-11s %-9s %-8s %s\n",
+           "NT", "stage", "tiles", "ms", "GB moved", "eff GB/s", "vs NT8", "bitexact", "notes");
+    /* swap the routing under the macro (which references `rt`), refresh the base */
+    cudaFree(rt.d_sorted_pairs); cudaFree(rt.d_offsets); cudaFree(rt.d_counts);
+    build_routing_imbalanced(&rt, n_tokens);
+    gu_base_ms = 0;
+    RUN_GU(8, 1, 0);     /* NT=8 staged base under imbalanced routing (refreshes d_ref) */
+    RUN_GU(16, 1, 0);    /* NT=16 staged, generic LD -- shipped */
+    RUN_GU(16, 2, 0);    /* NT=16 staged, LDS -- the lever, honest routing */
 
     printf("\n=== DOWN (mid=%u -> out=%u, midq_blocks=%u) ===\n", MID_DIM, IN_DIM, midq_blocks);
     printf("%-6s %-7s %-7s %-9s %-10s %-11s %-9s %-8s %s\n",
