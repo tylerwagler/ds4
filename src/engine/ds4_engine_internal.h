@@ -1254,6 +1254,15 @@ typedef struct {
     uint64_t *keys;           /* packed (sort key << 32 | id)   */
     uint64_t *tmp;            /* radix ping-pong buffer         */
     uint32_t cap;             /* elements reserved in each      */
+    /* Dense token->q(prob) map for ds4_sample_dist_draw_residual, which needs
+     * q(x) for each x in p's support: the linear ds4_sample_dist_prob scan
+     * would make that O(|p|*|q|) — 1.6e10 at full vocab. Sized by token id
+     * (NOT by `cap`, which is top_k on the preselect path while ids still run
+     * to n_vocab), and INVARIANT: all-zero on entry and on exit. The residual
+     * draw scatters q in, reads, then re-zeros only q's own ids, so the clear
+     * is O(|q|) rather than a full-vocab memset. */
+    float *qmap;
+    uint32_t qmap_cap;
 } ds4_sample_scratch;
 
 void ds4_sample_scratch_free(ds4_sample_scratch *s);
@@ -1323,6 +1332,45 @@ struct ds4_session {
      * drafter #2 | #1 rejected), bucketed by conf. Measurement-only. */
     int32_t dspark_pending_alt[16];
     float   dspark_pending_conf[16];
+    /* --- Temperature-matched draft sampling (spec-decode Item 1) ---
+     * At temperature > 0 the drafts above are DRAWN from a temperature-matched
+     * proposal q (the drafter's refined logits filtered at the request's
+     * params) rather than taken as the drafter's argmax. Verification then uses
+     * the standard sampled-proposal rule — accept w.p. min(1, p/q), else draw
+     * the residual (p-q)+ — which is not capped at p(mode) the way the
+     * deterministic-proposal rule is.
+     *
+     * `dspark_pending_sampled` records which rule the pendings were PROPOSED
+     * under, so verify applies the matching rule: false => argmax proposal =>
+     * the deterministic rule (accept w.p. p(x), residual p-excluding). The two
+     * rules are not interchangeable; applying p/q to an argmax proposal (or
+     * vice versa) silently breaks exactness. */
+    bool dspark_pending_sampled;
+    /* q(pend[i]) at draft time — the accept denominator. */
+    float dspark_pending_q[16];
+    /* The refined-logits row each pending draft was sampled from, 16 rows of
+     * DS4_N_VOCAB floats, allocated lazily on first sampled draft. The residual
+     * needs the FULL q, but only for the single rejected position — unknown
+     * until verify — so every position's row is persisted and the one that
+     * rejects rebuilds its q via ds4_sample_dist_build.
+     *
+     * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
+     * q: dist_build is a pure function of (logits, params) and both are stored
+     * verbatim. What must never happen is recomputing q from live drafter state
+     * (which has advanced by then) — that is the "possibly-drifted state" trap.
+     *
+     * Device-first note (Item 2): storing the logits ROW + params rather than a
+     * materialized nucleus is deliberate — the GPU accept kernel wants exactly
+     * this, so it swaps this host pool for a resident device buffer instead of
+     * reshaping the format. */
+    float *dspark_pending_qrows;
+    uint32_t dspark_pending_qrows_cap;   /* floats reserved */
+    /* The sampling params the pendings were sampled under. Drafts sampled under
+     * params X are INVALID if verify runs under params Y — the p/q ratio would
+     * divide by a q from the wrong distribution and break exactness silently.
+     * Mirrors the spec_carry_* params guard. Greedy never needed this. */
+    float dspark_pending_temp, dspark_pending_top_p, dspark_pending_min_p;
+    int   dspark_pending_top_k;
 };
 
 typedef struct {
@@ -2316,6 +2364,19 @@ float ds4_sample_dist_prob(const ds4_sample_dist *d, int token);
 int ds4_sample_dist_accept(const ds4_sample_dist *d, int token, uint64_t *rng);
 int ds4_sample_dist_draw(const ds4_sample_dist *d, uint64_t *rng);
 int ds4_sample_dist_draw_excluding(const ds4_sample_dist *d, int excluded, uint64_t *rng);
+/* Sampled-proposal speculative rule (the deterministic-proposal pair above is
+ * ds4_sample_dist_accept / _draw_excluding). `token` was drawn from a proposal
+ * q; `q` is q(token). Accepts with probability min(1, p(token)/q(token)).
+ * Never accepts a token with p(token) <= 0. Consumes no rng when the outcome
+ * is certain (p >= q), matching ds4_sample_dist_accept's p >= 1 fast path —
+ * which is what keeps the temperature<=0 path byte-identical. */
+int ds4_sample_dist_accept_pq(const ds4_sample_dist *p, int token, float q, uint64_t *rng);
+/* The matching residual: draw from (p-q)+ normalized. Every token it can
+ * return has p(token) > 0 AND strictly positive residual mass; if the total
+ * residual mass is <= 0 it falls back to a plain draw from p. `scratch` is
+ * working memory (see ds4_sample_scratch::qmap); it must not alias p or q. */
+int ds4_sample_dist_draw_residual(const ds4_sample_dist *p, const ds4_sample_dist *q,
+                                  ds4_sample_scratch *scratch, uint64_t *rng);
 
 int sample_top_p_min_p(
         const float *logits,
