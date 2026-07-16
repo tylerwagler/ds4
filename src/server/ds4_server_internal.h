@@ -287,6 +287,16 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    /* Presence flags: true iff the CLIENT sent the parameter in the request
+     * body. request_init() fills the value fields with engine defaults at
+     * parse time, so the values alone cannot distinguish "explicitly 1.0"
+     * from "absent" — downstream policy (e.g. think-mode defaults in
+     * generate.c) must consult these and default only what is absent.
+     * Zeroed by request_init's memset; set only in api_parse.c. */
+    bool has_temperature;
+    bool has_top_k;
+    bool has_top_p;
+    bool has_min_p;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;

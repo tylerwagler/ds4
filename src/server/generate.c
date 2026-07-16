@@ -1325,6 +1325,31 @@ static void gen_decode_init(server *s, session_slot *sl) {
 
 
 
+/* Sampling contract: request_init() pre-fills the engine defaults, so the
+ * request values are already correct for non-thinking requests. In thinking
+ * mode the engine defaults are re-asserted, but ONLY for parameters the
+ * client left absent (per-param has_* flags set in api_parse.c); anything the
+ * client sent explicitly is respected as-is. That includes an explicit
+ * temperature==0, which selects greedy decode so DSpark speculative decode
+ * (greedy-only) can engage. Tool-call payload forcing (temperature=0 while
+ * decoding structured tool output, in gen_step_decode) is a separate,
+ * deliberate override applied on top of this. */
+static void gen_resolve_sampling(const request *req, float *temperature,
+                                 int *top_k, float *top_p, float *min_p) {
+    *temperature = req->temperature;
+    *top_k = req->top_k;
+    *top_p = req->top_p;
+    *min_p = req->min_p;
+    if (ds4_think_mode_enabled(req->think_mode)) {
+        if (!req->has_temperature) *temperature = DS4_DEFAULT_TEMPERATURE;
+        if (!req->has_top_k) *top_k = 0;
+        if (!req->has_top_p) *top_p = DS4_DEFAULT_TOP_P;
+        if (!req->has_min_p) *min_p = DS4_DEFAULT_MIN_P;
+    }
+}
+
+
+
 /* One decode quantum: run the sampling loop for at most
  * DS4_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
  * state parked in gen_state. The session is untouched between quanta, so
@@ -1347,19 +1372,9 @@ static void gen_step_decode(server *s, session_slot *sl) {
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (g->saw_tool_start || in_tool_call))) {
             kv_cache_maybe_store_continued(s, sl);
         }
-        float temperature = j->req.temperature;
-        int top_k = j->req.top_k;
-        float top_p = j->req.top_p;
-        float min_p = j->req.min_p;
-        /* Thinking mode normally forces sampling defaults for quality, but an
-         * EXPLICIT temperature==0 (default is 1.0) means the caller wants greedy
-         * decode — honor it so DSpark speculative decode (greedy-only) can engage. */
-        if (ds4_think_mode_enabled(j->req.think_mode) && j->req.temperature > 0.0f) {
-            temperature = DS4_DEFAULT_TEMPERATURE;
-            top_k = 0;
-            top_p = DS4_DEFAULT_TOP_P;
-            min_p = DS4_DEFAULT_MIN_P;
-        }
+        float temperature, top_p, min_p;
+        int top_k;
+        gen_resolve_sampling(&j->req, &temperature, &top_k, &top_p, &min_p);
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }

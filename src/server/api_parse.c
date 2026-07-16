@@ -80,6 +80,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 goto bad;
             }
             r->temperature = (float)v;
+            r->has_temperature = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -87,6 +88,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 goto bad;
             }
             r->top_p = (float)v;
+            r->has_top_p = true;
         } else if (!strcmp(key, "min_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -94,11 +96,13 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 goto bad;
             }
             r->min_p = (float)v;
+            r->has_min_p = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
                 goto bad;
             }
+            r->has_top_k = true;
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -316,6 +320,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
                 goto bad;
             }
             r->temperature = (float)v;
+            r->has_temperature = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -323,11 +328,13 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
                 goto bad;
             }
             r->top_p = (float)v;
+            r->has_top_p = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
                 goto bad;
             }
+            r->has_top_k = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -1230,6 +1237,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                 goto bad;
             }
             r->temperature = (float)v;
+            r->has_temperature = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -1237,6 +1245,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                 goto bad;
             }
             r->top_p = (float)v;
+            r->has_top_p = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -1452,6 +1461,7 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                 goto bad;
             }
             r->temperature = (float)v;
+            r->has_temperature = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -1459,6 +1469,7 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                 goto bad;
             }
             r->top_p = (float)v;
+            r->has_top_p = true;
         } else if (!strcmp(key, "min_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -1466,11 +1477,13 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                 goto bad;
             }
             r->min_p = (float)v;
+            r->has_min_p = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
                 goto bad;
             }
+            r->has_top_k = true;
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {

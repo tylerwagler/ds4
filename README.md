@@ -337,8 +337,12 @@ controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
 Default sampled API generation uses `temperature=1`, `top_p=1`, and
 `min_p=0.05`, so the default filter is relative probability rather than
-nucleus mass. In thinking mode DwarfStar uses those fixed sampling defaults and
-ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
+nucleus mass. Those defaults apply only to parameters the request leaves
+absent (in thinking and non-thinking mode alike); any sampling knob the client
+sends explicitly is respected as-is, including `temperature=0` to select
+greedy decode (which lets DSpark speculative decoding engage). During
+structured tool-call output the server still forces greedy decode regardless
+of the request's sampling parameters.
 
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
 mode, reasoning is streamed in the native API shape instead of being mixed into

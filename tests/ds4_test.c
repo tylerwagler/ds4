@@ -2412,6 +2412,73 @@ static void test_spec_pq_math(void) {
 
 
 
+/* Per-surface sampling presence flags: every API surface must mark
+ * temperature/top_k/top_p/min_p as client-sent exactly when the key appears
+ * in the request body, so downstream think-mode defaulting
+ * (gen_resolve_sampling in generate.c) can distinguish "explicitly 1.0" from
+ * "absent". Parse-only; the engine is used just to tokenize the prompt. */
+static void test_api_sampling_presence_flags(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    char err[160];
+    request r;
+
+    /* OpenAI chat completions: all four knobs */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"temperature\":0.35,\"top_k\":40,\"top_p\":0.9,\"min_p\":0.1}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
+    TEST_ASSERT(r.has_top_k && r.top_k == 40);
+    TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
+    TEST_ASSERT(r.has_min_p && r.min_p == 0.1f);
+    request_free(&r);
+
+    /* OpenAI chat completions: nothing sent -> defaults, all flags false */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(!r.has_temperature && r.temperature == DS4_DEFAULT_TEMPERATURE);
+    TEST_ASSERT(!r.has_top_k && r.top_k == 0);
+    TEST_ASSERT(!r.has_top_p && r.top_p == DS4_DEFAULT_TOP_P);
+    TEST_ASSERT(!r.has_min_p && r.min_p == DS4_DEFAULT_MIN_P);
+    request_free(&r);
+
+    /* Anthropic messages: temperature/top_p/top_k (the API has no min_p) */
+    TEST_ASSERT(parse_anthropic_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"max_tokens\":64,\"temperature\":0.35,\"top_p\":0.9,\"top_k\":40}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
+    TEST_ASSERT(r.has_top_k && r.top_k == 40);
+    TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
+    TEST_ASSERT(!r.has_min_p && r.min_p == DS4_DEFAULT_MIN_P);
+    request_free(&r);
+
+    /* Responses: temperature/top_p */
+    TEST_ASSERT(parse_responses_request(engine, NULL,
+        "{\"input\":\"hi\",\"temperature\":0.35,\"top_p\":0.9}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
+    TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
+    TEST_ASSERT(!r.has_top_k && !r.has_min_p);
+    request_free(&r);
+
+    /* Legacy completions: all four knobs; explicit values EQUAL to the
+     * defaults must still be flagged as client-sent */
+    TEST_ASSERT(parse_completion_request(engine,
+        "{\"prompt\":\"hi\",\"temperature\":1.0,\"top_k\":0,"
+        "\"top_p\":1.0,\"min_p\":0.05}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_temperature && r.temperature == DS4_DEFAULT_TEMPERATURE);
+    TEST_ASSERT(r.has_top_k && r.top_k == 0);
+    TEST_ASSERT(r.has_top_p && r.top_p == DS4_DEFAULT_TOP_P);
+    TEST_ASSERT(r.has_min_p && r.min_p == DS4_DEFAULT_MIN_P);
+    request_free(&r);
+}
+
+
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -2435,6 +2502,7 @@ static const ds4_test_entry test_entries[] = {
     {"--short-prefill-ratio4", "short-prefill-ratio4", "ratio-4 short prefill regression", test_short_prefill_ratio4},
     {"--f16-kernels", "f16-kernels", "isolated F16 matmul kernel numeric regressions", test_f16_kernel_group},
     {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
+    {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
 #endif
     {"--sampler", "sampler", "sampler byte-exactness vs pre-radix reference", test_sampler_dist_equivalence},
     {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},

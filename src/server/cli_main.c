@@ -1749,7 +1749,106 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(!r.has_temperature);
+    TEST_ASSERT(!r.has_top_k);
+    TEST_ASSERT(!r.has_top_p);
+    TEST_ASSERT(!r.has_min_p);
     request_free(&r);
+}
+
+
+
+static void check_resolved_sampling(const request *r, float want_temp,
+                                    int want_top_k, float want_top_p,
+                                    float want_min_p) {
+    float temperature = -1.0f, top_p = -1.0f, min_p = -1.0f;
+    int top_k = -1;
+    gen_resolve_sampling(r, &temperature, &top_k, &top_p, &min_p);
+    TEST_ASSERT(temperature == want_temp);
+    TEST_ASSERT(top_k == want_top_k);
+    TEST_ASSERT(top_p == want_top_p);
+    TEST_ASSERT(min_p == want_min_p);
+}
+
+/* The sampling contract: engine defaults apply only to parameters the request
+ * left absent; anything the client sent explicitly reaches the sampler as-is,
+ * including values that happen to equal the defaults. Exercises
+ * gen_resolve_sampling (generate.c) over the full matrix of
+ * {absent, explicit-nondefault, explicit-equal-to-default} per parameter,
+ * with thinking on and off. "Absent" is simulated exactly as the parser
+ * leaves it: request_init's default value with the has_ flag false. */
+static void test_think_sampling_respects_explicit_params(void) {
+    const ds4_think_mode modes[2] = {DS4_THINK_HIGH, DS4_THINK_NONE};
+    for (int m = 0; m < 2; m++) {
+        for (int p = 0; p < 4; p++) {      /* param under test */
+            for (int st = 0; st < 3; st++) { /* 0 absent, 1 explicit-nondefault,
+                                              * 2 explicit-equal-to-default */
+                request r;
+                request_init(&r, REQ_CHAT, 128);
+                r.think_mode = modes[m];
+                float want_temp = DS4_DEFAULT_TEMPERATURE;
+                int want_top_k = 0;
+                float want_top_p = DS4_DEFAULT_TOP_P;
+                float want_min_p = DS4_DEFAULT_MIN_P;
+                if (st != 0) {
+                    switch (p) {
+                    case 0:
+                        r.has_temperature = true;
+                        r.temperature = st == 1 ? 0.35f : DS4_DEFAULT_TEMPERATURE;
+                        want_temp = r.temperature;
+                        break;
+                    case 1:
+                        r.has_top_k = true;
+                        r.top_k = st == 1 ? 40 : 0;
+                        want_top_k = r.top_k;
+                        break;
+                    case 2:
+                        r.has_top_p = true;
+                        r.top_p = st == 1 ? 0.9f : DS4_DEFAULT_TOP_P;
+                        want_top_p = r.top_p;
+                        break;
+                    case 3:
+                        r.has_min_p = true;
+                        r.min_p = st == 1 ? 0.0f : DS4_DEFAULT_MIN_P;
+                        want_min_p = r.min_p;
+                        break;
+                    }
+                }
+                check_resolved_sampling(&r, want_temp, want_top_k,
+                                        want_top_p, want_min_p);
+                request_free(&r);
+            }
+        }
+
+        /* Explicit temperature EQUAL to the default alongside explicit
+         * non-default knobs: the case the old value-only check could not
+         * express — with thinking on it clobbered all four; the explicit
+         * knobs must survive. */
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.think_mode = modes[m];
+        r.temperature = DS4_DEFAULT_TEMPERATURE;
+        r.has_temperature = true;
+        r.top_k = 40;
+        r.has_top_k = true;
+        r.top_p = 0.9f;
+        r.has_top_p = true;
+        r.min_p = 0.0f;
+        r.has_min_p = true;
+        check_resolved_sampling(&r, DS4_DEFAULT_TEMPERATURE, 40, 0.9f, 0.0f);
+
+        /* Explicit temperature==0 (others absent): greedy decode must reach
+         * the sampler so DSpark speculative decode can engage. */
+        request greedy;
+        request_init(&greedy, REQ_CHAT, 128);
+        greedy.think_mode = modes[m];
+        greedy.temperature = 0.0f;
+        greedy.has_temperature = true;
+        check_resolved_sampling(&greedy, 0.0f, 0, DS4_DEFAULT_TOP_P,
+                                DS4_DEFAULT_MIN_P);
+        request_free(&greedy);
+        request_free(&r);
+    }
 }
 
 
@@ -4988,6 +5087,7 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();
     test_request_defaults_use_min_p_filtering();
+    test_think_sampling_respects_explicit_params();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
