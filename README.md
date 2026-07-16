@@ -185,25 +185,35 @@ full flag list, and start serving with:
 ## Speed
 
 Performance is measured on this fork's target hardware — a **DGX Spark GB10**
-running the ~91 GB REAP-pruned MXFP8/IQ2 Flash build — with `tool-eval-bench`
-performance runs. Decode is bandwidth-bound and stays flat as context
-grows; prefill tapers slowly as the long-context indexer scan grows; the
-DSpark speculative drafter lifts decode well above the single-stream baseline
-at every temperature.
+running the ~91 GB REAP-pruned MXFP8/IQ2 Flash build. Prefill is measured
+**cold** (no prefix-cache reuse — a warm cache reports arbitrarily high
+prompt-processing rates and is not a real prefill number); decode is measured
+with the merged DSpark speculative drafter, single stream.
 
-| Context depth | Prefill (t/s) | Decode (t/s, speculative) |
+| Context | Prefill (t/s, cold) | Decode (t/s, speculative) |
 | ---: | ---: | ---: |
-| 2k | ~306 | 16.5 |
-| 8k | ~289 | 16.5 |
+| ~2k | ~370-410 | ~20 structured / ~17 prose |
+| ~8k | ~355 | ~16 structured / ~15 prose |
 
-Measured on the shipped v5mx build (`ds4-bench` prefill sweep, single stream).
-Decode is measured with the merged DSpark drafter on structured/tool workloads,
-where draft acceptance holds at α = 77.2%, and is flat with context depth out to
-8k. Prefill runs ~290-306 t/s: the byte-lossless MXFP4 rich-expert layers are
-~4.25 bpw versus the ~2 bpw floor, so they read ~2x the weight bytes and set the
-prefill rate. (A uniform 2-bit build prefills faster, ~390-420 t/s, but scores
-lower on quality — the measured allocation trades some prefill for the +8-point
-tool-use win.)
+Prefill runs ~360-410 t/s cold and tapers slowly with context as the
+long-context indexer scan grows. The MXFP4 rich-expert layers (~4.25 bpw versus
+the ~2 bpw floor) read ~2x the weight bytes and set the prefill rate; an
+expert-tiled big-batch kernel keeps each decoded weight resident across a wide
+token tile so its decode cost amortizes across the batch. (A uniform 2-bit build
+prefills faster, ~420 t/s, but scores lower on quality — the measured allocation
+trades some prefill for the tool-use win: 92 vs 84 on hard-mode tool-eval-bench.)
+
+Decode is **not** flat with context on the speculative path: both effective t/s
+and draft acceptance decline as context grows (α ~77% on structured/tool output
+at shallow context, ~60% by 8k), because the drafter predicts a longer prompt
+less well; the speedup is largest on structured/tool workloads where acceptance
+is highest. Plain (non-speculative) decode is roughly flat and bandwidth-bound;
+speculation is a speedup layered on top. It never changes the output
+distribution — exact sampled acceptance at all temperatures — so it is a pure
+speed knob, not a quality one. (Prefill is measured with the `ds4-bench` cold
+sweep and `tool-eval-bench --perf-only --benchy-args='--no-cache'`; decode with
+`tool-eval-bench --spec-bench` on the server's own wall-clock. Speculative t/s
+is stochastic run-to-run under sampling; the numbers above are `--temp 0`.)
 
 ## Model residency
 
@@ -275,15 +285,22 @@ The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
-Request parsing and sockets run in client threads, but inference itself is
-serialized through one graph worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session. That is the supported release scope: **one live session at
-a time**, with a context you can size up to the model's 1M-token limit.
-Two guardrails keep a misbehaving client from wedging the server: concurrent
-client connections are capped (64; connections over the cap get an immediate
-503 instead of piling up threads), and a whole-request read deadline (30
-seconds) drops clients that never finish sending their request.
+Request parsing and sockets run in client threads; inference runs on one graph
+worker. The server serves **multiple concurrent sessions**, time-sliced on that
+single engine lane: a small pool of live sessions is admitted against a measured
+KV/VRAM budget, scheduled round-robin at a decode-quantum granularity, and
+evicted least-recently-used — snapshotting to a disk KV cache so a returning
+client resumes instead of re-prefilling. Sessions do **not** yet share a batched
+decode step (that is a planned throughput feature), so aggregate decode is
+roughly the single-stream rate divided across active sessions, while concurrent
+prefills overlap and scale. On the ~128 GB GB10 with ~85 GB of resident weights,
+roughly three concurrent sessions fit at a large context; each session's context
+can be sized up to the model's 1M-token limit, and requests beyond the admission
+budget queue or are refused rather than driving the box out of memory.
+Two further guardrails keep a misbehaving client from wedging the server:
+concurrent client connections are capped (64; connections over the cap get an
+immediate 503 instead of piling up threads), and a whole-request read deadline
+(30 seconds) drops clients that never finish sending their request.
 
 Supported endpoints:
 
@@ -876,11 +893,13 @@ Model Weights and Speed above); it is no longer a near-term roadmap item.
 
 ### Longer term
 
-- **Multi-session serving.** The supported scope today is one live session
-  at a time. First a session pool with round-robin scheduling and KV-budget
-  admission control; later, batched multi-session decode. Decode is
-  weight-bandwidth-bound, so co-scheduled sessions share a single read of
-  the weights and aggregate throughput should scale near-linearly.
+- **Batched multi-session decode.** Concurrent sessions are served today by
+  time-slicing one engine lane (a session pool with round-robin scheduling,
+  KV-budget admission control, and LRU eviction to a disk KV cache). The next
+  step is a batched decode step so co-scheduled sessions share a single read of
+  the weights: decode is weight-bandwidth-bound, so aggregate throughput should
+  scale toward ~N× (early engine-level measurements show ~1.7× at three
+  sessions before it saturates).
 - **MXFP6 tensor-core paths**, if measured demand holds. MXFP6 (E2M3) is
   expected to beat `Q6_K` on quality-per-byte for FP8-source tensors.
 - **MoE verify-microbatch routing audit.** Verify batches are only a few
