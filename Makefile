@@ -35,7 +35,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-prefill-gate cuda-prefill-gate-baseline
 
 all: help
 
@@ -51,6 +51,12 @@ help:
 	@echo "  make cuda-multiseq-gate-nodspark"
 	@echo "                           The same gate with speculation disabled"
 	@echo "                           (--no-dspark config; needs the model)"
+	@echo "  make cuda-prefill-gate   Prefill bit-exactness gate: full-vocab frontier"
+	@echo "                           logits byte-compared against a baseline build"
+	@echo "                           (needs the model + a baseline blob)"
+	@echo "  make cuda-prefill-gate-baseline"
+	@echo "                           Build the baseline blob from PREFILL_BASELINE_REF"
+	@echo "                           in a git worktree (needs the model)"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -98,6 +104,55 @@ cuda-multiseq-gate: tests/multiseq_decode_gate
 cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
 	DS4_MSEQ_BANKS=2 DS4_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
 
+# Prefill bit-exactness gate (the D2R acceptance gate; see the header of
+# tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,
+# not part of `make test`.  Discipline before running: no ds4-server/ds4_test
+# process, `sync; echo 3 > /proc/sys/vm/drop_caches`, check `free -g` headroom
+# (the model is ~87 GB).  The GPU is shared: hold temp/gpu.lock.
+#
+# Two-step, and the baseline is the slow half:
+#   1. `make cuda-prefill-gate-baseline`  — ONCE per baseline ref.  Checks out
+#      PREFILL_BASELINE_REF into a detached worktree, copies THIS tree's gate
+#      source + Makefile into it (the harness must be identical; only the
+#      engine/kernels may differ), builds there, and dumps the blob.
+#   2. `make cuda-prefill-gate`           — after every D2R increment.
+# Each step loads the model once (~35 s) and prefills 2*(512+2048+4096) tokens.
+PREFILL_BASELINE_REF ?= 8aa9d35
+PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
+PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
+# The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
+# worktree; normalise the expected ref through the same abbreviation so the
+# provenance compare is not defeated by a differing --short length.
+PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_REF) 2>/dev/null || echo $(PREFILL_BASELINE_REF))
+
+# Both sides of a byte-compare must be built for the SAME arch, so pin sm_120f
+# here exactly as the baseline sub-make does.  (Objects do not encode the arch,
+# so a tree previously built at another arch needs a `make clean` first — the
+# same caveat cuda-spark sidesteps with -B.)  The .o is forced so the embedded
+# DS4_GATE_BUILD_REF always reflects the current HEAD.
+cuda-prefill-gate:
+	$(MAKE) -B tests/prefill_bitexact_gate.o CUDA_ARCH=sm_120f
+	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
+	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
+		$(PREFILL_BASELINE_REF_SHORT)
+
+# NOTE: `git worktree add` does not populate submodules, so the baseline build
+# is pointed at THIS tree's CUTLASS pin (a header-only include path).
+cuda-prefill-gate-baseline:
+	git worktree remove --force $(PREFILL_BASELINE_WT) 2>/dev/null || true
+	rm -rf $(PREFILL_BASELINE_WT)
+	git worktree prune
+	git worktree add --detach $(PREFILL_BASELINE_WT) $(PREFILL_BASELINE_REF)
+	cp tests/prefill_bitexact_gate.c $(PREFILL_BASELINE_WT)/tests/
+	cp Makefile $(PREFILL_BASELINE_WT)/
+	cp tests/long_context_story_prompt.txt $(PREFILL_BASELINE_WT)/tests/
+	$(MAKE) -C $(PREFILL_BASELINE_WT) tests/prefill_bitexact_gate \
+		CUDA_ARCH=sm_120f CUTLASS_DIR=$(abspath $(CUTLASS_DIR))
+	cd $(PREFILL_BASELINE_WT) && ./tests/prefill_bitexact_gate $(abspath $(FRONTIER_MODEL)) \
+		--dump $(abspath $(PREFILL_BASELINE))
+	git worktree remove --force $(PREFILL_BASELINE_WT)
+	@echo "baseline ($(PREFILL_BASELINE_REF)) -> $(PREFILL_BASELINE)"
+
 src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
 
@@ -131,6 +186,17 @@ tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.c src/engine/ds4_en
 tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.c
 
+# Public-API only (ds4.h): the gate must build unchanged against the baseline
+# ref's tree, so it must not depend on engine internals that may have drifted.
+# DS4_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
+# a baseline re-dumped from the tree under test cannot pass vacuously (see the
+# file header).  cuda-prefill-gate force-rebuilds this object so the stamp is
+# never stale.
+GATE_BUILD_REF := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+tests/prefill_bitexact_gate.o: tests/prefill_bitexact_gate.c src/ds4.h
+	$(CC) $(CFLAGS) $(DS4_INC) -DDS4_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' \
+		-c -o $@ tests/prefill_bitexact_gate.c
+
 src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
 
@@ -148,6 +214,9 @@ tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/ds4_help.o 
 tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
@@ -158,4 +227,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate
