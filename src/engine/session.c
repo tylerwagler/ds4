@@ -2565,25 +2565,32 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     uint32_t K = s->dspark_n_pending;
     if (K > 16u) K = 16u;
     if (K && s->dspark_pending_base != (int32_t)first_token) K = 0;
-    /* Position guard: the drafts are only valid at the exact position they were
-     * produced at. dspark_pending_base is a token VALUE, so a plain eval that
-     * advances the session (tool injection, </think> recovery) followed by a
-     * first_token that happens to collide with it would otherwise resurrect
-     * drafts — and their q — from the old position. Mirrors carry_pos_match.
-     * (checkpoint.len is still the drafting-step value here: this runs before
-     * the first_token push below.) */
+    /* Position guard — ACCEPTANCE, not exactness. The drafts were conditioned on
+     * the old position; dspark_pending_base is a token VALUE, so a plain eval
+     * that advances the session (tool injection, </think> recovery) followed by
+     * a first_token that happens to collide with it would otherwise resurrect
+     * them. Dropping them is a throughput choice: a draft conditioned on the
+     * wrong position is near-worthless and would just burn a verify row. It is
+     * NOT what keeps the output exact — both accept rules are proposal-agnostic
+     * (see the walk below), so q_oldpos is still exactly the distribution the
+     * draft was drawn from and the rule still yields p at the new position.
+     * Mirrors carry_pos_match. (checkpoint.len is still the drafting-step value
+     * here: this runs before the first_token push below.) */
     if (K && s->dspark_pending_pos != (int32_t)s->checkpoint.len) K = 0;
-    /* Params guard (temperature-matched drafts). The base-token check above is
-     * NOT sufficient once drafts are SAMPLED: a draft drawn from q under params
-     * X carries a stored q(pend[i]) that is only the correct accept denominator
-     * under X. Verifying it under params Y would form p_Y/q_X — a ratio of two
-     * different distributions — and silently break exactness (the emitted
-     * stream stays plausible, so nothing downstream would notice). Mirrors the
-     * spec_carry_* params guard in ds4_session_generate_speculative.
+    /* Params guard — also acceptance, not exactness. Drafts drawn under params X
+     * and verified under params Y are still verified EXACTLY: the residual
+     * rebuilds q under the stored params X (see the walk below), so the accept
+     * denominator and the residual name one proposal q_X, and the p/q rule
+     * returns exactly p_Y for any q. What a param change costs is acceptance —
+     * q_X is a poor proposal for p_Y — so we drop them and draft afresh.
+     * Mirrors the spec_carry_* params guard in ds4_session_generate_speculative.
      *
-     * Greedy drafts (dspark_pending_sampled == false) carry no q and are
-     * verified by argmax equality, but the params still gate them: a temp<=0 ->
-     * temp>0 change must not feed argmax proposals to the p/q rule. */
+     * The same holds for argmax drafts (dspark_pending_sampled == false), which
+     * carry no q: a temp<=0 -> temp>0 change cannot misroute them, because the
+     * walk picks its rule from pend_sampled, not from the live temperature, so
+     * they still meet the deterministic rule — itself exact for an arbitrary
+     * proposal. The guard just keeps a badly-matched proposal from wasting a
+     * row. */
     const bool pending_params_match =
         s->dspark_pending_temp == temperature && s->dspark_pending_top_k == top_k &&
         s->dspark_pending_top_p == top_p && s->dspark_pending_min_p == min_p;
@@ -2704,16 +2711,23 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                 continue;
             }
             if (pend_sampled) {
-                /* Rebuild THIS position's q from the refined-logits row stored
-                 * at draft time. Bit-identical to the draft-time q: dist_build
-                 * is pure and both the row and the params are persisted
-                 * verbatim (never recomputed from live drafter state, which has
-                 * advanced). Only the one rejecting position pays this — the
-                 * walk stops here. */
+                /* Rebuild THIS position's q from the refined-logits row AND the
+                 * params stored at draft time. Both halves of the rule must name
+                 * the SAME proposal: the accept denominator above is the stored
+                 * scalar q(pend[i]) computed under the draft-time params, so the
+                 * residual's q must be rebuilt under those params too — not the
+                 * live ones. dist_build is pure, so feeding it the persisted row
+                 * + the persisted params reproduces the draft-time q bit-exactly,
+                 * by construction rather than by the params guard's coincidence
+                 * (never recomputed from live drafter state, which has advanced).
+                 * Only the one rejecting position pays this — the walk stops
+                 * here. */
                 ds4_sample_dist qd;
                 ds4_sample_dist_build(s->dspark_pending_qrows +
                                           (size_t)commit * DS4_N_VOCAB,
-                                      DS4_N_VOCAB, temperature, top_k, top_p, min_p,
+                                      DS4_N_VOCAB, s->dspark_pending_temp,
+                                      s->dspark_pending_top_k, s->dspark_pending_top_p,
+                                      s->dspark_pending_min_p,
                                       &s->sample_scratch, &qd);
                 /* Holding two dists over one scratch is safe by dist_build's
                  * aliasing contract: out->ids/probs never point into scratch. */
@@ -3087,10 +3101,15 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     s->dspark_pending_base = (int32_t)next_base;
     s->dspark_n_pending = keep;
     for (uint32_t i = 0; i < keep; i++) s->dspark_pending[i] = refined[i + 1];
-    /* The proposal rule and the exact params these drafts were sampled under —
-     * next step's params guard compares against these, and the verify walk
-     * picks its accept rule from the flag. dspark_pending_q[] and the qrows
-     * pool were filled in the drafting loop above. */
+    /* The proposal rule and the exact params these drafts were sampled under.
+     * Stamped unconditionally, in the same straight-line block as
+     * dspark_n_pending above — this is the only site that makes pendings
+     * non-zero, so a populated dspark_pending_q[]/qrows pool (filled in the
+     * drafting loop above, under sample_drafts) always has its params alongside
+     * it. Three consumers: the verify walk picks its accept rule from the flag,
+     * next step's params guard compares against the params, and — load-bearing —
+     * the residual rebuilds q from the qrows under THESE params, so the stored
+     * accept denominator and the residual describe one proposal. */
     s->dspark_pending_sampled = sample_drafts;
     s->dspark_pending_pos = (int32_t)s->checkpoint.len;
     s->dspark_pending_temp = temperature;

@@ -1311,17 +1311,24 @@ struct ds4_session {
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
     int32_t dspark_pending_base;
-    /* checkpoint.len the drafts were produced at. The base-token check above is
-     * a VALUE check, not an identity check: a plain ds4_session_eval (tool
-     * injection, think-tag recovery) advances the session and clears the carry
-     * but leaves the pendings, so a later first_token that merely COLLIDES with
+    /* checkpoint.len the drafts were produced at — an ACCEPTANCE guard, not an
+     * exactness guard. The base-token check above is a VALUE check, not an
+     * identity check: a plain ds4_session_eval (tool injection, think-tag
+     * recovery) advances the session and clears the carry but leaves the
+     * pendings, so a later first_token that merely COLLIDES with
      * dspark_pending_base would resurrect drafts conditioned on a different
-     * position. That was harmless while proposals were verified by the
-     * deterministic rule — which is exact for an ARBITRARY proposal and never
-     * reads where it came from, so a stale draft only cost acceptance. Under
-     * p/q it is fatal: q must be the distribution the draft was actually drawn
-     * from, and p_newpos/q_oldpos is a ratio of unrelated distributions that
-     * biases the output silently. Mirrors spec_carry_pos. */
+     * position.
+     *
+     * Do NOT read this as an exactness guard and do NOT delete it on the grounds
+     * that it isn't one. Both accept rules are PROPOSAL-AGNOSTIC: they are exact
+     * for an arbitrary proposal and never read where it came from. q_oldpos IS
+     * the distribution the stale draft was actually drawn from, so p_newpos/q_oldpos
+     * is a perfectly valid ratio and the rule still emits exactly p_newpos — the
+     * draft simply won't get accepted very often. That was true of the
+     * deterministic rule (which is why staleness was benign before Item 1) and it
+     * stays true under p/q. The cost of staleness is throughput; we drop stale
+     * pendings because a draft conditioned on the wrong position is a wasted
+     * verify row. Mirrors spec_carry_pos. */
     int32_t dspark_pending_pos;
     /* Speculative-sampling carry: the next base token, already drawn from the
      * request's filtered distribution (bonus draw on full accept, residual
@@ -1367,9 +1374,13 @@ struct ds4_session {
      * rejects rebuilds its q via ds4_sample_dist_build.
      *
      * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
-     * q: dist_build is a pure function of (logits, params) and both are stored
-     * verbatim. What must never happen is recomputing q from live drafter state
-     * (which has advanced by then) — that is the "possibly-drifted state" trap.
+     * q: dist_build is a pure function of (logits, params), and the rebuild is
+     * handed BOTH persisted halves — this row and dspark_pending_temp/top_k/
+     * top_p/min_p below. Feeding it either half from live state is the trap: the
+     * live drafter state has advanced, and the live REQUEST params may differ
+     * from the draft-time ones, which would leave the stored accept denominator
+     * dspark_pending_q[i] (computed under the draft-time params) and the
+     * residual's q describing two different proposals inside one rule.
      *
      * Device-first note (Item 2): storing the logits ROW + params rather than a
      * materialized nucleus is deliberate — the GPU accept kernel wants exactly
@@ -1377,9 +1388,18 @@ struct ds4_session {
      * reshaping the format. */
     float *dspark_pending_qrows;
     uint32_t dspark_pending_qrows_cap;   /* floats reserved */
-    /* The sampling params the pendings were sampled under. Drafts sampled under
-     * params X are INVALID if verify runs under params Y — the p/q ratio would
-     * divide by a q from the wrong distribution and break exactness silently.
+    /* The sampling params the pendings were sampled under. TWO consumers, and
+     * they are different in kind:
+     *   1) EXACTNESS (load-bearing): the verify walk rebuilds the rejecting
+     *      position's q from dspark_pending_qrows using THESE params, so the
+     *      stored accept denominator dspark_pending_q[i] and the residual's q
+     *      name the same proposal q_X by construction. This is why the rebuild
+     *      must never be fed the live request params.
+     *   2) THROUGHPUT (the guard in the verify path): drafts sampled under X and
+     *      verified under Y are still exact — the rule is proposal-agnostic and
+     *      returns exactly p_Y for any q — but q_X is a badly-matched proposal
+     *      for p_Y, so acceptance craters. The guard drops them to avoid wasting
+     *      verify rows, not to avoid bias.
      * Mirrors the spec_carry_* params guard. Greedy never needed this. */
     float dspark_pending_temp, dspark_pending_top_p, dspark_pending_min_p;
     int   dspark_pending_top_k;

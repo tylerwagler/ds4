@@ -56,7 +56,12 @@
  *
  * MODEL-DEPENDENT — needs the merged drafter gguf and ~95 GB free. Run:
  *   make cuda-spec-sampling-gate                  (defaults to gguf/model.gguf)
- *   ./tests/spec_sampling_gate <model.gguf> [temp] [filler_tokens]
+ *   ./tests/spec_sampling_gate <model.gguf> [temp] [filler_tokens] [traj] \
+ *                              [top_p] [dump_path]
+ * Defaults: temp 0.95, filler 0, traj 2500 (clamped to [1,TRAJ]), top_p 0.95,
+ * dump off. top_p is not a knob to turn down casually — see the note at its
+ * parse below; too low makes the nucleus a single token and the chi-square
+ * passes vacuously.
  */
 #include <math.h>
 #include <stdio.h>
