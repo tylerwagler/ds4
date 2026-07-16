@@ -106,20 +106,16 @@ def main():
     X, y, R = [], [], []
     steps = []   # (x_start, nd, commit_capped, req) for prefix-trim simulation
     gen = []     # generating manifest entries, request-order, across runs
+    from spec_stats import parse_requests
     for rd in args.run_dir:
         recs = parse_dump(os.path.join(rd, "dump.bin"))
-        lines = parse_log(os.path.join(rd, "server.log"))
+        segs = [s for s in parse_requests(os.path.join(rd, "server.log")) if s]
+        lines = [l for s in segs for l in s]
+        req_id = [i for i, s in enumerate(segs) for _ in s]
         print(f"{rd}: {len(recs)} dump records (n_draft={recs[0][0]}), "
               f"{len(lines)} fused stats lines")
         assert len(lines) == len(recs), f"line/record mismatch: {len(lines)} vs {len(recs)}"
-
-        # request segmentation: a request starts where n_batch==1
-        req_id, cur = [], -1
-        for nb, _, _, _ in lines:
-            if nb == 1:
-                cur += 1
-            req_id.append(max(cur, 0))
-        n_req = req_id[-1] + 1
+        n_req = len(segs)
 
         manifest = [json.loads(l) for l in open(os.path.join(rd, "manifest.jsonl"))]
         rgen = [e for e in manifest if e["status"] == "ok" and e["completion_tokens"] >= 1]

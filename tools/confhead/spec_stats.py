@@ -23,6 +23,23 @@ def parse(path):
         out.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))))
     return out
 
+def parse_requests(path):
+    """Fused lines grouped per request, delimited by the server's own
+    'completion ... prompt start' markers. n_batch==1 is NOT a request
+    boundary: pending drafts also reset mid-request (e.g. the periodic disk-KV
+    checkpoint store), which run1 measured at ~17 extra n_batch==1 steps
+    across 48 requests."""
+    segs, cur = [], None
+    for line in open(path):
+        if "ds4-server: completion" in line and "prompt start" in line:
+            cur = []
+            segs.append(cur)
+            continue
+        m = RX.search(line)
+        if m and cur is not None:
+            cur.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))))
+    return segs
+
 def agg(lines):
     if not lines:
         return None

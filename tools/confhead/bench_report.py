@@ -10,19 +10,12 @@ Usage: bench_report.py <out_dir> [<out_dir2> ...]   (each dir from bench.sh)
 import json, os, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from spec_stats import parse, agg
+from spec_stats import parse_requests, agg
 
 def leg(d):
-    lines = parse(os.path.join(d, "server.log"))
     manifest = [json.loads(l) for l in open(os.path.join(d, "manifest.jsonl"))]
     gen = [e for e in manifest if e["status"] == "ok" and e["completion_tokens"] >= 1]
-    segs, seg = [], []
-    for l in lines:
-        if l[0] == 1 and seg:
-            segs.append(seg); seg = []
-        seg.append(l)
-    if seg:
-        segs.append(seg)
+    segs = [s for s in parse_requests(os.path.join(d, "server.log")) if s]
     if len(segs) != len(gen):
         print(f"WARNING {d}: {len(segs)} segments vs {len(gen)} ok requests", file=sys.stderr)
     cells = {}
