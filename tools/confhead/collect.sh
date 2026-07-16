@@ -19,10 +19,11 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
-OUT="${1:?usage: collect.sh <out_dir> [model] [port]}"
+OUT="${1:?usage: collect.sh <out_dir> [model] [port] [ctx] [driver args...]}"
 MODEL="${2:-gguf/ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf}"
 PORT="${3:-8077}"
 CTX="${4:-36864}"
+shift $(( $# < 4 ? $# : 4 ))
 mkdir -p "$OUT"
 
 if pgrep -x ds4-server >/dev/null; then
@@ -78,7 +79,7 @@ fi
 echo "ready after ${i}s"
 
 python3 tools/confhead/collect_driver.py --port "$PORT" \
-    --manifest "$OUT/manifest.jsonl" > "$OUT/driver.log" 2>&1
+    --manifest "$OUT/manifest.jsonl" "$@" > "$OUT/driver.log" 2>&1
 RC=$?
 
 kill -INT "$SRV" 2>/dev/null

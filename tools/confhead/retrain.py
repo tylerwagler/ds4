@@ -84,14 +84,13 @@ def ece(conf, yy, nbins=10):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--run-dir", required=True, nargs="+")
     ap.add_argument("--gguf", default="gguf/dspark-conf3-v1.gguf")
     ap.add_argument("--out", default=None)
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--lam", type=float, default=1e-3)
     args = ap.parse_args()
-    rd = args.run_dir
-    out = args.out or os.path.join(rd, "proj_new.npy")
+    out = args.out or os.path.join(args.run_dir[0], "proj_new.npy")
 
     proj0, pdims = read_f32(args.gguf, "dspark.2.confidence_head.proj.weight")
     mkw, mdims = read_f32(args.gguf, "dspark.2.markov_head.markov_w1.weight")
@@ -100,40 +99,53 @@ def main():
     mkw = mkw.reshape(vocab, MK)
     print(f"shipped proj [4352] from {args.gguf}, markov_w1 ({vocab},{MK})")
 
-    recs = parse_dump(os.path.join(rd, "dump.bin"))
-    lines = parse_log(os.path.join(rd, "server.log"))
-    print(f"{len(recs)} dump records (n_draft={recs[0][0]}), {len(lines)} fused stats lines")
-    assert len(lines) == len(recs), f"line/record mismatch: {len(lines)} vs {len(recs)}"
-
-    # request segmentation: a request starts where n_batch==1
-    req_id, cur = [], -1
-    for nb, _, _, _ in lines:
-        if nb == 1:
-            cur += 1
-        req_id.append(max(cur, 0))
-    n_req = req_id[-1] + 1
-
-    manifest = [json.loads(l) for l in open(os.path.join(rd, "manifest.jsonl"))]
-    gen = [e for e in manifest if e["status"] == "ok" and e["completion_tokens"] >= 1]
-    print(f"{n_req} request segments in log, {len(gen)} generating manifest entries")
-    assert n_req == len(gen), "manifest/segment mismatch -- cannot attribute regimes"
-
     def depth_bucket(pt):
         return "1k" if pt < 2500 else "8k" if pt < 16000 else "30k"
 
-    # ---- build the labeled dataset ----
+    # ---- build the labeled dataset across run dirs ----
     X, y, R = [], [], []
     steps = []   # (x_start, nd, commit_capped, req) for prefix-trim simulation
-    for r in range(len(recs) - 1):
-        nd, rid, ffn = recs[r]
-        nb1, c1 = lines[r + 1][0], lines[r + 1][1]
-        if nb1 != 1 + lines[r][2] and nb1 != 1 + nd:
-            continue
-        steps.append((len(y), nd, min(c1, nd), req_id[r]))
-        for i in range(nd):
-            X.append(np.concatenate([ffn[i], mkw[int(rid[i])]]))
-            y.append(1.0 if c1 > i else 0.0)
-            R.append(req_id[r])
+    gen = []     # generating manifest entries, request-order, across runs
+    for rd in args.run_dir:
+        recs = parse_dump(os.path.join(rd, "dump.bin"))
+        lines = parse_log(os.path.join(rd, "server.log"))
+        print(f"{rd}: {len(recs)} dump records (n_draft={recs[0][0]}), "
+              f"{len(lines)} fused stats lines")
+        assert len(lines) == len(recs), f"line/record mismatch: {len(lines)} vs {len(recs)}"
+
+        # request segmentation: a request starts where n_batch==1
+        req_id, cur = [], -1
+        for nb, _, _, _ in lines:
+            if nb == 1:
+                cur += 1
+            req_id.append(max(cur, 0))
+        n_req = req_id[-1] + 1
+
+        manifest = [json.loads(l) for l in open(os.path.join(rd, "manifest.jsonl"))]
+        rgen = [e for e in manifest if e["status"] == "ok" and e["completion_tokens"] >= 1]
+        print(f"  {n_req} request segments, {len(rgen)} generating manifest entries")
+        assert n_req == len(rgen), "manifest/segment mismatch -- cannot attribute regimes"
+        # effective temperature: with thinking on (run1 predates the think
+        # field) the server forces temp>0 requests to the thinking defaults
+        # (temp 1.0) -- label the regime by what actually ran.
+        for e in rgen:
+            if e.get("think", "on") == "on" and e["temperature"] > 0:
+                e["eff_temp"] = 1.0
+            else:
+                e["eff_temp"] = e["temperature"]
+        base = len(gen)
+        gen.extend(rgen)
+
+        for r in range(len(recs) - 1):
+            nd, rid, ffn = recs[r]
+            nb1, c1 = lines[r + 1][0], lines[r + 1][1]
+            if nb1 != 1 + lines[r][2] and nb1 != 1 + nd:
+                continue
+            steps.append((len(y), nd, min(c1, nd), base + req_id[r]))
+            for i in range(nd):
+                X.append(np.concatenate([ffn[i], mkw[int(rid[i])]]))
+                y.append(1.0 if c1 > i else 0.0)
+                R.append(base + req_id[r])
     X = np.stack(X).astype(np.float32)
     y = np.array(y, np.float32)
     R = np.array(R)
@@ -141,19 +153,20 @@ def main():
 
     # regime arrays per position
     ent = [gen[r] for r in R]
-    sampled = np.array([e["temperature"] > 0 for e in ent])
     depth = np.array([depth_bucket(e["prompt_tokens"]) for e in ent])
     workload = np.array([e["workload"] for e in ent])
     variant = np.array([e["variant"] for e in ent])
-    temp = np.array([e["temperature"] for e in ent])
+    temp = np.array([e["eff_temp"] for e in ent])
+    sampled = temp > 0
 
+    all_temps = sorted(set(temp.tolist()))
     print("\n=== collection mix (labeled positions per cell, accept rate) ===")
     for w in ("prose", "code", "structured"):
         for d in ("1k", "8k", "30k"):
             row = []
-            for t in (0.0, 0.7, 0.95):
+            for t in all_temps:
                 m = (workload == w) & (depth == d) & (temp == t)
-                row.append(f"t{t}: {m.sum():5d}/{y[m].mean():5.1%}" if m.sum() else f"t{t}:     0")
+                row.append(f"t{t:g}: {m.sum():5d}/{y[m].mean():5.1%}" if m.sum() else f"t{t:g}: 0")
             print(f"  {w:10s} {d:3s}  " + "  ".join(row))
 
     # held-out = prompt variant 1 (no request overlap, every cell on both sides)
@@ -226,9 +239,9 @@ def main():
     print("tau  | regime            | keep  | tokens kept | rows saved/step")
     step_te = [(s0, nd, cm, gen[rq]) for (s0, nd, cm, rq) in steps if gen[rq]["variant"] == 1]
     for tau in TAUS:
-        for rname, sel in (("greedy", lambda e: e["temperature"] == 0),
-                           ("sampled", lambda e: e["temperature"] > 0),
-                           ("sampled@30k", lambda e: e["temperature"] > 0 and
+        for rname, sel in (("greedy", lambda e: e["eff_temp"] == 0),
+                           ("sampled", lambda e: e["eff_temp"] > 0),
+                           ("sampled@30k", lambda e: e["eff_temp"] > 0 and
                             depth_bucket(e["prompt_tokens"]) == "30k")):
             ks, kept, tot_c, saved = [], 0, 0, 0
             for (s0, nd, cm, e) in step_te:

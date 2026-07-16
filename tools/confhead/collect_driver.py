@@ -23,10 +23,11 @@ import argparse, glob, json, os, random, sys, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# chars-per-token estimates by workload (validated against usage in the manifest)
-CPT = {"prose": 3.6, "code": 3.0, "structured": 2.9}
+# chars-per-token estimates by workload (validated against usage in the manifest;
+# run1 measured: prose 3.7, code 3.7, structured 2.0 -- log lines full of IPs and
+# numbers tokenize ~2 chars/token, the original 2.9 blew the 30k cell past -c)
+CPT = {"prose": 3.6, "code": 3.4, "structured": 2.0}
 DEPTHS = {"1k": 1000, "8k": 8000, "30k": 28000}   # 28k keeps headroom under -c
-TEMPS = [0.0, 0.7, 0.95]
 GEN_TOKENS = 512
 
 def prose_prompt(depth_tok, variant):
@@ -85,9 +86,15 @@ def structured_prompt(depth_tok, variant):
 
 BUILDERS = {"prose": prose_prompt, "code": code_prompt, "structured": structured_prompt}
 
-def request(port, prompt, temperature, max_tokens, timeout):
+def request(port, prompt, temperature, max_tokens, timeout, think):
+    # ds4-server's /v1/completions renders a chat wrapper and defaults
+    # thinking ON; with thinking enabled the server FORCES temp>0 requests to
+    # the thinking defaults (temp 1.0, top_p 1.0 -- generate.c). "think":
+    # false makes the requested temperature real.
     body = {"model": "d", "prompt": prompt, "max_tokens": max_tokens,
             "temperature": temperature}
+    if not think:
+        body["think"] = False
     r = urllib.request.urlopen(urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/completions",
         json.dumps(body).encode(), {"Content-Type": "application/json"}),
@@ -100,27 +107,39 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--timeout", type=int, default=2400)
     ap.add_argument("--dry-run", action="store_true", help="build prompts, print sizes, no requests")
+    ap.add_argument("--think-off", action="store_true",
+                    help="send think:false so requested temperatures are honored")
+    ap.add_argument("--temps", default="0,0.7,0.95",
+                    help="comma-separated temperature legs")
+    ap.add_argument("--only", default="",
+                    help="restrict to workload:depth cells, e.g. structured:30k (comma-separated)")
     args = ap.parse_args()
+    temps = [float(t) for t in args.temps.split(",")]
+    only = set(tuple(c.split(":")) for c in args.only.split(",") if c)
 
     entries = []
     idx = 0
     # depth-major outer order keeps same-prompt temps adjacent (KV prefix reuse)
     for workload in ("prose", "code", "structured"):
         for dname, dtok in DEPTHS.items():
+            if only and (workload, dname) not in only:
+                continue
             for variant in (0, 1):
                 prompt = BUILDERS[workload](dtok, variant)
                 if args.dry_run:
                     print(f"[dry] {workload}/{dname}/v{variant}: {len(prompt)} chars "
                           f"(~{len(prompt)/CPT[workload]:.0f} tok est)", flush=True)
                     continue
-                for temp in TEMPS:
+                for temp in temps:
                     tag = f"{workload}/{dname}/v{variant}/t{temp}"
                     ent = {"idx": idx, "tag": tag, "workload": workload,
                            "depth": dname, "variant": variant, "temperature": temp,
+                           "think": "off" if args.think_off else "on",
                            "status": "pending", "prompt_tokens": 0, "completion_tokens": 0}
                     t0 = time.time()
                     try:
-                        resp = request(args.port, prompt, temp, GEN_TOKENS, args.timeout)
+                        resp = request(args.port, prompt, temp, GEN_TOKENS,
+                                       args.timeout, not args.think_off)
                         u = resp["usage"]
                         ent.update(status="ok", prompt_tokens=u["prompt_tokens"],
                                    completion_tokens=u["completion_tokens"])

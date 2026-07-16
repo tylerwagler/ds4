@@ -28,8 +28,10 @@ def cells(suite):
     raise SystemExit(f"unknown suite {suite}")
 
 def request(port, prompt, temperature, seed, timeout):
+    # think:false always -- with thinking on the server FORCES temp>0 to the
+    # thinking defaults (temp 1.0), which would silently break the temp legs.
     body = {"model": "d", "prompt": prompt, "max_tokens": GEN_TOKENS,
-            "temperature": temperature, "seed": seed}
+            "temperature": temperature, "seed": seed, "think": False}
     r = urllib.request.urlopen(urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/completions",
         json.dumps(body).encode(), {"Content-Type": "application/json"}),
