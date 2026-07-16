@@ -35,7 +35,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-prefill-gate cuda-prefill-gate-baseline
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
 
 all: help
 
@@ -57,6 +57,9 @@ help:
 	@echo "  make cuda-prefill-gate-baseline"
 	@echo "                           Build the baseline blob from PREFILL_BASELINE_REF"
 	@echo "                           in a git worktree (needs the model)"
+	@echo "  make cuda-spec-sampling-gate"
+	@echo "                           Speculative-sampling chi-square exactness"
+	@echo "                           oracle + acceptance alpha (needs the model)"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -169,6 +172,15 @@ cuda-prefill-gate-baseline:
 		--dump $(abspath $(PREFILL_BASELINE))
 	git worktree remove --force $(PREFILL_BASELINE_WT)
 	@echo "baseline ($(PREFILL_BASELINE_REF)) -> $(PREFILL_BASELINE)"
+# Speculative-sampling exactness oracle: chi-square of plain-sampled vs
+# speculative per-position marginals, plus the greedy prefix gate and the
+# acceptance rate alpha (see the header of tests/spec_sampling_gate.c).
+# Proposal-agnostic, so it gates both the deterministic and the
+# temperature-matched (p/q) accept rules.  MODEL-DEPENDENT — same memory
+# discipline as the gates above; not part of `make test`.
+SPEC_GATE_MODEL ?= gguf/model.gguf
+cuda-spec-sampling-gate: tests/spec_sampling_gate
+	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) 0.95
 
 src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
@@ -213,6 +225,8 @@ GATE_BUILD_REF := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown
 tests/prefill_bitexact_gate.o: tests/prefill_bitexact_gate.c src/ds4.h
 	$(CC) $(CFLAGS) $(DS4_INC) -DDS4_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' \
 		-c -o $@ tests/prefill_bitexact_gate.c
+tests/spec_sampling_gate.o: tests/spec_sampling_gate.c src/ds4.h
+	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ tests/spec_sampling_gate.c
 
 src/cuda/%.o: src/cuda/%.cu src/cuda/ds4_cuda_internal.h src/ds4_gpu.h src/cuda/ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
@@ -232,6 +246,7 @@ tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/ds4_help.o $(CO
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+tests/spec_sampling_gate: tests/spec_sampling_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_test: tests/ds4_test.o src/lib/ds4_help.o src/lib/ds4_kvstore.o src/vendor/rax.o $(CORE_OBJS)
@@ -245,3 +260,4 @@ test: ds4_test
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate

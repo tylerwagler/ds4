@@ -1888,6 +1888,7 @@ void ds4_session_free(ds4_session *s) {
     gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     ds4_sample_scratch_free(&s->sample_scratch);
+    free(s->dspark_pending_qrows);
     free(s->logits);
     free(s);
 }
@@ -1980,6 +1981,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
      * truncated generation belongs to the previous request's distribution.
      * (position stamping alone misses a same-length full rebuild.) */
     s->spec_carry_valid = false;
+    /* Same argument, same blind spot: the pendings' position stamp cannot see a
+     * rebuild that lands on the same length, and a sampled draft's q belongs to
+     * the previous request's distribution. Dropping them here costs one draft
+     * round at the start of a request and is the only guard that covers it. */
+    s->dspark_n_pending = 0;
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -2559,6 +2565,39 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     uint32_t K = s->dspark_n_pending;
     if (K > 16u) K = 16u;
     if (K && s->dspark_pending_base != (int32_t)first_token) K = 0;
+    /* Position guard — ACCEPTANCE, not exactness. The drafts were conditioned on
+     * the old position; dspark_pending_base is a token VALUE, so a plain eval
+     * that advances the session (tool injection, </think> recovery) followed by
+     * a first_token that happens to collide with it would otherwise resurrect
+     * them. Dropping them is a throughput choice: a draft conditioned on the
+     * wrong position is near-worthless and would just burn a verify row. It is
+     * NOT what keeps the output exact — both accept rules are proposal-agnostic
+     * (see the walk below), so q_oldpos is still exactly the distribution the
+     * draft was drawn from and the rule still yields p at the new position.
+     * Mirrors carry_pos_match. (checkpoint.len is still the drafting-step value
+     * here: this runs before the first_token push below.) */
+    if (K && s->dspark_pending_pos != (int32_t)s->checkpoint.len) K = 0;
+    /* Params guard — also acceptance, not exactness. Drafts drawn under params X
+     * and verified under params Y are still verified EXACTLY: the residual
+     * rebuilds q under the stored params X (see the walk below), so the accept
+     * denominator and the residual name one proposal q_X, and the p/q rule
+     * returns exactly p_Y for any q. What a param change costs is acceptance —
+     * q_X is a poor proposal for p_Y — so we drop them and draft afresh.
+     * Mirrors the spec_carry_* params guard in ds4_session_generate_speculative.
+     *
+     * The same holds for argmax drafts (dspark_pending_sampled == false), which
+     * carry no q: a temp<=0 -> temp>0 change cannot misroute them, because the
+     * walk picks its rule from pend_sampled, not from the live temperature, so
+     * they still meet the deterministic rule — itself exact for an arbitrary
+     * proposal. The guard just keeps a badly-matched proposal from wasting a
+     * row. */
+    const bool pending_params_match =
+        s->dspark_pending_temp == temperature && s->dspark_pending_top_k == top_k &&
+        s->dspark_pending_top_p == top_p && s->dspark_pending_min_p == min_p;
+    if (K && !pending_params_match) K = 0;
+    /* Proposal rule the pendings were drafted under; the verify walk must apply
+     * the matching rule (see dspark_pending_sampled). */
+    const bool pend_sampled = K ? s->dspark_pending_sampled : false;
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
     for (uint32_t i = 0; i < K; i++) pend[i] = s->dspark_pending[i];
@@ -2635,11 +2674,18 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     }
 
     /* Accept the longest prefix the target agrees with. Greedy: row i's
-     * argmax must equal pend[i]. Sampled: exact speculative sampling for a
-     * deterministic proposal — accept pend[i] with probability p_i(pend[i])
-     * under the request's FILTERED target distribution; on rejection draw the
-     * replacement from p_i excluding pend[i] (the residual), which becomes
-     * the carry token. Both yield the exact per-token target distribution. */
+     * argmax must equal pend[i]. Sampled: exact speculative sampling under the
+     * request's FILTERED target distribution p_i, with the rule matched to how
+     * the draft was PROPOSED:
+     *   - sampled proposal (the production path at temperature > 0): pend[i]
+     *     was drawn from a temperature-matched q_i, so accept w.p.
+     *     min(1, p_i/q_i) and on rejection draw the residual (p_i - q_i)+.
+     *     Acceptance is NOT capped at p_i(mode).
+     *   - argmax proposal (drafter/target vocab mismatch fallback): the
+     *     deterministic rule — accept w.p. p_i(pend[i]), residual p_i with
+     *     pend[i] excluded. Capped at p_i(mode).
+     * The rejected row's replacement becomes the carry token. All three paths
+     * yield the exact per-token target distribution. */
     int commit = 0;
     int carry_tok = -1;
     if (temperature <= 0.0f || K == 0) {
@@ -2655,12 +2701,42 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
             ds4_sample_dist dist;
             ds4_sample_dist_build(row_logits, DS4_N_VOCAB, temperature, top_k,
                                   top_p, min_p, &s->sample_scratch, &dist);
-            if (ds4_sample_dist_accept(&dist, (int)pend[commit], rng)) {
+            const bool accepted_row = pend_sampled
+                ? ds4_sample_dist_accept_pq(&dist, (int)pend[commit],
+                                            s->dspark_pending_q[commit], rng)
+                : ds4_sample_dist_accept(&dist, (int)pend[commit], rng);
+            if (accepted_row) {
                 ds4_sample_dist_free(&dist);
                 commit++;
                 continue;
             }
-            carry_tok = ds4_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
+            if (pend_sampled) {
+                /* Rebuild THIS position's q from the refined-logits row AND the
+                 * params stored at draft time. Both halves of the rule must name
+                 * the SAME proposal: the accept denominator above is the stored
+                 * scalar q(pend[i]) computed under the draft-time params, so the
+                 * residual's q must be rebuilt under those params too — not the
+                 * live ones. dist_build is pure, so feeding it the persisted row
+                 * + the persisted params reproduces the draft-time q bit-exactly,
+                 * by construction rather than by the params guard's coincidence
+                 * (never recomputed from live drafter state, which has advanced).
+                 * Only the one rejecting position pays this — the walk stops
+                 * here. */
+                ds4_sample_dist qd;
+                ds4_sample_dist_build(s->dspark_pending_qrows +
+                                          (size_t)commit * DS4_N_VOCAB,
+                                      DS4_N_VOCAB, s->dspark_pending_temp,
+                                      s->dspark_pending_top_k, s->dspark_pending_top_p,
+                                      s->dspark_pending_min_p,
+                                      &s->sample_scratch, &qd);
+                /* Holding two dists over one scratch is safe by dist_build's
+                 * aliasing contract: out->ids/probs never point into scratch. */
+                carry_tok = ds4_sample_dist_draw_residual(&dist, &qd,
+                                                          &s->sample_scratch, rng);
+                ds4_sample_dist_free(&qd);
+            } else {
+                carry_tok = ds4_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
+            }
             ds4_sample_dist_free(&dist);
             break;
         }
@@ -2834,9 +2910,43 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     ds4_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
     if (!dspark_logits || ds4_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
     int32_t refined[17];
-    int32_t refined2[17];   /* DTree Phase 0: markov runner-up per draft position */
+    /* DTree Phase 0: markov runner-up per draft position. CAVEAT since drafts
+     * are sampled: this is the runner-up to the markov ARGMAX, which is no
+     * longer necessarily the token we drafted. DTREE_V's alt_hit therefore no
+     * longer means "target's correction == drafter's #2 given #1 rejected" —
+     * the p2 table in memory was measured under argmax drafting. Diagnostic
+     * only (dtree_stats), but re-derive p2 before reusing that conclusion. */
+    int32_t refined2[17];
     refined[0] = (int32_t)next_base;
     refined2[0] = -1;
+    /* Temperature-matched draft sampling: draw each draft from the refined
+     * logits filtered at the REQUEST's params (q) instead of taking the
+     * drafter's argmax, so the verify walk can use min(1, p/q) — whose
+     * acceptance is not capped at p(mode).
+     *
+     * temperature <= 0 keeps the argmax path untouched: no readback, no
+     * dist_build, and — critically — no rng draw, so the greedy token stream
+     * stays byte-identical (dist_build would collapse to a point mass, but
+     * ds4_sample_dist_draw would still consume an rng word and shift the
+     * stream). It is also the fast path we do not want to slow down.
+     *
+     * The vocab check is a correctness guard, not an optimization: p is built
+     * over DS4_N_VOCAB target logits and q over the drafter's vocab_size. If
+     * they disagree the two are not distributions over the same space (and the
+     * row copy would overrun), so fall back to argmax proposals + the
+     * deterministic accept rule, which needs no q. */
+    const bool sample_drafts = temperature > 0.0f && vocab_size == DS4_N_VOCAB;
+    if (sample_drafts) {
+        /* n_draft rows, not 16: the depth is fixed per engine
+         * (e->dspark_draft_tokens, 5 by default), so this is 2.6 MB rather than
+         * 8.3 MB per session. Grow-only, so a depth change is still safe. */
+        const uint32_t need = n_draft * DS4_N_VOCAB;
+        if (s->dspark_pending_qrows_cap < need) {
+            free(s->dspark_pending_qrows);
+            s->dspark_pending_qrows = xmalloc((size_t)need * sizeof(float));
+            s->dspark_pending_qrows_cap = need;
+        }
+    }
     bool draft_ok = true;
     for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
         ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
@@ -2849,6 +2959,33 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                              w->markov_w2->abs_offset,
                                              refined[pos], vocab_size, embed_dim);
         ds4_gpu_tensor_free(base_row);
+        if (!draft_ok || !sample_drafts) continue;
+        /* Read this position's refined logits back BEFORE the next markov step
+         * overwrites the single-row scratch, and keep the row: the residual
+         * needs the full q of whichever position rejects, which is not known
+         * until verify. (This full-vocab D2H per draft position is the
+         * deliberate temporary cost Item 2's fused GPU accept kernel removes.) */
+        float *qrow = s->dspark_pending_qrows + (size_t)pos * DS4_N_VOCAB;
+        if (!ds4_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
+            draft_ok = false;
+            break;
+        }
+        ds4_sample_dist q;
+        ds4_sample_dist_build(qrow, DS4_N_VOCAB, temperature, top_k, top_p, min_p,
+                              &s->sample_scratch, &q);
+        const int drawn = ds4_sample_dist_draw(&q, rng);
+        refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
+        s->dspark_pending_q[pos] = ds4_sample_dist_prob(&q, drawn);
+        /* Diagnostic: how much proposal entropy is there actually? The whole
+         * premise of temperature-matched drafting is that q is a DISTRIBUTION.
+         * If q.n == 1 (or q(top) ~ 1) the draw is the argmax, min(1,p/q)
+         * degenerates to the deterministic rule, and Item 1 is a no-op. */
+        if (dspark_stats)
+            fprintf(stderr, "DSPARK_Q pos=%u q_n=%u q_top=%.4f q_drawn=%.4f "
+                            "drawn_is_argmax=%d\n",
+                    pos, q.n, (double)q.probs[0],
+                    (double)s->dspark_pending_q[pos], drawn == q.ids[0]);
+        ds4_sample_dist_free(&q);
     }
     if (!draft_ok) return n_accept;
 
@@ -2964,6 +3101,21 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     s->dspark_pending_base = (int32_t)next_base;
     s->dspark_n_pending = keep;
     for (uint32_t i = 0; i < keep; i++) s->dspark_pending[i] = refined[i + 1];
+    /* The proposal rule and the exact params these drafts were sampled under.
+     * Stamped unconditionally, in the same straight-line block as
+     * dspark_n_pending above — this is the only site that makes pendings
+     * non-zero, so a populated dspark_pending_q[]/qrows pool (filled in the
+     * drafting loop above, under sample_drafts) always has its params alongside
+     * it. Three consumers: the verify walk picks its accept rule from the flag,
+     * next step's params guard compares against the params, and — load-bearing —
+     * the residual rebuilds q from the qrows under THESE params, so the stored
+     * accept denominator and the residual describe one proposal. */
+    s->dspark_pending_sampled = sample_drafts;
+    s->dspark_pending_pos = (int32_t)s->checkpoint.len;
+    s->dspark_pending_temp = temperature;
+    s->dspark_pending_top_k = top_k;
+    s->dspark_pending_top_p = top_p;
+    s->dspark_pending_min_p = min_p;
     if (dtree_stats)
         for (uint32_t i = 0; i < keep; i++) {
             s->dspark_pending_alt[i] = refined2[i + 1];

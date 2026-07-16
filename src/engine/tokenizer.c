@@ -1021,6 +1021,11 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 
 
 
+/* NOTE: the free below also drops `qmap` (and its all-zero invariant with it),
+ * because ds4_sample_scratch_free clears the whole struct. That is safe only
+ * because no caller holds live qmap state across a dist_build — the residual
+ * draw scatters, reads and re-zeros within one call. Do not cache anything in
+ * qmap across calls without decoupling this. */
 static void sample_scratch_reserve(ds4_sample_scratch *s, uint32_t cap) {
     if (s->cap >= cap) return;
     ds4_sample_scratch_free(s);
@@ -1036,7 +1041,21 @@ void ds4_sample_scratch_free(ds4_sample_scratch *s) {
     free(s->cand);
     free(s->keys);
     free(s->tmp);
+    free(s->qmap);
     memset(s, 0, sizeof(*s));
+}
+
+
+
+/* Reserve the dense q map, zero-filled. Sized by token id, independent of
+ * sample_scratch_reserve's `cap` (which is top_k on the preselect path). Grows
+ * by free+calloc: callers restore every entry they set, so a fresh all-zero
+ * buffer preserves the invariant. */
+static void sample_qmap_reserve(ds4_sample_scratch *s, uint32_t cap) {
+    if (s->qmap_cap >= cap) return;
+    free(s->qmap);
+    s->qmap = xcalloc((size_t)cap, sizeof(*s->qmap));
+    s->qmap_cap = cap;
 }
 
 
@@ -1305,6 +1324,94 @@ int ds4_sample_dist_draw(const ds4_sample_dist *d, uint64_t *rng) {
         if (r <= 0.0f) return d->ids[i];
     }
     return d->ids[d->n - 1];
+}
+
+/* =====
+ * Sampled-proposal speculative rule (Leviathan/Chen). The pair above
+ * (_accept / _draw_excluding) is the DETERMINISTIC-proposal rule: it accepts an
+ * argmax draft with probability p(draft), so its acceptance is mathematically
+ * capped at p(mode). Drawing the draft from a temperature-matched q instead and
+ * accepting w.p. min(1, p/q) removes that cap; both rules emit exactly p.
+ *
+ * Two bugs in the reference implementation this is modelled on
+ * (xangel82/DS4-GB10-GX10-DSpark-CUDA — technique only, no code taken) are
+ * fixed here, and the unit gate tests/ds4_test.c --spec-math pins both:
+ *   (a) its `u <= ap` accept test can emit a token with p(x) == 0 (u==0 draws
+ *       accept an impossible token). We reject p <= 0 outright and use a
+ *       strict `<`, matching ds4_sample_dist_accept's discipline.
+ *   (b) its residual fallback can land on a token whose residual mass is zero.
+ *       We track the last STRICTLY POSITIVE residual index instead.
+ */
+int ds4_sample_dist_accept_pq(const ds4_sample_dist *p, int token, float q, uint64_t *rng) {
+    const float pd = ds4_sample_dist_prob(p, token);
+    /* bug (a): a token outside p's nucleus is impossible under the target and
+     * must never be emitted, whatever u is. */
+    if (pd <= 0.0f) return 0;
+    /* Defensive: the token was drawn from q, so q(token) > 0 by construction.
+     * A non-positive q here would mean the stored q lost sync with the draft;
+     * accepting is the exact-preserving choice (p(token) > 0 is established). */
+    if (q <= 0.0f) return 1;
+    /* min(1, p/q) == 1: certain accept, and — like _accept's `pd >= 1` fast
+     * path — consume no rng. Load-bearing for temperature<=0 byte-identity:
+     * greedy makes p and q both point masses of 1.0 at the argmax, so this
+     * returns 1 having touched neither the rng stream nor its ordering. */
+    if (pd >= q) return 1;
+    /* u < p/q, written without the divide. u in [0,1). */
+    return sample_rng_f32(rng) * q < pd;
+}
+
+int ds4_sample_dist_draw_residual(const ds4_sample_dist *p, const ds4_sample_dist *q,
+                                  ds4_sample_scratch *scratch, uint64_t *rng) {
+    /* r(x) = max(0, p(x) - q(x)). r(x) > 0 requires p(x) > 0, so the union of
+     * the two supports collapses to p's support: an x in q but not in p has
+     * r = max(0, 0 - q(x)) = 0 and cannot be drawn. Iterating p alone is
+     * therefore complete, and every id considered already has p(x) > 0. */
+    uint32_t maxid = 0;
+    for (uint32_t i = 0; i < q->n; i++) {
+        if (q->ids[i] < 0) continue;
+        if ((uint32_t)q->ids[i] > maxid) maxid = (uint32_t)q->ids[i];
+    }
+    sample_qmap_reserve(scratch, maxid + 1u);
+    for (uint32_t i = 0; i < q->n; i++)
+        if (q->ids[i] >= 0) scratch->qmap[q->ids[i]] = q->probs[i];
+
+    float mass = 0.0f;
+    for (uint32_t i = 0; i < p->n; i++) {
+        const int id = p->ids[i];
+        const float qv = (id >= 0 && (uint32_t)id <= maxid) ? scratch->qmap[id] : 0.0f;
+        const float r = p->probs[i] - qv;
+        if (r > 0.0f) mass += r;
+    }
+
+    int out;
+    if (mass <= 0.0f) {
+        /* Degenerate: q dominates p across p's whole support. Exactness is
+         * already lost in the numerics here; emit SOMETHING p can produce
+         * rather than an impossible token. */
+        out = ds4_sample_dist_draw(p, rng);
+    } else {
+        float r_acc = sample_rng_f32(rng) * mass;
+        int last = -1;
+        out = -1;
+        for (uint32_t i = 0; i < p->n; i++) {
+            const int id = p->ids[i];
+            const float qv = (id >= 0 && (uint32_t)id <= maxid) ? scratch->qmap[id] : 0.0f;
+            const float r = p->probs[i] - qv;
+            if (r <= 0.0f) continue;
+            /* bug (b): remember the last id with STRICTLY POSITIVE residual, so
+             * the float-rounding overrun below cannot land on a zero-residual
+             * token. Every candidate here has p(x) > 0 by construction. */
+            last = id;
+            r_acc -= r;
+            if (r_acc <= 0.0f) { out = id; break; }
+        }
+        if (out < 0) out = last;   /* overrun: mass > 0 guarantees last >= 0 */
+    }
+
+    /* restore the all-zero invariant (only q's own ids were touched) */
+    for (uint32_t i = 0; i < q->n; i++)
+        if (q->ids[i] >= 0) scratch->qmap[q->ids[i]] = 0.0f;
+    return out;
 }
 
 int ds4_sample_dist_draw_excluding(const ds4_sample_dist *d, int excluded, uint64_t *rng) {

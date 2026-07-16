@@ -2216,6 +2216,202 @@ static void test_sampler_dist_equivalence(void) {
 
 
 
+/* =====
+ * Sampled-proposal (p/q) speculative math — the pure-CPU oracle for
+ * temperature-matched draft sampling. No model, no GPU, no batch numerics, so
+ * a failure here is the math, not the engine.
+ *
+ * The property: drawing x ~ q, accepting w.p. min(1, p(x)/q(x)), and otherwise
+ * drawing from the residual (p-q)+ must reproduce p EXACTLY — for ANY proposal
+ * q, including one that proposes tokens p rules out. That is what lets the
+ * drafter propose from a temperature-matched q without biasing the output.
+ *
+ * Also pins the two bugs fixed in ds4_sample_dist_accept_pq / _draw_residual
+ * (see the block comment in tokenizer.c), which are silent-corruption bugs:
+ * both emit a *plausible* wrong token, so only a distributional test catches
+ * them.
+ */
+#define SPEC_V 64u
+
+/* total (p-q)+ mass, computed independently of _draw_residual's own loop */
+static float spec_residual_mass(const ds4_sample_dist *p, const ds4_sample_dist *q) {
+    float m = 0.0f;
+    for (uint32_t i = 0; i < p->n; i++) {
+        const float r = p->probs[i] - ds4_sample_dist_prob(q, p->ids[i]);
+        if (r > 0.0f) m += r;
+    }
+    return m;
+}
+
+static void test_spec_pq_math(void) {
+    ds4_sample_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    sampler_warn_if_flush_to_zero();
+    float pl[SPEC_V], ql[SPEC_V];
+    long counts[SPEC_V];
+    uint64_t rng = 12345;
+    int fails = 0, checked = 0;
+
+    for (int trial = 0; trial < 8; trial++) {
+        /* p and q are built from DIFFERENT logits (target row vs drafter's
+         * refined row) filtered at the SAME request params — the production
+         * shape. Params vary across trials to cover top_p / top_k / min_p. */
+        samp_seed(0xBEEF0000u + (uint64_t)trial);
+        for (uint32_t i = 0; i < SPEC_V; i++) pl[i] = (float)(samp_u01() * 8.0 - 4.0);
+        for (uint32_t i = 0; i < SPEC_V; i++) ql[i] = (float)(samp_u01() * 8.0 - 4.0);
+        const char *shape = "disjoint-logits";
+        if (trial == 6) {
+            /* q is sharply peaked on a token p ranks last — forces the
+             * rejection branch (and thus the residual) almost every draw. */
+            shape = "q-peaked-off-p";
+            for (uint32_t i = 0; i < SPEC_V; i++) ql[i] = -8.0f;
+            ql[SPEC_V - 1] = 12.0f;
+            pl[SPEC_V - 1] = -9.0f;
+        } else if (trial == 7) {
+            /* p == q: the ratio is 1 everywhere, acceptance must be total and
+             * the residual must never be reached. */
+            shape = "p-equals-q";
+            memcpy(ql, pl, sizeof(pl));
+        }
+        const float temp = (trial % 2) ? 0.95f : 0.7f;
+        const float topp = (trial % 3 == 0) ? 1.0f : 0.38f;
+        const int   topk = (trial % 4 == 3) ? 8 : 0;
+        const float minp = (trial == 5) ? 0.05f : 0.0f;
+
+        ds4_sample_dist p, q;
+        ds4_sample_dist_build(pl, SPEC_V, temp, topk, topp, minp, &scratch, &p);
+        ds4_sample_dist_build(ql, SPEC_V, temp, topk, topp, minp, &scratch, &q);
+        const float rmass = spec_residual_mass(&p, &q);
+
+        memset(counts, 0, sizeof(counts));
+        const long N = 400000;
+        long accepts = 0, zero_p = 0, zero_resid = 0;
+        for (long it = 0; it < N; it++) {
+            const int x = ds4_sample_dist_draw(&q, &rng);
+            int tok;
+            if (ds4_sample_dist_accept_pq(&p, x, ds4_sample_dist_prob(&q, x), &rng)) {
+                tok = x;
+                accepts++;
+            } else {
+                tok = ds4_sample_dist_draw_residual(&p, &q, &scratch, &rng);
+                /* bug (b): a residual draw must carry strictly positive
+                 * residual mass. Only the mass<=0 fallback (plain draw from p)
+                 * is exempt, and it cannot occur while rmass > 0. */
+                if (rmass > 0.0f &&
+                    ds4_sample_dist_prob(&p, tok) - ds4_sample_dist_prob(&q, tok) <= 0.0f)
+                    zero_resid++;
+            }
+            /* bug (a): an emitted token must be possible under the target. */
+            if (ds4_sample_dist_prob(&p, tok) <= 0.0f) zero_p++;
+            counts[tok]++;
+        }
+
+        /* the marginal must be p */
+        double chi = 0.0;
+        int df = 0;
+        for (uint32_t i = 0; i < p.n; i++) {
+            const double e = (double)N * p.probs[i];
+            if (e < 8.0) continue;
+            const double o = (double)counts[p.ids[i]];
+            chi += (o - e) * (o - e) / e;
+            df++;
+        }
+        df = df > 1 ? df - 1 : 1;
+        const double crit = df + 3.1 * sqrt(2.0 * df) + 4.0;
+        const int bad = chi > crit || zero_p || zero_resid;
+        printf("  spec-math trial %d (%s temp=%.2f top_k=%d top_p=%.2f min_p=%.2f "
+               "|p|=%u |q|=%u): alpha=%.3f chi2=%.1f df=%d crit=%.1f%s%s -> %s\n",
+               trial, shape, (double)temp, topk, (double)topp, (double)minp, p.n, q.n,
+               (double)accepts / (double)N, chi, df, crit,
+               zero_p ? " ZERO-P-EMITTED" : "", zero_resid ? " ZERO-RESIDUAL" : "",
+               bad ? "FAIL" : "OK");
+        if (bad) fails++;
+        /* p == q must accept every single draw: min(1,p/q) == 1 identically. */
+        if (trial == 7 && accepts != N) {
+            printf("  spec-math: p==q accepted only %ld/%ld\n", accepts, N);
+            fails++;
+        }
+        checked++;
+        ds4_sample_dist_free(&p);
+        ds4_sample_dist_free(&q);
+    }
+
+    /* Deterministic guards for the two reference bugs. The distributional loop
+     * above is necessary but NOT sufficient for bug (a): `u <= p/q` only
+     * misfires when u is exactly 0, which 3.2M random draws will usually miss.
+     * What makes the bug impossible is that the p<=0 rejection happens BEFORE
+     * any rng is drawn — so pin exactly that, by asserting the rng state is
+     * untouched. A `u <= ap` implementation consumes a word here and fails,
+     * whatever u happens to be. */
+    {
+        float l[SPEC_V];
+        samp_seed(0x5AFE01u);
+        for (uint32_t i = 0; i < SPEC_V; i++) l[i] = (float)(samp_u01() * 8.0 - 4.0);
+        l[0] = 20.0f;                      /* one dominant token */
+        ds4_sample_dist p;
+        /* top_p=0.5 with a dominant token => a small nucleus, so most of the
+         * vocab sits strictly outside it with p(x) == 0. */
+        ds4_sample_dist_build(l, SPEC_V, 1.0f, 0, 0.5f, 0.0f, &scratch, &p);
+        int off = -1;
+        for (uint32_t i = 0; i < SPEC_V && off < 0; i++)
+            if (ds4_sample_dist_prob(&p, (int)i) <= 0.0f) off = (int)i;
+        TEST_ASSERT(off >= 0);
+
+        uint64_t r_before = 0xD15EA5Eull, r_after = 0xD15EA5Eull;
+        const int acc = ds4_sample_dist_accept_pq(&p, off, 0.5f, &r_after);
+        TEST_ASSERT(acc == 0);             /* bug (a): p(x)==0 is never accepted */
+        TEST_ASSERT(r_after == r_before);  /* ...and the guard fired before the rng */
+
+        /* A certain accept (p >= q) must likewise consume no rng — this is what
+         * keeps temperature<=0 byte-identical, where p and q are both point
+         * masses of 1.0 at the argmax. */
+        r_after = r_before;
+        const float pmode = p.probs[0];
+        const int acc2 = ds4_sample_dist_accept_pq(&p, p.ids[0], pmode * 0.5f, &r_after);
+        TEST_ASSERT(acc2 == 1);
+        TEST_ASSERT(r_after == r_before);
+        ds4_sample_dist_free(&p);
+    }
+    {
+        /* bug (b): the residual must never return a zero-(p-q)+ token. Build a
+         * q that exactly covers p's LAST-ranked support element (residual 0
+         * there, positive earlier) — the element a "return the last index"
+         * fallback would wrongly emit on a rounding overrun. */
+        float pl2[SPEC_V], ql2[SPEC_V];
+        samp_seed(0x5AFE02u);
+        for (uint32_t i = 0; i < SPEC_V; i++) pl2[i] = (float)(samp_u01() * 4.0 - 2.0);
+        memcpy(ql2, pl2, sizeof(pl2));
+        ds4_sample_dist p2, q2;
+        ds4_sample_dist_build(pl2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &p2);
+        /* q2 == p2 on the tail but heavier there => tail residual is <= 0 */
+        ql2[p2.ids[p2.n - 1]] += 3.0f;
+        ds4_sample_dist_build(ql2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &q2);
+        const int tail = p2.ids[p2.n - 1];
+        TEST_ASSERT(ds4_sample_dist_prob(&p2, tail) -
+                    ds4_sample_dist_prob(&q2, tail) <= 0.0f);
+        uint64_t r2 = 777;
+        int tail_emits = 0;
+        for (int it = 0; it < 200000; it++) {
+            const int tok = ds4_sample_dist_draw_residual(&p2, &q2, &scratch, &r2);
+            if (tok == tail) tail_emits++;
+            if (ds4_sample_dist_prob(&p2, tok) <= 0.0f) tail_emits++;
+        }
+        if (tail_emits)
+            printf("  spec-math: residual emitted a zero-residual token %d times\n",
+                   tail_emits);
+        TEST_ASSERT(tail_emits == 0);
+        ds4_sample_dist_free(&p2);
+        ds4_sample_dist_free(&q2);
+    }
+
+    TEST_ASSERT(fails == 0);
+    ds4_sample_scratch_free(&scratch);
+    printf("  spec-math: %d p/q accept+residual trials reproduce the target "
+           "distribution; p=0 reject and zero-residual guards pinned\n", checked);
+}
+
+
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -2241,6 +2437,7 @@ static const ds4_test_entry test_entries[] = {
     {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
 #endif
     {"--sampler", "sampler", "sampler byte-exactness vs pre-radix reference", test_sampler_dist_equivalence},
+    {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
