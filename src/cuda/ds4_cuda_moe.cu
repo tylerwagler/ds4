@@ -181,10 +181,32 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
 
 
 
+/* e2m1 nibble -> signed int8 magnitude.  The 8 magnitudes are exactly
+ * {0,1,2,3,4,6,8,12}, so the arithmetic form
+ *     e = (nib>>1)&3; m = nib&1; mag = e ? ((1<<e)|(m<<(e-1))) : m;
+ * can be replaced by a byte select out of two 32-bit IMMEDIATES.  Identical on
+ * all 16 nibbles -- each byte below IS the value the arithmetic produces -- and
+ * weight decode is 42.9% of the gate/up instruction stream, so this is a real
+ * lever rather than a micro-optimisation.  Shared by every MXFP4 dot, so both
+ * gate/up and down get it.
+ *
+ * NOT A TABLE LOOKUP, and the distinction is the whole point: a
+ * `static const int8_t lut[16]` is numerically identical but nvcc lowers it to
+ * GLOBAL GATHERS (LDG.E.U8.CONSTANT), which is slower AND -- during the
+ * microbench -- silently rewrote the kernel being measured, collapsing decode's
+ * apparent share from 43% to 13% and nearly inverting the whole finding.  Two
+ * immediates plus a shift keep it in registers with no memory operand.
+ *
+ * Verified in SASS on the shipped object, which is the check that matters: the
+ * global-load count does NOT move (LDG 301 -> 301 at NT=8, 325 -> 325 at
+ * NT=16), so no gather was introduced, while `decode` falls 5019 -> 2203 at
+ * NT=8 and 5090 -> 2267 at NT=16, and NT=16 registers ease 128 -> 126. */
 __device__ __forceinline__ static int dev_e2m1_x2(unsigned nib) {
-    const unsigned e = (nib >> 1) & 3u;
-    const unsigned m = nib & 1u;
-    const int mag = e ? (int)((1u << e) | (m << (e - 1u))) : (int)m;
+    const uint32_t w0 = 0x03020100u;      /* nib 0..3 -> 0, 1, 2, 3  */
+    const uint32_t w1 = 0x0C080604u;      /* nib 4..7 -> 4, 6, 8, 12 */
+    const unsigned k = nib & 7u;
+    const uint32_t w = (k < 4u) ? w0 : w1;
+    const int mag = (int)((w >> ((k & 3u) * 8u)) & 0xFFu);
     return (nib & 8u) ? -mag : mag;
 }
 
