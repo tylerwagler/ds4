@@ -75,11 +75,20 @@ static void spec_report(const char *tag, spec_snap a, spec_snap b) {
 }
 
 int main(int argc, char **argv) {
+    /* progress must be visible in a redirected log: stdout to a file is
+     * block-buffered, which makes a long run look like a hang. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     const char *model = argc > 1 ? argv[1] : "gguf/model.gguf";
     /* 0.95 is the acceptance-sensitive regime: hot enough that the greedy
      * p(mode) acceptance ceiling actually binds. */
     const float TEMP = argc > 2 ? (float)atof(argv[2]) : 0.95f;
     const int filler = argc > 3 ? atoi(argv[3]) : 0;
+    /* Trajectory count. The chi-square needs the full TRAJ for power, but
+     * alpha converges in a few hundred draft rounds — so an alpha-only
+     * comparison run (e.g. the pre-Item-1 baseline) can be much shorter. */
+    int traj = argc > 4 ? atoi(argv[4]) : TRAJ;
+    if (traj < 1) traj = 1;
+    if (traj > TRAJ) traj = TRAJ;
     const float TOP_P = 0.38f, MIN_P = 0.0f;
 
     ds4_engine_options opt = { .model_path = model, .backend = DS4_BACKEND_CUDA };
@@ -109,8 +118,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sync failed: %s\n", err);
         return 1;
     }
-    printf("model=%s temp=%.2f top_p=%.2f ctx_depth=%d\n",
-           model, (double)TEMP, (double)TOP_P, ds4_session_pos(session));
+    printf("model=%s temp=%.2f top_p=%.2f ctx_depth=%d traj=%d\n",
+           model, (double)TEMP, (double)TOP_P, ds4_session_pos(session), traj);
     ds4_session_snapshot snap = {0};
     if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
         fprintf(stderr, "snapshot failed: %s\n", err);
@@ -177,7 +186,7 @@ int main(int argc, char **argv) {
     spec_snap s0 = {0}, s1 = {0};
     for (int mode = 0; mode < 2; mode++) {
         if (mode == 1) s0 = spec_take(engine);
-        for (int t = 0; t < TRAJ; t++) {
+        for (int t = 0; t < traj; t++) {
             if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) return 1;
             uint64_t rng = 0x9E3779B97F4A7C15ull * (uint64_t)(t + 1) + (uint64_t)mode * 77777u;
             int *dst = mode == 0 ? seqA[t] : seqB[t];
@@ -201,8 +210,8 @@ int main(int argc, char **argv) {
                 }
             }
             for (int k = got; k < DEPTH; k++) dst[k] = -1;
-            if ((t + 1) % 500 == 0)
-                fprintf(stderr, "mode %d: %d/%d trajectories\r", mode, t + 1, TRAJ);
+            if ((t + 1) % 250 == 0)
+                printf("  mode %d: %d/%d trajectories\n", mode, t + 1, traj);
         }
         fputc('\n', stderr);
     }
@@ -218,7 +227,7 @@ int main(int argc, char **argv) {
         bucket bk[4096];
         int nb = 0;
         for (int mode = 0; mode < 2; mode++)
-            for (int t = 0; t < TRAJ; t++) {
+            for (int t = 0; t < traj; t++) {
                 int tok = mode == 0 ? seqA[t][posn] : seqB[t][posn];
                 int j = 0;
                 for (; j < nb; j++) if (bk[j].id == tok) break;

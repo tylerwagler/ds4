@@ -1021,6 +1021,11 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 
 
 
+/* NOTE: the free below also drops `qmap` (and its all-zero invariant with it),
+ * because ds4_sample_scratch_free clears the whole struct. That is safe only
+ * because no caller holds live qmap state across a dist_build — the residual
+ * draw scatters, reads and re-zeros within one call. Do not cache anything in
+ * qmap across calls without decoupling this. */
 static void sample_scratch_reserve(ds4_sample_scratch *s, uint32_t cap) {
     if (s->cap >= cap) return;
     ds4_sample_scratch_free(s);

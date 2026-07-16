@@ -1981,6 +1981,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
      * truncated generation belongs to the previous request's distribution.
      * (position stamping alone misses a same-length full rebuild.) */
     s->spec_carry_valid = false;
+    /* Same argument, same blind spot: the pendings' position stamp cannot see a
+     * rebuild that lands on the same length, and a sampled draft's q belongs to
+     * the previous request's distribution. Dropping them here costs one draft
+     * round at the start of a request and is the only guard that covers it. */
+    s->dspark_n_pending = 0;
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -2560,6 +2565,14 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     uint32_t K = s->dspark_n_pending;
     if (K > 16u) K = 16u;
     if (K && s->dspark_pending_base != (int32_t)first_token) K = 0;
+    /* Position guard: the drafts are only valid at the exact position they were
+     * produced at. dspark_pending_base is a token VALUE, so a plain eval that
+     * advances the session (tool injection, </think> recovery) followed by a
+     * first_token that happens to collide with it would otherwise resurrect
+     * drafts — and their q — from the old position. Mirrors carry_pos_match.
+     * (checkpoint.len is still the drafting-step value here: this runs before
+     * the first_token push below.) */
+    if (K && s->dspark_pending_pos != (int32_t)s->checkpoint.len) K = 0;
     /* Params guard (temperature-matched drafts). The base-token check above is
      * NOT sufficient once drafts are SAMPLED: a draft drawn from q under params
      * X carries a stored q(pend[i]) that is only the correct accept denominator
@@ -2883,7 +2896,13 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     ds4_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
     if (!dspark_logits || ds4_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
     int32_t refined[17];
-    int32_t refined2[17];   /* DTree Phase 0: markov runner-up per draft position */
+    /* DTree Phase 0: markov runner-up per draft position. CAVEAT since drafts
+     * are sampled: this is the runner-up to the markov ARGMAX, which is no
+     * longer necessarily the token we drafted. DTREE_V's alt_hit therefore no
+     * longer means "target's correction == drafter's #2 given #1 rejected" —
+     * the p2 table in memory was measured under argmax drafting. Diagnostic
+     * only (dtree_stats), but re-derive p2 before reusing that conclusion. */
+    int32_t refined2[17];
     refined[0] = (int32_t)next_base;
     refined2[0] = -1;
     /* Temperature-matched draft sampling: draw each draft from the refined
@@ -2904,7 +2923,10 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * deterministic accept rule, which needs no q. */
     const bool sample_drafts = temperature > 0.0f && vocab_size == DS4_N_VOCAB;
     if (sample_drafts) {
-        const uint32_t need = 16u * DS4_N_VOCAB;
+        /* n_draft rows, not 16: the depth is fixed per engine
+         * (e->dspark_draft_tokens, 5 by default), so this is 2.6 MB rather than
+         * 8.3 MB per session. Grow-only, so a depth change is still safe. */
+        const uint32_t need = n_draft * DS4_N_VOCAB;
         if (s->dspark_pending_qrows_cap < need) {
             free(s->dspark_pending_qrows);
             s->dspark_pending_qrows = xmalloc((size_t)need * sizeof(float));
@@ -3061,6 +3083,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * picks its accept rule from the flag. dspark_pending_q[] and the qrows
      * pool were filled in the drafting loop above. */
     s->dspark_pending_sampled = sample_drafts;
+    s->dspark_pending_pos = (int32_t)s->checkpoint.len;
     s->dspark_pending_temp = temperature;
     s->dspark_pending_top_k = top_k;
     s->dspark_pending_top_p = top_p;

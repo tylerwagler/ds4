@@ -1311,6 +1311,18 @@ struct ds4_session {
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
     int32_t dspark_pending_base;
+    /* checkpoint.len the drafts were produced at. The base-token check above is
+     * a VALUE check, not an identity check: a plain ds4_session_eval (tool
+     * injection, think-tag recovery) advances the session and clears the carry
+     * but leaves the pendings, so a later first_token that merely COLLIDES with
+     * dspark_pending_base would resurrect drafts conditioned on a different
+     * position. That was harmless while proposals were verified by the
+     * deterministic rule — which is exact for an ARBITRARY proposal and never
+     * reads where it came from, so a stale draft only cost acceptance. Under
+     * p/q it is fatal: q must be the distribution the draft was actually drawn
+     * from, and p_newpos/q_oldpos is a ratio of unrelated distributions that
+     * biases the output silently. Mirrors spec_carry_pos. */
+    int32_t dspark_pending_pos;
     /* Speculative-sampling carry: the next base token, already drawn from the
      * request's filtered distribution (bonus draw on full accept, residual
      * draw on rejection) but NOT yet forwarded through the target. The next
