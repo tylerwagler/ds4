@@ -246,6 +246,8 @@ tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/ds4_help.o $(CO
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/spec_sampling_gate: tests/spec_sampling_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
