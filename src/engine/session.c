@@ -2962,6 +2962,15 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         const int drawn = ds4_sample_dist_draw(&q, rng);
         refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
         s->dspark_pending_q[pos] = ds4_sample_dist_prob(&q, drawn);
+        /* Diagnostic: how much proposal entropy is there actually? The whole
+         * premise of temperature-matched drafting is that q is a DISTRIBUTION.
+         * If q.n == 1 (or q(top) ~ 1) the draw is the argmax, min(1,p/q)
+         * degenerates to the deterministic rule, and Item 1 is a no-op. */
+        if (dspark_stats)
+            fprintf(stderr, "DSPARK_Q pos=%u q_n=%u q_top=%.4f q_drawn=%.4f "
+                            "drawn_is_argmax=%d\n",
+                    pos, q.n, (double)q.probs[0],
+                    (double)s->dspark_pending_q[pos], drawn == q.ids[0]);
         ds4_sample_dist_free(&q);
     }
     if (!draft_ok) return n_accept;

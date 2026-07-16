@@ -89,7 +89,14 @@ int main(int argc, char **argv) {
     int traj = argc > 4 ? atoi(argv[4]) : TRAJ;
     if (traj < 1) traj = 1;
     if (traj > TRAJ) traj = TRAJ;
-    const float TOP_P = 0.38f, MIN_P = 0.0f;
+    /* top_p matters more than it looks. dist_build stops adding candidates once
+     * filtered_sum/sum >= top_p, so on a CONFIDENT row — p(top) > top_p — the
+     * nucleus is a single token, sampling is deterministic, and the chi-square
+     * compares two point masses and passes vacuously (chi2=0.0, df=1). The
+     * inherited 0.38 does exactly that on this prompt: 2500 trajectories, one
+     * token per position. Keep this high enough that the nucleus is real. */
+    const float TOP_P = argc > 5 ? (float)atof(argv[5]) : 0.95f;
+    const float MIN_P = 0.0f;
 
     ds4_engine_options opt = { .model_path = model, .backend = DS4_BACKEND_CUDA };
     ds4_engine *engine = NULL;
@@ -222,7 +229,7 @@ int main(int argc, char **argv) {
     spec_report("sampled ", s0, s1);
 
     /* chi-square per position over pooled top buckets */
-    int fail = 0;
+    int fail = 0, degenerate = 0;
     for (int posn = 0; posn < DEPTH; posn++) {
         bucket bk[4096];
         int nb = 0;
@@ -253,11 +260,24 @@ int main(int argc, char **argv) {
         df = df > 1 ? df - 1 : 1;
         /* p ~ 0.001 critical values: chi2(df) ≈ df + 3.1*sqrt(2 df) + 4 */
         const double crit = df + 3.1 * sqrt(2.0 * df) + 4.0;
-        printf("pos %d: chi2=%.1f df=%d crit(p~.001)=%.1f -> %s\n",
-               posn, chi, df, crit, chi <= crit ? "OK" : "FAIL");
+        /* nb = distinct tokens seen at this position across both modes. nb==1
+         * means the sampler is a point mass here (p(top) >= top_p), the chi2 is
+         * comparing two identical constants, and this position proves NOTHING
+         * about exactness. Treat it as a failed gate, not a pass. */
+        printf("pos %d: chi2=%.1f df=%d crit(p~.001)=%.1f distinct=%d -> %s%s\n",
+               posn, chi, df, crit, nb, chi <= crit ? "OK" : "FAIL",
+               nb < 2 ? "  [DEGENERATE: point mass, test is vacuous]" : "");
         if (chi > crit) fail = 1;
+        if (nb < 2) degenerate++;
     }
-    printf(fail ? "spec sampling oracle FAIL\n" : "spec sampling oracle PASS\n");
+    if (degenerate == DEPTH) {
+        printf("spec sampling oracle VACUOUS: every position is a point mass at "
+               "top_p=%.2f — raise top_p (or use a less confident prompt) or the "
+               "gate proves nothing\n", (double)TOP_P);
+        fail = 1;
+    } else {
+        printf(fail ? "spec sampling oracle FAIL\n" : "spec sampling oracle PASS\n");
+    }
     free(user);
     return fail;
 }
