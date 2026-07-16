@@ -841,14 +841,108 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
 }
 
 
+/* Dynamic-SMEM bytes the MXFP4 N-tile gate/up kernel stages for NT tokens of
+ * xq_blocks q8_K activation blocks each -- or 0, meaning "read the activations
+ * straight from global".  HOST AND DEVICE CALL THIS SAME FUNCTION: the kernel
+ * stages iff it returns non-zero, and the launch's dynamic-SMEM argument is
+ * exactly what it returns.  One predicate, two callers -- two copies could
+ * drift apart into a kernel that indexes SMEM the host never allocated. */
+__host__ __device__ __forceinline__ static uint32_t moe_mxfp4_gate_up_smem_bytes(
+        uint32_t nt, uint32_t xq_blocks) {
+    return (xq_blocks <= 16u) ? (uint32_t)(nt * xq_blocks * (uint32_t)sizeof(cuda_block_q8_K)) : 0u;
+}
+
+/* The most the NT=16 kernel can ever stage, given the xq_blocks <= 16 bound
+ * above: 16 tokens * 16 blocks * 292 B = 74,752 B.  That is over the 48 KB
+ * static __shared__ cap -- which is the whole reason this tile was pinned to 8
+ * -- so NT=16 is reachable only through the one-time dynamic-SMEM opt-in in
+ * moe_mxfp4_gate_up_tile_width(). */
+#define MOE_MXFP4_GATE_UP_NT16_SMEM_MAX (16u * 16u * (uint32_t)sizeof(cuda_block_q8_K))
+
+/* MXFP4 (type-39) weight block vs up to NT q8_K activation blocks: the N-tile
+ * generalisation of dev_dot_mxfp4_q8_K_block8, decoding each weight
+ * nibble-group ONCE (into wpack) and dp4a-ing it against all NT tokens.
+ *
+ * BIT-EXACTNESS: the reduction is over K, and NT tiles TOKENS.  The per-subblock
+ * (scale*sumi) order and the trailing 0.5*y->d fold are identical at every NT,
+ * and tokens are independent output columns, so a tile of NT is bit-identical to
+ * NT single dev_dot_mxfp4_q8_K_block calls -- for any NT.  Widening N moves zero
+ * bits; `make cuda-prefill-gate` is the referee.
+ *
+ * The loops over the token arrays are unrolled over the COMPILE-TIME bound NT
+ * with a uniform `break`, never over runtime `n`.  A runtime bound makes ptxas
+ * spill ys[]/facc[] to LOCAL memory, which trades the tile win for local-memory
+ * traffic.  np is block-uniform, so the predicate is a uniform branch, not
+ * divergence.  (dev_dot_mxfp4_q8_K_block8 above keeps its runtime loop and its
+ * 8 scalar parameters: it is the down kernel's dot, which this increment does
+ * not touch -- down is already past its tile knee, measured 1.00x at NT=32.
+ * Any change to the decode arithmetic here must be mirrored there.) */
+template <uint32_t NT>
+__device__ static void dev_dot_mxfp4_q8_K_blockN(
+        const unsigned char *x,
+        const cuda_block_q8_K *const *ys,
+        uint32_t n,
+        float acc[NT]) {
+    float facc[NT];
+    #pragma unroll
+    for (uint32_t p = 0; p < NT; p++) facc[p] = 0.0f;
+    #pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        const unsigned char *blk = x + (size_t)sb * 17;
+        const float scale = __int_as_float((uint32_t)blk[0] << 23);
+        int32_t wpack[8];
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            const unsigned char b0 = blk[1 + g * 2];
+            const unsigned char b1 = blk[1 + g * 2 + 1];
+            wpack[g] =
+                  ((uint32_t)(uint8_t)dev_e2m1_x2(b0 & 0xF))
+                | ((uint32_t)(uint8_t)dev_e2m1_x2(b0 >> 4)  << 8)
+                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 & 0xF) << 16)
+                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 >> 4)  << 24);
+        }
+        #pragma unroll
+        for (uint32_t p = 0; p < NT; p++) {
+            if (p >= n) break;
+            const int8_t *q8 = ys[p]->qs + sb * 32;
+            int32_t sumi = 0;
+            #pragma unroll
+            for (int g = 0; g < 8; g++)
+                sumi = __dp4a(wpack[g], *(const int32_t *)(q8 + g * 4), sumi);
+            facc[p] += scale * (float)sumi;
+        }
+    }
+    #pragma unroll
+    for (uint32_t p = 0; p < NT; p++) { if (p >= n) break; acc[p] += 0.5f * ys[p]->d * facc[p]; }
+}
+
+
 /* MXFP4 (type-39) gate/up big-batch expert-tiled kernel: mirror of
  * moe_gate_up_mid_expert_tile8_rowspan_kernel but with the MXFP4 dot (no
- * iq2 grid/signs tables needed). One 8-token tile reuses each weight row's
- * decode across all 8 tokens -- the prefill weight-reuse the per-pair
+ * iq2 grid/signs tables needed). One NT-token tile reuses each weight row's
+ * decode across all NT tokens -- the prefill weight-reuse the per-pair
  * qwarp32 kernel lacks. Writes only mid_out (swiglu fused), same as the
- * iq2/q2k tiled kernels. Bit-identical to the qwarp32 path per token. */
-template <uint32_t ROW_SPAN>
-__global__ static void moe_gate_up_mid_mxfp4_expert_tile8_rowspan_kernel(
+ * iq2/q2k tiled kernels. Bit-identical to the qwarp32 path per token.
+ *
+ * NT was 8 until this increment, inherited from the iq2 gate (7c92951 "mirrors
+ * the iq2 gate") despite MXFP4 carrying 2.06x the weight bytes -- and 8 was
+ * never a register or occupancy choice, it was the largest tile whose staging
+ * fit the 48 KB STATIC __shared__ cap (8*16*292 = 37,376 B; 16 tokens needs
+ * 74,752 and ptxas refuses it outright).  Staging in DYNAMIC SMEM lifts that
+ * ceiling, and NT=16 measures 2.30x on the GB10, bit-exact.
+ *
+ * Two counter-intuitive results, recorded so they are not "optimised" away:
+ *   - NT=16 runs at 1 block/SM (16.7% occupancy), HALF the NT=8 kernel's, and is
+ *     still 2.30x faster.  Occupancy is not the constraint; decode amortisation
+ *     (per-weight, flat in NT) and the halved weight re-reads are.
+ *   - Dropping the staging at NT=16 looks better on every traffic metric (4.2 GB
+ *     of L2 vs 14.6) and is 2x SLOWER.  The kernel is issue/latency-bound, not
+ *     bandwidth-bound.  STAGE AT 16.
+ * NT=32 cannot stage at all (149,504 B > the 101,376 B opt-in cap) and unstaged
+ * hits 255 registers + spill (1.43x, worse than NT=16 staged); NT=64 spills
+ * 1536 B and is SLOWER than shipped.  16 is the peak, not a waypoint. */
+template <uint32_t ROW_SPAN, uint32_t NT>
+__global__ static void moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel(
         float *mid_out,
         const char *gate_base,
         const char *up_base,
@@ -872,49 +966,56 @@ __global__ static void moe_gate_up_mid_mxfp4_expert_tile8_rowspan_kernel(
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
-    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    uint32_t np = 0;
-    for (; np < 8u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        tok[np] = pair[np] / n_expert;
-        slot[np] = pair[np] - tok[np] * n_expert;
-        xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
+    /* [NT][xq_blocks], packed to the real xq_blocks stride (the static array
+     * this replaces was [8][16] and wasted the tail when xq_blocks < 16).
+     * Sized by the host from moe_mxfp4_gate_up_smem_bytes(); untouched when
+     * that returns 0. */
+    extern __shared__ cuda_block_q8_K sxq_dyn[];
+    uint32_t pair[NT];
+    uint32_t tok[NT];
+    uint32_t slot[NT];
+    const cuda_block_q8_K *xqb[NT];
+    #pragma unroll
+    for (uint32_t i = 0; i < NT; i++) { pair[i] = 0; tok[i] = 0; slot[i] = 0; xqb[i] = NULL; }
+    const uint32_t cnt = counts[expert];
+    const uint32_t avail = (local_start < cnt) ? (cnt - local_start) : 0u;
+    const uint32_t np = avail < NT ? avail : NT;
+    #pragma unroll
+    for (uint32_t i = 0; i < NT; i++) {
+        if (i >= np) break;
+        pair[i] = sorted_pairs[offsets[expert] + local_start + i];
+        tok[i] = pair[i] / n_expert;
+        slot[i] = pair[i] - tok[i] * n_expert;
+        xqb[i] = xq + (uint64_t)tok[i] * xq_blocks;
     }
-    if (xq_blocks <= 16u) {
+    if (moe_mxfp4_gate_up_smem_bytes(NT, xq_blocks)) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
-            sxq[p][b] = xqb[p][b];
+            sxq_dyn[p * xq_blocks + b] = xqb[p][b];
         }
         __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+        #pragma unroll
+        for (uint32_t p = 0; p < NT; p++) { if (p >= np) break; xqb[p] = sxq_dyn + p * xq_blocks; }
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
         const unsigned char *gr = (const unsigned char *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const unsigned char *ur = (const unsigned char *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float gate[NT], up[NT];
+        #pragma unroll
+        for (uint32_t p = 0; p < NT; p++) { gate[p] = 0.0f; up[p] = 0.0f; }
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            dev_dot_mxfp4_q8_K_block8(gr + (uint64_t)b * 8u * 17u,
-                                      xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                      xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                      xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                      xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate);
-            dev_dot_mxfp4_q8_K_block8(ur + (uint64_t)b * 8u * 17u,
-                                      xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                      xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                      xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                      xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up);
+            const cuda_block_q8_K *yb[NT];
+            #pragma unroll
+            for (uint32_t p = 0; p < NT; p++) { yb[p] = (p < np) ? xqb[p] + b : NULL; }
+            dev_dot_mxfp4_q8_K_blockN<NT>(gr + (uint64_t)b * 8u * 17u, yb, np, gate);
+            dev_dot_mxfp4_q8_K_blockN<NT>(ur + (uint64_t)b * 8u * 17u, yb, np, up);
         }
-        for (uint32_t p = 0; p < np; p++) {
+        #pragma unroll
+        for (uint32_t p = 0; p < NT; p++) {
+            if (p >= np) break;
             gate[p] = quarter_warp_sum_f32(gate[p], lane);
             up[p] = quarter_warp_sum_f32(up[p], lane);
             if (lane == 0) {
@@ -930,6 +1031,78 @@ __global__ static void moe_gate_up_mid_mxfp4_expert_tile8_rowspan_kernel(
     }
 }
 
+
+/* The MXFP4 gate/up token-tile width, resolved ONCE from a DEVICE QUERY plus
+ * the opt-in call itself -- deliberately NOT an env switch (project rule: no
+ * getenv/flag branching on per-token/per-layer paths).  NT=16 stages 74,752 B,
+ * over the 48 KB default cap; a device whose opt-in cap cannot cover that, or a
+ * driver that refuses the opt-in, gets NT=8 -- which needs no opt-in (37,376 B)
+ * and is the shipped behaviour -- rather than a launch that fails at 16.
+ *
+ * The cudaGetLastError() bracketing is not superstition.  A failed
+ * cudaFuncSetAttribute leaves a STICKY last-error that the next unrelated
+ * cudaGetLastError() reads as its own; in the microbench that exact mechanism
+ * reported NT=32/64 as "launch failures" they never were and inverted the
+ * finding.  So: clear before, trust the call's OWN return value, clear after --
+ * never infer this call's outcome from a later cudaGetLastError().
+ *
+ * ROW_SPAN is a template parameter because the attribute is per-INSTANTIATION:
+ * it must be set on exactly the specialisation that gets launched. */
+/* Does this device grant the NT=16 tile?  Split out from the caching wrapper so
+ * that the cache is published EXACTLY ONCE, with its final value, rather than
+ * staging an 8 up front as an "unresolved" marker that a concurrent caller could
+ * observe as a resolved 8 and take the narrow tile on.  (That would only ever
+ * have been a lost speedup, never a wrong result -- each caller re-derives its
+ * nt, its smem size and its tile list together, so any launch is self-consistent
+ * and bit-exact -- and engine access is single-threaded today.  But the
+ * multi-session work would make it reachable, and a once-resolver that can hand
+ * out a provisional answer is not worth keeping.) */
+template <uint32_t ROW_SPAN>
+static uint32_t moe_mxfp4_gate_up_resolve_tile_width(void) {
+    int dev = 0;
+    int optin_cap = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&optin_cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: MoE MXFP4 gate/up: device SMEM query failed; using the NT=8 tile\n");
+        return 8u;
+    }
+    if ((uint32_t)optin_cap < MOE_MXFP4_GATE_UP_NT16_SMEM_MAX) {
+        fprintf(stderr,
+                "ds4: MoE MXFP4 gate/up: device dynamic-SMEM opt-in cap %d B < %u B needed for the "
+                "NT=16 tile; using the NT=8 tile (~2.3x slower on this stage)\n",
+                optin_cap, MOE_MXFP4_GATE_UP_NT16_SMEM_MAX);
+        return 8u;
+    }
+    (void)cudaGetLastError();       /* clear: a stale error must not be misread as ours */
+    const cudaError_t at = cudaFuncSetAttribute(
+        (const void *)moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<ROW_SPAN, 16u>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)MOE_MXFP4_GATE_UP_NT16_SMEM_MAX);
+    (void)cudaGetLastError();       /* clear: a FAILED setattr is sticky and would surface as the next launch's error */
+    if (at != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: MoE MXFP4 gate/up: dynamic-SMEM opt-in for %u B refused (%s); "
+                "using the NT=8 tile\n",
+                MOE_MXFP4_GATE_UP_NT16_SMEM_MAX, cudaGetErrorString(at));
+        return 8u;
+    }
+    return 16u;
+}
+
+/* NOTE: the attribute cudaFuncSetAttribute sets is per-device/per-context, while
+ * this cache is per-process.  Tearing down and recreating the primary context, or
+ * selecting a second device with a smaller opt-in cap, would leave a cached 16
+ * launching against a kernel whose attribute is unset -- which surfaces as a loud
+ * cudaErrorInvalidValue on the launch check, not as bad output.  No
+ * cudaDeviceReset exists in the tree and the target is single-GPU, so this is
+ * latent; it needs re-resolving per device if that ever changes. */
+template <uint32_t ROW_SPAN>
+static uint32_t moe_mxfp4_gate_up_tile_width(void) {
+    static uint32_t width = 0;      /* 0 = unresolved; resolved once, then cached */
+    if (!width) width = moe_mxfp4_gate_up_resolve_tile_width<ROW_SPAN>();
+    return width;
+}
 
 
 /* Q2_K gate/up variants of the three gate kernels above (mid preset:
@@ -2386,10 +2559,13 @@ static int routed_moe_launch(
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         /* One release configuration (the tuned production values from the old
-         * DS4_CUDA_MOE_* env matrix): expert-major sorted tiles of 8 rows,
-         * atomic down accumulation + 16-row down tiles + row-span kernels for
-         * big prefill batches, LUT gate for decode, direct down-sum for the
-         * 6-expert decode case. */
+         * DS4_CUDA_MOE_* env matrix): expert-major sorted pair tiles, 16-row
+         * down tiles + row-span kernels for big prefill batches, LUT gate for
+         * decode, direct down-sum for the 6-expert decode case.  (This said
+         * "atomic down accumulation" until this commit; there is no atomicAdd
+         * on any down path -- every output element is written by exactly one
+         * thread, per-pair stores plus a fixed-order moe_sum_kernel, which is
+         * precisely why these stages are bit-exact and re-tileable.) */
         const uint32_t pair_count = n_tokens * n_expert;
         /* Sorted expert tiles exist for the iq2_xxs/q2_k kernels only; mxfp4
          * stages take the per-pair qwarp32 kernels. Build the sorted
@@ -2540,13 +2716,41 @@ static int routed_moe_launch(
                     }
                 }
             } else if (sorted_pairs && gate_mxfp4 && fp4_tiled && use_big_batch) {
-                dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                moe_gate_up_mid_mxfp4_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
-                    (float *)mid->ptr,
-                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                    clamp);
+                /* NT=16 where the device allows the dynamic-SMEM opt-in (measured
+                 * 2.30x, bit-exact), else the NT=8 fallback.  The two widths must
+                 * read tile lists of their OWN width: a 16-token tile walking the
+                 * tile-8 list would re-process pairs and skip others.  Both lists
+                 * are already built above under use_big_batch, which this branch
+                 * requires; the mxfp4 down stage has consumed the tile16 list since
+                 * 7c92951. */
+                /* NT=16 ONLY WHERE IT CAN STAGE.  The width and the staging are not
+                 * independent knobs -- measured at the v5mx shape: staged, 8 ->
+                 * 171.67 ms and 16 -> 74.64 (2.30x); UNSTAGED, 8 -> 122.53 but 16 ->
+                 * 152.71, i.e. unstaged the WIDER tile is ~25% SLOWER than the
+                 * narrower one.  So when xq_blocks > 16 puts staging out of reach
+                 * (moe_mxfp4_gate_up_smem_bytes -> 0), widening would be a
+                 * regression, not a win: keep NT=8 there. */
+                const uint32_t nt = moe_mxfp4_gate_up_smem_bytes(16u, xq_blocks)
+                                        ? moe_mxfp4_gate_up_tile_width<1024u>()
+                                        : 8u;
+                const uint32_t smem = moe_mxfp4_gate_up_smem_bytes(nt, xq_blocks);
+                if (nt == 16u) {
+                    dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile16_capacity, 1);
+                    moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 16u><<<tgrid, 256, smem>>>(
+                        (float *)mid->ptr,
+                        gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                        tile16_total, tile16_experts, tile16_starts, (const float *)weights->ptr,
+                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        clamp);
+                } else {
+                    dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
+                    moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 8u><<<tgrid, 256, smem>>>(
+                        (float *)mid->ptr,
+                        gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                        tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        clamp);
+                }
             } else {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
                 if (gate_mxfp4) {
