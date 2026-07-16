@@ -33,10 +33,21 @@
  * THREE TRAPS THIS HARNESS HIT, EACH OF WHICH SILENTLY INVERTS THE ANSWER.  If you
  * fork this file, keep all three guards:
  *
- *  1. DECODE MUST MATCH PRODUCTION.  dev_e2m1_x2 is copied verbatim from
- *     ds4_cuda_moe.cu:184 and computes the e2m1 magnitude ARITHMETICALLY.  Replacing
- *     it with a `static const int8_t lut[16]` is numerically identical but nvcc lowers
- *     it to GLOBAL gather loads, cutting the decode from 43% to 13% of the stream --
+ *  1. DECODE MUST MATCH PRODUCTION.  ***STALE AS OF 5c86e4d — READ THIS FIRST.***
+ *     When this harness was written, production's dev_e2m1_x2 computed the e2m1
+ *     magnitude ARITHMETICALLY, and DECODE=0 below is a verbatim copy of that.
+ *     Production has since adopted the packed-shift select this harness measured
+ *     as DECODE=1's `dev_e2m1_x2_lut` (two 32-bit immediates + a shift -- NOT the
+ *     memory table described below).  So the mapping is now inverted: **DECODE=1
+ *     is production and DECODE=0 is the retired form.**  Any future sweep taken
+ *     against DECODE=0 as "the baseline" mis-attributes decode cost -- which is
+ *     exactly the failure this guard exists to prevent.  Re-copy from production
+ *     before trusting a new number.
+ *
+ *     The original warning, still true and still the reason DECODE is a knob:
+ *     replacing the decode with a `static const int8_t lut[16]` is numerically
+ *     identical but nvcc lowers it to GLOBAL gather loads, cutting the decode
+ *     from 43% to 13% of the stream --
  *     i.e. benchmarking a kernel we do not ship, against which the N-tile looks
  *     worthless.  Verified: with the arithmetic decode this bench's NT=8 kernel is
  *     11,688 SASS instructions vs the shipped kernel's 11,671 (0.15%).  That match is

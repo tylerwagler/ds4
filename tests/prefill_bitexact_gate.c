@@ -79,7 +79,7 @@
  * WHICH REDUCTION ORDER ACTUALLY MATTERS (measured 2026-07-15, and NOT what
  * temp/d2r-prefill-spec.md section 3.1 predicts — read this before writing a
  * D2R kernel).  Each gate/up output element is a THREE-level float reduction
- * (moe_gate_up_mid_mxfp4_expert_tile8_rowspan_kernel + the block8 dot):
+ * (moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel + the blockN dot):
  *
  *   level 1  facc_b   = SUM over sb=0..7 of scale_sb * (float)sumi_sb
  *   level 2  g_l      = SUM over b == l (mod 8), ascending, of 0.5f*y->d*facc_b
@@ -116,7 +116,7 @@
  * TEETH (each seeded as a local kernel edit, gate re-run, edit reverted;
  * verified on this tree 2026-07-15 — see the commit message):
  *   T1  MXFP4 gate/up block->lane REPARTITION — src/cuda/ds4_cuda_moe.cu,
- *       moe_gate_up_mid_mxfp4_expert_tile8_rowspan_kernel: give lane l the
+ *       moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel: give lane l the
  *       blocks {2l, 2l+1} instead of {l, l+8}
  *           for (uint32_t b = lane * 2u; b < lane * 2u + 2u && b < xq_blocks; b++)
  *       At v5mx's xq_blocks == 16 (n_embd 4096 / 256) that is the SAME blocks
