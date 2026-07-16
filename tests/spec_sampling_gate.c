@@ -27,6 +27,33 @@
  * engine's own counters, so the same run answers "is the sampled proposal
  * beating the greedy p(mode) acceptance ceiling?".
  *
+ * *** READ THIS BEFORE "FIXING" THE DEEP CHI-SQUARE ***
+ * This gate's own test compares mode 0 (plain, sampled from SINGLE-TOKEN DECODE
+ * logits) against mode 1 (speculative, p read from the BATCHED verify rows).
+ * Those are two different numeric paths. They are KNOWN to diverge on near-ties
+ * — the Tier-2 driver control proved the batched sweep diverges from classic
+ * decode using only pre-existing code on an untouched baseline ("batch-sweep
+ * DIVERGES from classic decode at step 18", gaps 0.03-0.26). So at depth this
+ * test has a systematic difference between its arms that is NOT a sampler bug,
+ * and it sits near crit even on the SHIPPED engine (measured: baseline at ctx
+ * 6017, traj 2000 -> pos3 chi2=21.3 vs crit 22.6, i.e. 94% of threshold).
+ *
+ * Consequence: a deep FAIL here does NOT by itself indict the sampler. Measured
+ * TVD between arms, ctx 6017 traj 2000:
+ *     fixed    mode0 vs mode1 : 0.0530 / 0.0605  (pos2/pos3)
+ *     baseline mode0 vs mode1 : 0.0400 / 0.0445
+ *     fixed mode1 vs baseline mode1 : 0.0130 / 0.0180   <-- 3-4x smaller
+ * The two speculative engines agree with EACH OTHER far better than either
+ * agrees with plain decode: one shared artifact, both rules exact.
+ *
+ * To test the SAMPLER rather than the numerics, dump both engines (argv[6]) and
+ * run tests/spec_sampling_compare.py — mode1-vs-mode1 removes the confound
+ * because both arms are batch-sourced. The proper repair of THIS test is to
+ * have mode 0 read the same batched rows (a 1-row spec batch, drafter off) so
+ * it compares like with like; until then, treat a deep mode0-vs-mode1 FAIL as
+ * "engine numerics", not "sampler bias". The batch-vs-decode divergence is a
+ * real engine property we are deliberately NOT fixing here.
+ *
  * MODEL-DEPENDENT — needs the merged drafter gguf and ~95 GB free. Run:
  *   make cuda-spec-sampling-gate                  (defaults to gguf/model.gguf)
  *   ./tests/spec_sampling_gate <model.gguf> [temp] [filler_tokens]
@@ -97,6 +124,19 @@ int main(int argc, char **argv) {
      * token per position. Keep this high enough that the nucleus is real. */
     const float TOP_P = argc > 5 ? (float)atof(argv[5]) : 0.95f;
     const float MIN_P = 0.0f;
+    /* Optional: dump both arms' raw trajectories so two ENGINES can be compared
+     * directly. The chi-square below pits plain-sampled (mode 0) against
+     * speculative (mode 1) — but mode 0 samples single-token DECODE logits
+     * while mode 1 reads p from the BATCHED verify rows, and those two numeric
+     * paths are known to diverge on near-ties (the Tier-2 driver control proved
+     * batch-sweep diverges from classic decode on an untouched baseline:
+     * "diverges at step 18", gaps 0.03-0.26). So at depth this gate has a
+     * systematic difference between its arms that is NOT a sampler bug, and it
+     * sits near crit even on shipped code. Dumping lets us run the confound-free
+     * comparison instead: mode1(engine A) vs mode1(engine B) — both spec, both
+     * batch-sourced. Both accept rules are exact for an arbitrary proposal, so
+     * if they are correct they must reproduce the SAME filtered target. */
+    const char *dump_path = argc > 6 ? argv[6] : NULL;
 
     ds4_engine_options opt = { .model_path = model, .backend = DS4_BACKEND_CUDA };
     ds4_engine *engine = NULL;
@@ -223,6 +263,26 @@ int main(int argc, char **argv) {
         fputc('\n', stderr);
     }
     s1 = spec_take(engine);
+    if (dump_path) {
+        FILE *df = fopen(dump_path, "wb");
+        if (df) {
+            const int32_t hdr[2] = { (int32_t)traj, (int32_t)DEPTH };
+            fwrite(hdr, sizeof(int32_t), 2, df);
+            for (int t = 0; t < traj; t++)
+                for (int k = 0; k < DEPTH; k++) {
+                    const int32_t v = seqA[t][k];
+                    fwrite(&v, sizeof(v), 1, df);
+                }
+            for (int t = 0; t < traj; t++)
+                for (int k = 0; k < DEPTH; k++) {
+                    const int32_t v = seqB[t][k];
+                    fwrite(&v, sizeof(v), 1, df);
+                }
+            fclose(df);
+            printf("dumped %d trajectories x %d positions (modeA then modeB) -> %s\n",
+                   traj, DEPTH, dump_path);
+        }
+    }
     /* THE Item 1 number: sampled-proposal acceptance at TEMP. The deterministic
      * (argmax-proposal) rule is capped at E[p(mode)]; min(1,p/q) is not. Compare
      * against a build of this same gate from the pre-Item-1 commit. */
