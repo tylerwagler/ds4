@@ -1543,7 +1543,7 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     buf rendered = {0};
-    buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
+    buf_puts(&rendered, DS4_SERVER_RENDER_BOS);
     if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
     buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
     buf_puts(&rendered, prompt);

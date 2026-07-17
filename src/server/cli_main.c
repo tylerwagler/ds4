@@ -401,6 +401,33 @@ int main(int argc, char **argv) {
     s.slots[0].state = SLOT_IDLE;
     s.slots[0].ctx_size = cfg.ctx_size;
     s.slots[0].est_cost_bytes = session_actual;
+    /* Slot-routing trivial-match threshold (choose_slot_for_job): the token
+     * depth at which a shared prefix stops meaning "same rendered template
+     * header" and starts meaning "same conversation". Derived once per model
+     * rather than hardcoded: tokenize the largest template-injected text two
+     * UNRELATED conversations can share — BOS plus the fixed think-max
+     * preamble (prompt_render.c renders both before any client content; the
+     * preamble only appears at DS4_THINK_MAX, unreachable below a 384K
+     * context, but a threshold sized for it stays correct on boxes where it
+     * IS reachable and costs nothing here) — then allow
+     * DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS of incidental prologue
+     * overlap on top (see the constant's comment for the sizing evidence). */
+    {
+        buf hdr = {0};
+        buf_puts(&hdr, DS4_SERVER_RENDER_BOS);
+        buf_puts(&hdr, ds4_think_max_prefix());
+        ds4_tokens hdr_tokens = {0};
+        ds4_tokenize_rendered_chat(engine, hdr.ptr, &hdr_tokens);
+        s.slot_trivial_common_tokens =
+            hdr_tokens.len + DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: slot routing: trivial-match threshold %d tokens "
+                   "(template header %d + incidental allowance %d)",
+                   s.slot_trivial_common_tokens, hdr_tokens.len,
+                   DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS);
+        ds4_tokens_free(&hdr_tokens);
+        buf_free(&hdr);
+    }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -4973,6 +5000,111 @@ static void test_session_eviction_victim_selection(void) {
 
 
 
+/* Routing decision (task #30): the choose-vs-provision gate. Through v0.2.0
+ * the gate was best_common == 0, unreachable for rendered chat traffic
+ * (every rendered prompt shares the template header — measured common = 4-9
+ * tokens across DISTINCT conversations in the task-#24 bounce repro), so
+ * sequential conversations always clobbered slot 0 and the pool provisioned
+ * zero slots. The classifier reclassifies header-deep matches as no-match
+ * for the routing decision only. T mirrors the startup-derived threshold
+ * (template header tokens + DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS);
+ * the decision must hold for any plausible derivation, so the matrix uses
+ * the allowance floor. Owner routing (live tool-state continuations) sits
+ * UPSTREAM of this classifier in choose_slot_for_job and is untouched;
+ * its slot lookup needs a live session frontier, so it is exercised by the
+ * e2e gates rather than here. */
+static void test_slot_route_trivial_match_decision(void) {
+    const int T = DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
+    /* zero common vs a warm 5.2k-token conversation: provision (the one
+     * case the v0.2.0 gate did handle — behavior kept) */
+    TEST_ASSERT(server_slot_match_is_trivial(0, 5200, T));
+    /* trivial common (template header only, the measured bounce shape):
+     * THE FIX — a different conversation must not clobber a warm slot */
+    TEST_ASSERT(server_slot_match_is_trivial(4, 5200, T));
+    TEST_ASSERT(server_slot_match_is_trivial(9, 5200, T));
+    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 5200, T));
+    /* real common (long shared prefix: a client resending a longer version
+     * of the same prompt, or the documented stateless-continuation
+     * pattern): reuse the warm slot, never provision away from it */
+    TEST_ASSERT(!server_slot_match_is_trivial(T, 5200, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(5175, 5900, T));
+    /* empty slot: nothing to protect, reuse it (never "clobbers") */
+    TEST_ASSERT(!server_slot_match_is_trivial(0, 0, T));
+    /* short same-conversation continuation: common covers nearly the whole
+     * slot state — stay on the warm slot even though common < T */
+    TEST_ASSERT(!server_slot_match_is_trivial(38, 40, T));
+    /* sub-threshold warm tail past the match: clobbering costs a sub-second
+     * re-prefill, a fresh provisioning costs seconds — reuse (deliberate
+     * semantic change from v0.2.0, which provisioned for pos in (0, T)) */
+    TEST_ASSERT(!server_slot_match_is_trivial(0, T - 1, T));
+    /* boundary: destroyed tail exactly at the threshold provisions */
+    TEST_ASSERT(server_slot_match_is_trivial(0, T, T));
+    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 2 * T - 1, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(T - 1, 2 * T - 2, T));
+}
+
+
+
+/* Routing probe for thinking chats (task #30): a slot whose live thinking
+ * binding byte-matches the request's visible transcript is that
+ * conversation's warm continuation, even when the token common prefix is
+ * header-short (the client replays visible content; the slot's sampled
+ * frontier holds the hidden reasoning). choose_slot_for_job must route such
+ * a request back to its slot instead of provisioning a "fresh conversation"
+ * slot for it. Host fields only — sess is never dereferenced (the caller
+ * passes the live position). */
+static void test_thinking_binding_routes_visible_continuation(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    char vis[] = "<BOS>sys<U>hi<A></think>hello<EOS>";
+    session_slot sl;
+    memset(&sl, 0, sizeof(sl));
+    sl.thinking_live.valid = true;
+    sl.thinking_live.visible_text = vis;
+    sl.thinking_live.visible_len = strlen(vis);
+    sl.thinking_live.live_tokens = 40;
+
+    char prompt[] = "<BOS>sys<U>hi<A></think>hello<EOS><U>again";
+    request req;
+    memset(&req, 0, sizeof(req));
+    req.kind = REQ_CHAT;
+    req.api = API_OPENAI;
+    req.prompt_text = prompt;
+
+    /* the continuation matches its slot at the remembered frontier */
+    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == strlen(vis));
+    /* frontier moved (slot served someone else meanwhile): stale, no match */
+    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 41) == 0);
+    /* a different conversation sharing only the header must not match —
+     * longer than the binding key so the BYTE COMPARE is what rejects it,
+     * not the visible_len < prompt_len guard (2026-07-16 review) */
+    char other[] = "<BOS>sys<U>completely different much longer conversation";
+    req.prompt_text = other;
+    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    /* an exact replay (no new suffix) is not a continuation */
+    char exact[] = "<BOS>sys<U>hi<A></think>hello<EOS>";
+    req.prompt_text = exact;
+    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    /* owner-routed protocols resolve via live call ids upstream; the probe
+     * must not claim them */
+    req.prompt_text = prompt;
+    req.api = API_RESPONSES;
+    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    req.api = API_OPENAI;
+    req.kind = REQ_COMPLETION;
+    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    /* invalidated binding (clobbered/evicted slot) never matches */
+    req.kind = REQ_CHAT;
+    sl.thinking_live.valid = false;
+    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+
+
 /* Multi-session increment 2: while a job is bound to a slot, the worker's
  * send_all() routes through a slot_writer — writes that do not fit the socket
  * buffer defer instead of blocking, and flushes deliver every byte in order.
@@ -5083,6 +5215,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_floor_admits_warmed_box_shape();
     test_session_eviction_ledger_math();
     test_session_eviction_victim_selection();
+    test_slot_route_trivial_match_decision();
+    test_thinking_binding_routes_visible_continuation();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();

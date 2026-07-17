@@ -887,3 +887,39 @@ int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
     return live_tokens->len;
 }
 
+
+
+/* Routing probe (choose_slot_for_job): does this slot's live thinking
+ * binding mark it as the warm continuation of req's visible transcript?
+ * Same guards as thinking_live_visible_prefix_prompt above, but byte-prefix
+ * check only — no tokenization, no effective-prompt build (gen_begin redoes
+ * the full resolution on the chosen slot). The router needs this because
+ * the token common prefix UNDERSTATES relatedness for thinking chats: the
+ * client replays visible content while the slot's sampled frontier holds
+ * the hidden reasoning too, so a short token match can still be the same
+ * conversation. Returns the matched visible-key length (>0) so the caller
+ * can prefer the most recent frontier if several slots hold bindings for
+ * prefixes of one conversation, or 0 for no match. Never dereferences
+ * sl->sess (the caller passes the slot's live position). */
+size_t thinking_live_binds_prompt(server *s, session_slot *sl,
+                                  const request *req, int live_pos) {
+    if (!s || !sl || !req || !req->prompt_text) return 0;
+    if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
+
+    const size_t prompt_len = strlen(req->prompt_text);
+    size_t visible_len = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    if (sl->thinking_live.valid &&
+        sl->thinking_live.live_tokens == live_pos &&
+        sl->thinking_live.visible_text &&
+        sl->thinking_live.visible_len < prompt_len &&
+        byte_prefix_match(req->prompt_text, prompt_len,
+                          sl->thinking_live.visible_text,
+                          sl->thinking_live.visible_len))
+    {
+        visible_len = sl->thinking_live.visible_len;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return visible_len;
+}
+
