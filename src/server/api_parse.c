@@ -95,6 +95,12 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 free(key);
                 goto bad;
             }
+            /* Same convention as top_p's range handling in the engine
+             * samplers (sample_top_p_min_p): an out-of-range value disables
+             * the filter instead of erroring.  Unvalidated, min_p > 1
+             * silently collapses sampling to greedy (only the max-prob
+             * candidate survives the cutoff). */
+            if (v < 0.0 || v > 1.0) v = 0.0;
             r->min_p = (float)v;
             r->has_min_p = true;
         } else if (!strcmp(key, "top_k")) {
@@ -1476,6 +1482,12 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                 free(key);
                 goto bad;
             }
+            /* Same convention as top_p's range handling in the engine
+             * samplers (sample_top_p_min_p): an out-of-range value disables
+             * the filter instead of erroring.  Unvalidated, min_p > 1
+             * silently collapses sampling to greedy (only the max-prob
+             * candidate survives the cutoff). */
+            if (v < 0.0 || v > 1.0) v = 0.0;
             r->min_p = (float)v;
             r->has_min_p = true;
         } else if (!strcmp(key, "top_k")) {

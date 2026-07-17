@@ -2846,6 +2846,57 @@ static void test_api_sampling_presence_flags(void) {
 
 
 
+/* min_p range validation at parse: an out-of-range min_p (min_p < 0 or
+ * min_p > 1) disables the filter (0.0), following top_p's out-of-range
+ * convention in the engine samplers; unvalidated, min_p > 1 silently
+ * collapsed sampling to greedy.  In-range values pass through untouched,
+ * and the presence flag is set either way (the client DID send it, so
+ * think-mode defaulting must not re-assert DS4_DEFAULT_MIN_P).  Covers
+ * both surfaces that parse min_p (OpenAI chat + legacy completions). */
+static void test_api_min_p_range_validation(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    char err[160];
+    request r;
+
+    /* OpenAI chat completions: min_p > 1 -> filter disabled, flag set */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"min_p\":1.5}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_min_p && r.min_p == 0.0f);
+    request_free(&r);
+
+    /* OpenAI chat completions: min_p < 0 -> filter disabled, flag set */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"min_p\":-0.5}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_min_p && r.min_p == 0.0f);
+    request_free(&r);
+
+    /* OpenAI chat completions: boundary values 0 and 1 are valid as-is */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"min_p\":1.0}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_min_p && r.min_p == 1.0f);
+    request_free(&r);
+
+    /* Legacy completions: same clamp on the other min_p surface */
+    TEST_ASSERT(parse_completion_request(engine,
+        "{\"prompt\":\"hi\",\"min_p\":2.0}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_min_p && r.min_p == 0.0f);
+    request_free(&r);
+
+    /* Legacy completions: in-range value untouched */
+    TEST_ASSERT(parse_completion_request(engine,
+        "{\"prompt\":\"hi\",\"min_p\":0.1}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.has_min_p && r.min_p == 0.1f);
+    request_free(&r);
+}
+
+
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -2870,6 +2921,7 @@ static const ds4_test_entry test_entries[] = {
     {"--f16-kernels", "f16-kernels", "isolated F16 matmul kernel numeric regressions", test_f16_kernel_group},
     {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
+    {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
 #endif
     {"--sampler", "sampler", "sampler byte-exactness vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
