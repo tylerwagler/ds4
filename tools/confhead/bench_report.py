@@ -27,17 +27,31 @@ def leg(d):
         cells.setdefault(key, []).append(agg(s))
     return cells
 
+def show(title, cells):
+    print(f"\n=== {title} ===")
+    print(f"{'cell':32s} {'runs':4s} {'eff_tps(med)':12s} {'alpha':7s} {'tok/step':8s} {'ms/step':8s}")
+    for key in sorted(cells, key=str):
+        rs = cells[key]
+        med = lambda k: float(np.median([r[k] for r in rs]))
+        name = f"{key[0]}/{key[1]}/t{key[2]}"
+        print(f"{name:32s} {len(rs):4d} {med('eff_tps'):12.2f} {med('alpha'):7.3f} "
+              f"{med('tok_step'):8.2f} {med('ms_step'):8.1f}")
+
 def main():
-    for d in sys.argv[1:]:
-        print(f"\n=== {d} ===")
-        cells = leg(d)
-        print(f"{'cell':32s} {'runs':4s} {'eff_tps(med)':12s} {'alpha':7s} {'tok/step':8s} {'ms/step':8s}")
-        for key in sorted(cells, key=str):
-            rs = cells[key]
-            med = lambda k: float(np.median([r[k] for r in rs]))
-            name = f"{key[0]}/{key[1]}/t{key[2]}"
-            print(f"{name:32s} {len(rs):4d} {med('eff_tps'):12.2f} {med('alpha'):7.3f} "
-                  f"{med('tok_step'):8.2f} {med('ms_step'):8.1f}")
+    args = sys.argv[1:]
+    pool = "--pool" in args
+    dirs = [a for a in args if a != "--pool"]
+    if pool:
+        # one table over all dirs (e.g. per-run A/B legs of the same config:
+        # each leg is a fresh server, medians run across legs)
+        merged = {}
+        for d in dirs:
+            for k, rs in leg(d).items():
+                merged.setdefault(k, []).extend(rs)
+        show(" + ".join(dirs), merged)
+    else:
+        for d in dirs:
+            show(d, leg(d))
 
 if __name__ == "__main__":
     main()
