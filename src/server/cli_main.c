@@ -184,6 +184,87 @@ static const char *resolve_default_gguf(const char *pointer) {
     return NULL;
 }
 
+/* Default directory for the disk KV cache, which is ON by default: the
+ * conversation-bounce restore (sub-second vs full re-prefill TTFT) must not
+ * depend on remembering --kv-disk-dir.  Placement follows XDG:
+ * $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>.  The user
+ * cache dir is chosen over <dirname(model)>/ because the model store may be
+ * read-only or a network mount, while checkpoints are latency-sensitive,
+ * regenerable, per-user state.
+ *
+ * <model> keys the directory by model identity.  The store header only
+ * self-validates the model VARIANT (Flash/Pro, ds4_engine_model_id) and the
+ * routed-expert quant bits — NOT the exact weight artifact — so two different
+ * ggufs of the same shape sharing a directory could cross-restore each
+ * other's checkpoints.  gguf/model.gguf is an ACTIVE-POINTER symlink by
+ * convention; its realpath basename is the versioned artifact name and
+ * therefore the right identity key.  Returns a heap path (process lifetime),
+ * or NULL when no cache home can be resolved. */
+static char *server_default_kv_disk_dir(const char *model_path) {
+    char resolved[PATH_MAX];
+    const char *src = model_path ? model_path : "";
+    if (model_path && realpath(model_path, resolved)) src = resolved;
+    const char *base = strrchr(src, '/');
+    base = base ? base + 1 : src;
+    size_t len = strlen(base);
+    if (len > 5 && !strcasecmp(base + len - 5, ".gguf")) len -= 5;
+    char key[128];
+    if (len == 0) {
+        strcpy(key, "model");
+    } else {
+        if (len > sizeof(key) - 1) len = sizeof(key) - 1;
+        for (size_t j = 0; j < len; j++) {
+            unsigned char ch = (unsigned char)base[j];
+            key[j] = (isalnum(ch) || ch == '.' || ch == '_' || ch == '-') ?
+                     (char)ch : '_';
+        }
+        key[len] = '\0';
+    }
+    buf b = {0};
+    /* Per the XDG spec a non-absolute XDG_CACHE_HOME is ignored (a relative
+     * value would key the cache off whatever the post---chdir cwd happens to
+     * be). */
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    if (xdg && xdg[0] == '/') {
+        buf_printf(&b, "%s/ds4/kv-%s", xdg, key);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) return NULL;
+        buf_printf(&b, "%s/.cache/ds4/kv-%s", home, key);
+    }
+    return buf_take(&b);
+}
+
+
+
+/* Resolve the effective disk KV cache directory after option parsing (and
+ * after --chdir, so a relative model path realpaths from the project tree).
+ * Explicit --kv-disk-dir PATH behaves exactly as before; --kv-disk-dir "" or
+ * --no-kv-disk opts out; otherwise the default above is filled in.  An
+ * unresolvable or unusable directory must never be fatal — the server runs
+ * with the disk cache disabled (kv_cache_open handles the unusable case). */
+static void server_resolve_kv_disk_dir(server_config *c) {
+    if (c->kv_disk_disable) {
+        c->kv_disk_dir = NULL;
+        server_log(DS4_LOG_DEFAULT, "ds4-server: disk KV cache disabled by flag");
+        return;
+    }
+    if (c->kv_disk_dir) return; /* explicit path: unchanged behavior */
+    c->kv_disk_dir = server_default_kv_disk_dir(c->engine.model_path);
+    if (c->kv_disk_dir) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: disk KV cache default dir %s "
+                   "(--kv-disk-dir PATH overrides; --no-kv-disk disables)",
+                   c->kv_disk_dir);
+    } else {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: disk KV cache disabled (neither XDG_CACHE_HOME "
+                   "nor HOME is set, no default directory)");
+    }
+}
+
+
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -234,7 +315,13 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
+            /* An empty value opts out of the default-on disk cache; the last
+             * kv-disk flag on the command line wins. */
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
+            c.kv_disk_disable = !c.kv_disk_dir[0];
+        } else if (!strcmp(arg, "--no-kv-disk")) {
+            c.kv_disk_dir = NULL;
+            c.kv_disk_disable = true;
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-min-tokens")) {
@@ -337,6 +424,7 @@ int main(int argc, char **argv) {
                    cfg.chdir_path, strerror(errno));
         return 1;
     }
+    server_resolve_kv_disk_dir(&cfg);
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
@@ -432,9 +520,17 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
-    if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    if (cfg.kv_disk_dir &&
+        !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                       cfg.kv_cache_reject_different_quant, cfg.kv_cache))
+    {
+        /* Never fatal: an uncreatable/read-only directory logs its reason in
+         * kv_cache_open; state the consequence once and serve without disk
+         * restore. */
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: disk KV cache disabled (directory %s unusable); "
+                   "serving without disk restore",
+                   cfg.kv_disk_dir);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -5210,7 +5306,175 @@ static void test_slot_writer_stall_times_out(void) {
 
 
 
+/* ---- disk-KV default-on resolution matrix (task #31) ---- */
+
+static char *test_env_save(const char *name) {
+    const char *v = getenv(name);
+    return v ? xstrdup(v) : NULL;
+}
+
+static void test_env_restore(const char *name, char *saved) {
+    if (saved) {
+        setenv(name, saved, 1);
+        free(saved);
+    } else {
+        unsetenv(name);
+    }
+}
+
+
+
+static void test_kv_disk_default_dir_resolution(void) {
+    char *old_xdg = test_env_save("XDG_CACHE_HOME");
+    char *old_home = test_env_save("HOME");
+
+    /* XDG_CACHE_HOME wins; nonexistent model path falls back to its raw
+     * basename; the .gguf extension is stripped case-insensitively. */
+    setenv("XDG_CACHE_HOME", "/tmp/ds4-kvtest-xdg", 1);
+    char *d = server_default_kv_disk_dir("/no/such/dir/ds4flash-test.gguf");
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/ds4/kv-ds4flash-test"));
+    free(d);
+
+    /* The gguf/model.gguf ACTIVE-POINTER symlink must key by the versioned
+     * artifact it points at, not by the pointer name. */
+    char tmpl[] = "/tmp/ds4-kvtest-XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (dir) {
+        char artifact[PATH_MAX], pointer[PATH_MAX];
+        snprintf(artifact, sizeof(artifact), "%s/ds4flash-v9-test.gguf", dir);
+        snprintf(pointer, sizeof(pointer), "%s/model.gguf", dir);
+        FILE *fp = fopen(artifact, "w");
+        TEST_ASSERT(fp != NULL);
+        if (fp) fclose(fp);
+        TEST_ASSERT(symlink(artifact, pointer) == 0);
+        d = server_default_kv_disk_dir(pointer);
+        TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/ds4/kv-ds4flash-v9-test"));
+        free(d);
+        unlink(pointer);
+        unlink(artifact);
+        rmdir(dir);
+    }
+
+    /* Without XDG_CACHE_HOME, fall back to ~/.cache; shell-hostile bytes in
+     * the model name are sanitized. */
+    unsetenv("XDG_CACHE_HOME");
+    setenv("HOME", "/tmp/ds4-kvtest-home", 1);
+    d = server_default_kv_disk_dir("weird name!.GGUF");
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/ds4/kv-weird_name_"));
+    free(d);
+
+    /* A relative XDG_CACHE_HOME is ignored per the XDG spec (it would key
+     * the cache off the current working directory). */
+    setenv("XDG_CACHE_HOME", "relative-cache", 1);
+    d = server_default_kv_disk_dir("x.gguf");
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/ds4/kv-x"));
+    free(d);
+    unsetenv("XDG_CACHE_HOME");
+
+    /* No cache home at all: resolution reports NULL (server then runs with
+     * the disk cache disabled instead of guessing a path). */
+    unsetenv("HOME");
+    TEST_ASSERT(server_default_kv_disk_dir("x.gguf") == NULL);
+
+    test_env_restore("XDG_CACHE_HOME", old_xdg);
+    test_env_restore("HOME", old_home);
+}
+
+
+
+static void test_kv_disk_flag_matrix(void) {
+    char *old_xdg = test_env_save("XDG_CACHE_HOME");
+    setenv("XDG_CACHE_HOME", "/tmp/ds4-kvtest-xdg", 1);
+
+    /* Unset: the default directory is resolved (default-on). */
+    {
+        char *argv[] = {(char *)"ds4-server"};
+        server_config c = parse_options(1, argv);
+        server_resolve_kv_disk_dir(&c);
+        TEST_ASSERT(c.kv_disk_dir != NULL);
+        TEST_ASSERT(c.kv_disk_dir &&
+                    !strncmp(c.kv_disk_dir, "/tmp/ds4-kvtest-xdg/ds4/kv-",
+                             strlen("/tmp/ds4-kvtest-xdg/ds4/kv-")));
+        free((char *)c.kv_disk_dir);
+    }
+
+    /* Explicit path: used verbatim, exactly as before. */
+    {
+        char *argv[] = {(char *)"ds4-server",
+                        (char *)"--kv-disk-dir", (char *)"/tmp/explicit-kv"};
+        server_config c = parse_options(3, argv);
+        server_resolve_kv_disk_dir(&c);
+        TEST_ASSERT(c.kv_disk_dir && !strcmp(c.kv_disk_dir, "/tmp/explicit-kv"));
+    }
+
+    /* Empty value: opt-out. */
+    {
+        char *argv[] = {(char *)"ds4-server",
+                        (char *)"--kv-disk-dir", (char *)""};
+        server_config c = parse_options(3, argv);
+        server_resolve_kv_disk_dir(&c);
+        TEST_ASSERT(c.kv_disk_dir == NULL);
+    }
+
+    /* --no-kv-disk: opt-out. */
+    {
+        char *argv[] = {(char *)"ds4-server", (char *)"--no-kv-disk"};
+        server_config c = parse_options(2, argv);
+        server_resolve_kv_disk_dir(&c);
+        TEST_ASSERT(c.kv_disk_dir == NULL);
+    }
+
+    /* Last kv-disk flag wins: opt-out then explicit path re-enables. */
+    {
+        char *argv[] = {(char *)"ds4-server", (char *)"--no-kv-disk",
+                        (char *)"--kv-disk-dir", (char *)"/tmp/explicit-kv"};
+        server_config c = parse_options(4, argv);
+        server_resolve_kv_disk_dir(&c);
+        TEST_ASSERT(c.kv_disk_dir && !strcmp(c.kv_disk_dir, "/tmp/explicit-kv"));
+    }
+
+    test_env_restore("XDG_CACHE_HOME", old_xdg);
+}
+
+
+
+static void test_kv_cache_open_unusable_dir_disables(void) {
+    /* Uncreatable path: open fails, cache stays disabled, no crash. */
+    kv_disk_cache kc = {0};
+    TEST_ASSERT(!kv_cache_open(&kc, "/proc/ds4-kvtest-nope/kv", 64, false,
+                               kv_cache_default_options()));
+    TEST_ASSERT(!kc.enabled);
+    kv_cache_close(&kc);
+
+    /* Pre-existing read-only directory: refused up front (writability probe)
+     * instead of failing store-by-store later.  Mode bits do not bind root. */
+    char tmpl[] = "/tmp/ds4-kvtest-ro-XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (dir) {
+        TEST_ASSERT(chmod(dir, 0500) == 0);
+        kv_disk_cache ro = {0};
+        bool opened = kv_cache_open(&ro, dir, 64, false,
+                                    kv_cache_default_options());
+        if (geteuid() == 0) {
+            TEST_ASSERT(opened);
+        } else {
+            TEST_ASSERT(!opened);
+            TEST_ASSERT(!ro.enabled);
+        }
+        kv_cache_close(&ro);
+        chmod(dir, 0700);
+        rmdir(dir);
+    }
+}
+
+
+
 static void ds4_server_unit_tests_run(void) {
+    test_kv_disk_default_dir_resolution();
+    test_kv_disk_flag_matrix();
+    test_kv_cache_open_unusable_dir_disables();
     test_kv_admission_budget_math();
     test_mem_floor_admits_warmed_box_shape();
     test_session_eviction_ledger_math();

@@ -646,6 +646,20 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
                 kv_log_name(kc), dir, strerror(errno));
         return false;
     }
+    /* Probe writability up front: a pre-existing read-only directory passes
+     * kv_mkdir_p (EEXIST) but would make every later store fail one at a
+     * time.  Fail the open instead so the caller runs with the cache cleanly
+     * disabled after one clear log line.  (This intentionally also refuses a
+     * read-only pre-populated dir that restores alone could serve from —
+     * this store is a read-write cache, not a frozen-snapshot reader.)
+     * AT_EACCESS: check the EFFECTIVE credentials, the ones fopen/rename
+     * will actually use. */
+    if (faccessat(AT_FDCWD, dir, W_OK | X_OK, AT_EACCESS) != 0) {
+        kv_logf(kc, DS4_KVSTORE_LOG_DEFAULT,
+                "%s: KV cache directory %s is not writable: %s",
+                kv_log_name(kc), dir, strerror(errno));
+        return false;
+    }
     kc->enabled = true;
     kc->dir = kv_xstrdup(dir);
     if (budget_mb == 0) budget_mb = DS4_KVSTORE_DEFAULT_MB;

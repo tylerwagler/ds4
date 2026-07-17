@@ -954,6 +954,7 @@ typedef struct {
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
+    bool kv_disk_disable;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;

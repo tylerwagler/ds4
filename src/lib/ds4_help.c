@@ -280,8 +280,9 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
 
 static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
-    opt(fp, c, "--kv-disk-dir DIR", "Enable disk KV checkpoints in DIR.");
-    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default when enabled: 4096");
+    opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>. \"\" disables.");
+    opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
+    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 4096");
     opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");
     opt(fp, c, "--kv-cache-cold-max-tokens N", "Save cold first prompts up to N tokens. 0 disables. Default: 30000");
     opt(fp, c, "--kv-cache-continued-interval-tokens N", "Save aligned continued frontiers. 0 disables. Default: 10000");
@@ -406,7 +407,7 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     } else if (topic_is(topic, "steering")) {
         opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
     } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
-        opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192");
+        opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-space-mb 8192");
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
     } else if (tool == DS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
         opt(fp, c, "interactive", "./ds4-agent");

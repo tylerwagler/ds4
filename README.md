@@ -274,8 +274,12 @@ avoiding the old per-layer chunk dispatch path.
 Start a local OpenAI/Anthropic-compatible server:
 
 ```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ds4-server --ctx 100000
 ```
+
+The disk KV cache is on by default (see [Disk KV Cache](#disk-kv-cache));
+add `--kv-disk-dir DIR` / `--kv-disk-space-mb N` only to relocate or resize it,
+or `--no-kv-disk` to turn it off.
 
 Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
 so relative runtime paths such as the default `./ds4flash.gguf` model and
@@ -423,7 +427,7 @@ chat completions. Start the server first, and set the client context limit no
 higher than the `--ctx` value you started the server with:
 
 ```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ds4-server --ctx 100000
 ```
 
 You can use larger context and larger cache if you wish, up to the model's
@@ -574,9 +578,10 @@ exec "$HOME/.local/bin/claude" "$@"
 ```
 
 Claude Code may send a large initial prompt, often around 25k tokens, before it
-starts doing useful work. Keep `--kv-disk-dir` enabled: after the first expensive
-prefill, the disk KV cache lets later continuations or restarted sessions reuse
-the saved prefix instead of processing the whole prompt again.
+starts doing useful work. Keep the default-on disk KV cache enabled (do not pass
+`--no-kv-disk`): after the first expensive prefill, the disk KV cache lets later
+continuations or restarted sessions reuse the saved prefix instead of
+processing the whole prompt again.
 
 ## Thinking Modes
 
@@ -604,11 +609,30 @@ re-processing if it was written to the disk KV cache. In other words, memory
 cache handles the active session; disk cache is the resume mechanism for
 different sessions.
 
-Enable it with:
+The disk KV cache is **on by default**. When `--kv-disk-dir` is not given, the
+server resolves `$XDG_CACHE_HOME/ds4/kv-<model>` (else `~/.cache/ds4/kv-<model>`),
+where `<model>` is the symlink-resolved gguf basename — so two different model
+artifacts never share a default directory, while restarts of the same model
+find their checkpoints again. The resolved directory and disk budget are logged
+at startup. If the directory cannot be created or is not writable, the server
+logs that once and keeps serving with the disk cache disabled — it never fails
+to start over cache placement.
 
 ```sh
-./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ds4-server                                        # default-on, default dir
+./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192   # custom
+./ds4-server --no-kv-disk                           # opt out (or --kv-disk-dir "")
 ```
+
+The disk budget defaults to 4096 MiB (`--kv-disk-space-mb`); least-valuable
+checkpoints are evicted when the budget fills. Snapshot behavior is unchanged
+by the default-on switch: files are written with ordinary write + fsync + rename
+into place, and the store validates model variant, quant bits, and the rendered
+byte prefix before restoring. Note that on unified-memory hosts (GB10) the
+checkpoint writes pass through the host page cache, which competes with GPU
+memory — the usual `sync; echo 3 > /proc/sys/vm/drop_caches` discipline before
+a model load still applies; pass `--no-kv-disk` if you want none of that
+pressure.
 
 The cache key is the SHA1 of the rendered byte prefix, and files are named
 `<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
