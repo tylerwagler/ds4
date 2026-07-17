@@ -16,8 +16,11 @@ def leg(d):
     manifest = [json.loads(l) for l in open(os.path.join(d, "manifest.jsonl"))]
     gen = [e for e in manifest if e["status"] == "ok" and e["completion_tokens"] >= 1]
     segs = [s for s in parse_requests(os.path.join(d, "server.log")) if s]
-    if len(segs) != len(gen):
-        print(f"WARNING {d}: {len(segs)} segments vs {len(gen)} ok requests", file=sys.stderr)
+    # hard-fail: zipping past a divergence would misattribute every later
+    # segment to the wrong cell (e.g. a client-side timeout whose request the
+    # server kept serving). retrain.py asserts the same join.
+    assert len(segs) == len(gen), \
+        f"{d}: {len(segs)} log segments vs {len(gen)} ok requests -- cannot attribute cells"
     cells = {}
     for e, s in zip(gen, segs):
         key = (e["workload"], e["depth"], e["temperature"])

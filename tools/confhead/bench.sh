@@ -2,7 +2,7 @@
 # One bench leg: launch ds4-server on MODEL with conf-sched TAU, run a
 # fixed-seed suite, tear down. Callers serialize via flock on the gpu lock.
 #
-# Usage: tools/confhead/bench.sh <out_dir> <model.gguf> <tau> <suite> [runs] [port]
+# Usage: tools/confhead/bench.sh <out_dir> <model.gguf> <tau> <suite> [runs] [port] [ctx]
 #   suite: sweep | ab   (see bench_driver.py)
 #   out_dir gets: server.log, driver.log, manifest.jsonl, texts/ (greedy), DONE
 set -u
@@ -24,7 +24,7 @@ fi
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 free -g | sed -n 2p
 avail_gb=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
-if [ "$avail_gb" -lt 100 ]; then
+if [ "${avail_gb:-0}" -lt 100 ]; then
     echo "FATAL: only ${avail_gb} GiB available after drop_caches; box not clean" >&2
     exit 1
 fi
@@ -76,3 +76,4 @@ kill "$DOG" 2>/dev/null
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 [ "$RC" = 0 ] && touch "$OUT/DONE"
 echo "BENCH-DONE rc=$RC tau=$TAU suite=$SUITE"
+exit "$RC"

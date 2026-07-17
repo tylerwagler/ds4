@@ -54,7 +54,10 @@ def main():
     idx = 0
     for run in range(args.runs):
         for (w, d, t) in cells(args.suite):
-            prompt = BUILDERS[w](d, 0)
+            # variant 1 = retrain.py's HELD-OUT split. The sweep and A/B must
+            # never run on variant 0: that is the training data, and a head
+            # tuned on it would measure optimistically here.
+            prompt = BUILDERS[w](d, 1)
             # fixed per cell, same every leg/run/process (python hash() is
             # per-process randomized -- never use it for seeds)
             seed = 7000 + zlib.crc32(f"{w}/{d}/{t}".encode()) % 1000

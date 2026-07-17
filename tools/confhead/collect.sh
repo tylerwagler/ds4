@@ -3,7 +3,7 @@
 # matched drafting) over the collect_driver.py mixture, dumping lean
 # confidence records + fused stats for offline labeling.
 #
-# Usage: tools/confhead/collect.sh <out_dir> [model.gguf] [port]
+# Usage: tools/confhead/collect.sh <out_dir> [model.gguf] [port] [ctx] [driver args...]
 #   out_dir gets: dump.bin, server.log, driver.log, manifest.jsonl, DONE
 #
 # Successor of temp/conf_collect2.sh (the argmax-era collector). Differences:
@@ -36,7 +36,7 @@ free -g | sed -n 2p
 # watchdogs) if something else still holds unified memory -- which is often
 # invisible to RSS and survives drop_caches.
 avail_gb=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
-if [ "$avail_gb" -lt 100 ]; then
+if [ "${avail_gb:-0}" -lt 100 ]; then
     echo "FATAL: only ${avail_gb} GiB available after drop_caches; box not clean" >&2
     exit 1
 fi
@@ -99,3 +99,4 @@ grep -c "dspark fused" "$OUT/server.log" || true
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 [ "$RC" = 0 ] && touch "$OUT/DONE"
 echo "COLLECT-DONE rc=$RC"
+exit "$RC"

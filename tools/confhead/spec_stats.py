@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Aggregate DSpark fused-step stats from a ds4-server log (DS4_DSPARK_STATS=1).
 
-Reports, whole-log and per-request (requests segmented at n_batch==1):
+Reports, whole-log and per-request (requests delimited by the server's
+'completion ... prompt start' markers -- n_batch==1 is NOT a boundary, see
+parse_requests):
   eff_tps     1000 * sum(committed+1) / sum(step_ms)   (spec throughput)
   tok/step    mean(committed+1)                        (tokens per round)
   alpha       sum(committed) / sum(n_batch-1)          (accepted / verified)
   rows/step   mean(n_batch)                            (verify budget actually spent)
+
+'nodraft' fused steps print no pend= field and are excluded everywhere, so
+eff_tps is over drafted steps only (~one nodraft per request at EOS);
+symmetric across compared legs.
 
 Never quote bare t/s from spec runs: spec throughput is stochastic across
 seeds; compare eff_tps AND alpha AND tok/step at fixed seeds.
@@ -71,13 +77,7 @@ def main():
           f"tok/step={a['tok_step']:.2f} alpha={a['alpha']:.3f} "
           f"rows/step={a['rows_step']:.2f} ms/step={a['ms_step']:.1f}")
     if args.per_request:
-        seg, segs = [], []
-        for l in lines:
-            if l[0] == 1 and seg:
-                segs.append(seg); seg = []
-            seg.append(l)
-        if seg:
-            segs.append(seg)
+        segs = [s for s in parse_requests(args.log) if s]
         for i, s in enumerate(segs):
             r = agg(s)
             print(f"  req{i:02d}: steps={r['steps']:4d} eff_tps={r['eff_tps']:6.2f} "

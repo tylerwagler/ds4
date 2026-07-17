@@ -18,7 +18,7 @@ if pgrep -x ds4-server >/dev/null; then
 fi
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 avail_gb=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
-if [ "$avail_gb" -lt 100 ]; then
+if [ "${avail_gb:-0}" -lt 100 ]; then
     echo "FATAL: only ${avail_gb} GiB available after drop_caches; box not clean" >&2
     exit 1
 fi
@@ -67,3 +67,4 @@ sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 echo "SMOKE-DONE rc=$RC"
 [ "$RC" = 0 ] && touch "$OUT/DONE"
 tail -20 "$OUT/smoke.log"
+exit "$RC"
