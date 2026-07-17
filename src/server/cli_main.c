@@ -1,4 +1,242 @@
 #include "ds4_server_internal.h"
+#include "ds4_gpu.h"
+
+#include <malloc.h>
+
+
+/* =========================================================================
+ * F1 memory diagnostics (env-gated sampler).
+ *
+ * DS4_SERVER_MEMDIAG=<path>|1|stderr — read ONCE at startup (no-hot-path-
+ * flags rule) — starts a low-rate (200 ms) sampler thread that emits one
+ * line per sample: process RSS/HWM/swap, system MemAvailable/Free/Cached/
+ * Dirty/Writeback, CUDA free/total, the live ds4_gpu tensor byte counter,
+ * the admission ledger, and the glibc heap footprint (mallinfo2).  All
+ * values in MiB.  Purely observational: it takes s->mu only to read the
+ * ledger, exactly like the scheduler's own logging.
+ * ========================================================================= */
+
+typedef struct {
+    server *s;
+    FILE   *out;
+    pthread_t thread;
+    bool    running;
+} memdiag;
+
+/* Sum of the given keys' kB values from a /proc status-style file; keys[i]
+ * match line prefixes ("VmRSS:").  Values land in out_kib[i] (0 if absent). */
+static void memdiag_scan_kib(const char *path, const char *const *keys,
+                             uint64_t *out_kib, int n) {
+    for (int i = 0; i < n; i++) out_kib[i] = 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        for (int i = 0; i < n; i++) {
+            const size_t klen = strlen(keys[i]);
+            if (!strncmp(line, keys[i], klen)) {
+                unsigned long long v = 0;
+                if (sscanf(line + klen, " %llu kB", &v) == 1) out_kib[i] = v;
+            }
+        }
+    }
+    fclose(fp);
+}
+
+static void *memdiag_main(void *ud) {
+    memdiag *d = ud;
+    server *s = d->s;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const double MIB = 1024.0 * 1024.0;
+    for (;;) {
+        pthread_mutex_lock(&s->mu);
+        const bool stop = s->stopping;
+        const uint64_t ledger = s->kv_committed_bytes;
+        pthread_mutex_unlock(&s->mu);
+        if (stop) break;
+
+        static const char *const skeys[] = {"VmRSS:", "VmHWM:", "VmSwap:"};
+        static const char *const mkeys[] = {"MemAvailable:", "MemFree:",
+                                            "Cached:", "Dirty:", "Writeback:"};
+        uint64_t sv[3], mv[5];
+        memdiag_scan_kib("/proc/self/status", skeys, sv, 3);
+        memdiag_scan_kib("/proc/meminfo", mkeys, mv, 5);
+        uint64_t cuda_free = 0, cuda_total = 0;
+        ds4_gpu_mem_info(&cuda_free, &cuda_total);
+        struct mallinfo2 mi = mallinfo2();
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 +
+                          (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        fprintf(d->out,
+                "memdiag ms=%.0f rss=%.1f hwm=%.1f swap=%.1f "
+                "avail=%.1f memfree=%.1f cached=%.1f dirty=%.1f wb=%.1f "
+                "cudafree=%.1f cudatotal=%.1f gputensor=%.1f ledger=%.1f "
+                "heap=%.1f heapmmap=%.1f heapused=%.1f\n",
+                ms, sv[0] / 1024.0, sv[1] / 1024.0, sv[2] / 1024.0,
+                mv[0] / 1024.0, mv[1] / 1024.0, mv[2] / 1024.0,
+                mv[3] / 1024.0, mv[4] / 1024.0,
+                (double)cuda_free / MIB, (double)cuda_total / MIB,
+                (double)ds4_gpu_tensor_alloc_bytes_current() / MIB,
+                (double)ledger / MIB,
+                (double)mi.arena / MIB, (double)mi.hblkhd / MIB,
+                (double)mi.uordblks / MIB);
+        fflush(d->out);
+        struct timespec nap = {0, 200 * 1000 * 1000};
+        nanosleep(&nap, NULL);
+    }
+    if (d->out != stderr) fclose(d->out);
+    return NULL;
+}
+
+/* Env is read here, once, before any request runs; returns false when the
+ * diagnostic is off.  Caller joins d->thread at shutdown iff d->running. */
+static bool memdiag_start(memdiag *d, server *s) {
+    memset(d, 0, sizeof(*d));
+    const char *v = getenv("DS4_SERVER_MEMDIAG");
+    if (!v || !v[0]) return false;
+    d->s = s;
+    d->out = stderr;
+    if (strcmp(v, "1") != 0 && strcmp(v, "stderr") != 0) {
+        d->out = fopen(v, "w");
+        if (!d->out) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: DS4_SERVER_MEMDIAG: cannot open %s: %s "
+                       "(sampling to stderr)", v, strerror(errno));
+            d->out = stderr;
+        }
+    }
+    if (pthread_create(&d->thread, NULL, memdiag_main, d) != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: DS4_SERVER_MEMDIAG: sampler thread failed to start");
+        if (d->out != stderr) fclose(d->out);
+        return false;
+    }
+    d->running = true;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: memory diagnostics sampler on (%s)",
+               d->out == stderr ? "stderr" : v);
+    return true;
+}
+
+
+
+/* =========================================================================
+ * Startup warmup generation (F1 unledgered-spike fix, task #32).
+ *
+ * The CUDA stack allocates a large first-generation working set LAZILY —
+ * cuBLASLt workspaces, FP8/MXFP4 staging, GEMV activation buffers — on the
+ * first prefill/decode that exercises each kernel family (measured on the
+ * GB10, 2026-07-17: ~9.2 GiB, materializing in ~1.5 s on the first client
+ * burst; see ds4_server_internal.h, DS4_SERVER_PROCESS_OVERHEAD_BYTES).
+ * Every MemAvailable-based admission check made before that burst is
+ * therefore stale-high by that amount: the floor check legally admits
+ * sessions whose room the first generation then consumes, and the box
+ * craters straight through watchdog floors mid-request (F1 symptom B:
+ * 6.3 -> 2.9 GiB in ~3 s with the session ledger clean).
+ *
+ * Running one throwaway generation here — a full prefill chunk plus a tail,
+ * then a few tokens through the production decode path (speculative when
+ * the drafter is loaded, so its buffers materialize too) — moves that cliff
+ * to startup, BEFORE the listener opens and before the admission budget is
+ * derived.  After this returns, MemAvailable is the truth every later
+ * check needs it to be.
+ *
+ * Best-effort: a warmup failure is logged and serving continues (the cost
+ * is only that the first real generation pays the materialization instead).
+ * The session state is shrunk to a single token afterwards so the warmup
+ * transcript can never win slot routing, hit the disk KV min-tokens floor,
+ * or collide with a real conversation. */
+static void server_warmup_generation(ds4_engine *engine, ds4_session *session,
+                                     int ctx_size) {
+    const double t0 = server_now_sec();
+    const uint64_t avail_before = server_mem_available_bytes();
+    /* One full prefill-cap chunk plus a tail: exercises the widened chunk
+     * prefill shape AND the sub-chunk tail shape.  The session's resolved
+     * cap is used (the config value can be 0 = engine default). */
+    const int prefill_cap = ds4_session_prefill_cap(session);
+    int want = prefill_cap + 64;
+    if (want < 64) want = 64;
+    if (want > ctx_size - 256) want = ctx_size - 256;
+    if (want < prefill_cap) {
+        /* A small --ctx-size truncates the warmup below one full prefill
+         * chunk: the chunked-prefill working set is NOT materialized here
+         * (single-shot path only) and the measured budget will read
+         * stale-high — still bounded by the static formula's min(). */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: warmup prompt truncated to %d tokens "
+                   "(< prefill cap %d): chunked-prefill workspaces are not "
+                   "materialized at startup; first long prompt pays them",
+                   want, prefill_cap);
+    }
+    ds4_tokens body = {0}, prompt = {0};
+    ds4_tokenize_text(engine, "The quick brown fox jumps over the lazy dog. ",
+                      &body);
+    if (body.len > 0 && want > 0) {
+        while (prompt.len < want)
+            for (int i = 0; i < body.len && prompt.len < want; i++)
+                ds4_tokens_push(&prompt, body.v[i]);
+    }
+    char err[256];
+    err[0] = '\0';
+    bool ok = prompt.len > 0 &&
+              ds4_session_sync(session, &prompt, err, sizeof(err)) == 0;
+    int emitted = 0;
+    if (ok) {
+        uint64_t rng = 0x5eed5eed5eed5eedULL;
+        int toks[17];
+        while (emitted < 12) {
+            if (ds4_engine_has_dspark(engine)) {
+                const int n = ds4_session_generate_speculative(
+                        session, 0.0f, 0, 1.0f, 0.0f, &rng, 12 - emitted,
+                        ds4_token_eos(engine), toks,
+                        (int)(sizeof(toks) / sizeof(toks[0])),
+                        err, sizeof(err));
+                /* Contract (session.c): eos arrives as a returned token; 0 means
+                 * a rejected step (bad args / dirty multiseq state), not eos. */
+                if (n <= 0) { ok = false; break; }
+                emitted += n;
+                if (toks[n - 1] == ds4_token_eos(engine)) break;
+            } else {
+                const int tok = ds4_session_argmax(session);
+                if (tok == ds4_token_eos(engine)) break;
+                if (ds4_session_eval(session, tok, err, sizeof(err)) != 0) {
+                    ok = false;
+                    break;
+                }
+                emitted++;
+            }
+        }
+    }
+    /* Shrink the live state to one token: below every routing/storage
+     * threshold, and the next real prompt rebuilds from zero anyway. */
+    if (prompt.len > 0) {
+        prompt.len = 1;
+        char shrink_err[256];
+        (void)ds4_session_sync(session, &prompt, shrink_err,
+                               sizeof(shrink_err));
+    }
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&body);
+    const uint64_t avail_after = server_mem_available_bytes();
+    if (ok) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: warmup generation: %d prompt + %d decode tokens "
+                   "in %.1f s; MemAvailable %.2f -> %.2f GiB "
+                   "(first-generation working set %.2f GiB materialized)",
+                   want, emitted, server_now_sec() - t0,
+                   (double)avail_before / (1024.0 * 1024.0 * 1024.0),
+                   (double)avail_after / (1024.0 * 1024.0 * 1024.0),
+                   (double)(avail_before > avail_after
+                                ? avail_before - avail_after : 0) /
+                       (1024.0 * 1024.0 * 1024.0));
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: warmup generation failed (%s); the first real "
+                   "generation will pay the deferred CUDA allocations instead",
+                   err[0] ? err : "empty warmup prompt");
+    }
+}
 
 
 
@@ -477,13 +715,75 @@ int main(int argc, char **argv) {
         server_reconciled_session_cost(0, cfg.ctx_size, session_est,
                                        ds4_session_resident_bytes(session));
 
+    /* Materialize the lazy first-generation CUDA working set BEFORE deriving
+     * the admission budget or opening the listener (F1, task #32). */
+    server_warmup_generation(engine, session, cfg.ctx_size);
+
+    /* Re-derive the admission budget from MEASURED post-warmup MemAvailable
+     * (the est==actual discipline applied to the budget itself): the static
+     * USABLE/OVERHEAD constants drift as kernels and workspaces change
+     * (measured drift ~1 GiB by 2026-07-17, two days after the constants
+     * were sized), while the measured number cannot.  The static formula is
+     * kept as an upper bound — it still protects against a page-cache- or
+     * UVM-inflated MemAvailable reading — and slot 0's committed actual is
+     * added back because its bytes are already resident (and therefore
+     * already excluded from MemAvailable).  A parse failure keeps the
+     * static budget: the live floor check in provision_slot fails closed on
+     * its own read. */
+    uint64_t kv_budget_final = kv_budget;
+    {
+        const uint64_t avail_now = server_mem_available_bytes();
+        if (avail_now > 0) {
+            const uint64_t headroom =
+                avail_now > DS4_SERVER_MEM_FLOOR_BYTES
+                    ? avail_now - DS4_SERVER_MEM_FLOOR_BYTES : 0;
+            uint64_t measured = session_actual + headroom;
+            /* The measured budget is one-shot and PERMANENT, while the
+             * MemAvailable it derives from can read transiently low at
+             * startup (a previous model process still releasing memory;
+             * UVM/MemTotal shrink on driver 610).  A budget refusal is
+             * classed "eviction helps" by the scheduler, so a collapsed
+             * budget would evict-thrash slot 0 forever instead of ever
+             * provisioning slot 1.  Clamp: the budget always structurally
+             * permits at least one more session (slot 0's actual + one
+             * session estimate — the extra-slot ctx is capped at slot 0's,
+             * so its est can never exceed session_est); when memory is
+             * GENUINELY tight, the LIVE per-attempt floor check
+             * (server_mem_floor_admits — truthful post-warmup) is the guard,
+             * and it recovers naturally when memory frees. */
+            const uint64_t budget_min = session_actual + session_est;
+            if (measured < budget_min) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: session admission: measured budget "
+                           "%.2f GiB clamped up to %.2f GiB (slot 0 actual + "
+                           "one session est): MemAvailable %.2f GiB reads low "
+                           "at startup; the live MemAvailable floor check "
+                           "remains the per-attempt guard",
+                           (double)measured / (1024.0 * 1024.0 * 1024.0),
+                           (double)budget_min / (1024.0 * 1024.0 * 1024.0),
+                           (double)avail_now / (1024.0 * 1024.0 * 1024.0));
+                measured = budget_min;
+            }
+            if (measured < kv_budget_final) kv_budget_final = measured;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: session admission: measured budget %.2f GiB "
+                       "(MemAvailable %.2f GiB post-warmup - floor %.2f GiB "
+                       "+ slot 0 committed %.2f GiB; static bound %.2f GiB)",
+                       (double)kv_budget_final / (1024.0 * 1024.0 * 1024.0),
+                       (double)avail_now / (1024.0 * 1024.0 * 1024.0),
+                       (double)DS4_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
+                       (double)session_actual / (1024.0 * 1024.0 * 1024.0),
+                       (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     /* Slot 0 is provisioned here at the configured --ctx-size; the scheduler
      * provisions slots 1..cap-1 lazily under the same admission predicate. */
     s.n_slots = 1;
-    s.kv_budget_bytes = kv_budget;
+    s.kv_budget_bytes = kv_budget_final;
     s.kv_committed_bytes = session_actual;
     s.slots[0].sess = session;
     s.slots[0].state = SLOT_IDLE;
@@ -560,6 +860,9 @@ int main(int argc, char **argv) {
      * engine access. */
     server_publish_metrics_snapshot(&s);
 
+    memdiag mdiag;
+    const bool mdiag_on = memdiag_start(&mdiag, &s);
+
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 
@@ -571,6 +874,7 @@ int main(int argc, char **argv) {
         pthread_cond_broadcast(&s.cv);
         pthread_mutex_unlock(&s.mu);
         pthread_join(worker, NULL);
+        if (mdiag_on) pthread_join(mdiag.thread, NULL);
         server_close_resources(&s);
         return 1;
     }
@@ -626,6 +930,7 @@ int main(int argc, char **argv) {
     pthread_cond_broadcast(&s.cv);
     pthread_mutex_unlock(&s.mu);
     pthread_join(worker, NULL);
+    if (mdiag_on) pthread_join(mdiag.thread, NULL);
     pthread_mutex_lock(&s.mu);
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
