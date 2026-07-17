@@ -190,10 +190,17 @@ running the ~91 GB REAP-pruned MXFP8/IQ2 Flash build. Prefill is measured
 prompt-processing rates and is not a real prefill number); decode is measured
 with the merged DSpark speculative drafter, single stream.
 
-| Context | Prefill (t/s, cold) | Decode (t/s, speculative) |
-| ---: | ---: | ---: |
-| ~2k | ~370-410 | ~20 structured / ~17 prose |
-| ~8k | ~355 | ~16 structured / ~15 prose |
+| Context | Prefill (t/s, cold) | Decode structured (t/s) | Decode prose (t/s) |
+| ---: | ---: | ---: | ---: |
+| ~0.3k | — | ~21.5 | ~16.4 |
+| ~2k | ~383 | ~20.7 | ~16.7 |
+| ~8-9k | ~355 | ~16.5 | ~15.5 |
+
+Decode figures are the production speculative path (drafter on, thinking on),
+greedy (`temp:0`), single stream, on the server's own wall-clock; prefill is the
+cold first request. (Speculative decode at `temp:1.0` is comparable and on
+several depths faster — up to ~+23% on structured 2-8k — but is stochastic
+run-to-run, so the greedy rows are the reported baseline.)
 
 Prefill runs ~360-410 t/s cold and tapers slowly with context as the
 long-context indexer scan grows. The MXFP4 rich-expert layers (~4.25 bpw versus
@@ -208,9 +215,14 @@ and draft acceptance decline as context grows (α ~77% on structured/tool output
 at shallow context, ~60% by 8k), because the drafter predicts a longer prompt
 less well; the speedup is largest on structured/tool workloads where acceptance
 is highest. Plain (non-speculative) decode is roughly flat and bandwidth-bound;
-speculation is a speedup layered on top. It never changes the output
-distribution — exact sampled acceptance at all temperatures — so it is a pure
-speed knob, not a quality one. (Prefill is measured with the `ds4-bench` cold
+speculation is a speedup layered on top. The wins in this release's sweep run
++13% to +39% on structured/tool output and +5% to +18% on deep prose; on
+shallow, low-acceptance requests speculation can run slightly *slower* than
+plain, so **its downside is now capped to a few percent (measured −2% to −6% on
+the shallow cells, versus as much as ~−26% before) by the yield-quench safety
+net** described under Speculative decoding — not "speculation never hurts." It
+never changes the output distribution — exact sampled acceptance at all
+temperatures — so it is a pure speed knob, not a quality one. (Prefill is measured with the `ds4-bench` cold
 sweep and `tool-eval-bench --perf-only --benchy-args='--no-cache'`; decode with
 `tool-eval-bench --spec-bench` on the server's own wall-clock. Speculative t/s
 is stochastic run-to-run under sampling; the numbers above are `--temp 0`.)
@@ -225,6 +237,29 @@ scratch all fit together with a comfortable margin.
 A model that does not fit is rejected at startup with a clear error instead of
 silently degrading — there is no partial-residency or streaming fallback, so a
 successful load is also a residency guarantee for the whole run.
+
+### Startup warmup and session admission
+
+At startup, before the listener accepts requests, the server runs a short
+(~13 s) warmup generation that materializes the first-generation CUDA working
+set (~8.7 GiB). This has two consequences. First, **prefill numbers are
+effectively post-warmup**: the first real request already has its working set
+resident, which is why cold and process-warm prefill agree within run-to-run
+noise. Second, warmup lets session admission measure the *actual* memory cost of
+a live slot rather than estimate it; the measured budget is logged at startup,
+for example:
+
+```text
+warmup generation: 4160 prompt + 12 decode tokens in 12.8 s;
+  MemAvailable 18.09 -> 9.36 GiB (first-generation working set 8.73 GiB materialized)
+session admission: measured budget 9.81 GiB
+  (MemAvailable 9.36 GiB post-warmup - floor 4.00 GiB + slot 0 committed 4.45 GiB; static bound 13.95 GiB)
+```
+
+Each admitted session slot costs ~4.45 GiB of (graph-dominated) working set, so
+on a warmed box the measured ~9.8 GiB budget admits **two live sessions**; a
+third (which would need ~13.4 GiB) exceeds the budget and is refused. Admission
+is driven by this measured ledger, not a fixed slot count.
 
 Long-context KV state is kept compact by default: the compressed-attention
 cache uses a bit-exact packed value layout (`DS4_ATTN_PACK`, on by default),
@@ -256,6 +291,30 @@ run-to-run deterministic: accumulation orders are fixed everywhere
 (no atomic-order races, no split-K reduction schemes), so the same prompt,
 sampling parameters, and seed reproduce the same output across runs, and the
 speculative verify pass sees exactly the numerics plain decode would.
+
+### Yield-quench safety net
+
+A draft that is rarely accepted costs more than it saves, so on shallow or
+low-acceptance requests speculation can be a net slowdown. This release pairs the
+drafter with a **yield-quench** controller: it tracks each request's realized
+draft economics (an EWMA of per-step speedup and an accumulated debt) and, once a
+request is clearly losing, latches *that request* to plain decode for the
+remainder — bounding the worst case. The controller has to run a short mandatory
+pre-latch window (`WARMUP=3` + `MINEV=8` steps) speculatively before it can fire,
+so on very short or low-α generations a small residual cost survives. Measured in
+this release's sweep, quench caps the worst case from **~−26%** (unquenched
+speculation on the historically-losing prose / `temp:1.0` / thinking-off cell)
+to a **−2% to −6%** residual on the shallow, low-acceptance cells. The honest
+claim is therefore **"speculation's downside is now capped to a few percent,"**
+not "speculation never hurts." When quench fires it logs, e.g.:
+
+```text
+ds4: dspark yield-quench pos=330 steps=13 debt=5.92 ewma=-0.60 -> plain decode for request remainder
+```
+
+The min-p draft prefilter on the speculative path is bit-exact at the production
+sampling parameters (`top_p=1.0`), so both quench and the prefilter change only
+speed, never the sampled output distribution.
 
 ## Prefill chunking
 
@@ -298,7 +357,10 @@ client resumes instead of re-prefilling. Sessions do **not** yet share a batched
 decode step (that is a planned throughput feature), so aggregate decode is
 roughly the single-stream rate divided across active sessions, while concurrent
 prefills overlap and scale. On the ~128 GB GB10 with ~85 GB of resident weights,
-roughly three concurrent sessions fit at a large context; each session's context
+the practical cap is **two live sessions on a warmed box** at a large context:
+each provisioned slot costs ~4.45 GiB of (graph-dominated) working set, admitted
+against a measured ~9.8 GiB budget, so a third session exceeds the budget and is
+refused (see Startup warmup and session admission). Each session's context
 can be sized up to the model's 1M-token limit, and requests beyond the admission
 budget queue or are refused rather than driving the box out of memory.
 Two further guardrails keep a misbehaving client from wedging the server:
@@ -346,7 +408,9 @@ absent (in thinking and non-thinking mode alike); any sampling knob the client
 sends explicitly is respected as-is, including `temperature=0` to select
 greedy decode (which lets DSpark speculative decoding engage). During
 structured tool-call output the server still forces greedy decode regardless
-of the request's sampling parameters.
+of the request's sampling parameters. `min_p` is range-validated at parse time:
+an out-of-range value disables the min-p filter (the same convention `top_p`
+uses out of range) rather than being silently clamped.
 
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
 mode, reasoning is streamed in the native API shape instead of being mixed into
@@ -807,6 +871,11 @@ The CUTLASS MXFP4 expert path requires the **`sm_120f`** family arch for its
 block-scaled tensor-core MMA, so `cuda-spark` builds with `CUDA_ARCH=sm_120f`.
 This fork targets the GB10 only; there is a single build target, and
 `make cuda-spark` builds only the shipped binary, `ds4-server`.
+
+If a binary is run on a GPU whose architecture it was not built for, it **fails
+fast at startup**: every translation unit's compiled arch list is checked at
+init, and a mismatch aborts with rebuild instructions instead of crashing later
+inside a kernel launch.
 
 ### Development tools
 
