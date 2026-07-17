@@ -154,9 +154,21 @@ static void server_warmup_generation(ds4_engine *engine, ds4_session *session,
     /* One full prefill-cap chunk plus a tail: exercises the widened chunk
      * prefill shape AND the sub-chunk tail shape.  The session's resolved
      * cap is used (the config value can be 0 = engine default). */
-    int want = ds4_session_prefill_cap(session) + 64;
+    const int prefill_cap = ds4_session_prefill_cap(session);
+    int want = prefill_cap + 64;
     if (want < 64) want = 64;
     if (want > ctx_size - 256) want = ctx_size - 256;
+    if (want < prefill_cap) {
+        /* A small --ctx-size truncates the warmup below one full prefill
+         * chunk: the chunked-prefill working set is NOT materialized here
+         * (single-shot path only) and the measured budget will read
+         * stale-high — still bounded by the static formula's min(). */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: warmup prompt truncated to %d tokens "
+                   "(< prefill cap %d): chunked-prefill workspaces are not "
+                   "materialized at startup; first long prompt pays them",
+                   want, prefill_cap);
+    }
     ds4_tokens body = {0}, prompt = {0};
     ds4_tokenize_text(engine, "The quick brown fox jumps over the lazy dog. ",
                       &body);
@@ -725,7 +737,33 @@ int main(int argc, char **argv) {
             const uint64_t headroom =
                 avail_now > DS4_SERVER_MEM_FLOOR_BYTES
                     ? avail_now - DS4_SERVER_MEM_FLOOR_BYTES : 0;
-            const uint64_t measured = session_actual + headroom;
+            uint64_t measured = session_actual + headroom;
+            /* The measured budget is one-shot and PERMANENT, while the
+             * MemAvailable it derives from can read transiently low at
+             * startup (a previous model process still releasing memory;
+             * UVM/MemTotal shrink on driver 610).  A budget refusal is
+             * classed "eviction helps" by the scheduler, so a collapsed
+             * budget would evict-thrash slot 0 forever instead of ever
+             * provisioning slot 1.  Clamp: the budget always structurally
+             * permits at least one more session (slot 0's actual + one
+             * session estimate — the extra-slot ctx is capped at slot 0's,
+             * so its est can never exceed session_est); when memory is
+             * GENUINELY tight, the LIVE per-attempt floor check
+             * (server_mem_floor_admits — truthful post-warmup) is the guard,
+             * and it recovers naturally when memory frees. */
+            const uint64_t budget_min = session_actual + session_est;
+            if (measured < budget_min) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: session admission: measured budget "
+                           "%.2f GiB clamped up to %.2f GiB (slot 0 actual + "
+                           "one session est): MemAvailable %.2f GiB reads low "
+                           "at startup; the live MemAvailable floor check "
+                           "remains the per-attempt guard",
+                           (double)measured / (1024.0 * 1024.0 * 1024.0),
+                           (double)budget_min / (1024.0 * 1024.0 * 1024.0),
+                           (double)avail_now / (1024.0 * 1024.0 * 1024.0));
+                measured = budget_min;
+            }
             if (measured < kv_budget_final) kv_budget_final = measured;
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: session admission: measured budget %.2f GiB "
