@@ -1253,6 +1253,12 @@ typedef struct {
     sample_candidate *cand;   /* sorted candidates              */
     uint64_t *keys;           /* packed (sort key << 32 | id)   */
     uint64_t *tmp;            /* radix ping-pong buffer         */
+    /* Gather target for the min-p prefilter path: survivors are collected
+     * into `cand` in ascending-id order (probs computed once, alongside the
+     * full-vocab sum), then gathered here in descending sort order. A second
+     * buffer because the gather cannot run in place and the degenerate
+     * all-equal-logits case keeps every candidate (m == cap). */
+    sample_candidate *cand2;
     uint32_t cap;             /* elements reserved in each      */
     /* Dense token->q(prob) map for ds4_sample_dist_draw_residual, which needs
      * q(x) for each x in p's support: the linear ds4_sample_dist_prob scan
