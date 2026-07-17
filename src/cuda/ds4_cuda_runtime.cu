@@ -1737,6 +1737,15 @@ extern "C" int ds4_gpu_cache_external_range(const void *host_base_key, int fd,
 
 
 
+extern "C" void ds4_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
+    size_t free_b = 0, total_b = 0;
+    (void)cudaMemGetInfo(&free_b, &total_b);
+    if (free_out) *free_out = (uint64_t)free_b;
+    if (total_out) *total_out = (uint64_t)total_b;
+}
+
+
+
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);

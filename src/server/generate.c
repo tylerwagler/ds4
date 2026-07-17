@@ -2205,7 +2205,7 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * UVM accounting lags MemAvailable, and under UVM pressure MemTotal itself
  * shrinks, so this is a belt-and-suspenders floor check on top of the
  * ledger, not a precise gauge. */
-static uint64_t server_mem_available_bytes(void) {
+uint64_t server_mem_available_bytes(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return 0;
     char line[256];

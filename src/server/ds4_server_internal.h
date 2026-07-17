@@ -734,7 +734,21 @@ typedef struct {
  * No further erosion after the first generation (MemAvailable flat within
  * ±0.01 GiB over subsequent generations and minutes of idle), so 18 GiB IS
  * the steady-state reserve; MemAvailable-based checks made after warm-up
- * must not re-reserve any part of it (see DS4_SERVER_MEM_FLOOR_BYTES). */
+ * must not re-reserve any part of it (see DS4_SERVER_MEM_FLOOR_BYTES).
+ *
+ * F1 addendum (task #32, 2026-07-17): the lazy first-request component had
+ * grown to ~9.2 GiB (instrumented 3-client greedy burst: MemAvailable fell
+ * 13.8 GiB in ~1.5 s, of which 4.59 GiB was a ledgered slot-1 create and
+ * the rest this working set + measured total overhead ~18.7-19.0 GiB), and
+ * it materialized mid-burst, AFTER every admission check had already read a
+ * stale-high MemAvailable.  Two changes de-fang it:
+ *   - cli_main.c runs a warmup generation at startup, so the working set
+ *     materializes before the listener opens and before any admission math;
+ *   - the admission budget is then re-derived from MEASURED post-warmup
+ *     MemAvailable, min()'d with the static formula below, so these
+ *     constants are an upper bound rather than the load-bearing estimate.
+ * Re-measure the constants when the measured/static gap logged at startup
+ * ("session admission: measured budget") exceeds ~2 GiB. */
 #define DS4_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
 #define DS4_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
 
@@ -1360,6 +1374,11 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * at provisioning time on top of the ledger (defined in cli_main.c;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
+
+/* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
+ * fail closed).  Never called on a token/layer hot path (defined in
+ * generate.c; also used by startup warmup/budget derivation in cli_main.c). */
+uint64_t server_mem_available_bytes(void);
 /* Log estimate-vs-actual for a freshly created session, warn loudly on >10%
  * drift (sizing code out of sync with the allocator), and return the value
  * the ledger must commit — the actual (defined in generate.c). */
