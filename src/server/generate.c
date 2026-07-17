@@ -2370,6 +2370,33 @@ static int provision_ctx_for_job(const server *s, const job *j) {
 
 
 
+/* Trivial-match classifier for the router's choose-vs-provision decision
+ * (unit-tested in cli_main.c). A candidate slot's token-prefix match is
+ * TRIVIAL — grounds to prefer provisioning a fresh slot over reusing (and
+ * clobbering) the candidate — only when BOTH hold:
+ *   - common < trivial_tokens: the match is no deeper than the rendered
+ *     template header plus incidental prologue overlap (threshold derived at
+ *     startup, cli_main.c / DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS), so it
+ *     does not indicate the same conversation;
+ *   - slot_pos - common >= trivial_tokens: reuse would destroy a meaningful
+ *     amount of some conversation's warm KV. When the slot holds less than
+ *     that past the match, clobbering costs at worst a sub-threshold
+ *     re-prefill (sub-second) — always cheaper than a multi-GiB,
+ *     multi-second session create — and this clause also keeps short
+ *     same-conversation continuations (whose common covers nearly the whole
+ *     slot state) on their warm slot. An empty slot (slot_pos == 0) is
+ *     never "clobbered": it is simply free.
+ * Deliberate semantic change from v0.2.0 (common == 0 && pos > 0): a slot
+ * holding only a sub-threshold warm tail past the match is now reused
+ * (clobbered) rather than protected by a fresh provisioning — protecting
+ * <threshold tokens of KV is never worth seconds of session create. */
+bool server_slot_match_is_trivial(int common, int slot_pos,
+                                  int trivial_tokens) {
+    return common < trivial_tokens && slot_pos - common >= trivial_tokens;
+}
+
+
+
 /* Route the job to a slot. Preferences, in order:
  *   1. A live-tool-state continuation binds to the slot that owns its call
  *      ids (waiting for it if busy — running it elsewhere could only 409).
@@ -2381,12 +2408,25 @@ static int provision_ctx_for_job(const server *s, const job *j) {
  *      front door sends (http_server.c / request_exceeds_context; the front
  *      door checks against slot 0's ctx and cannot see the owner's smaller
  *      one).
- *   2. Among free slots with enough context, the longest common token prefix
+ *   2. A free fitting slot whose live thinking binding byte-matches the
+ *      request's visible transcript is that conversation's warm continuation
+ *      and wins outright (thinking_live_binds_prompt): for thinking chats
+ *      the client replays visible content while the slot's frontier holds
+ *      the hidden reasoning, so the token common prefix understates
+ *      relatedness and must not out-vote the binding.
+ *   3. Among free slots with enough context, the longest common token prefix
  *      wins, keeping a client's follow-ups on their warm KV.
- *   3. A job with no matching prefix anywhere prefers a fresh lazily
- *      provisioned slot over clobbering another conversation's warm state
- *      (budget permitting); with the pool exhausted it falls back to the
- *      warmest free slot exactly like the single-session server did.
+ *   4. A job whose best token match is TRIVIAL — header-deep only, against a
+ *      slot holding meaningful warm state past the match
+ *      (server_slot_match_is_trivial) — prefers a fresh lazily provisioned
+ *      slot over clobbering that conversation (budget permitting); with the
+ *      pool exhausted it falls back to the warmest free slot exactly like
+ *      the single-session server did. (Through v0.2.0 this gate required
+ *      common == 0, which rendered chat traffic can never produce — every
+ *      rendered prompt shares the template header, measured 4–9 common
+ *      tokens across distinct conversations — so sequential conversations
+ *      always clobbered slot 0 and the pool never provisioned; task #24
+ *      bounce repro, fixed in task #30.)
  * Returns NULL when the job must wait for a slot to free — except when
  * *reject_ctx is set nonzero (the owner slot's ctx_size), which means the
  * job can never run and must be failed, not left queued. *waiting_owner is
@@ -2422,19 +2462,38 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
     const int needed = job_needed_ctx(s, j);
     session_slot *best = NULL;
     int best_common = -1;
+    session_slot *bound = NULL;   /* thinking-binding match (preference 2) */
+    size_t bound_visible = 0;     /* longest key = most recent frontier */
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         if (sl->active_job || !sl->sess) continue;
         if (sl->ctx_size < needed) continue;
+        const size_t visible =
+            thinking_live_binds_prompt(s, sl, &j->req,
+                                       ds4_session_pos(sl->sess));
+        if (visible > bound_visible) {
+            bound_visible = visible;
+            bound = sl;
+        }
         const int common = ds4_session_common_prefix(sl->sess, &j->req.prompt);
         if (common > best_common) {
             best_common = common;
             best = sl;
         }
     }
+    if (bound) return bound;
     const bool best_clobbers_warm_state =
-        best && best_common == 0 && ds4_session_pos(best->sess) > 0;
+        best && server_slot_match_is_trivial(best_common,
+                                             ds4_session_pos(best->sess),
+                                             s->slot_trivial_common_tokens);
     if (!best || best_clobbers_warm_state) {
+        if (best_clobbers_warm_state) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: slot routing: best match is trivial "
+                       "(common=%d pos=%d threshold=%d); preferring a fresh slot",
+                       best_common, ds4_session_pos(best->sess),
+                       s->slot_trivial_common_tokens);
+        }
         session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j),
                                              refusal);
         if (fresh) return fresh;

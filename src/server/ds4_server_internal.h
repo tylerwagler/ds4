@@ -694,6 +694,23 @@ typedef struct {
  * its need (capped at slot 0's ctx), admission permitting. */
 #define DS4_SERVER_EXTRA_SLOT_CTX_TOKENS 65536
 
+/* Slot-routing trivial-match allowance (task #30, 2026-07-16). The router's
+ * choose-vs-provision gate treats a candidate slot's common token prefix as
+ * TRIVIAL — "just the shared rendered-template header, not a warm
+ * continuation" — below a threshold of
+ *     tokens(BOS + think-max preamble) + this allowance,
+ * measured once per model at startup (cli_main.c). The derived part is the
+ * largest template-injected text two UNRELATED conversations can share; the
+ * allowance covers incidental natural-language prologue overlap between
+ * distinct conversations (measured 3–8 tokens beyond the header across real
+ * conversation pairs in the task-#24 bounce repro — 64 gives ~8x margin)
+ * while staying an order of magnitude below any warm state worth a slot:
+ * the 512-token disk-snapshot floor (--kv-cache-min-tokens) and the
+ * multi-thousand-token preambles the session pool exists for. Used only by
+ * the routing decision (server_slot_match_is_trivial); prefill reuse of a
+ * chosen slot still honors arbitrarily short common prefixes. */
+#define DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS 64
+
 /* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
  * usable; weights are queried at runtime (ds4_engine_weights_resident_bytes).
  * The overhead reserve is the fixed process footprint measured on the GB10,
@@ -804,6 +821,11 @@ struct server {
     int          n_slots;            /* provisioned slots (worker-owned; published under mu) */
     uint64_t     kv_budget_bytes;    /* admission ceiling computed at startup */
     uint64_t     kv_committed_bytes; /* sum of est_cost_bytes over live slots (under mu) */
+    /* Trivial-match threshold for the choose-vs-provision routing decision:
+     * template-header tokens measured at startup +
+     * DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.c; immutable after
+     * startup, worker thread reads only). */
+    int slot_trivial_common_tokens;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -1310,6 +1332,18 @@ int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
                                                const request *req,
                                                int live_pos,
                                                ds4_tokens *effective_prompt);
+/* Routing probe: does this slot's live thinking binding mark it as the warm
+ * continuation of req's visible transcript? Same guards as
+ * thinking_live_visible_prefix_prompt but byte-prefix check only — no
+ * tokenization, no effective-prompt build. Returns the matched visible-key
+ * length (>0), or 0 for no match (defined in kv_cache.c; unit-tested in
+ * cli_main.c). */
+size_t thinking_live_binds_prompt(server *s, session_slot *sl,
+                                         const request *req, int live_pos);
+/* Trivial-match classifier for the router's choose-vs-provision decision
+ * (defined in generate.c; unit-tested in cli_main.c). */
+bool server_slot_match_is_trivial(int common, int slot_pos,
+                                         int trivial_tokens);
 /* Admission predicate (defined in cli_main.c; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
