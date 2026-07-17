@@ -1232,4 +1232,42 @@ int ds4_gpu_dspark_confidence_score_model(
 }
 #endif
 
+/* ===========================================================================
+ * Wrong-arch build trap (checked at startup by ds4_gpu_init).
+ *
+ * A plain `make` rebuilds stale CUDA objects WITHOUT CUDA_ARCH=sm_120f, so
+ * they compile for nvcc's default arch (sm_75 on CUDA 13).  The binary still
+ * links and loads on the GB10, then dies mid-run with an opaque device assert
+ * the first time a kernel needing sm_120f features launches — and `make test`
+ * cannot catch it.  Every nvcc-compiled TU that includes this header (all of
+ * src/cuda/ does, directly or via ds4_cuda_internal.h) registers the
+ * __CUDA_ARCH_LIST__ it was compiled with; ds4_gpu_init() verifies each TU
+ * carries code for the device's SM family and aborts startup with an
+ * actionable message instead.  Per-TU registration also catches MIXED builds
+ * (one stale object rebuilt default-arch by a plain `make`).  Host C compiles
+ * never define __CUDA_ARCH_LIST__, so this block is nvcc-only; the `inline`
+ * list head merges into one copy per linked binary, so any subset of objects
+ * links (no central symbol required).
+ */
+#if defined(__cplusplus) && defined(__CUDA_ARCH_LIST__)
+typedef struct ds4_tu_archs {
+    const char            *file;    /* __BASE_FILE__ of the registering TU */
+    const int             *archs;   /* __CUDA_ARCH_LIST__ entries, e.g. 1200 */
+    int                     n_archs;
+    struct ds4_tu_archs   *next;
+} ds4_tu_archs;
+inline ds4_tu_archs *ds4_tu_archs_head = nullptr;
+namespace {
+const int ds4_tu_arch_list_[] = { __CUDA_ARCH_LIST__ };
+ds4_tu_archs ds4_tu_archs_rec_ = {
+    __BASE_FILE__, ds4_tu_arch_list_,
+    (int)(sizeof(ds4_tu_arch_list_) / sizeof(ds4_tu_arch_list_[0])), nullptr
+};
+__attribute__((constructor)) void ds4_tu_archs_register_(void) {
+    ds4_tu_archs_rec_.next = ds4_tu_archs_head;
+    ds4_tu_archs_head = &ds4_tu_archs_rec_;
+}
+}
+#endif
+
 #endif

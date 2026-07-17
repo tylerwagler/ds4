@@ -1070,6 +1070,36 @@ int cublas_ok(cublasStatus_t st, const char *what) {
 
 
 
+/* Wrong-arch build trap (registration block at the bottom of ds4_gpu.h):
+ * every nvcc-compiled TU must carry device code for this GPU's SM family
+ * (same SM major — sm_120f serves every sm_12x device, so the family match
+ * cannot false-positive on the correct GB10 build).  Walk the registered TUs
+ * BEFORE any kernel can launch and fail startup with the rebuild command
+ * instead of dying mid-run in an opaque device assert. */
+static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
+#ifdef __CUDA_ARCH_LIST__
+    for (const ds4_tu_archs *r = ds4_tu_archs_head; r; r = r->next) {
+        int ok = 0;
+        for (int i = 0; i < r->n_archs; i++)
+            if (r->archs[i] / 100 == prop->major) ok = 1;
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: wrong-arch build: %s was compiled for sm_%d but this GPU "
+                    "(%s) is sm_%d%d — rebuild with `make cuda-spark` (a plain "
+                    "`make` drops CUDA_ARCH=sm_120f)\n",
+                    r->file, r->n_archs > 0 ? r->archs[0] / 10 : 0,
+                    prop->name, prop->major, prop->minor);
+            return 0;
+        }
+    }
+#else
+    (void)prop;
+#endif
+    return 1;
+}
+
+
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -1077,6 +1107,7 @@ extern "C" int ds4_gpu_init(void) {
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
+        if (!cuda_tu_archs_ok(&prop)) return 0;
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
