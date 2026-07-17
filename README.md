@@ -627,8 +627,10 @@ to start over cache placement.
 The disk budget defaults to 4096 MiB (`--kv-disk-space-mb`); least-valuable
 checkpoints are evicted when the budget fills. Snapshot behavior is unchanged
 by the default-on switch: files are written with ordinary write + fsync + rename
-into place, and the store validates model variant, quant bits, and the rendered
-byte prefix before restoring. Note that on unified-memory hosts (GB10) the
+into place, and the store validates the model variant and the rendered byte
+prefix before restoring (quant bits are recorded and logged, but mismatches are
+refused only with `--kv-cache-reject-different-quant`; the per-artifact default
+directory is what keeps different builds' checkpoints apart). Note that on unified-memory hosts (GB10) the
 checkpoint writes pass through the host page cache, which competes with GPU
 memory — the usual `sync; echo 3 > /proc/sys/vm/drop_caches` discipline before
 a model load still applies; pass `--no-kv-disk` if you want none of that
