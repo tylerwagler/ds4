@@ -1666,16 +1666,30 @@ static void test_tool_call_quality(void) {
  * 129k vocab with a stable radix sort + reused scratch (it ran once per
  * accepted position in the sampled speculative walk, ~10.6 ms a call). The
  * rewrite claims BYTE-EXACT equivalence, which is subtle: the sort's result
- * feeds max_logit, `sum` is accumulated over ALL candidates in sorted order,
- * and both cutoffs are relative to that sum — so sort order and summation
- * order jointly decide which token a given seed draws.
+ * feeds max_logit, `sum` is accumulated over ALL candidates, and both
+ * cutoffs are relative to that sum — so sort order and summation order
+ * jointly decide which token a given seed draws.
  *
- * This gate pins that claim against a verbatim copy of the pre-rewrite
- * implementation (HEAD~ tokenizer.c), across adversarial logit shapes
- * (all-equal, heavy ties, +/-0.0, non-finites) x the sampling configs that
- * reach production. It compares the built distribution bit-for-bit AND the
- * rng-driven accept/draw/draw-excluding sequences the spec path actually
- * consumes.
+ * RE-DERIVED for the min-p prefilter (dev-minp): on the top_k <= 0,
+ * min_p > 0 path the shipped build now accumulates `sum` in VOCAB-INDEX
+ * order (one pass computing each prob once, collecting only the prefilter
+ * survivors for sorting) instead of the old sorted-descending order. The
+ * byte-exact reference below (ref_sample_dist_build) mirrors that: an
+ * UNFILTERED qsort implementation whose sum is taken in index order on that
+ * path — so any prefilter-induced membership or ordering error is caught
+ * bit-for-bit, while the deliberate summation-order change is shared by
+ * both sides. The OLD sorted-order-sum reference is kept verbatim as
+ * ref_sample_dist_build_sortsum, and --sampler-prefilter gates the shipped
+ * build against IT for survivor-set/order identity plus a characterized
+ * (<= 1e-6 relative) prob delta. min_p <= 0 and top_k > 0 paths are
+ * unchanged and stay byte-exact against the old semantics by construction
+ * (both references agree there).
+ *
+ * This gate pins the claim across adversarial logit shapes (all-equal,
+ * heavy ties, +/-0.0, non-finites, exact min-p boundary) x the sampling
+ * configs that reach production. It compares the built distribution
+ * bit-for-bit AND the rng-driven accept/draw/draw-excluding sequences the
+ * spec path actually consumes.
  * ============================================================================ */
 
 static int ref_sample_argmax(const float *logits, uint32_t n_vocab) {
@@ -1709,9 +1723,14 @@ static int ref_cand_cmp_desc(const void *a, const void *b) {
     return (ca->id > cb->id) - (ca->id < cb->id);
 }
 
-static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
-                                 float temperature, int top_k, float top_p, float min_p,
-                                 ds4_sample_dist *out) {
+/* OLD-semantics reference (pre-prefilter, sorted-order sum), kept VERBATIM.
+ * No longer the byte-exact target on the top_k <= 0, min_p > 0 path — the
+ * shipped build's sum moved to index order there. --sampler-prefilter gates
+ * the shipped build against this for survivor-set/order IDENTITY and a
+ * bounded prob delta; on all other paths it still agrees bit-for-bit. */
+static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
+                                         float temperature, int top_k, float top_p, float min_p,
+                                         ds4_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
         out->ids = malloc(sizeof(int));
@@ -1765,6 +1784,124 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
     for (uint32_t i = 0; i < n; i++) {
         cand[i].prob = expf((cand[i].logit - max_logit) / temperature);
         sum += cand[i].prob;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        out->ids = malloc(sizeof(int));
+        out->probs = malloc(sizeof(float));
+        out->ids[0] = cand[0].id;
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        free(cand);
+        return 1;
+    }
+    const float min_prob = (cand[0].prob / sum) * min_p;
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float pr = cand[i].prob / sum;
+        if (i > 0 && pr < min_prob) break;
+        filtered_sum += cand[i].prob;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered == 0) filtered = 1;
+    out->ids = malloc((size_t)filtered * sizeof(int));
+    out->probs = malloc((size_t)filtered * sizeof(float));
+    out->n = filtered;
+    for (uint32_t i = 0; i < filtered; i++) {
+        out->ids[i] = cand[i].id;
+        out->probs[i] = cand[i].prob / filtered_sum;   /* renormalized nucleus */
+    }
+    free(cand);
+    return 1;
+}
+
+
+/* The byte-exact reference for the CURRENT build, re-derived for the min-p
+ * prefilter: identical to the sortsum reference EXCEPT that the
+ * top_k <= 0, min_p > 0 path computes each prob once and accumulates `sum`
+ * in VOCAB-INDEX order before the sort, carrying probs through the qsort —
+ * the summation-order semantics the shipped build adopted. It applies NO
+ * prefilter (full descending walk with the byte-exact cutoffs), so a
+ * prefilter that drops a candidate the cutoff would keep, keeps one it
+ * would drop, or perturbs order/probs in any way fails the memcmp below. */
+static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
+                                 float temperature, int top_k, float top_p, float min_p,
+                                 ds4_sample_dist *out) {
+    memset(out, 0, sizeof(*out));
+    if (temperature <= 0.0f) {
+        out->ids = malloc(sizeof(int));
+        out->probs = malloc(sizeof(float));
+        out->ids[0] = ref_sample_argmax(logits, n_vocab);
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        return 1;
+    }
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
+
+    uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
+    sample_candidate *cand = malloc((size_t)cap * sizeof(cand[0]));
+    uint32_t n = 0;
+    int have_probs = 0;
+    float sum = 0.0f;
+    if (top_k > 0) {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            if (n == (uint32_t)top_k && v <= cand[n - 1].logit) continue;
+            uint32_t j = n < (uint32_t)top_k ? n++ : n - 1;
+            while (j > 0 && cand[j - 1].logit < v) {
+                cand[j] = cand[j - 1];
+                j--;
+            }
+            cand[j].id = (int)i;
+            cand[j].logit = v;
+        }
+    } else if (min_p > 1e-30f) {   /* SAMPLE_MINP_PREFILTER_MIN */
+        /* index-order sum, probs computed once and carried through the sort */
+        float max_logit = 0.0f;
+        uint32_t finite = 0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            if (finite == 0 || v > max_logit) max_logit = v;
+            finite++;
+        }
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            const float p = expf((v - max_logit) / temperature);
+            sum += p;
+            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
+        }
+        if (n) qsort(cand, n, sizeof(cand[0]), ref_cand_cmp_desc);
+        have_probs = 1;
+    } else {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = 0.0f};
+        }
+        if (n) qsort(cand, n, sizeof(cand[0]), ref_cand_cmp_desc);
+    }
+    if (n == 0) {
+        free(cand);
+        out->ids = malloc(sizeof(int));
+        out->probs = malloc(sizeof(float));
+        out->ids[0] = ref_sample_argmax(logits, n_vocab);
+        out->probs[0] = 1.0f;
+        out->n = 1;
+        return 1;
+    }
+
+    if (!have_probs) {
+        const float max_logit = cand[0].logit;
+        for (uint32_t i = 0; i < n; i++) {
+            cand[i].prob = expf((cand[i].logit - max_logit) / temperature);
+            sum += cand[i].prob;
+        }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
         out->ids = malloc(sizeof(int));
@@ -1984,6 +2121,26 @@ static double samp_u01(void) {
     return (double)((samp_rs * 0x2545f4914f6cdd1dULL) >> 11) / 9007199254740992.0;
 }
 
+/* Find a float x with expf(x) == target EXACTLY, scanning a few thousand
+ * ulps around logf(target). Around 0.5 the expf image spacing (~3e-8) is
+ * about half the float spacing of the target (~6e-8), so a preimage exists
+ * for essentially every target there; the scan is cheap and deterministic. */
+static int samp_expf_preimage(float target, float *out) {
+    const float x0 = logf(target);
+    uint32_t ub;
+    memcpy(&ub, &x0, sizeof(ub));
+    for (int32_t d = -4096; d <= 4096; d++) {
+        const uint32_t u = ub + (uint32_t)d;
+        float x;
+        memcpy(&x, &u, sizeof(x));
+        if (expf(x) == target) {
+            *out = x;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Adversarial logit shapes. Ties and signed zeros are the cases where sort
  * order is observable at all; non-finites exercise the compaction path. */
 static void samp_fill_shape(float *l, uint32_t n, int shape, const char **name) {
@@ -2066,6 +2223,31 @@ static void samp_fill_shape(float *l, uint32_t n, int shape, const char **name) 
          * that makes sort stability load-bearing rather than cosmetic. */
         for (uint32_t i = 0; i < n; i++) l[i] = 1.25f;
         break;
+    case 11: *name = "min-p exact boundary (p==min_p tie pair + 1ulp below)";
+        /* Crafted so that at temp=1, min_p=0.5 the sum is EXACT (1+.5+.5
+         * [+.5-1ulp] rounds identically in index and sorted order) and the
+         * tie pair sits exactly AT the min-p threshold: pr == min_prob
+         * bit-for-bit, so the `pr < min_prob` operator alone decides
+         * membership. The fourth candidate is 1ulp of prob below: a min-p
+         * PREFILTER must keep it within slack yet the exact cutoff must trim
+         * it. Logits are laid out in ascending-id descending-logit order so
+         * old (sorted-order) and new (index-order) sums are the same float
+         * sequence — boundary decisions are isolated from the summation-order
+         * change. samp_expf_preimage can in principle fail to find an exact
+         * preimage (degrade: logf value, still a near-boundary shape); the
+         * dedicated boundary teeth in --sampler-prefilter TEST_ASSERT it. */
+        {
+            float L_at, L_below;
+            if (!samp_expf_preimage(0.5f, &L_at)) L_at = logf(0.5f);
+            if (!samp_expf_preimage(nextafterf(0.5f, 0.0f), &L_below))
+                L_below = logf(nextafterf(0.5f, 0.0f));
+            for (uint32_t i = 0; i < n; i++) l[i] = -INFINITY;
+            l[100] = 0.0f;      /* max, prob exactly 1.0 */
+            l[200] = L_at;      /* prob exactly 0.5 == min_p */
+            l[300] = L_at;      /* tie at the boundary     */
+            l[400] = L_below;   /* prob 1ulp below the boundary */
+        }
+        break;
     default: *name = "?"; break;
     }
 }
@@ -2120,7 +2302,7 @@ static void test_sampler_dist_equivalence(void) {
     memset(&scratch, 0, sizeof(scratch));
 
     int checked = 0;
-    for (int shape = 0; shape <= 10; shape++) {
+    for (int shape = 0; shape <= 11; shape++) {
         const char *sname = "?";
         samp_fill_shape(logits, n, shape, &sname);
         for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
@@ -2210,8 +2392,193 @@ static void test_sampler_dist_equivalence(void) {
 
     ds4_sample_scratch_free(&scratch);
     free(logits);
-    printf("  sampler: %d shape x config combinations byte-exact vs pre-rewrite reference\n",
+    printf("  sampler: %d shape x config combinations byte-exact vs re-derived reference\n",
            checked);
+}
+
+
+
+/* ===== min-p prefilter equivalence gate ========================================
+ * The shipped ds4_sample_dist_build (top_k <= 0, min_p > 0) vs the OLD
+ * sorted-order-sum semantics (ref_sample_dist_build_sortsum): the survivor
+ * SET, ids and order must be IDENTICAL wherever the old top_p crossing is
+ * reproducible at all (always when top_p >= 1; see the in-loop comment for
+ * the top_p < 1 tail-shift exception, which is characterized and bounded,
+ * not waved through); probs may differ only by the summation-order
+ * rounding, characterized here and bounded at 1e-6 relative (measured
+ * ~1e-7). Plus dedicated boundary teeth: a candidate
+ * whose prob sits bit-exactly AT the min-p threshold must be INCLUDED
+ * (`pr < min_prob` is the operator, so >= keeps), and a candidate 1 ulp
+ * below — which the prefilter's slack deliberately keeps for sorting —
+ * must be trimmed by the exact cutoff. Constructed so index-order and
+ * sorted-order sums are the same float sequence, isolating boundary
+ * semantics from the deliberate stream change.
+ * ============================================================================ */
+static void test_sampler_prefilter_equivalence(void) {
+    const uint32_t n = SAMP_N_VOCAB;
+    float *logits = malloc((size_t)n * sizeof(float));
+    TEST_ASSERT(logits != NULL);
+    sampler_warn_if_flush_to_zero();
+    ds4_sample_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+
+    int checked = 0;
+    int n_shifts = 0;
+    double max_rel = 0.0, max_rel_shifted = 0.0;
+    int max_shape = -1, max_cfg = -1;
+    for (int shape = 0; shape <= 11; shape++) {
+        const char *sname = "?";
+        samp_fill_shape(logits, n, shape, &sname);
+        for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
+            const samp_cfg *cfg = &samp_cfgs[c];
+            ds4_sample_dist old, got;
+            ref_sample_dist_build_sortsum(logits, n, cfg->temp, cfg->top_k,
+                                          cfg->top_p, cfg->min_p, &old);
+            ds4_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
+                                  cfg->top_p, cfg->min_p, &scratch, &got);
+            /* MIN-P membership vs the old semantics is identical (the
+             * prefilter is a superset under ANY sum and the exact cutoff
+             * decides; the boundary teeth below pin it). What CAN move is
+             * the TOP_P crossing index: with top_p < 1 the break compares
+             * fl(filtered_sum/sum) >= top_p, and the deliberate index-order
+             * `sum` differs from the old sorted-order one by ~1e-7 rel — on
+             * a huge near-flat nucleus (e.g. temp=100, ~128k candidates,
+             * per-candidate step ~1e-5 of mass) that rounding shift moves
+             * the crossing by a few candidates (a whole tie group if one
+             * straddles it). So: n must be IDENTICAL whenever top_p >= 1;
+             * with top_p < 1 a small tail shift is the characterized cost
+             * of the stream change, the common prefix must still match
+             * exactly, and the shift is reported below. */
+            const uint32_t k = old.n < got.n ? old.n : got.n;
+            if (old.n != got.n) {
+                fprintf(stderr,
+                        "prefilter: shape=%s cfg=%s top_p crossing shift: "
+                        "n %u -> %u (dn %+d)\n",
+                        sname, cfg->name, old.n, got.n,
+                        (int)got.n - (int)old.n);
+                TEST_ASSERT(cfg->top_p < 1.0f);
+                const int dn = (int)got.n - (int)old.n;
+                TEST_ASSERT(dn <= 64 && dn >= -64);
+                n_shifts++;
+            }
+            for (uint32_t i = 0; i < k; i++) {
+                if (old.ids[i] != got.ids[i])
+                    fprintf(stderr, "prefilter: shape=%s cfg=%s rank %u id %d != %d\n",
+                            sname, cfg->name, i, old.ids[i], got.ids[i]);
+                TEST_ASSERT(old.ids[i] == got.ids[i]);
+                const double a = (double)old.probs[i];
+                const double b = (double)got.probs[i];
+                const double denom = a > 0.0 ? a : 1e-45;
+                const double rel = a == b ? 0.0 : fabs(b - a) / denom;
+                if (old.n == got.n) {
+                    if (rel > max_rel) {
+                        max_rel = rel;
+                        max_shape = shape;
+                        max_cfg = (int)c;
+                    }
+                } else if (rel > max_rel_shifted) {
+                    max_rel_shifted = rel;
+                }
+            }
+            ds4_sample_dist_free(&old);
+            ds4_sample_dist_free(&got);
+            checked++;
+        }
+    }
+    /* the float-sum-order delta: expected ~1e-7 relative; > 1e-6 means
+     * something beyond summation-order moved and needs investigating. On the
+     * few top_p-crossing-shifted combos the renormalizer (filtered_sum) also
+     * moves by the shifted candidates' mass — characterized separately. */
+    printf("  prefilter: max prob delta %.3e rel (shape %d, cfg %d) over %d combos\n",
+           max_rel, max_shape, max_cfg, checked);
+    printf("  prefilter: %d top_p-crossing tail shift(s); max prefix prob delta there %.3e rel\n",
+           n_shifts, max_rel_shifted);
+    TEST_ASSERT(max_rel <= 1e-6);
+    TEST_ASSERT(max_rel_shifted <= 1e-3);
+
+    /* survivor-count stats at the server defaults (what the radix actually
+     * sorts now: prefilter survivors, not 129,280 candidates). */
+    for (int shape = 0; shape <= 1; shape++) {
+        const char *sname = "?";
+        samp_fill_shape(logits, n, shape, &sname);
+        float max_logit = 0.0f;
+        uint32_t finite = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!isfinite(logits[i])) continue;
+            if (finite == 0 || logits[i] > max_logit) max_logit = logits[i];
+            finite++;
+        }
+        const float thr = 0.05f * (1.0f - 4e-6f);
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!isfinite(logits[i])) continue;
+            if (expf(logits[i] - max_logit) >= thr) m++;
+        }
+        printf("  prefilter: shape \"%s\": %u of %u sorted at defaults (min_p=0.05, temp=1)\n",
+               sname, m, finite);
+    }
+
+    /* dedicated boundary teeth (temp=1, top_k=0, top_p=1, min_p=0.5) */
+    {
+        float L_at = 0.0f, L_below = 0.0f, p_below = 0.0f;
+        TEST_ASSERT(samp_expf_preimage(0.5f, &L_at));
+        TEST_ASSERT(expf(L_at) == 0.5f);
+        /* an exact preimage of (0.5 - 1ulp) is not guaranteed to exist (its
+         * rounding interval is ~1 x-ulp wide); 1..3 ulps below all work —
+         * anything in [min_p*slack, min_p) that the exact cutoff rounds
+         * below min_prob, with the sum still rounding to 2.5 either order. */
+        int found_below = 0;
+        for (int k = 1; k <= 3 && !found_below; k++) {
+            p_below = 0.5f - (float)k * 0x1p-25f;
+            found_below = samp_expf_preimage(p_below, &L_below);
+        }
+        TEST_ASSERT(found_below);
+        TEST_ASSERT(expf(L_below) == p_below && p_below < 0.5f &&
+                    p_below >= 0.5f * (1.0f - 4e-6f));
+        for (uint32_t i = 0; i < n; i++) logits[i] = -INFINITY;
+        logits[100] = 0.0f;   /* max: prob 1.0 */
+        logits[200] = L_at;   /* prob == 0.5 == min_p: exactly AT the threshold */
+        logits[300] = L_at;   /* boundary tie */
+
+        /* Shape A: sum = 1.0+0.5+0.5 = 2.0 EXACT in any order, so
+         * min_prob = (1.0/2.0)*0.5 = 0.25 exact and pr = 0.5/2.0 = 0.25
+         * exact: pr == min_prob, and `pr < min_prob` false must INCLUDE both
+         * boundary candidates. Old semantics agree bit-for-bit here. */
+        ds4_sample_dist old, got;
+        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.5f, &scratch, &got);
+        ref_sample_dist_build_sortsum(logits, n, 1.0f, 0, 1.0f, 0.5f, &old);
+        TEST_ASSERT(got.n == 3);
+        TEST_ASSERT(got.ids[0] == 100 && got.ids[1] == 200 && got.ids[2] == 300);
+        TEST_ASSERT(old.n == 3 && old.ids[1] == 200 && old.ids[2] == 300);
+        for (uint32_t i = 0; i < 3; i++)
+            TEST_ASSERT(memcmp(&old.probs[i], &got.probs[i], sizeof(float)) == 0);
+        ds4_sample_dist_free(&old);
+        ds4_sample_dist_free(&got);
+
+        /* Shape B: add prob = 0.5 - (1..3)ulp at id 400. sum = 2.5 exact both
+         * orders; the boundary pair still sits exactly AT min_prob
+         * (0.5/2.5 == (1.0/2.5)*0.5 bit-for-bit) and stays included, while
+         * id 400's pr rounds strictly below min_prob: the PREFILTER keeps it
+         * (within slack) but the exact cutoff must trim it. n == 4 here
+         * would mean prefilter slack leaked into membership. */
+        logits[400] = L_below;
+        ds4_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.5f, &scratch, &got);
+        ref_sample_dist_build_sortsum(logits, n, 1.0f, 0, 1.0f, 0.5f, &old);
+        TEST_ASSERT(got.n == 3);
+        TEST_ASSERT(got.ids[0] == 100 && got.ids[1] == 200 && got.ids[2] == 300);
+        TEST_ASSERT(old.n == 3);
+        for (uint32_t i = 0; i < 3; i++) {
+            TEST_ASSERT(old.ids[i] == got.ids[i]);
+            TEST_ASSERT(memcmp(&old.probs[i], &got.probs[i], sizeof(float)) == 0);
+        }
+        ds4_sample_dist_free(&old);
+        ds4_sample_dist_free(&got);
+        printf("  prefilter: boundary teeth: AT-threshold pair included, "
+               "ulp-below trimmed post-prefilter\n");
+    }
+
+    ds4_sample_scratch_free(&scratch);
+    free(logits);
 }
 
 
@@ -2504,7 +2871,8 @@ static const ds4_test_entry test_entries[] = {
     {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
 #endif
-    {"--sampler", "sampler", "sampler byte-exactness vs pre-radix reference", test_sampler_dist_equivalence},
+    {"--sampler", "sampler", "sampler byte-exactness vs re-derived reference", test_sampler_dist_equivalence},
+    {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
     {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

@@ -57,11 +57,14 @@
  * MODEL-DEPENDENT — needs the merged drafter gguf and ~95 GB free. Run:
  *   make cuda-spec-sampling-gate                  (defaults to gguf/model.gguf)
  *   ./tests/spec_sampling_gate <model.gguf> [temp] [filler_tokens] [traj] \
- *                              [top_p] [dump_path]
+ *                              [top_p] [dump_path] [min_p]
  * Defaults: temp 0.95, filler 0, traj 2500 (clamped to [1,TRAJ]), top_p 0.95,
- * dump off. top_p is not a knob to turn down casually — see the note at its
+ * dump off ("-" or "" also = off, so min_p can be given without a dump),
+ * min_p 0. top_p is not a knob to turn down casually — see the note at its
  * parse below; too low makes the nucleus a single token and the chi-square
- * passes vacuously.
+ * passes vacuously. min_p > 0 is what makes this gate NON-VACUOUS for the
+ * min-p prefilter in ds4_sample_dist_build (dev-minp): at min_p == 0 the
+ * prefilter path is not even entered. The server default is 0.05.
  */
 #include <math.h>
 #include <stdio.h>
@@ -128,7 +131,7 @@ int main(int argc, char **argv) {
      * inherited 0.38 does exactly that on this prompt: 2500 trajectories, one
      * token per position. Keep this high enough that the nucleus is real. */
     const float TOP_P = argc > 5 ? (float)atof(argv[5]) : 0.95f;
-    const float MIN_P = 0.0f;
+    const float MIN_P = argc > 7 ? (float)atof(argv[7]) : 0.0f;
     /* Optional: dump both arms' raw trajectories so two ENGINES can be compared
      * directly. The chi-square below pits plain-sampled (mode 0) against
      * speculative (mode 1) — but mode 0 samples single-token DECODE logits
@@ -142,6 +145,7 @@ int main(int argc, char **argv) {
      * batch-sourced. Both accept rules are exact for an arbitrary proposal, so
      * if they are correct they must reproduce the SAME filtered target. */
     const char *dump_path = argc > 6 ? argv[6] : NULL;
+    if (dump_path && (!dump_path[0] || !strcmp(dump_path, "-"))) dump_path = NULL;
 
     ds4_engine_options opt = { .model_path = model, .backend = DS4_BACKEND_CUDA };
     ds4_engine *engine = NULL;
@@ -170,8 +174,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sync failed: %s\n", err);
         return 1;
     }
-    printf("model=%s temp=%.2f top_p=%.2f ctx_depth=%d traj=%d\n",
-           model, (double)TEMP, (double)TOP_P, ds4_session_pos(session), traj);
+    printf("model=%s temp=%.2f top_p=%.2f min_p=%.2f ctx_depth=%d traj=%d\n",
+           model, (double)TEMP, (double)TOP_P, (double)MIN_P,
+           ds4_session_pos(session), traj);
     ds4_session_snapshot snap = {0};
     if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
         fprintf(stderr, "snapshot failed: %s\n", err);

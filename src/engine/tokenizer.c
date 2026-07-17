@@ -1021,6 +1021,49 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 
 
 
+/* =====
+ * min-p prefilter threshold (shared by sample_full_vocab and
+ * ds4_sample_dist_build's full-vocab paths).
+ *
+ * The min-p cutoff both paths apply post-sort keeps candidate i (i > 0) iff
+ *
+ *     fl(p_i / sum) >= min_prob,   min_prob = fl(fl(p_max / sum) * min_p)
+ *
+ * where p_max = expf((max - max)/T) = expf(0.0f) == 1.0f EXACTLY. In exact
+ * arithmetic the sum cancels and the condition is p_i >= min_p. In float,
+ * each of the three roundings perturbs by at most one unit roundoff
+ * u = 2^-24, so:
+ *   - any candidate the cutoff CAN keep satisfies
+ *         p_i >= min_p * (1-u)^2 / (1+u) > min_p * (1 - 3u);
+ *   - any candidate with p_i < min_p * (1 - 3u) is cut for EVERY value of
+ *     `sum`, i.e. regardless of summation order.
+ * A logit-side prefilter that keeps p_i >= min_p * (1 - 4e-6) (~67u of
+ * slack, which also absorbs the rounding of this threshold product itself)
+ * therefore keeps a SUPERSET of whatever the exact cutoff keeps, under any
+ * sum. Because probs are monotone in the logit, that superset is a PREFIX of
+ * the descending sort — so the byte-exact cutoff loop, run unchanged over
+ * the sorted survivors, walks exactly the candidates it would have walked
+ * over the full sorted vocab and trims the boundary with the SAME float
+ * comparisons as before. Membership is never decided by the prefilter.
+ *
+ * The max candidate is kept unconditionally (mirrors the loop's i > 0
+ * exemption; also covers min_p > 1 and a NaN temperature poisoning p).
+ *
+ * DOMAIN: the one-roundoff-per-operation bound only holds while min_prob and
+ * pr are NORMAL floats; if min_prob lands in the subnormals (min_p on the
+ * order of 1e-38 * sum), ties-to-even at a few ulps can round the cutoff
+ * below what the slack covers and the superset claim fails (review finding,
+ * 2026-07-17: min_p = 13*2^-149, sum = 2.0, p_i = 12*2^-149 flips). min_p is
+ * NOT range-checked server-side, so both paths take the prefilter only for
+ * min_p > SAMPLE_MINP_PREFILTER_MIN and fall back to the exact full sort
+ * below it: sum <= n_vocab <= ~1.3e5 keeps min_prob >= min_p/sum > 7e-36 —
+ * normal, with ~650x margin over FLT_MIN — and boundary p_i ~ min_p are
+ * normal too. Requests with 0 < min_p <= 1e-30 are absurd but stay correct. */
+#define SAMPLE_MINP_PREFILTER_SLACK (1.0f - 4e-6f)
+#define SAMPLE_MINP_PREFILTER_MIN 1e-30f
+
+
+
 /* NOTE: the free below also drops `qmap` (and its all-zero invariant with it),
  * because ds4_sample_scratch_free clears the whole struct. That is safe only
  * because no caller holds live qmap state across a dist_build — the residual
@@ -1032,6 +1075,7 @@ static void sample_scratch_reserve(ds4_sample_scratch *s, uint32_t cap) {
     s->cand = xmalloc((size_t)cap * sizeof(*s->cand));
     s->keys = xmalloc((size_t)cap * sizeof(*s->keys));
     s->tmp = xmalloc((size_t)cap * sizeof(*s->tmp));
+    s->cand2 = xmalloc((size_t)cap * sizeof(*s->cand2));
     s->cap = cap;
 }
 
@@ -1041,6 +1085,7 @@ void ds4_sample_scratch_free(ds4_sample_scratch *s) {
     free(s->cand);
     free(s->keys);
     free(s->tmp);
+    free(s->cand2);
     free(s->qmap);
     memset(s, 0, sizeof(*s));
 }
@@ -1111,22 +1156,35 @@ static int sample_full_vocab(
      *
      * `sum` here accumulates in VOCAB order, BEFORE the sort (unlike
      * dist_build, which sums post-sort) — so this loop must stay exactly as it
-     * was. probs are therefore computed once and carried THROUGH the sort by
-     * packing the compaction index as the radix payload, rather than
-     * recomputed post-sort: a second expf loop could be vectorized differently
-     * from this one under -ffast-math and differ in the last ulp. */
+     * was: it still adds EVERY finite candidate's prob, in the same order, so
+     * `sum` is bit-identical with the prefilter on or off. probs are computed
+     * once and carried THROUGH the sort by packing the compaction index as the
+     * radix payload, rather than recomputed post-sort: a second expf loop
+     * could be vectorized differently from this one under -ffast-math and
+     * differ in the last ulp.
+     *
+     * With min_p > 0 only the prefilter's survivors (a superset of the min-p
+     * cutoff's survivors — see SAMPLE_MINP_PREFILTER_SLACK) are collected for
+     * sorting, which is what turns the 129k-candidate sort into a
+     * tens-of-candidates sort at the default min_p. The cutoff loop below is
+     * unchanged and trims the boundary byte-exactly, so this path's output
+     * (token and rng stream) is bit-identical to the unfiltered build. */
     sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
     uint64_t *keys = xmalloc((size_t)finite * sizeof(keys[0]));
     uint64_t *tmp = xmalloc((size_t)finite * sizeof(tmp[0]));
     uint32_t n = 0;
     float sum = 0.0f;
+    const float prefilter = min_p > SAMPLE_MINP_PREFILTER_MIN
+        ? min_p * SAMPLE_MINP_PREFILTER_SLACK : -1.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
         const float p = expf((v - max_logit) / temperature);
-        keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
-        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
         sum += p;
+        if (p >= prefilter || (int)i == best) {
+            keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
+            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
+        }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
         free(cand);
@@ -1187,14 +1245,31 @@ static int sample_full_vocab(
  * sampling. Mirrors the sampler branch-for-branch; the spec_sampling harness
  * chi-square-checks the equivalence.
  *
- * NOTE on optimizing this: `sum` is taken over ALL n candidates in sorted
- * order BEFORE any cutoff, and both cutoffs are relative to it (min_prob =
+ * NOTE on optimizing this: `sum` is taken over ALL n candidates BEFORE any
+ * cutoff, and both cutoffs are relative to it (min_prob =
  * (cand[0].prob/sum)*min_p; the top_p test is filtered_sum/sum). Dropping
- * candidates up front — e.g. a min-p logit pre-filter — therefore changes
+ * candidates from `sum` — the NAIVE min-p pre-filter — therefore changes
  * `sum`, hence `filtered`, hence `filtered_sum`, hence EVERY output
  * probability. It is not an equivalent rewrite; tests/ds4_test.c --sampler
- * catches it. The full descending sort and the full-vocab sum are both
- * load-bearing; only their cost is negotiable.
+ * catches it (n 6 != 5). The full-vocab sum is load-bearing.
+ *
+ * What the top_k <= 0, min_p > 0 path DOES do (the LEGAL prefilter): the sum
+ * still covers every finite candidate, but is accumulated in VOCAB-INDEX
+ * order in the same pass that computes each prob once and collects only the
+ * prefilter survivors (see SAMPLE_MINP_PREFILTER_SLACK: a strict superset of
+ * the min-p cutoff's survivors under ANY sum, forming a prefix of the
+ * descending sort). Only the survivors are sorted — tens instead of 129k at
+ * the server-default min_p = 0.05 — and the byte-exact cutoff loop then
+ * trims the boundary with the same comparisons as ever, evaluated against
+ * that sum. Distribution-preserving by construction; NOT stream-preserving:
+ * summing in index order instead of the old sorted-descending order rounds
+ * differently (~1e-7 relative), so every output prob moves by that much and
+ * rng draws near a bucket edge can flip. Survivor membership and order are
+ * unchanged (tests/ds4_test.c --sampler-prefilter pins set/order identity
+ * against the old-sum reference and characterizes the prob delta; --sampler
+ * is byte-exact against the re-derived index-order-sum reference). The
+ * min_p <= 0 full sort and the top_k > 0 preselect keep the old sorted-order
+ * sum and remain byte-identical to the pre-prefilter build.
  *
  * ALIASING CONTRACT: `out`'s ids/probs must never point into `scratch`. The
  * spec walk (session.c) holds one dist at a time while reusing the scratch
@@ -1224,7 +1299,14 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
     uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
     sample_scratch_reserve(scratch, cap);
     sample_candidate *cand = scratch->cand;
+    /* `sc` is the descending-order candidate view the cutoff tail walks. The
+     * prefilter path gathers into scratch->cand2 (probs and sum already
+     * computed, index-order sum); the other paths sort `cand` in place and
+     * compute probs + sum post-sort, in sorted order, exactly as before. */
+    sample_candidate *sc = cand;
     uint32_t n = 0;
+    int have_probs = 0;
+    float sum = 0.0f;
     if (top_k > 0) {
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
@@ -1237,6 +1319,50 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
             }
             cand[j].id = (int)i;
             cand[j].logit = v;
+        }
+    } else if (min_p > SAMPLE_MINP_PREFILTER_MIN) {
+        /* min-p prefilter path (see the block comment above; the MIN floor
+         * keeps the cutoff arithmetic normal — below it the exact full sort
+         * runs instead). Pass 1: the
+         * true max over finite logits, first occurrence on ties — the same
+         * candidate the stable descending sort put at cand[0]. */
+        float max_logit = 0.0f;
+        uint32_t max_id = 0;
+        uint32_t finite = 0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            if (finite == 0 || v > max_logit) {
+                max_logit = v;
+                max_id = i;
+            }
+            finite++;
+        }
+        /* Pass 2: one prob per finite candidate, computed ONCE and carried
+         * through the sort; `sum` over ALL of them, in this (index) order;
+         * survivors collected in ascending-id order so the stable radix keeps
+         * ascending-id as the canonical tie order. */
+        if (finite > 0) {
+            uint64_t *keys = scratch->keys;
+            const float prefilter = min_p * SAMPLE_MINP_PREFILTER_SLACK;
+            for (uint32_t i = 0; i < n_vocab; i++) {
+                const float v = logits[i];
+                if (!isfinite(v)) continue;
+                const float p = expf((v - max_logit) / temperature);
+                sum += p;
+                if (p >= prefilter || i == max_id) {
+                    keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
+                    cand[n] = (sample_candidate){
+                        .id = (int)i, .logit = v, .prob = p};
+                    n++;
+                }
+            }
+            /* n >= 1: the max candidate is always kept. */
+            sample_radix_sort_desc(keys, scratch->tmp, n);
+            for (uint32_t i = 0; i < n; i++)
+                scratch->cand2[i] = cand[(uint32_t)keys[i]];
+            sc = scratch->cand2;
+            have_probs = 1;
         }
     } else {
         uint64_t *keys = scratch->keys;
@@ -1263,27 +1389,28 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
         return 1;
     }
 
-    const float max_logit = cand[0].logit;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < n; i++) {
-        cand[i].prob = expf((cand[i].logit - max_logit) / temperature);
-        sum += cand[i].prob;
+    if (!have_probs) {
+        const float max_logit = sc[0].logit;
+        for (uint32_t i = 0; i < n; i++) {
+            sc[i].prob = expf((sc[i].logit - max_logit) / temperature);
+            sum += sc[i].prob;
+        }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
         out->ids = xmalloc(sizeof(int));
         out->probs = xmalloc(sizeof(float));
-        out->ids[0] = cand[0].id;
+        out->ids[0] = sc[0].id;
         out->probs[0] = 1.0f;
         out->n = 1;
         return 1;
     }
-    const float min_prob = (cand[0].prob / sum) * min_p;
+    const float min_prob = (sc[0].prob / sum) * min_p;
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const float pr = cand[i].prob / sum;
+        const float pr = sc[i].prob / sum;
         if (i > 0 && pr < min_prob) break;
-        filtered_sum += cand[i].prob;
+        filtered_sum += sc[i].prob;
         filtered++;
         if (filtered_sum / sum >= top_p) break;
     }
@@ -1292,8 +1419,8 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
     out->probs = xmalloc((size_t)filtered * sizeof(float));
     out->n = filtered;
     for (uint32_t i = 0; i < filtered; i++) {
-        out->ids[i] = cand[i].id;
-        out->probs[i] = cand[i].prob / filtered_sum;   /* renormalized nucleus */
+        out->ids[i] = sc[i].id;
+        out->probs[i] = sc[i].prob / filtered_sum;   /* renormalized nucleus */
     }
     return 1;
 }

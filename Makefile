@@ -179,8 +179,9 @@ cuda-prefill-gate-baseline:
 # temperature-matched (p/q) accept rules.  MODEL-DEPENDENT — same memory
 # discipline as the gates above; not part of `make test`.
 SPEC_GATE_MODEL ?= gguf/model.gguf
+SPEC_GATE_ARGS ?= 0.95
 cuda-spec-sampling-gate: tests/spec_sampling_gate
-	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) 0.95
+	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
 
 src/engine/%.o: src/engine/%.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -c -o $@ $<
