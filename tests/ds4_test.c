@@ -1859,7 +1859,7 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
             cand[j].id = (int)i;
             cand[j].logit = v;
         }
-    } else if (min_p > 0.0f) {
+    } else if (min_p > 1e-30f) {   /* SAMPLE_MINP_PREFILTER_MIN */
         /* index-order sum, probs computed once and carried through the sort */
         float max_logit = 0.0f;
         uint32_t finite = 0;

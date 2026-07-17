@@ -1047,8 +1047,20 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
  * comparisons as before. Membership is never decided by the prefilter.
  *
  * The max candidate is kept unconditionally (mirrors the loop's i > 0
- * exemption; also covers min_p > 1 and a NaN temperature poisoning p). */
+ * exemption; also covers min_p > 1 and a NaN temperature poisoning p).
+ *
+ * DOMAIN: the one-roundoff-per-operation bound only holds while min_prob and
+ * pr are NORMAL floats; if min_prob lands in the subnormals (min_p on the
+ * order of 1e-38 * sum), ties-to-even at a few ulps can round the cutoff
+ * below what the slack covers and the superset claim fails (review finding,
+ * 2026-07-17: min_p = 13*2^-149, sum = 2.0, p_i = 12*2^-149 flips). min_p is
+ * NOT range-checked server-side, so both paths take the prefilter only for
+ * min_p > SAMPLE_MINP_PREFILTER_MIN and fall back to the exact full sort
+ * below it: sum <= n_vocab <= ~1.3e5 keeps min_prob >= min_p/sum > 7e-36 —
+ * normal, with ~650x margin over FLT_MIN — and boundary p_i ~ min_p are
+ * normal too. Requests with 0 < min_p <= 1e-30 are absurd but stay correct. */
 #define SAMPLE_MINP_PREFILTER_SLACK (1.0f - 4e-6f)
+#define SAMPLE_MINP_PREFILTER_MIN 1e-30f
 
 
 
@@ -1162,8 +1174,8 @@ static int sample_full_vocab(
     uint64_t *tmp = xmalloc((size_t)finite * sizeof(tmp[0]));
     uint32_t n = 0;
     float sum = 0.0f;
-    const float prefilter =
-        min_p > 0.0f ? min_p * SAMPLE_MINP_PREFILTER_SLACK : -1.0f;
+    const float prefilter = min_p > SAMPLE_MINP_PREFILTER_MIN
+        ? min_p * SAMPLE_MINP_PREFILTER_SLACK : -1.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
@@ -1308,8 +1320,10 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
             cand[j].id = (int)i;
             cand[j].logit = v;
         }
-    } else if (min_p > 0.0f) {
-        /* min-p prefilter path (see the block comment above). Pass 1: the
+    } else if (min_p > SAMPLE_MINP_PREFILTER_MIN) {
+        /* min-p prefilter path (see the block comment above; the MIN floor
+         * keeps the cutoff arithmetic normal — below it the exact full sort
+         * runs instead). Pass 1: the
          * true max over finite logits, first occurrence on ties — the same
          * candidate the stable descending sort put at cand[0]. */
         float max_logit = 0.0f;
