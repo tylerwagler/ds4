@@ -60,7 +60,9 @@ This is **beta quality**, but a first release has shipped: the
 measured-allocation DeepSeek-V4-Flash GGUF (the `v5mx` build) and the
 `ds4-server` engine that serves it. The inference path, the MXFP4/MXFP8/IQ2
 quantization, and speculative decoding are validated against the tests in this
-tree and the hardmode `tool-eval-bench` quality run (92/100). Model serving is
+tree and the `tool-eval-bench` quality suite — a fresh full-suite run of the
+shipping build scores 88/100 with hardmode included (97/100 on the core suite).
+Model serving is
 a large surface, so rough edges remain; we keep the project usable and are
 actively hardening it. If you hit a problem, run `ds4-server --trace
 /tmp/ds4-trace.txt` to capture the session and open an issue with the full
@@ -130,9 +132,13 @@ A few things this fork's GGUFs do beyond upstream:
   layer; the CUTLASS tensor-core layout is the one exception, since its
   grouped GEMM runs the whole expert FFN in one dispatch, it applies to all
   three tensors or none. The measured-allocation build is the **shipped
-  release**: in a hardmode `tool-eval-bench` bake-off it scored 92/100 against
-  84/100 for a uniform all-`Q2_K` build, so the measured build ships and the
-  all-`Q2_K` build was dropped. Recommended sampling for the shipped build is
+  release**: in the hardmode `tool-eval-bench` bake-off that selected it, it
+  scored 92/100 against 84/100 for a uniform all-`Q2_K` build, so the measured
+  build ships and the all-`Q2_K` build was dropped. (A fresh full-suite
+  re-measure of the shipping build scores 88/100 with hardmode; the weakest
+  area is Category K safety/refusal — including one cross-turn prompt-injection
+  scenario the model does not resist — a model-alignment limitation, not a
+  quantization artifact.) Recommended sampling for the shipped build is
   temperature 0.95, top-p 0.38 (send these as the `temperature`/`top_p` API
   parameters).
 - **REAP expert pruning.** Production GGUFs are REAP expert-pruned: expert
@@ -208,7 +214,8 @@ the ~2 bpw floor) read ~2x the weight bytes and set the prefill rate; an
 expert-tiled big-batch kernel keeps each decoded weight resident across a wide
 token tile so its decode cost amortizes across the batch. (A uniform 2-bit build
 prefills faster, ~420 t/s, but scores lower on quality — the measured allocation
-trades some prefill for the tool-use win: 92 vs 84 on hard-mode tool-eval-bench.)
+trades some prefill for the tool-use win, beating the uniform 2-bit build on
+hard-mode tool-eval-bench.)
 
 Decode is **not** flat with context on the speculative path: both effective t/s
 and draft acceptance decline as context grows (α ~77% on structured/tool output
