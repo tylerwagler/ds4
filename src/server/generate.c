@@ -115,7 +115,7 @@ static int chat_think_tool_recovery(server *s,
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
-    const char *bos = "<｜begin▁of▁sentence｜>";
+    const char *bos = DS4_SERVER_RENDER_BOS;
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
     const char *max_prefix = ds4_think_max_prefix();

@@ -315,7 +315,7 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     }
 
     buf out = {0};
-    buf_puts(&out, "<｜begin▁of▁sentence｜>");
+    buf_puts(&out, DS4_SERVER_RENDER_BOS);
     if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
     buf_puts(&out, system.ptr ? system.ptr : "");
 

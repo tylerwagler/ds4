@@ -694,6 +694,13 @@ typedef struct {
  * its need (capped at slot 0's ctx), admission permitting. */
 #define DS4_SERVER_EXTRA_SLOT_CTX_TOKENS 65536
 
+/* The rendered-prompt BOS marker. One definition for every render site AND
+ * the startup trivial-match-threshold derivation (cli_main.c), so the
+ * derived threshold can never silently drift from what rendered prompts
+ * actually begin with. (Unit tests keep independent string literals on
+ * purpose — they pin the wire bytes, not this macro.) */
+#define DS4_SERVER_RENDER_BOS "<｜begin▁of▁sentence｜>"
+
 /* Slot-routing trivial-match allowance (task #30, 2026-07-16). The router's
  * choose-vs-provision gate treats a candidate slot's common token prefix as
  * TRIVIAL — "just the shared rendered-template header, not a warm

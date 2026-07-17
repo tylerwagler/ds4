@@ -414,7 +414,7 @@ int main(int argc, char **argv) {
      * overlap on top (see the constant's comment for the sizing evidence). */
     {
         buf hdr = {0};
-        buf_puts(&hdr, "<｜begin▁of▁sentence｜>");
+        buf_puts(&hdr, DS4_SERVER_RENDER_BOS);
         buf_puts(&hdr, ds4_think_max_prefix());
         ds4_tokens hdr_tokens = {0};
         ds4_tokenize_rendered_chat(engine, hdr.ptr, &hdr_tokens);
@@ -5077,8 +5077,10 @@ static void test_thinking_binding_routes_visible_continuation(void) {
     TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == strlen(vis));
     /* frontier moved (slot served someone else meanwhile): stale, no match */
     TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 41) == 0);
-    /* a different conversation sharing only the header must not match */
-    char other[] = "<BOS>sys<U>completely different";
+    /* a different conversation sharing only the header must not match —
+     * longer than the binding key so the BYTE COMPARE is what rejects it,
+     * not the visible_len < prompt_len guard (2026-07-16 review) */
+    char other[] = "<BOS>sys<U>completely different much longer conversation";
     req.prompt_text = other;
     TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
     /* an exact replay (no new suffix) is not a continuation */
