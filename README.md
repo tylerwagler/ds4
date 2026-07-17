@@ -198,9 +198,9 @@ with the merged DSpark speculative drafter, single stream.
 
 | Context | Prefill (t/s, cold) | Decode structured (t/s) | Decode prose (t/s) |
 | ---: | ---: | ---: | ---: |
-| ~0.3k | — | ~21.5 | ~16.4 |
-| ~2k | ~383 | ~20.7 | ~16.7 |
-| ~8-9k | ~355 | ~16.5 | ~15.5 |
+| ~0.3k | — | ~27.7 | ~18.7 |
+| ~2k | ~383 | ~26.6 | ~20.7 |
+| ~8-9k | ~355 | ~25.0 | ~21.6 |
 
 Decode figures are the production speculative path (drafter on, thinking on),
 greedy (`temp:0`), single stream, on the server's own wall-clock; prefill is the
@@ -217,11 +217,13 @@ prefills faster, ~420 t/s, but scores lower on quality — the measured allocati
 trades some prefill for the tool-use win, beating the uniform 2-bit build on
 hard-mode tool-eval-bench.)
 
-Decode is **not** flat with context on the speculative path: both effective t/s
-and draft acceptance decline as context grows (α ~77% on structured/tool output
-at shallow context, ~60% by 8k), because the drafter predicts a longer prompt
-less well; the speedup is largest on structured/tool workloads where acceptance
-is highest. Plain (non-speculative) decode is roughly flat and bandwidth-bound;
+Draft acceptance declines as context grows (α ~77% on structured/tool output at
+shallow context, ~60% by 8k), because the drafter predicts a longer prompt less
+well; the speedup is largest on structured/tool workloads where acceptance is
+highest. The default draft depth is **3** (measured optimum for this build — see
+Speculative decoding); the autoregressive drafter's per-position cost means
+deeper chains stop paying, and shallower drafting especially helps at long
+context, where the old depth-5 default lost the most to verify-row cost. Plain (non-speculative) decode is roughly flat and bandwidth-bound;
 speculation is a speedup layered on top. The wins in this release's sweep run
 +13% to +39% on structured/tool output and +5% to +18% on deep prose; on
 shallow, low-acceptance requests speculation can run slightly *slower* than

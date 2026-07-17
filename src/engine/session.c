@@ -1641,12 +1641,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->prefill_chunk = opt->prefill_chunk;
-    /* Default draft depth 5: the measured optimum WITH confidence-scheduled
-     * verification (2026-07-09 sweep, conf3 head, tau 0.35: 24.46 eff t/s vs
-     * 23.18 at draft 3).  Without conf-sched (tau 0) the fixed-depth optimum
-     * was 3; the tau default in dspark_conf_sched_tau() keeps 5 profitable by
-     * trimming the low-confidence tail before the batch verify. */
-    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 5;
+    /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
+     * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
+     * disarmed, conf-sched trimming active). k=3 beats k=5 by +15% structured
+     * to +32% prose served decode; output is bit-identical (exact verify).
+     * The DSpark drafter forward is autoregressive, so its cost scales with the
+     * chain length ON TOP of the verify rows — ms/accepted-token stays flat
+     * ~41-46 ms across k, i.e. depth never amortizes, so shallower wins.
+     * The prior default 5 was a compact-model figure (2026-07-09, conf3 head,
+     * tau 0.35) that does not hold on shipped v5mx at the tau=0.25 default. */
+    e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 3;
     if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
     e->dspark_confidence = opt->dspark_confidence > 0.0f ? opt->dspark_confidence : 0.5f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
@@ -3108,7 +3112,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     const bool sample_drafts = temperature > 0.0f && vocab_size == DS4_N_VOCAB;
     if (sample_drafts) {
         /* n_draft rows, not 16: the depth is fixed per engine
-         * (e->dspark_draft_tokens, 5 by default), so this is 2.6 MB rather than
+         * (e->dspark_draft_tokens, 3 by default), so this is 1.6 MB rather than
          * 8.3 MB per session. Grow-only, so a depth change is still safe. */
         const uint32_t need = n_draft * DS4_N_VOCAB;
         if (s->dspark_pending_qrows_cap < need) {
