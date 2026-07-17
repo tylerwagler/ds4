@@ -22,6 +22,135 @@ static float dspark_conf_sched_tau(void) {
     return cached;
 }
 
+/* --- Terminal yield-quench controller (spec-decode Item 4) ---------------
+ * Controller design after the Entrpi ds4 yield quench (v0.1.1, MIT): per
+ * request, every fused spec step accrues debt = breakeven yield minus
+ * realized yield; when the request has provably lost more than a small
+ * budget of plain tokens to speculation AND its recent yield is still below
+ * breakeven, speculation turns off for the REMAINDER of that request
+ * (terminal; a new request re-arms).
+ *
+ * Breakeven derivation (calibrated 2026-07-17 against per-step
+ * DS4_DSPARK_STATS traces of the production v5mx serving path — 2585 steps
+ * across prose/structured x greedy/T1.0, least-squares, resid rms 7.2 ms;
+ * offline method after Entrpi's dspark_trace_replay, tool:
+ * temp/quench/quench_replay.py):
+ *   fused spec step   ~= FLAT + ROW * n_batch   milliseconds
+ *     FLAT: pooled fit 101.6 ms, SHIPPED 95.7 ms — see the greedy-fit
+ *           paragraph below for why the lower bound is the one compiled in
+ *           (batched projections + shared + drafter dense/markov + sampled-q
+ *           readback/dist walk — flat in verify rows; the old 53.6 ms nsys
+ *           figure was the draft=3 build before temperature-matched drafting)
+ *     ROW:  pooled fit 19.15 ms, SHIPPED 18.37 ms (marginal verify row —
+ *           bandwidth-bound; matches the 2026-07-09 nsys 19.7 ms/row audit)
+ *   plain decode token = PLAIN(pos), piecewise-linear through the measured
+ *     served-plain depth table (2026-07-15, medians of 3): 59.7 ms @0.3k,
+ *     67.3 @2.3k, 68.7 @9.3k, 74.5 @38k. Depth-dependence matters: spec step
+ *     cost is ~flat in depth while plain slows, so a scalar PLAIN would
+ *     overprice speculation exactly in the deep cells where it wins most
+ *     (e.g. sweep-prose greedy @2.3k, +11.7%).
+ * The breakeven yield of a step that verified K drafts at frontier pos is
+ *   guard = (FLAT + ROW*(1+K)) / PLAIN(pos)     [plain tokens]
+ * ~2.9 at full depth shallow, ~2.0 for a draft-only step. A request whose
+ * committed tokens/step run below guard would have been faster plain.
+ * Charging the ACTUAL n_batch (post conf-sched trim) rather than a scalar
+ * guard prices exactly the steps the trimmer already shortened; committed
+ * likewise is the post-trim realized yield. Measured operating points:
+ * t2x prose y~2.05 vs guard ~2.8 (loses -> quench), structured y~5.1-5.3 vs
+ * guard ~3.5 (wins by >1.5 -> never quenches).
+ *
+ * FLAT/ROW are the greedy-prose fit (the LOWER bound across the four
+ * calibrated cells; the sampled cells fit ~6-11 ms higher FLAT). Deliberate:
+ * underpricing the spec step biases against quenching, which keeps the
+ * borderline deep greedy cells (sweep prose @2.3k: y~3.2 vs guard 3.06,
+ * wins +11.7% measured) strictly on the no-quench side of the model.
+ *
+ * WARMUP: the first steps of every request are drafter pipeline fill —
+ * n_batch ramps 1->2->3 with near-zero commits while the pendings build and
+ * the prompt window seeds (a one-time ~40 ms not in the step model). That is
+ * a fixed startup cost every request pays, not evidence about proposal
+ * quality — charging it was measured (2026-07-17, first Load-2 gate run) to
+ * book ~4.9 debt by step 6 at 2.3k ctx and spuriously quench the WINNING
+ * sweep-prose cell (16.6 -> 14.8 t/s). The controller therefore ignores the
+ * first DS4_QUENCH_WARMUP steps entirely, and MINEV=8 (Entrpi's replay
+ * default) delays the verdict until the EWMA reflects steady state.
+ * Re-validated offline over all 17 Load-1 traces + deep synthetic steady
+ * states: losers (shallow y~2.05, deep y~2.5) fire at tokens ~11-25;
+ * winners (struct, deep y>=3.2) never fire.
+ *
+ * Debt is deliberately NOT clamped below (matches Entrpi's shipped default):
+ * unclamped, debt is exactly the request's NET plain-token-equivalents lost,
+ * so the quench fires iff the request is genuinely >= BUDGET behind plain —
+ * banked credit is real measured savings being spent, not optimism. Entrpi
+ * measured the zero-clamped variant false-quenching long bursty winners, and
+ * our offline replay selftest reproduces the same false quench for any
+ * finite credit cap on a net-positive bursty request. Budget = 4 plain-token
+ * equivalents (~250 ms): large enough that per-step yield variance on a
+ * winning request cannot cross it (compounded with the EWMA and MINEV
+ * conditions), small enough that a 400-token losing request recovers nearly
+ * all of the loss.
+ *
+ * The controller reads only (commit, n_batch) — counts, never wall-clock —
+ * so for a fixed token stream the quench point is deterministic. Constants
+ * are compile-time (no hot-path env reads; project rule). */
+#define DS4_QUENCH_FLAT_MS    95.7f
+#define DS4_QUENCH_ROW_MS     18.37f
+#define DS4_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
+#define DS4_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
+#define DS4_QUENCH_MINEV      8u      /* min spec steps before quench */
+#define DS4_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
+
+/* Served plain-decode ms/token vs request depth: piecewise-linear through the
+ * measured 2026-07-15 depth table, clamped at the ends. The bottom clamp
+ * over-estimates plain and biases AGAINST quenching (conservative for the
+ * no-spurious-quench gates). The TOP clamp is the opposite: beyond 38k it
+ * under-estimates plain (last-segment slope ~0.2 ms/1k would give ~87 ms at
+ * 100k vs the clamped 74.5), inflating the guard ~17% and biasing TOWARD
+ * quenching exactly where spec advantage is already marginal. Bounded and
+ * accepted for now; extrapolate the last segment if deep-context quenches
+ * ever look spurious. */
+static float spec_quench_plain_ms(int pos) {
+    static const float px[4] = { 300.0f, 2300.0f, 9300.0f, 38000.0f };
+    static const float py[4] = { 59.7f, 67.3f, 68.7f, 74.5f };
+    const float p = (float)pos;
+    if (p <= px[0]) return py[0];
+    for (int i = 1; i < 4; i++)
+        if (p <= px[i])
+            return py[i - 1] + (py[i] - py[i - 1]) * (p - px[i - 1]) /
+                                   (px[i] - px[i - 1]);
+    return py[3];
+}
+
+static float spec_quench_guard(uint32_t n_batch, int pos) {
+    return (DS4_QUENCH_FLAT_MS + DS4_QUENCH_ROW_MS * (float)n_batch) /
+           spec_quench_plain_ms(pos);
+}
+
+/* Re-arm at request boundaries (the same sites that drop the carry and
+ * pendings). All-zero == armed, matching the xcalloc'd session. */
+static void spec_quench_reset(ds4_session *s) {
+    s->spec_quench_debt = 0.0f;
+    s->spec_quench_ewma = 0.0f;
+    s->spec_quench_steps = 0;
+    s->spec_quenched = false;
+}
+
+/* Test-only (identity gates): DS4_QUENCH_FORCE_STEP=<N> latches the quench
+ * unconditionally once N fused spec steps have run, and disables the policy
+ * decision. The check runs inside the fused step after steps++, so the
+ * earliest possible latch is after step 1 completes: N=0 behaves like N=1
+ * (a request that must be fully plain wants dspark_disable, not this hook).
+ * Read once; absent in production. */
+static int spec_quench_force_step(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char *fs = getenv("DS4_QUENCH_FORCE_STEP");
+        cached = fs && fs[0] ? atoi(fs) : -1;
+        if (cached < -1) cached = -1;
+    }
+    return cached;
+}
+
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
 }
@@ -858,6 +987,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
      * and pendings were conditioned on */
     s->spec_carry_valid = false;
     s->dspark_n_pending = 0;
+    spec_quench_reset(s);
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -1064,6 +1194,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
      * ran before the restore — the source of run-to-run tie flips. */
     s->spec_carry_valid = false;
     s->dspark_n_pending = 0;
+    spec_quench_reset(s);
     for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = 0;
     g->dspark_prompt_n = 0;
     return 0;
@@ -1986,6 +2117,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
      * the previous request's distribution. Dropping them here costs one draft
      * round at the start of a request and is the only guard that covers it. */
     s->dspark_n_pending = 0;
+    /* A sync begins a new request: re-arm the terminal yield quench. */
+    spec_quench_reset(s);
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -2762,6 +2895,40 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
         for (int i = 0; i < commit && i < 16; i++) e->spec_accepted_per_pos[i]++;
     }
 
+    /* Yield-quench controller update (see the constants block up top). Uses
+     * the ACTUAL verify width n_batch (post conf-sched trim last step) and the
+     * ACTUAL committed yield 1+commit — counts only, so the decision is
+     * deterministic for a fixed stream. Once latched, generate_speculative
+     * routes this request's remaining tokens down the plain-decode path and
+     * the drafting block below is skipped; both paths sample the exact target
+     * distribution, so quenching changes speed, never marginals. */
+    if (!s->spec_quenched) {
+        s->spec_quench_steps++;
+        const int force = spec_quench_force_step();
+        bool fire = false;
+        if (force >= 0) {
+            fire = s->spec_quench_steps >= (uint32_t)force;
+        } else if (s->spec_quench_steps > DS4_QUENCH_WARMUP) {
+            const float margin = (1.0f + (float)commit) -
+                                 spec_quench_guard(n_batch, saved_len);
+            s->spec_quench_ewma = (1.0f - DS4_QUENCH_ALPHA) * s->spec_quench_ewma +
+                                  DS4_QUENCH_ALPHA * margin;
+            s->spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
+            fire = s->spec_quench_steps >= DS4_QUENCH_MINEV &&
+                   s->spec_quench_ewma < 0.0f &&
+                   s->spec_quench_debt > DS4_QUENCH_BUDGET;
+        }
+        if (fire) {
+            s->spec_quenched = true;
+            fprintf(stderr,
+                    "ds4: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
+                    "-> plain decode for request remainder%s\n",
+                    saved_len + 1 + commit, s->spec_quench_steps,
+                    (double)s->spec_quench_debt, (double)s->spec_quench_ewma,
+                    force >= 0 ? " (forced)" : "");
+        }
+    }
+
     /* DTree Phase 0 (§6): emit one record per ON-POLICY verified position — the
      * accepted prefix 0..commit-1 plus the split (first rejected draft) at
      * commit. Each carries that position's drafter confidence, whether the
@@ -2885,7 +3052,10 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     s->spec_carry_min_p = min_p;
     uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     if (n_draft > 16u) n_draft = 16u;
-    if (hit_eos || next_base == eos_token || n_draft == 0) {
+    if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec_quenched) {
+        /* Quenched: don't draft the next chain — the carry persisted above is
+         * still the correctly-distributed next base, which the next
+         * generate_speculative call consumes before routing plain. */
         if (dspark_stats)
             fprintf(stderr, "ds4: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
                     n_batch, commit, (now_sec() - t0) * 1000.0);
@@ -3191,7 +3361,10 @@ int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_
         accepted[0] = first;
         return 1;
     }
-    if (!ds4_engine_has_dspark(s->engine)) {
+    /* Yield-quenched requests run plain for their remainder — the same route
+     * as a drafterless engine, chosen per request. The carry consumed above is
+     * already correctly distributed, so this is a pure speed decision. */
+    if (!ds4_engine_has_dspark(s->engine) || s->spec_quenched) {
         if (ds4_session_eval(s, first, err, errlen) != 0) return -1;
         accepted[0] = first;
         return 1;
@@ -3216,7 +3389,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                  "per-bank state is stale; re-sync the session first");
         return -1;
     }
-    if (!ds4_engine_has_dspark(s->engine)) {
+    if (!ds4_engine_has_dspark(s->engine) || s->spec_quenched) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -3559,6 +3732,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint.len = 0;
     s->dspark_n_pending = 0;
     s->spec_carry_valid = false;
+    spec_quench_reset(s);
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first
      * attended over the PREVIOUS request's window rows for its first ~128
@@ -3577,6 +3751,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->checkpoint.len = pos;
     s->dspark_n_pending = 0;
     s->spec_carry_valid = false;
+    spec_quench_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;

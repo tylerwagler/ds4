@@ -1403,6 +1403,27 @@ struct ds4_session {
      * Mirrors the spec_carry_* params guard. Greedy never needed this. */
     float dspark_pending_temp, dspark_pending_top_p, dspark_pending_min_p;
     int   dspark_pending_top_k;
+    /* --- Terminal yield-quench controller (spec-decode Item 4) ---
+     * Per-request cumulative-regret gate: each fused spec step charges
+     * debt += guard(n_batch) - tokens_committed (the breakeven yield minus the
+     * realized yield, in plain-token equivalents), and once the request has
+     * demonstrably lost more than DS4_QUENCH_BUDGET plain tokens to
+     * speculation with its recent yield still below breakeven, spec_quenched
+     * latches and the request decodes PLAIN for its remainder (terminal;
+     * re-armed at the request boundaries: sync/invalidate/rewind/load — the
+     * same sites that drop the carry and pendings). All-zero is the armed
+     * state, so xcalloc'd sessions start armed and spec_quench_reset is a
+     * plain zeroing. Controller design after Entrpi ds4 v0.1.1 (MIT).
+     *
+     * The controller reads only (commit, n_batch) — counts, never wall-clock —
+     * so the quench decision is deterministic run-to-run for a fixed stream.
+     * Multiseq note: this state belongs to the classic single-request flow;
+     * the dormant multi-bank driver would need per-bank copies (not wired —
+     * generate_speculative already refuses when mseq_dirty). */
+    float spec_quench_debt;    /* cumulative plain-token-equivalents lost */
+    float spec_quench_ewma;    /* EWMA of per-step margin (yield - guard) */
+    uint32_t spec_quench_steps;/* fused spec steps this request */
+    bool spec_quenched;        /* latched: plain decode for the remainder */
 };
 
 typedef struct {
