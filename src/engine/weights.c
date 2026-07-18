@@ -105,6 +105,23 @@ static void tensor_expect_optional(
         uint64_t          d2) {
     if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
 }
+/* MXFP8 workhorse weight: either the classic interleaved type (FP8_E4M3, 38) or
+ * its pre-stored device layout (MXFP8_LT, 41). Both share dims and byte
+ * accounting; the FP8 matmul resolver dispatches on the registered offset. */
+static void tensor_expect_mxfp8(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (t->type == DS4_TENSOR_FP8_E4M3)
+        tensor_expect_layout(t, DS4_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
+    else if (t->type == DS4_TENSOR_MXFP8_LT)
+        tensor_expect_layout(t, DS4_TENSOR_MXFP8_LT, ndim, d0, d1, d2);
+    else
+        ds4_die("tensor has unsupported weight type; expected FP8_E4M3 or MXFP8_LT");
+}
 static void tensor_expect_plain_or_mxfp8(
         const ds4_tensor *t,
         uint32_t          ndim,
@@ -117,6 +134,13 @@ static void tensor_expect_plain_or_mxfp8(
     else if (t->type == DS4_TENSOR_FP8_E4M3)
         tensor_expect_layout(t, DS4_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
     else
+        /* Deliberately does NOT accept MXFP8_LT: the weights routed here
+         * (hc_attn_fn/hc_ffn_fn, ffn_gate_inp, attn/indexer compressors,
+         * output_hc_fn) take the PLAIN matmul path (gpu_graph_matmul_plain_tensor),
+         * which has no type-41 branch. Pre-storing one as MXFP8_LT would decode to
+         * garbage, so a future FP8 variant of these must fail FAST here at load,
+         * not silently pass. Only the tensor_expect_mxfp8 workhorse set (routed
+         * through cuda_fp8_mx_weight) may be MXFP8_LT. */
         ds4_die("tensor has unsupported weight type; expected F16 or FP8_E4M3");
 }
 
@@ -429,7 +453,7 @@ static void weights_validate_layout(
         if (w->output->type == DS4_TENSOR_BF16)
             tensor_expect_layout(w->output,      DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
         else
-            tensor_expect_layout(w->output,      DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+            tensor_expect_mxfp8(w->output,       2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -444,14 +468,14 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+        tensor_expect_mxfp8(l->attn_q_a,        2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+        tensor_expect_mxfp8(l->attn_q_b,        2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_mxfp8(l->attn_kv,         2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-        tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_FP8_E4M3, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_FP8_E4M3, 2, out_low_dim, DS4_N_EMBD, 0);
+        tensor_expect_mxfp8(l->attn_output_a,   2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_mxfp8(l->attn_output_b,   2, out_low_dim, DS4_N_EMBD, 0);
 
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -488,9 +512,9 @@ static void weights_validate_layout(
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_mxfp8(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (il < DS4_N_HASH_LAYER) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
@@ -889,6 +913,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case DS4_TENSOR_I32:
     case DS4_TENSOR_BF16:
     case DS4_TENSOR_FP8_E4M3:
+    case DS4_TENSOR_MXFP8_LT:
     case DS4_TENSOR_FP4_E2M1:
     case DS4_TENSOR_CUTLASS_MXFP4:
         return true;
@@ -1045,7 +1070,7 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
 
-    tensor_expect_layout(w->main_proj, DS4_TENSOR_FP8_E4M3, 2, 3ull * E, E, 0);
+    tensor_expect_mxfp8(w->main_proj, 2, 3ull * E, E, 0);
     tensor_expect_layout(w->main_norm, DS4_TENSOR_F32, 1, E, 0, 0);
 
     for (int li = 0; li < 3; li++) {
@@ -1054,15 +1079,15 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
         tensor_expect_layout(l->hc_attn_scale, DS4_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base, DS4_TENSOR_F32, 1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
-        tensor_expect_layout(l->attn_q_a, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_LORA_Q, 0);
+        tensor_expect_mxfp8(l->attn_q_a, 2, E, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm, DS4_TENSOR_F32, 1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b, DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_HEAD_DIM, 0);
+        tensor_expect_mxfp8(l->attn_q_b, 2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_mxfp8(l->attn_kv, 2, E, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks, DS4_TENSOR_F32, 1, DS4_N_HEAD, 0, 0);
-        tensor_expect_layout(l->attn_output_a, DS4_TENSOR_FP8_E4M3, 2,
+        tensor_expect_mxfp8(l->attn_output_a, 2,
                              DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_layout(l->attn_output_b, DS4_TENSOR_FP8_E4M3, 2, out_low_dim, E, 0);
+        tensor_expect_mxfp8(l->attn_output_b, 2, out_low_dim, E, 0);
         tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_ffn_scale, DS4_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base, DS4_TENSOR_F32, 1, hc_mix_dim, 0, 0);
@@ -1074,9 +1099,9 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, E, 0);
+        tensor_expect_mxfp8(l->ffn_gate_shexp, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_up_shexp,   2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_down_shexp, 2, DS4_N_FF_EXP, E, 0);
     }
 
     tensor_expect_layout(w->markov_w1, DS4_TENSOR_F32, 2, 256, V, 0);

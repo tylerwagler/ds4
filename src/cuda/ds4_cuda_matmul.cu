@@ -571,6 +571,15 @@ __global__ static void mxfp8_weight_convert_kernel(const unsigned char *src, int
 
 static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
 
+/* Offsets whose MXFP8 weight is PRE-STORED in the mmap in the exact device
+ * layout (de-interleaved E4M3 data + mx_sfoff-swizzled E8M0 scale, contiguous:
+ * [data (in*out B)][scale]). For these the resolver skips cudaMalloc+convert and
+ * points cuBLASLt straight at g_model_device_base+offset. Populated once at load
+ * (cold path); the resolved fp8_mx_weight is then cached in g_fp8_mx_by_offset
+ * exactly like a converted weight, so the per-token hot path never probes this
+ * set. */
+static std::unordered_set<uint64_t> g_mxfp8_lt_offsets;
+
 
 /* lazily de-interleave + swizzle an MXFP8 weight into device buffers, cached by offset. */
 static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t offset, uint64_t weight_bytes,
@@ -594,11 +603,39 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
         fc_off[slot] = offset; fc_ptr[slot] = &it->second;
         return &it->second;
     }
-    const unsigned char *src = (const unsigned char *)cuda_model_range_ptr(model_map, offset, weight_bytes, "fp8_mx");
-    if (!src) return NULL;
     int KB = (int)(in_dim / 32), KBp = mx_rup(KB, 4);
     size_t data_bytes = in_dim * out_dim;
     size_t scale_bytes = (size_t)mx_rup((int)out_dim, 128) * KBp;
+
+    /* Pre-stored MXFP8_LT: the de-interleaved E4M3 data and swizzled E8M0 scale
+     * are already laid out contiguously in the mmap at [offset .. offset+data ..
+     * +scale]. Skip the cudaMalloc+convert entirely and hand cuBLASLt the
+     * device-accessible mmap pointers (g_model_device_base+offset). Byte-for-byte
+     * identical to what mxfp8_weight_convert_kernel would have produced. */
+    if (g_mxfp8_lt_offsets.count(offset)) {
+        __nv_fp8_e4m3 *ltdata =
+            (__nv_fp8_e4m3 *)cuda_model_range_ptr(model_map, offset, data_bytes, "fp8_mx_lt data");
+        unsigned char *ltscale =
+            (unsigned char *)cuda_model_range_ptr(model_map, offset + data_bytes, scale_bytes, "fp8_mx_lt scale");
+        if (ltdata && ltscale) {
+            fp8_mx_weight w = { model_map, offset, in_dim, out_dim, ltdata, ltscale };
+            g_fp8_mx_by_offset[offset] = w;
+            const fp8_mx_weight *wp = &g_fp8_mx_by_offset[offset];
+            fc_off[slot] = offset; fc_ptr[slot] = wp;
+            (void)label;
+            return wp;
+        }
+        /* An LT offset whose mmap pointers didn't resolve must NOT fall through
+         * to the generic convert path: that path reads 33B-interleaved blocks,
+         * but LT bytes are already de-interleaved, so a convert would be
+         * garbage. Fail cleanly instead (dispatch will report the error). */
+        fprintf(stderr, "ds4: MXFP8_LT weight at offset %llu did not resolve to "
+                "device-accessible mmap pointers\n", (unsigned long long)offset);
+        return NULL;
+    }
+
+    const unsigned char *src = (const unsigned char *)cuda_model_range_ptr(model_map, offset, weight_bytes, "fp8_mx");
+    if (!src) return NULL;
     __nv_fp8_e4m3 *data = NULL; unsigned char *scale = NULL;
     if (cudaMalloc(&data, data_bytes) != cudaSuccess) return NULL;
     if (cudaMalloc(&scale, scale_bytes) != cudaSuccess) { cudaFree(data); return NULL; }
@@ -1000,6 +1037,9 @@ std::unordered_set<uint64_t> g_fp8_offsets;
 extern "C" void ds4_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offsets.insert(weight_offset); }
 
 
+extern "C" void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offsets.insert(weight_offset); }
+
+
 
 static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
@@ -1061,6 +1101,18 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
                         w->data, w->scale, (const float *)x->ptr + t * in_dim,
                         (int)in_dim, (int)out_dim, KBp);
             return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint");
+        }
+        /* The raw kernel below reads 33B-INTERLEAVED blocks. A pre-stored
+         * MXFP8_LT weight is already de-interleaved, so it must NEVER reach this
+         * path — fail closed (rather than run the deint path's `w == NULL`
+         * fallthrough on LT bytes, which would be garbage). This also means
+         * DS4_FP8_MMVQ_RAW (which forces w == NULL above) is incompatible with an
+         * MXFP8_LT gguf. */
+        if (g_mxfp8_lt_offsets.count(weight_offset)) {
+            fprintf(stderr, "ds4: MXFP8_LT weight at offset %llu cannot use the raw "
+                    "interleaved mmvq path (DS4_FP8_MMVQ_RAW must not be set with a "
+                    "pre-stored MXFP8_LT gguf)\n", (unsigned long long)weight_offset);
+            return 0;
         }
         const unsigned char *wfp8 = (const unsigned char *)cuda_model_range_ptr(
                 model_map, weight_offset, fbytes, "fp8_mx_mmvq");

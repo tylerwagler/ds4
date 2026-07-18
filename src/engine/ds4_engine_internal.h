@@ -378,6 +378,16 @@ enum {
      * recognizes it; real per-expert offsets come from that helper, not
      * from the table's block_elems/block_bytes. */
     DS4_TENSOR_CUTLASS_MXFP4 = 40,
+    /* MXFP8_LT: the pre-store of DS4_TENSOR_FP8_E4M3 (type 38). Identical E4M3
+     * weights and E8M0 block scales, but stored in the EXACT device-side layout
+     * the runtime otherwise builds at first use: de-interleaved [in,out]
+     * col-major E4M3 data immediately followed by the mx_sfoff()-swizzled E8M0
+     * scale. On detection the FP8 matmul skips the per-weight cudaMalloc+convert
+     * and points cuBLASLt straight at the mmap (g_model_device_base+offset),
+     * freeing the ~6.4 GiB double-store. For 128-aligned shapes (out%128==0,
+     * (in/32)%4==0 -- true for every shipped weight) the total byte size equals
+     * the type-38 size exactly, so it shares the {32,33} table entry. */
+    DS4_TENSOR_MXFP8_LT = 41,
 };
 
 typedef struct {
