@@ -1078,6 +1078,16 @@ int ds4_cutlass_grouped_proj(float *out, const float *x_gathered,
         const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
         uint8_t *scratch, size_t scratch_bytes);
 
+/* Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
+ * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
+ * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
+int ds4_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *selected, const float *rweights,
+        const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
+        float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim);
+int ds4_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *selected,
+        const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
+        int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim);
+
 /* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
  * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
  * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to ds4_cutlass_pack_source so the

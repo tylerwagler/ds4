@@ -2557,20 +2557,6 @@ __global__ static void moe_padded_gather_pairflat_kernel(
     if (threadIdx.x == 0) padded_pair[R] = (int32_t)pair;
 }
 
-/* NON-padded per-expert gather of a PAIR-LAYOUT f32 buffer (src[pair*dim]) into contiguous
- * [count,dim] rows, ordered by sorted_pairs -- used by the small-batch (decode/verify) per-expert
- * CUTLASS path where the 128-padded grouped buffer would be pure waste (few tokens, many experts). */
-__global__ static void moe_pair_gather_kernel(
-        float *dst, const float *src_pairflat, const uint32_t *sorted_pairs,
-        uint32_t pair_offset, uint32_t count, uint32_t dim) {
-    uint32_t i = blockIdx.x;
-    if (i >= count) return;
-    uint32_t pair = sorted_pairs[pair_offset + i];
-    const float *s = src_pairflat + (uint64_t)pair * dim;
-    float *d = dst + (uint64_t)i * dim;
-    for (uint32_t k = threadIdx.x; k < dim; k += blockDim.x) d[k] = s[k];
-}
-
 static int routed_moe_launch_mixed40(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
@@ -2741,15 +2727,6 @@ static int routed_moe_launch_mixed40(
     }
     if (!ok) return 0;
 
-    /* per-expert (small-batch) path needs host token boundaries; grouped path is device-only. */
-    uint32_t *host_off = NULL;
-    if (!use_grouped) {
-        host_off = (uint32_t *)malloc(offsets_b);
-        if (!host_off) return 0;
-        if (!cuda_ok(cudaMemcpy(host_off, offsets, offsets_b, cudaMemcpyDeviceToHost), "mixed40 offsets readback")) {
-            free(host_off); return 0; }
-    }
-
     if (caseA) {
         /* Phase 1: gate & up W4A8 -> swiglu -> mid (pair layout). */
         float *gate_g = (float *)(scratch + gg_o);
@@ -2779,23 +2756,12 @@ static int routed_moe_launch_mixed40(
                 ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter");
             }
         } else {
-            /* per-expert (decode/verify): gather x -> single-proj gate & up -> swiglu -> scatter, per expert. */
-            for (uint32_t e = 0; ok && e < n_total_expert; e++) {
-                uint32_t c = host_off[e + 1] - host_off[e];
-                if (c == 0) continue;
-                moe_cutlass_gather_kernel<<<c, 256>>>(x_gathered, w_gathered, (const float *)x->ptr,
-                        (const float *)weights->ptr, sorted_pairs, host_off[e], c, n_expert, expert_in_dim);
-                if (!(ok = cuda_ok(cudaGetLastError(), "mixed40A pe gather"))) break;
-                const uint8_t *Wgd = (const uint8_t *)(gate_w + (uint64_t)e * gate_expert_bytes), *Wgsf = Wgd + gate_row_bytes;
-                const uint8_t *Wud = (const uint8_t *)(up_w   + (uint64_t)e * gate_expert_bytes), *Wusf = Wud + gate_row_bytes;
-                if (ds4_cutlass_proj_scratch(gate_g, x_gathered, Wgd, Wgsf, (int)c, (int)expert_in_dim, (int)expert_mid_dim, proj_scratch, proj_b) != 0) { ok = 0; break; }
-                if (ds4_cutlass_proj_scratch(up_g,   x_gathered, Wud, Wusf, (int)c, (int)expert_in_dim, (int)expert_mid_dim, proj_scratch, proj_b) != 0) { ok = 0; break; }
-                { uint64_t n = (uint64_t)c * expert_mid_dim;
-                  moe_swiglu_gathered_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(mid_g, gate_g, up_g, w_gathered, clamp, expert_mid_dim, c); }
-                if (!(ok = cuda_ok(cudaGetLastError(), "mixed40A pe swiglu"))) break;
-                moe_cutlass_scatter_kernel<<<c, 256>>>(mid_flat, mid_g, sorted_pairs, host_off[e], c, expert_mid_dim);
-                ok = cuda_ok(cudaGetLastError(), "mixed40A pe scatter");
-            }
+            /* decode/verify (n<=4): lean W4A8 GEMV -> mid_flat (fused swiglu+routing weight), pair
+             * layout, ONE launch over all slots -- no gather/scatter, no host sync, no TC underfill. */
+            (void)gate_g; (void)up_g; (void)mid_g;
+            if (ds4_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
+                    (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
+                    clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim) != 0) ok = 0;
         }
         /* Phase 2: Q8_K-quantize mid_flat -> midq, then dp4a down per pair. */
         cuda_block_q8_K *midq = (cuda_block_q8_K *)(scratch + midq_o);
@@ -2864,20 +2830,14 @@ static int routed_moe_launch_mixed40(
                 ok = cuda_ok(cudaGetLastError(), "mixed40B down scatter");
             }
         } else if (ok) {
-            /* per-expert (decode/verify): gather mid -> single-proj down -> scatter, per expert. */
-            for (uint32_t e = 0; ok && e < n_total_expert; e++) {
-                uint32_t c = host_off[e + 1] - host_off[e];
-                if (c == 0) continue;
-                moe_pair_gather_kernel<<<c, 256>>>(mid_g, mid_flat, sorted_pairs, host_off[e], c, expert_mid_dim);
-                if (!(ok = cuda_ok(cudaGetLastError(), "mixed40B pe mid gather"))) break;
-                const uint8_t *Wd = (const uint8_t *)(down_w + (uint64_t)e * down_expert_bytes), *Wsf = Wd + down_row_bytes;
-                if (ds4_cutlass_proj_scratch(out_g, mid_g, Wd, Wsf, (int)c, (int)expert_mid_dim, (int)out_dim, proj_scratch, proj_b) != 0) { ok = 0; break; }
-                moe_cutlass_scatter_kernel<<<c, 256>>>(down_flat, out_g, sorted_pairs, host_off[e], c, out_dim);
-                ok = cuda_ok(cudaGetLastError(), "mixed40B pe down scatter");
-            }
+            /* decode/verify (n<=4): lean W4A8 GEMV -> down_flat, pair layout, ONE launch over all
+             * slots (routing weight already applied by the dp4a gate/up swiglu into mid_flat). */
+            (void)mid_g; (void)out_g;
+            if (ds4_cutlass_gemv_down(down_flat, mid_flat, selected_ptr,
+                    (const uint8_t *)down_w, down_expert_bytes, down_row_bytes,
+                    (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_mid_dim, (int)out_dim) != 0) ok = 0;
         }
     }
-    if (host_off) free(host_off);
     if (!ok) return 0;
 
     uint64_t n = (uint64_t)n_tokens * out_dim;

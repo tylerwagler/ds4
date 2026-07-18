@@ -752,6 +752,24 @@ __global__ static void fp4_act_roundtrip_kernel(float *xq, const float *x, long 
   for (int i = 0; i < 32; i++) dst[i] = d_kE2M1[d_to_e2m1(src[i] / s)] * s;
 }
 
+/* W4A8 activation round-trip for the decode/small-batch GEMV: quantize f32 -> E4M3 (per-32 dynamic
+ * UE8M0 block scale, EXACTLY as pack_act_e4m3_rowmajor) then dequantize back to f32, so the GEMV
+ * (f32 act . fp4 weight dot) computes the SAME function as the prefill W4A8 grouped GEMM
+ * (E4M3 act x MXFP4 weight). Keeps decode numerics consistent with prefill -- no fp4-vs-E4M3 drift
+ * across the prefill/decode boundary, fully source-faithful. */
+__global__ static void e4m3_act_roundtrip_kernel(float *xq, const float *x, long nblk32) {
+  const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nblk32) return;
+  const float *src = x + b * 32;
+  float *dst = xq + b * 32;
+  float mx = 0.f;
+  for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
+  int se = -127; if (mx > 0.f) { int e = (int)floorf(log2f(mx)); se = e - 7; }
+  if (se < -127) se = -127; if (se > 127) se = 127;
+  const float inv = exp2f((float)-se), s = exp2f((float)se);
+  for (int i = 0; i < 32; i++) dst[i] = (float)((cutlass::float_e4m3_t)(src[i] * inv)) * s;
+}
+
 /* Persistent activation round-trip buffers, grown on demand and reused across
  * layers/calls -- single GPU-submission thread, same convention as the other
  * static caches. */
@@ -790,7 +808,7 @@ extern "C" int ds4_cutlass_expert_ffn_gemv_small(
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
   {
     const long nb = (long)(xq_floats / 32);
-    fp4_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb);
+    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb);   /* W4A8: E4M3 acts */
   }
   {
     dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
@@ -800,7 +818,7 @@ extern "C" int ds4_cutlass_expert_ffn_gemv_small(
   }
   {
     const long nb = (long)(midq_floats / 32);
-    fp4_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid_scratch, nb);
+    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid_scratch, nb);   /* W4A8: E4M3 acts */
   }
   {
     dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
@@ -808,6 +826,58 @@ extern "C" int ds4_cutlass_expert_ffn_gemv_small(
         down_w, down_stride, down_data_bytes, sfl_dn,
         n_total_expert, mid_dim, out_dim);
   }
+  return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+
+/* ---- Single-projection W4A8 GEMV for MIXED type-40 layers at DECODE/small-batch (n<=4). ----
+ * Decode is memory-bound; the M=1 CUTLASS tensor-core GEMM wastes launch + pack + TC-underfill
+ * overhead. These reuse the lean expert_gemv_* kernels (fp4 weight read directly, dequant via LUT,
+ * E4M3-roundtripped f32 activations = same function as the prefill grouped GEMM). One launch over
+ * all (token,expert) slots, no per-expert loop, no host sync. `mid`/`down_out` are the pair-layout
+ * f32 accumulators the caller composes with the dp4a side. Persistent actbuf grown on demand. */
+static int gemv_actbuf_ensure(size_t need_floats) {
+  if (need_floats <= g_fp4_gemv_actbuf_floats) return 1;
+  if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
+  g_fp4_gemv_actbuf = nullptr;
+  if (cudaMalloc(&g_fp4_gemv_actbuf, need_floats * sizeof(float)) != cudaSuccess) { g_fp4_gemv_actbuf_floats = 0; return 0; }
+  g_fp4_gemv_actbuf_floats = need_floats;
+  return 1;
+}
+/* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout). */
+extern "C" int ds4_cutlass_gemv_gateup(
+    float *mid, const float *x, const int32_t *selected, const float *rweights,
+    const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
+    float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim) {
+  if (in_dim % 256 || mid_dim % 8 || (gate_stride & 3u)) return 1;
+  const unsigned n_slots = (unsigned)(n_tokens * n_expert);
+  const size_t xq_floats = (size_t)n_tokens * in_dim;
+  if (!gemv_actbuf_ensure(xq_floats)) return 1;
+  float *xq = g_fp4_gemv_actbuf;
+  auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
+  { const long nb = (long)(xq_floats / 32);
+    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb); }
+  dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
+  expert_gemv_gu_swiglu_kernel<<<g, 256>>>(mid, xq, selected, rweights, gate_w, up_w,
+      gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
+  return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+/* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
+extern "C" int ds4_cutlass_gemv_down(
+    float *down_out, const float *mid, const int32_t *selected,
+    const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
+    int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim) {
+  if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u)) return 1;
+  const unsigned n_slots = (unsigned)(n_tokens * n_expert);
+  const size_t midq_floats = (size_t)n_slots * mid_dim;
+  if (!gemv_actbuf_ensure(midq_floats)) return 1;
+  float *midq = g_fp4_gemv_actbuf;
+  auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
+  { const long nb = (long)(midq_floats / 32);
+    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid, nb); }
+  dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
+  expert_gemv_down_kernel<<<g, 256>>>(down_out, midq, selected, down_w,
+      down_stride, down_data_bytes, sfl_dn, n_total_expert, mid_dim, out_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
