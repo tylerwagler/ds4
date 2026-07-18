@@ -1066,6 +1066,18 @@ int ds4_cutlass_proj_scratch(float *out, const float *x,
         const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
         uint8_t *scratch, size_t scratch_bytes);
 
+/* Grouped single-projection W4A8 GEMM for MIXED layers -- one device-built ptr-array grouped GEMM
+ * over 128-padded gathered activations: out[padded_total,out_dim] = x_gathered . W^T for every
+ * active expert (W_base+e*W_stride data, +W_data_bytes swizzled SFB). No host readback, no per-expert
+ * sync; bit-identical to the per-expert single-proj path (same pack + gather order + GEMM). Padding
+ * rows must be pre-zeroed. Caller sizes scratch once via ds4_cutlass_grouped_proj_scratch_bytes(). */
+size_t ds4_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim);
+int ds4_cutlass_grouped_proj(float *out, const float *x_gathered,
+        const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
+        int n_total_expert, int in_dim, int out_dim,
+        const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
+        uint8_t *scratch, size_t scratch_bytes);
+
 /* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
  * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
  * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to ds4_cutlass_pack_source so the

@@ -560,6 +560,56 @@ extern "C" int ds4_cutlass_grouped_moe(
   return 0;
 }
 
+// ---- Grouped SINGLE-projection W4A8 GEMM (for MIXED type-40 + iq2/q2k layers). ----
+// One device-built ptr-array grouped GEMM over the 128-padded gathered activations, for ONE
+// logical matmul out[padded_total,out_dim] = x_gathered . W^T (W = type-40 expert weight, data at
+// W_base+e*W_stride, swizzled SFB at +W_data_bytes). This is exactly the gate/up/down sub-step of
+// ds4_cutlass_grouped_moe factored out: same pack + same g_build_arrays gather order + same
+// run_grouped_gemm, so it is bit-identical to the per-expert single-projection path it replaces,
+// with NO host readback and NO per-expert sync. Padding rows (padded_offsets leave <128-row gaps)
+// must be pre-zeroed by the caller. `ws` is folded into scratch (shape-independent grouped WS). ----
+static size_t grouped_proj_layout(int padded_total, int n_total_expert, int in_dim,
+                                  size_t *xA_off, size_t *xSF_off, size_t *xSF_bytes,
+                                  size_t *arr_off, size_t *ws_off, size_t *ws_bytes) {
+  const size_t a = 256; size_t off = 0;
+  int tiles = padded_total / 128;
+  *xA_off = off;  off = align_up_bytes(off + (size_t)padded_total * in_dim, a);   /* E4M3: 1 byte/elem */
+  *xSF_bytes = (size_t)tiles * grouped_per_mtile_sfA(in_dim) * sizeof(ElementSF);
+  *xSF_off = off; off = align_up_bytes(off + *xSF_bytes, a);
+  *arr_off = off; off = align_up_bytes(off + g_arrays_bytes(n_total_expert), a);
+  *ws_bytes = grouped_gemm_workspace_bytes(n_total_expert, grouped_sm_count());
+  *ws_off = off;  off = align_up_bytes(off + *ws_bytes, a);
+  return off;
+}
+extern "C" size_t ds4_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim){
+  (void)out_dim;   /* grouped WS is shape-independent; D buffer is caller-owned */
+  size_t a,b,c,d,e,f; return grouped_proj_layout(padded_total, n_total_expert, in_dim, &a,&b,&c,&d,&e,&f);
+}
+extern "C" int ds4_cutlass_grouped_proj(
+    float *out, const float *x_gathered,
+    const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
+    int n_total_expert, int in_dim, int out_dim,
+    const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
+    uint8_t *scratch, size_t scratch_bytes){
+  size_t xA_off,xSF_off,xSF_bytes,arr_off,ws_off,ws_bytes;
+  size_t need = grouped_proj_layout(padded_total, n_total_expert, in_dim,
+                                    &xA_off,&xSF_off,&xSF_bytes,&arr_off,&ws_off,&ws_bytes);
+  if (!scratch || scratch_bytes < need) return -1;
+  int sm = grouped_sm_count();
+  uint8_t   *xA  = scratch + xA_off;
+  ElementSF *xSF = reinterpret_cast<ElementSF*>(scratch + xSF_off);
+  GArrays g = g_arrays_place(scratch + arr_off, n_total_expert);
+  void *ws = ws_bytes ? (void*)(scratch + ws_off) : nullptr;
+  cudaMemsetAsync(xSF, 0, xSF_bytes);
+  pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+  long pmt = grouped_per_mtile_sfA(in_dim);
+  const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
+  g_build_arrays<<<bb,bt>>>(g.prob, g.ptrA,g.dA,g.ptrSFA,g.lSFA, g.ptrB,g.dB,g.ptrSFB,g.lSFB,
+      g.ptrC,g.dC,g.ptrD,g.dD, counts, padded_offsets, xA,(const uint8_t*)xSF, pmt,
+      W_base, W_stride, W_data_bytes, out, out_dim, in_dim, n_total_expert);
+  return run_grouped_gemm(n_total_expert, g, ws, sm) == 0 ? 0 : 3;
+}
+
 // ---- Small-batch expert FFN via direct fp4 GEMV (spec-decode verify, n_tokens 2..4). ----
 // The grouped CUTLASS path costs ~2.8 ms per rich layer at n_tokens=3: per-expert GEMM
 // launches at M<=3 run far off roofline, behind a blocking per-layer offsets readback.
