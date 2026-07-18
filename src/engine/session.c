@@ -1833,6 +1833,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+
+        /* One MoE-tier boot line so a silent slow tier is no longer silent:
+         * resolved expert weight type (grouped-CUTLASS type-40 vs per-expert
+         * tiled type-39) + the resolved gate/up MXFP4 tile width (NT16/NT8).
+         * Reuses the bound-layer expert tensors and the CUDA tile-width
+         * accessor; log-only, runs once at open on every GPU serve. */
+        {
+            const ds4_layer_weights *ml = weights_first_bound_layer(&e->weights);
+            if (ml && ml->ffn_gate_exps && ml->ffn_down_exps) {
+                const uint32_t gt = ml->ffn_gate_exps->type;
+                const uint32_t dt = ml->ffn_down_exps->type;
+                /* The grouped/GEMV CUTLASS dispatch is entered only when BOTH
+                 * gate and down experts are type-40 (see the moe.cu batch
+                 * predicate); any other mix takes the per-expert tiled path. */
+                const char *tier = (gt == DS4_TENSOR_CUTLASS_MXFP4 &&
+                                    dt == DS4_TENSOR_CUTLASS_MXFP4)
+                                       ? "grouped-CUTLASS"
+                                       : "per-expert-tiled";
+                fprintf(stderr,
+                        "ds4: MoE expert tier: %s  gate=%s(%u) down=%s(%u) mxfp4 tile=NT%u\n",
+                        tier, tensor_type_name(gt), gt, tensor_type_name(dt), dt,
+                        ds4_gpu_moe_mxfp4_tile_width());
+            }
+        }
     }
 
     *out = e;

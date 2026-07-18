@@ -23,6 +23,12 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
+/* Boot-time observability: the resolved gate/up MXFP4 tile width (NT=16 where
+ * the device accepts the dynamic-SMEM opt-in, else NT=8) -- the same cached
+ * value the mxfp4 prefill path launches at <1024u>.  Resolving it is idempotent
+ * (a single cudaFuncSetAttribute) and does not alter any generated token. */
+uint32_t ds4_gpu_moe_mxfp4_tile_width(void);
+
 /* Running total of live tensor-alloc bytes (owned allocations only, views
  * excluded).  Snapshot around a session create to measure its true resident
  * cost; the server ledger commits that actual. */

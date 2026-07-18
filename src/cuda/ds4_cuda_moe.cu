@@ -1126,6 +1126,13 @@ static uint32_t moe_mxfp4_gate_up_tile_width(void) {
     return width;
 }
 
+/* Boot-line accessor for the resolved gate/up MXFP4 tile width at the production
+ * <1024u> row span.  Same cached value the prefill launcher reads at :2756;
+ * calling it early only warms the cache (idempotent) -- generation is unchanged. */
+extern "C" uint32_t ds4_gpu_moe_mxfp4_tile_width(void) {
+    return moe_mxfp4_gate_up_tile_width<1024u>();
+}
+
 
 /* Q2_K gate/up variants of the three gate kernels above (mid preset:
  * all-Q2_K experts). Same structure and q8_K activations; the dot is the
@@ -2482,6 +2489,17 @@ static int routed_moe_launch_cutlass_dispatch(
         }
         if (rc) return rc;   /* any failure falls through to the legacy loop (safety net) */
     }
+    /* Reached only when the grouped path was disabled or failed -> the ~4x
+     * slower per-expert loop.  Announce once, unconditionally (was gated behind
+     * the unset DS4_MOE_GROUPED_LOG), so this slow tier is never silent. */
+    {
+        static int fb_logged = 0;
+        if (!fb_logged) { fb_logged = 1;
+            fprintf(stderr,
+                    "ds4: WARNING MoE grouped GEMM %s -> per-expert loop (~4x slower prefill)\n",
+                    grouped ? "failed" : "disabled");
+        }
+    }
     return routed_moe_launch_cutlass(out, down, model_map, model_size,
             gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
             down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
@@ -3072,6 +3090,16 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
             }
             /* any failure: fall through to the grouped CUTLASS path */
         }
+        /* type-40 decode bypassed the fp4 GEMV fast path -> the per-expert
+         * CUTLASS loop.  Announce once, unconditionally, so the slow decode
+         * tier is not silent. */
+        {
+            static int gemv_dec_logged = 0;
+            if (!gemv_dec_logged) { gemv_dec_logged = 1;
+                fprintf(stderr,
+                        "ds4: WARNING MoE fp4 GEMV decode path not taken -> per-expert loop (slower decode)\n");
+            }
+        }
         return routed_moe_launch_cutlass(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,
@@ -3162,6 +3190,20 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
             /* any failure: fall through to the grouped CUTLASS path */
         }
         if (path_log > 0) fprintf(stderr, "ds4: moe40 layer=%u -> grouped\n", layer_index);
+        /* A small verify batch (n_tokens 2..4) that was ELIGIBLE for the fp4
+         * GEMV fast path but fell through is a genuine (if minor) silent
+         * fallback -- announce once, unconditionally.  n_tokens>4 (prefill)
+         * routing to the grouped dispatch is the intended fast path, not a
+         * fallback, so it is deliberately NOT flagged here. */
+        {
+            static int gemv_batch_logged = 0;
+            if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u && !gemv_batch_logged) {
+                gemv_batch_logged = 1;
+                fprintf(stderr,
+                        "ds4: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",
+                        n_tokens);
+            }
+        }
         return routed_moe_launch_cutlass_dispatch(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,
