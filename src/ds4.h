@@ -134,6 +134,11 @@ typedef struct {
     bool     has_dspark;            /* spec decode active */
 } ds4_spec_metrics;
 void ds4_engine_spec_metrics(ds4_engine *e, ds4_spec_metrics *out);
+/* Per-session cumulative counters (accepted/draft/num_drafts/gen_tokens only;
+ * accepted_per_pos left zero). Snapshot + diff across one request for a
+ * per-response accept-rate the global engine counters cannot attribute under
+ * concurrent decode. */
+void ds4_session_spec_metrics(const ds4_session *s, ds4_spec_metrics *out);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old

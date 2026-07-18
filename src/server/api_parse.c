@@ -137,7 +137,10 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "think")) {
+        } else if (!strcmp(key, "think") || !strcmp(key, "enable_thinking")) {
+            /* enable_thinking is the Qwen/vLLM spelling; accept it as a bool
+             * alias for our existing `think` field. Both remain additive to the
+             * Anthropic-style `thinking` object handled above. */
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);
                 goto bad;
@@ -1524,7 +1527,10 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "think")) {
+        } else if (!strcmp(key, "think") || !strcmp(key, "enable_thinking")) {
+            /* enable_thinking is the Qwen/vLLM spelling; accept it as a bool
+             * alias for our existing `think` field. Both remain additive to the
+             * Anthropic-style `thinking` object handled above. */
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);
                 goto bad;

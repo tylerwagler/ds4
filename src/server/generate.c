@@ -731,6 +731,9 @@ struct gen_state {
     char *disk_cache_path;
     int prompt_tokens;
     double t0;
+    double first_token_t;  /* wall time the first output token was produced (TTFT);
+                            * 0 until set. Request-lifetime: survives decode_again
+                            * so it reflects the genuinely first token emitted. */
     uint64_t trace_id;
     char ctx_span[48];
     char req_flags[64];
@@ -772,6 +775,9 @@ struct gen_state {
     int next_tool_progress;
     int next_decode_log;
     double decode_t0;
+    ds4_spec_metrics spec_start; /* per-session DSpark counters snapshotted at
+                                  * decode start; diffed at finish for this
+                                  * request's accept-rate/tokens-per-step */
     double last_decode_log_t;
     int last_decode_log_completion;
     thinking_state thinking;
@@ -1294,6 +1300,11 @@ static void gen_decode_init(server *s, session_slot *sl) {
     if (g->max_tokens > room) g->max_tokens = room;
     trace_event(s, g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens, room);
     g->decode_t0 = server_now_sec();
+    /* Snapshot the session's cumulative DSpark counters so gen_step_finish can
+     * diff them into this request's accept-rate/tokens-per-step. Re-snapshotting
+     * here (decode_again also lands here) keeps the diff consistent with the
+     * reset completion/decode_t0 for the attempt that actually finishes. */
+    ds4_session_spec_metrics(sl->sess, &g->spec_start);
     g->last_decode_log_t = g->decode_t0;
     g->last_decode_log_completion = 0;
     g->thinking = thinking_state_from_prompt(&j->req);
@@ -1410,6 +1421,11 @@ static void gen_step_decode(server *s, session_slot *sl) {
             toks[0] = token;
             ntok = 1;
         }
+
+        /* TTFT: stamp the moment the first output token is available. One guarded
+         * clock read for the whole request (branch is predictably not-taken after
+         * the first token), so no meaningful decode-loop overhead. */
+        if (g->first_token_t == 0.0 && ntok > 0) g->first_token_t = server_now_sec();
 
         for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
             token = toks[ti];
@@ -1830,6 +1846,28 @@ static void gen_step_finish(server *s, session_slot *sl) {
     }
     log_tool_calls_summary(g->ctx_span, &parsed_calls,
                            g->responses_protocol);
+
+    /* Populate the additive per-response "timings" block from counters the
+     * worker already kept. Pure metadata assembled once at finish, off any hot
+     * path; the emitter derives the rates. */
+    {
+        const double finish_t = server_now_sec();
+        req_timings *t = &j->req.timings;
+        t->ttft_s = g->first_token_t > 0.0 ? g->first_token_t - g->t0 : 0.0;
+        t->prefill_s = g->decode_t0 > g->t0 ? g->decode_t0 - g->t0 : 0.0;
+        t->decode_s = finish_t > g->decode_t0 ? finish_t - g->decode_t0 : 0.0;
+        t->prompt_n = g->prompt_tokens;
+        t->cached_n = j->req.cache_read_tokens;
+        t->decode_n = g->completion;
+        ds4_spec_metrics spec_end;
+        ds4_session_spec_metrics(sl->sess, &spec_end);
+        t->spec_gen = spec_end.gen_tokens - g->spec_start.gen_tokens;
+        t->spec_accepted = spec_end.accepted_tokens - g->spec_start.accepted_tokens;
+        t->spec_draft = spec_end.draft_tokens - g->spec_start.draft_tokens;
+        t->spec_drafts = spec_end.num_drafts - g->spec_start.num_drafts;
+        t->spec_active = t->spec_gen > 0; /* the fused spec loop ran this request */
+        t->valid = true;
+    }
 
     trace_finish(s, g->trace_id, &j->req, final_finish, g->completion,
                  g->saw_tool_start, g->saw_tool_end,

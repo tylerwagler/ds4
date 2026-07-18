@@ -1884,6 +1884,25 @@ void ds4_engine_spec_metrics(ds4_engine *e, ds4_spec_metrics *out) {
 
 
 
+/* Per-SESSION cumulative DSpark counters (accepted/draft/drafts/gen). Same
+ * semantics as ds4_engine_spec_metrics but scoped to one session, so a caller
+ * can diff a snapshot across a single request for a per-response accept-rate.
+ * accepted_per_pos is left zero (the per-position waterfall stays a /metrics,
+ * cross-request concern). */
+void ds4_session_spec_metrics(const ds4_session *s, ds4_spec_metrics *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!s) return;
+    out->accepted_tokens = s->spec_accepted_tokens;
+    out->draft_tokens = s->spec_draft_tokens;
+    out->num_drafts = s->spec_num_drafts;
+    out->gen_tokens = s->spec_gen_tokens;
+    out->max_draft = s->engine ? s->engine->dspark_draft_tokens : 0;
+    out->has_dspark = s->engine ? s->engine->dspark_ready : false;
+}
+
+
+
 int ds4_engine_layer_count(ds4_engine *e) {
     (void)e;
     return (int)DS4_N_LAYER;
@@ -2901,11 +2920,15 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * base token is always emitted; K drafts were verified this step and the
      * accepted prefix is [0,commit). num_drafts counts draft rounds only. */
     e->spec_gen_tokens += 1u + (uint64_t)commit;
+    s->spec_gen_tokens += 1u + (uint64_t)commit;
     if (K > 0) {
         e->spec_draft_tokens += K;
         e->spec_accepted_tokens += (uint64_t)commit;
         e->spec_num_drafts += 1u;
         for (int i = 0; i < commit && i < 16; i++) e->spec_accepted_per_pos[i]++;
+        s->spec_draft_tokens += K;
+        s->spec_accepted_tokens += (uint64_t)commit;
+        s->spec_num_drafts += 1u;
     }
 
     /* Yield-quench controller update (see the constants block up top). Uses
