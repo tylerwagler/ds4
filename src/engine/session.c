@@ -607,12 +607,32 @@ static int payload_read_raw_row(FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    /* Report the routed-expert precision tier actually present, derived from
+     * the loaded tensor types (was hardcoded 2, which under-reported the mixed
+     * IQ2 + MXFP4/type-40 build as pure 2-bit). Any 4-bit routed format
+     * (MXFP4 E2M1 / CUTLASS type-40) anywhere in gate/up/down makes this a
+     * 4-bit-tier model; otherwise the 2-bit floor (IQ2_XXS / Q2_K); 0 if no
+     * routed experts. The kvstore snapshot-compat guards accept {2,4} and
+     * ds4_engine_model_id() is a compile-time constant, so this is the only
+     * model-variant discriminator in the disk-KV key — a value change
+     * invalidates old snapshots (one-time re-prefill; fine in dev). */
+    int bits = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
-        if (!gate) continue;
-        return 2;
+        const ds4_tensor *proj[3] = {
+            e->weights.layer[il].ffn_gate_exps,
+            e->weights.layer[il].ffn_up_exps,
+            e->weights.layer[il].ffn_down_exps,
+        };
+        for (int k = 0; k < 3; k++) {
+            const ds4_tensor *t = proj[k];
+            if (!t) continue;
+            if (t->type == DS4_TENSOR_FP4_E2M1 ||
+                t->type == DS4_TENSOR_CUTLASS_MXFP4)
+                return 4;
+            if (bits == 0) bits = 2;
+        }
     }
-    return 0;
+    return bits;
 }
 
 
