@@ -20,8 +20,14 @@
 
 using namespace cute;
 
-// ---- GEMM: MXFP4 (A=activation RowMajor) x MXFP4 (B=weight ColumnMajor) -> f32 D. ----
-using ElementA   = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+// ---- GEMM: W4A8 mixed block-scaled — A=activation MXFP8 (E4M3, RowMajor) x B=weight MXFP4
+// (E2M1, ColumnMajor) -> f32 D. This is the native DeepSeek-V4-Flash expert scheme (expert_dtype
+// fp4 x activation e4m3, dynamic UE8M0 block scale). The sm120 CollectiveBuilder selects the
+// kind::f8f6f4 (MX_F4F6F8) instruction (cute atom SM120_16x8x32_TN<e2m1,e4m3,f32>, mma_sm120.hpp:157).
+// The weight-side SF (SFB) swizzle is BYTE-IDENTICAL to the former all-fp4 (mxf4nvf4) config
+// (verified: same tile_atom_to_shape_SFB shape/stride/size), so the type-40 weight repack and the
+// shipped blk 0-2 stay valid unchanged; only the activation element (fp4->fp8) and its packer change. ----
+using ElementA   = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
 using ElementB   = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
 using ElementD   = float;
 using ElementC   = float;
@@ -88,21 +94,29 @@ using GElemSF = typename GGemmKernel::CollectiveMainloop::ElementSF;
 using GElemC  = typename GGemm::ElementC;
 using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 
-// ---- device activation packer (validated): f32 [M,K] RowMajor -> A data (packed E2M1) + SF (swizzled) ----
-__device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-__device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
+// ---- device activation packer: f32 [M,K] RowMajor -> A data (E4M3, 1 byte/elem) + SF (swizzled UE8M0).
+// W4A8: activations are MXFP8 (E4M3) with a DYNAMIC per-32-element UE8M0 block scale, matching the
+// DeepSeek-V4-Flash source scheme (activation_scheme dynamic, fmt e4m3, scale_fmt ue8m0). The scale
+// exponent convention mirrors the engine's cuBLASLt MXFP8 packer (mxfp8_quant_act_kernel): se =
+// floor(log2(amax)) - 7, data = v * 2^-se, SF byte = se+127; CUTLASS reconstructs v = data*2^(se-127+127-... )
+// i.e. data * 2^(SF-127) = v exactly. The SF is written through the CUTLASS tile-atom SFA layout object
+// (identical swizzle to the weight SFB), NOT the cuBLASLt VEC32 swizzle. ----
 template<class TSFA>
-__global__ void pack_act_rowmajor(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
+__global__ void pack_act_e4m3_rowmajor(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
   int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
   int m=(int)(idx/nblk), kb=(int)(idx%nblk);
   const float *x=act+(size_t)m*K+(size_t)kb*32;
   float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(x[i]));
-  int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-30)e=-30; if(e>30)e=30;
-  float scale=exp2f((float)e);
-  uint8_t *outb=A_data+((size_t)m*K+(size_t)kb*32)/2;
-  for(int i=0;i<16;i++){ uint8_t lo=d_to_e2m1(x[2*i]/scale), hi=d_to_e2m1(x[2*i+1]/scale); outb[i]=(uint8_t)(lo|(hi<<4)); }
-  tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(e+127));
+  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
+  if(se<-127)se=-127; if(se>127)se=127;
+  float inv=exp2f((float)-se);
+  cutlass::float_e4m3_t *outb=reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+(size_t)m*K+(size_t)kb*32;
+  for(int i=0;i<32;i++) outb[i]=cutlass::float_e4m3_t(x[i]*inv);
+  tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
 }
+// LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
+__device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+__device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
 // mid = silu(clamp(gate)) * clamp(up) * routing_weight  — matches engine ds4_cuda.cu:10827-10835
 __global__ void swiglu_kernel(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
   long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
@@ -112,11 +126,12 @@ __global__ void swiglu_kernel(float *mid, const float *gate, const float *up, co
   mid[i]=s*u*w[i/mid_dim];
 }
 
+// A_data is E4M3: M*K bytes (1 byte/elem), NOT M*K/2. SFA via the CUTLASS tile-atom layout.
 static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, int M, int K){
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
   int nb=M*(K/32), t=128, b=(nb+t-1)/t;
-  pack_act_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
+  pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
 }
 
 static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
@@ -188,10 +203,10 @@ static ds4_cutlass_ffn_scratch_layout cutlass_ffn_scratch_layout(int T, int in_d
   ds4_cutlass_ffn_scratch_layout L{};
   const size_t align = 256;
   size_t off = 0;
-  L.xA_off = off; off = align_up_bytes(off + (size_t)T*in_dim/2, align);
+  L.xA_off = off; off = align_up_bytes(off + (size_t)T*in_dim, align);   /* E4M3: 1 byte/elem */
   L.xSF_n = (size_t)((T+127)/128*128)*((in_dim/32+3)/4*4);
   L.xSF_off = off; off = align_up_bytes(off + L.xSF_n*sizeof(ElementSF), align);
-  L.midA_off = off; off = align_up_bytes(off + (size_t)T*mid_dim/2, align);
+  L.midA_off = off; off = align_up_bytes(off + (size_t)T*mid_dim, align);  /* E4M3: 1 byte/elem */
   L.midSF_n = (size_t)((T+127)/128*128)*((mid_dim/32+3)/4*4);
   L.midSF_off = off; off = align_up_bytes(off + L.midSF_n*sizeof(ElementSF), align);
   L.gate_off = off; off = align_up_bytes(off + (size_t)T*mid_dim*sizeof(float), align);
@@ -262,6 +277,40 @@ extern "C" int ds4_cutlass_expert_ffn_scratch(
   pack_activation(midA,midSF,mid,T,mid_dim);
   rc|=run_gemm(out, midA,midSF,Wd_d,Wd_sf_e,T,out_dim,mid_dim,ws_down);
   return rc;
+}
+
+// ---- Single-projection W4A8 GEMM (for MIXED type-40 + iq2 layers). One logical matmul:
+// out[T,out_dim] = x[T,in_dim] . W[out_dim,in_dim]^T, where W is a type-40 CUTLASS-packed MXFP4
+// weight for ONE expert (data at W_d, swizzled SFB at W_sf) and x is f32 activations for the T
+// tokens routed to that expert (gathered contiguously by the caller). Activations are packed to
+// E4M3 (dynamic UE8M0) exactly as the full FFN's projections -- so this projection is bit-for-bit
+// the same function the uniform grouped path computes for a single GEMM. No allocation, no sync;
+// launches into the caller's current stream. SF pointer typed as raw bytes at the boundary. ----
+static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
+                                  size_t *xA_off, size_t *xSF_off, size_t *xSF_n, size_t *ws_off, size_t *ws_bytes){
+  const size_t a=256; size_t off=0;
+  *xA_off=off; off=align_up_bytes(off+(size_t)T*in_dim, a);                 /* E4M3: 1 byte/elem */
+  *xSF_n=(size_t)((T+127)/128*128)*((in_dim/32+3)/4*4);
+  *xSF_off=off; off=align_up_bytes(off+(*xSF_n)*sizeof(ElementSF), a);
+  *ws_bytes=gemm_workspace_bytes(T, out_dim, in_dim);
+  *ws_off=off; off=align_up_bytes(off+(*ws_bytes), a);
+  return off;
+}
+extern "C" size_t ds4_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
+  size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
+}
+extern "C" int ds4_cutlass_proj_scratch(float *out, const float *x,
+    const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
+    uint8_t *scratch, size_t scratch_bytes){
+  size_t xA_off,xSF_off,xSF_n,ws_off,ws_bytes;
+  size_t need=proj_scratch_layout(T,in_dim,out_dim,&xA_off,&xSF_off,&xSF_n,&ws_off,&ws_bytes);
+  if(!scratch || scratch_bytes<need) return -1;
+  uint8_t *xA=scratch+xA_off;
+  ElementSF *xSF=reinterpret_cast<ElementSF*>(scratch+xSF_off);
+  void *ws=ws_bytes?(void*)(scratch+ws_off):nullptr;
+  if(xSF_n) cudaMemsetAsync(xSF,0,xSF_n*sizeof(ElementSF));
+  pack_activation(xA,xSF,x,T,in_dim);
+  return run_gemm(out, xA, xSF, W_d, reinterpret_cast<const ElementSF*>(W_sf), T, out_dim, in_dim, ws);
 }
 
 // ---- extern-C expert FFN (standalone/test convenience): allocates+frees its own scratch and
@@ -342,7 +391,7 @@ __global__ static void g_build_arrays(
   dD[e] = cutlass::make_cute_packed_stride(GStrideD{}, cute::make_shape(M, N, 1));
   lSFA[e] = GSm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
   lSFB[e] = GSm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
-  ptrA[e]   = reinterpret_cast<const GElemA*>(A_data + (size_t)roff * (K / 2));
+  ptrA[e]   = reinterpret_cast<const GElemA*>(A_data + (size_t)roff * K);   /* E4M3 A: K bytes/row */
   ptrSFA[e] = reinterpret_cast<const GElemSF*>(A_sf + (size_t)(roff / 128u) * per_mtile_sfA);
   ptrB[e]   = reinterpret_cast<const GElemB*>(B_base + (size_t)e * B_stride);
   ptrSFB[e] = reinterpret_cast<const GElemSF*>(B_base + (size_t)e * B_stride + B_data_bytes);
@@ -429,13 +478,13 @@ static ds4_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n
   const size_t a = 256; size_t off = 0;
   int sm = grouped_sm_count();
   int tiles = padded_total / 128;
-  L.xA_off = off;  off = align_up_bytes(off + (size_t)padded_total*in_dim/2, a);
+  L.xA_off = off;  off = align_up_bytes(off + (size_t)padded_total*in_dim, a);   /* E4M3: 1 byte/elem */
   L.xSF_bytes = (size_t)tiles * grouped_per_mtile_sfA(in_dim) * sizeof(ElementSF);
   L.xSF_off = off; off = align_up_bytes(off + L.xSF_bytes, a);
   L.gate_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
   L.up_off   = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
   L.mid_off  = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
-  L.midA_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim/2, a);
+  L.midA_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim, a);   /* E4M3: 1 byte/elem */
   L.midSF_bytes = (size_t)tiles * grouped_per_mtile_sfA(mid_dim) * sizeof(ElementSF);
   L.midSF_off = off; off = align_up_bytes(off + L.midSF_bytes, a);
   L.gu_arr_off = off; off = align_up_bytes(off + g_arrays_bytes(n_total), a);

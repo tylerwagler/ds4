@@ -1056,6 +1056,16 @@ int ds4_cutlass_grouped_moe(
         uint8_t        *scratch,
         size_t          scratch_bytes);
 
+/* Single-projection W4A8 GEMM for MIXED type-40 + iq2/q2k layers. Computes out[T,out_dim] =
+ * x[T,in_dim] . W[out_dim,in_dim]^T for ONE expert's type-40 CUTLASS weight (data at W_d, swizzled
+ * SFB at W_sf), packing x to E4M3 dynamic block-scaled activations -- bit-identical to a single
+ * projection of the uniform grouped path. Caller gathers x contiguously (T = tokens for that
+ * expert) and sizes scratch once via ds4_cutlass_proj_scratch_bytes(). No allocation, no sync. */
+size_t ds4_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
+int ds4_cutlass_proj_scratch(float *out, const float *x,
+        const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
+        uint8_t *scratch, size_t scratch_bytes);
+
 /* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
  * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
  * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to ds4_cutlass_pack_source so the

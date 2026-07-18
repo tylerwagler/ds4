@@ -2508,6 +2508,229 @@ static int routed_moe_launch_cutlass_dispatch(
 
 
 
+/* ---- MIXED type-40 (CUTLASS W4A8) + iq2/q2k (dp4a) layer dispatch. ------------------------------
+ * After the type-40 unification, some layers have ONE projection as CUTLASS MXFP4 (type 40) and the
+ * others as iq2/q2k. The grouped path needs all-three-same-type, and the dp4a kernels cannot read
+ * the type-40 swizzle, so we run each projection in its native precision and compose in f32:
+ *   Case A (gate/up type-40, down dp4a): per-expert gather x -> single-projection CUTLASS gate & up
+ *     GEMMs (W4A8, E4M3 acts) -> swiglu(+routing weight) on the gathered rows -> scatter mid into the
+ *     per-(token,expert) pair layout -> Q8_K-quantize mid -> existing dp4a down per pair -> moe_sum.
+ *   Case B (gate/up dp4a, down type-40): existing dp4a gate/up per pair (fused swiglu) -> pair-gather
+ *     mid per expert -> single-projection CUTLASS down GEMM (W4A8) -> scatter into pair layout -> moe_sum.
+ * The CUTLASS projection is bit-identical to the same projection in the uniform grouped path (same
+ * pack + run_gemm); the dp4a projection is bit-identical to the all-dp4a path (same kernels). There is
+ * no cross-contamination: each projection reads only its own weight/SF and its own activation quant. */
+__global__ static void moe_swiglu_gathered_kernel(
+        float *mid_g, const float *gate_g, const float *up_g, const float *w_g,
+        float clamp, uint32_t mid_dim, uint32_t n_rows) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_rows * mid_dim;
+    if (i >= n) return;
+    float g = gate_g[i], u = up_g[i];
+    if (clamp > 1.0e-6f) { if (g > clamp) g = clamp; if (u > clamp) u = clamp; if (u < -clamp) u = -clamp; }
+    mid_g[i] = (g / (1.0f + expf(-g))) * u * w_g[i / mid_dim];   /* same order as qwarp32 line 487 */
+}
+
+/* Gather per-(token,expert)-pair rows of a PAIR-LAYOUT f32 buffer (src[pair*dim]) into a contiguous
+ * [count,dim] scratch, ordered by sorted_pairs -- the mid-side companion to moe_cutlass_gather_kernel
+ * (which gathers per-TOKEN x rows). Used to feed the CUTLASS down projection in case B. */
+__global__ static void moe_pair_gather_kernel(
+        float *dst, const float *src_pairflat, const uint32_t *sorted_pairs,
+        uint32_t pair_offset, uint32_t count, uint32_t dim) {
+    uint32_t i = blockIdx.x;
+    if (i >= count) return;
+    uint32_t pair = sorted_pairs[pair_offset + i];
+    const float *s = src_pairflat + (uint64_t)pair * dim;
+    float *d = dst + (uint64_t)i * dim;
+    for (uint32_t k = threadIdx.x; k < dim; k += blockDim.x) d[k] = s[k];
+}
+
+static int routed_moe_launch_mixed40(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t n_tokens) {
+    const int caseA = (gate_type == 40u);       /* gate/up type-40, down dp4a */
+    const int caseB = (down_type == 40u);       /* gate/up dp4a, down type-40 */
+    if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
+    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+        n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
+    if (mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
+        down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
+        gate->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
+        up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)) return 0;
+
+    const uint32_t pair_count = n_tokens * n_expert;
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint32_t T_max = n_tokens;            /* worst case: one expert gets every token */
+    const int32_t *selected_ptr = (const int32_t *)selected->ptr;
+
+    /* model weight bases */
+    const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_total > model_size - gate_offset || gate_total > model_size - up_offset ||
+        down_total > model_size - down_offset) return 0;
+    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_mix_gate");
+    const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_mix_up");
+    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_mix_down");
+    if (!gate_w || !up_w || !down_w) return 0;
+
+    /* one scratch alloc: sort structures + gather/proj scratch (+ quant scratch) */
+    const uint64_t A = 256;
+    const uint64_t counts_b  = (uint64_t)n_total_expert * sizeof(uint32_t);
+    const uint64_t offsets_b = ((uint64_t)n_total_expert + 1) * sizeof(uint32_t);
+    const uint64_t cursors_b = counts_b;
+    const uint64_t sorted_b  = (uint64_t)pair_count * sizeof(uint32_t);
+    const uint64_t xg_b   = (uint64_t)T_max * expert_in_dim * sizeof(float);   /* gathered x (A) / unused (B) */
+    const uint64_t wg_b   = (uint64_t)T_max * sizeof(float);
+    const uint64_t gg_b   = (uint64_t)T_max * expert_mid_dim * sizeof(float);  /* gate_g (A) */
+    const uint64_t ug_b   = (uint64_t)T_max * expert_mid_dim * sizeof(float);  /* up_g   (A) */
+    const uint64_t mg_b   = (uint64_t)T_max * expert_mid_dim * sizeof(float);  /* mid_g gathered (A/B) */
+    const uint64_t og_b   = (uint64_t)T_max * out_dim * sizeof(float);         /* out_g  (B) */
+    const uint64_t xq_b   = (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);           /* (B) */
+    const uint64_t midq_b = (uint64_t)pair_count * midq_blocks * sizeof(cuda_block_q8_K);       /* (A) */
+    const uint64_t proj_b = caseA
+        ? ds4_cutlass_proj_scratch_bytes((int)T_max, (int)expert_in_dim, (int)expert_mid_dim)
+        : ds4_cutlass_proj_scratch_bytes((int)T_max, (int)expert_mid_dim, (int)out_dim);
+
+    uint64_t off = 0;
+    const uint64_t counts_o  = off; off = cutlass_moe_align_up(off + counts_b, A);
+    const uint64_t offsets_o = off; off = cutlass_moe_align_up(off + offsets_b, A);
+    const uint64_t cursors_o = off; off = cutlass_moe_align_up(off + cursors_b, A);
+    const uint64_t sorted_o  = off; off = cutlass_moe_align_up(off + sorted_b, A);
+    const uint64_t xg_o = off; off = cutlass_moe_align_up(off + (caseA ? xg_b : 0), A);
+    const uint64_t wg_o = off; off = cutlass_moe_align_up(off + (caseA ? wg_b : 0), A);
+    const uint64_t gg_o = off; off = cutlass_moe_align_up(off + (caseA ? gg_b : 0), A);
+    const uint64_t ug_o = off; off = cutlass_moe_align_up(off + (caseA ? ug_b : 0), A);
+    const uint64_t mg_o = off; off = cutlass_moe_align_up(off + mg_b, A);
+    const uint64_t og_o = off; off = cutlass_moe_align_up(off + (caseB ? og_b : 0), A);
+    const uint64_t xq_o = off; off = cutlass_moe_align_up(off + (caseB ? xq_b : 0), A);
+    const uint64_t midq_o = off; off = cutlass_moe_align_up(off + (caseA ? midq_b : 0), A);
+    const uint64_t proj_o = off; off = cutlass_moe_align_up(off + proj_b, A);
+    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(off, "routed_moe mixed40");
+    if (!scratch) return 0;
+
+    uint32_t *counts  = (uint32_t *)(scratch + counts_o);
+    uint32_t *offsets = (uint32_t *)(scratch + offsets_o);
+    uint32_t *cursors = (uint32_t *)(scratch + cursors_o);
+    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_o);
+    float *mid_flat = (float *)mid->ptr;        /* pair-layout mid accumulator */
+    float *down_flat = (float *)down->ptr;      /* pair-layout down accumulator */
+    uint8_t *proj_scratch = scratch + proj_o;
+
+    int ok = cuda_ok(cudaMemset(counts, 0, counts_b), "mixed40 counts clear");
+    if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
+              ok = cuda_ok(cudaGetLastError(), "mixed40 count"); }
+    if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
+              ok = cuda_ok(cudaGetLastError(), "mixed40 prefix"); }
+    if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
+              ok = cuda_ok(cudaGetLastError(), "mixed40 scatter"); }
+    if (!ok) return 0;
+
+    /* per-expert token boundaries (host): a bounded readback, same pattern as routed_moe_launch_cutlass */
+    uint32_t *host_off = (uint32_t *)malloc(offsets_b);
+    if (!host_off) return 0;
+    if (!cuda_ok(cudaMemcpy(host_off, offsets, offsets_b, cudaMemcpyDeviceToHost), "mixed40 offsets readback")) {
+        free(host_off); return 0; }
+
+    if (caseB) {
+        /* Phase 1: dp4a gate/up per pair (fused swiglu) -> mid_flat. */
+        cuda_block_q8_K *xq = (cuda_block_q8_K *)(scratch + xq_o);
+        dim3 xqg(xq_blocks, n_tokens, 1);
+        q8_K_quantize_kernel<<<xqg, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+        ok = cuda_ok(cudaGetLastError(), "mixed40B xq");
+        if (ok) {
+            dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
+            if (gate_type == 10u)
+                moe_gate_up_mid_q2k_qwarp32_kernel<<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
+                    gate_w, up_w, xq, selected_ptr, (const float *)weights->ptr,
+                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+            else
+                moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
+                    gate_w, up_w, xq, selected_ptr, (const float *)weights->ptr,
+                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+            ok = cuda_ok(cudaGetLastError(), "mixed40B gate/up");
+        }
+        /* Phase 2: per expert, gather mid -> CUTLASS down proj -> scatter to down_flat[pair]. */
+        float *mid_g = (float *)(scratch + mg_o);
+        float *out_g = (float *)(scratch + og_o);
+        for (uint32_t e = 0; ok && e < n_total_expert; e++) {
+            uint32_t c = host_off[e + 1] - host_off[e];
+            if (c == 0) continue;
+            moe_pair_gather_kernel<<<c, 256>>>(mid_g, mid_flat, sorted_pairs, host_off[e], c, expert_mid_dim);
+            if (!(ok = cuda_ok(cudaGetLastError(), "mixed40B mid gather"))) break;
+            const uint8_t *Wd = (const uint8_t *)(down_w + (uint64_t)e * down_expert_bytes);
+            const uint8_t *Wsf = Wd + down_row_bytes;
+            if (ds4_cutlass_proj_scratch(out_g, mid_g, Wd, Wsf, (int)c, (int)expert_mid_dim, (int)out_dim,
+                                         proj_scratch, proj_b) != 0) { ok = 0; break; }
+            moe_cutlass_scatter_kernel<<<c, 256>>>(down_flat, out_g, sorted_pairs, host_off[e], c, out_dim);
+            ok = cuda_ok(cudaGetLastError(), "mixed40B down scatter");
+        }
+    } else {
+        /* Case A. Phase 1: per expert, gather x -> CUTLASS gate & up proj -> swiglu -> scatter mid. */
+        float *x_g = (float *)(scratch + xg_o);
+        float *w_g = (float *)(scratch + wg_o);
+        float *gate_g = (float *)(scratch + gg_o);
+        float *up_g = (float *)(scratch + ug_o);
+        float *mid_g = (float *)(scratch + mg_o);
+        for (uint32_t e = 0; ok && e < n_total_expert; e++) {
+            uint32_t c = host_off[e + 1] - host_off[e];
+            if (c == 0) continue;
+            moe_cutlass_gather_kernel<<<c, 256>>>(x_g, w_g, (const float *)x->ptr, (const float *)weights->ptr,
+                                                  sorted_pairs, host_off[e], c, n_expert, expert_in_dim);
+            if (!(ok = cuda_ok(cudaGetLastError(), "mixed40A x gather"))) break;
+            const uint8_t *Wgd = (const uint8_t *)(gate_w + (uint64_t)e * gate_expert_bytes);
+            const uint8_t *Wgsf = Wgd + gate_row_bytes;
+            const uint8_t *Wud = (const uint8_t *)(up_w + (uint64_t)e * gate_expert_bytes);
+            const uint8_t *Wusf = Wud + gate_row_bytes;
+            if (ds4_cutlass_proj_scratch(gate_g, x_g, Wgd, Wgsf, (int)c, (int)expert_in_dim, (int)expert_mid_dim,
+                                         proj_scratch, proj_b) != 0) { ok = 0; break; }
+            if (ds4_cutlass_proj_scratch(up_g, x_g, Wud, Wusf, (int)c, (int)expert_in_dim, (int)expert_mid_dim,
+                                         proj_scratch, proj_b) != 0) { ok = 0; break; }
+            { uint64_t n = (uint64_t)c * expert_mid_dim;
+              moe_swiglu_gathered_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(mid_g, gate_g, up_g, w_g, clamp, expert_mid_dim, c); }
+            if (!(ok = cuda_ok(cudaGetLastError(), "mixed40A swiglu"))) break;
+            moe_cutlass_scatter_kernel<<<c, 256>>>(mid_flat, mid_g, sorted_pairs, host_off[e], c, expert_mid_dim);
+            ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter");
+        }
+        /* Phase 2: Q8_K-quantize mid_flat -> midq, then dp4a down per pair. */
+        cuda_block_q8_K *midq = (cuda_block_q8_K *)(scratch + midq_o);
+        if (ok) {
+            dim3 mqg(midq_blocks, pair_count, 1);
+            q8_K_quantize_kernel<<<mqg, 256>>>(midq, mid_flat, expert_mid_dim, pair_count);
+            ok = cuda_ok(cudaGetLastError(), "mixed40A midq");
+        }
+        if (ok) {
+            dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
+            if (down_type == 16u)
+                moe_down_iq2_qwarp32_kernel<<<dgrid, 256>>>(down_flat, down_w, midq, selected_ptr,
+                    down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+            else
+                moe_down_qwarp32_kernel<<<dgrid, 256>>>(down_flat, down_w, midq, selected_ptr,
+                    down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+            ok = cuda_ok(cudaGetLastError(), "mixed40A down");
+        }
+    }
+    free(host_off);
+    if (!ok) return 0;
+
+    uint64_t n = (uint64_t)n_tokens * out_dim;
+    moe_sum_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>((float *)out->ptr, down_flat, out_dim, n_expert, n_tokens);
+    return cuda_ok(cudaGetLastError(), "mixed40 sum");
+}
+
+
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -3107,6 +3330,15 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                                          expert_in_dim, expert_mid_dim, out_dim,
                                          selected, weights, n_total_expert, n_expert, clamp, x, 1);
     }
+    if ((gate_type == 40u) != (down_type == 40u)) {
+        /* MIXED type-40 + iq2/q2k: per-projection dispatch. Fail-closed -- routed_moe_launch's
+         * dp4a kernels cannot read the type-40 swizzle, so never fall through to it. */
+        return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
+                                         gate_offset, up_offset, down_offset, gate_type, down_type,
+                                         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                                         expert_in_dim, expert_mid_dim, out_dim,
+                                         selected, weights, n_total_expert, n_expert, clamp, x, 1);
+    }
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -3211,6 +3443,14 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
                                          expert_in_dim, expert_mid_dim, out_dim,
                                          selected, weights, n_total_expert, n_expert, clamp, x,
                                          n_tokens);
+    }
+    if ((gate_type == 40u) != (down_type == 40u)) {
+        /* MIXED type-40 + iq2/q2k: per-projection dispatch. Fail-closed. */
+        return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
+                                         gate_offset, up_offset, down_offset, gate_type, down_type,
+                                         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                                         expert_in_dim, expert_mid_dim, out_dim,
+                                         selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
     }
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
