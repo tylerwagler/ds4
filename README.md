@@ -60,8 +60,8 @@ This is **beta quality**, but a first release has shipped: the
 measured-allocation DeepSeek-V4-Flash GGUF (the `v5mx` build) and the
 `ds4-server` engine that serves it. The inference path, the MXFP4/MXFP8/IQ2
 quantization, and speculative decoding are validated against the tests in this
-tree and the `tool-eval-bench` quality suite — a fresh full-suite run of the
-shipping build scores 88/100 with hardmode included (97/100 on the core suite).
+tree and the `tool-eval-bench` quality suite — a fresh 4-seed run of the
+shipping build averages ~90/100 with hardmode included (range 87–92 across seeds).
 Model serving is
 a large surface, so rough edges remain; we keep the project usable and are
 actively hardening it. If you hit a problem, run `ds4-server --trace
@@ -134,8 +134,8 @@ A few things this fork's GGUFs do beyond upstream:
   three tensors or none. The measured-allocation build is the **shipped
   release**: in the hardmode `tool-eval-bench` bake-off that selected it, it
   scored 92/100 against 84/100 for a uniform all-`Q2_K` build, so the measured
-  build ships and the all-`Q2_K` build was dropped. (A fresh full-suite
-  re-measure of the shipping build scores 88/100 with hardmode; the weakest
+  build ships and the all-`Q2_K` build was dropped. (A fresh 4-seed
+  re-measure of the shipping build averages ~90/100 with hardmode, range 87–92; the weakest
   area is Category K safety/refusal — including one cross-turn prompt-injection
   scenario the model does not resist — a model-alignment limitation, not a
   quantization artifact.) Recommended sampling for the shipped build is
