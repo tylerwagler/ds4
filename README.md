@@ -191,49 +191,57 @@ full flag list, and start serving with:
 ## Speed
 
 Performance is measured on this fork's target hardware — a **DGX Spark GB10**
-running the ~91 GB REAP-pruned MXFP8/IQ2 Flash build. Prefill is measured
-**cold** (no prefix-cache reuse — a warm cache reports arbitrarily high
-prompt-processing rates and is not a real prefill number); decode is measured
-with the merged DSpark speculative drafter, single stream.
+running the ~91 GB REAP-pruned Flash build. The **v0.2.3** artifact unifies every
+MXFP4 routed-expert layer onto the CUTLASS tensor-core **type-40 W4A8 path**
+(4-bit weights, E4M3 activations) and stores all MXFP8 workhorse weights in the
+**type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack). Prefill is measured
+**cold** (`cache_prompt` off, unique-prefix probe — a warm cache reports
+arbitrarily high prompt-processing rates and is not a real prefill number);
+decode is measured with the merged DSpark speculative drafter, single stream, on
+the server's own wall-clock. All numbers below are the median of three runs at
+real depth-varying prompts.
 
-| Context | Prefill (t/s, cold) | Decode structured (t/s) | Decode prose (t/s) |
-| ---: | ---: | ---: | ---: |
-| ~0.3k | — | ~27.7 | ~18.7 |
-| ~2k | ~383 | ~26.6 | ~20.7 |
-| ~8-9k | ~355 | ~25.0 | ~21.6 |
+| Context (actual) | Prefill (t/s, cold) | TTFT (cold) | Decode structured (t/s) | Decode prose (t/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| ~0.3k | — | ~1.3 s | ~27.0 | ~18.1 |
+| ~2.3k | ~390 | ~5.9 s | ~24.0 | ~20.7 |
+| ~9.3k | ~413 | ~22.6 s | ~25.6 | ~19.6 |
 
 Decode figures are the production speculative path (drafter on, thinking on),
-greedy (`temp:0`), single stream, on the server's own wall-clock; prefill is the
-cold first request. (Speculative decode at `temp:1.0` is comparable and on
-several depths faster — up to ~+23% on structured 2-8k — but is stochastic
-run-to-run, so the greedy rows are the reported baseline.)
+greedy (`temp:0`), single stream. Measured on the v0.2.3 type-40/MXFP8_LT build,
+decode is **neutral** versus the prior v0.2.2 build (within run-to-run noise:
+prior structured 27.7/26.6/25.0, prose 18.7/20.7/21.6 at the same depths).
+Prefill improved: at the pre-release single-shape gate the type-40 unification
+measured **+17.5%**, and the full cold sweep here reads ~390 t/s at ~2.3k rising
+to ~413 t/s at ~9.3k as the larger prefill amortizes fixed overhead. The change
+is **fidelity-neutral** — the type-40/MXFP8_LT re-encode measured KL 0.007 with
+top-1 agreement 100% against the prior build. (Speculative decode at `temp:1.0`
+is comparable and on several depths faster but is stochastic run-to-run, so the
+greedy rows are the reported baseline.)
 
-Prefill runs ~360-410 t/s cold and tapers slowly with context as the
-long-context indexer scan grows. The MXFP4 rich-expert layers (~4.25 bpw versus
-the ~2 bpw floor) read ~2x the weight bytes and set the prefill rate; an
-expert-tiled big-batch kernel keeps each decoded weight resident across a wide
-token tile so its decode cost amortizes across the batch. (A uniform 2-bit build
-prefills faster, ~420 t/s, but scores lower on quality — the measured allocation
-trades some prefill for the tool-use win, beating the uniform 2-bit build on
-hard-mode tool-eval-bench.)
+The MXFP4 rich-expert layers (~4.25 bpw versus the ~2 bpw floor) read ~2x the
+weight bytes and set the prefill rate; the type-40 grouped W4A8 GEMM runs those
+layers on the tensor cores. An expert-tiled big-batch kernel keeps each decoded
+weight resident across a wide token tile so its decode cost amortizes across the
+batch. (A uniform 2-bit build prefills faster but scores lower on quality — the
+measured allocation trades some prefill for the tool-use win, beating the uniform
+2-bit build on hard-mode tool-eval-bench.)
 
-Draft acceptance declines as context grows (α ~77% on structured/tool output at
-shallow context, ~60% by 8k), because the drafter predicts a longer prompt less
-well; the speedup is largest on structured/tool workloads where acceptance is
-highest. The default draft depth is **3** (measured optimum for this build — see
-Speculative decoding); the autoregressive drafter's per-position cost means
-deeper chains stop paying, and shallower drafting especially helps at long
-context, where the old depth-5 default lost the most to verify-row cost. Plain (non-speculative) decode is roughly flat and bandwidth-bound;
-speculation is a speedup layered on top. The wins in this release's sweep run
-+13% to +39% on structured/tool output and +5% to +18% on deep prose; on
+Draft acceptance varies with workload and depth: measured α runs ~81-91% on
+structured/tool output and ~60-68% on general prose, so the speedup is largest on
+structured/tool workloads where acceptance is highest. The default draft depth is
+**3** (measured optimum for this build — see Speculative decoding); the
+autoregressive drafter's per-position cost means deeper chains stop paying, and
+shallower drafting especially helps at long context, where the old depth-5
+default lost the most to verify-row cost. Plain (non-speculative) decode is
+roughly flat and bandwidth-bound; speculation is a speedup layered on top. On
 shallow, low-acceptance requests speculation can run slightly *slower* than
-plain, so **its downside is now capped to a few percent (measured −2% to −6% on
-the shallow cells, versus as much as ~−26% before) by the yield-quench safety
+plain, so **its downside is capped to a few percent by the yield-quench safety
 net** described under Speculative decoding — not "speculation never hurts." It
 never changes the output distribution — exact sampled acceptance at all
-temperatures — so it is a pure speed knob, not a quality one. (Prefill is measured with the `ds4-bench` cold
-sweep and `tool-eval-bench --perf-only --benchy-args='--no-cache'`; decode with
-`tool-eval-bench --spec-bench` on the server's own wall-clock. Speculative t/s
+temperatures — so it is a pure speed knob, not a quality one. (Prefill is
+measured cold with `cache_prompt` off and a unique-prefix probe to defeat the
+prefix cache; decode is measured on the server's own wall-clock. Speculative t/s
 is stochastic run-to-run under sampling; the numbers above are `--temp 0`.)
 
 ## Model residency
@@ -247,11 +255,19 @@ A model that does not fit is rejected at startup with a clear error instead of
 silently degrading — there is no partial-residency or streaming fallback, so a
 successful load is also a residency guarantee for the whole run.
 
+As of **v0.2.3**, the MXFP8 workhorse weights are stored in the type-41
+**MXFP8_LT** swizzle and loaded zero-copy, which frees the ~6.4 GiB runtime
+repack cache the prior build allocated on every load. The type-40 W4A8 expert
+path adds ~3.59 GiB of CUTLASS grouped-GEMM scratch, so the net change is
+**+2.8 GiB of runtime headroom** — enough to lift the live-session cap from two
+to three (see below).
+
 ### Startup warmup and session admission
 
 At startup, before the listener accepts requests, the server runs a short
-(~13 s) warmup generation that materializes the first-generation CUDA working
-set (~8.7 GiB). This has two consequences. First, **prefill numbers are
+(~11 s) warmup generation that materializes the first-generation CUDA working
+set (~3.8 GiB on v0.2.3, down from ~8.7 GiB before the MXFP8_LT change). This has
+two consequences. First, **prefill numbers are
 effectively post-warmup**: the first real request already has its working set
 resident, which is why cold and process-warm prefill agree within run-to-run
 noise. Second, warmup lets session admission measure the *actual* memory cost of
@@ -259,16 +275,18 @@ a live slot rather than estimate it; the measured budget is logged at startup,
 for example:
 
 ```text
-warmup generation: 4160 prompt + 12 decode tokens in 12.8 s;
-  MemAvailable 18.09 -> 9.36 GiB (first-generation working set 8.73 GiB materialized)
-session admission: measured budget 9.81 GiB
-  (MemAvailable 9.36 GiB post-warmup - floor 4.00 GiB + slot 0 committed 4.45 GiB; static bound 13.95 GiB)
+warmup generation: 4160 prompt + 12 decode tokens in 11.0 s;
+  MemAvailable 18.47 -> 14.71 GiB (first-generation working set 3.76 GiB materialized)
+session admission: measured budget 13.95 GiB
+  (MemAvailable 14.71 GiB post-warmup - floor 4.00 GiB + slot 0 committed 4.45 GiB; static bound 13.95 GiB)
 ```
 
 Each admitted session slot costs ~4.45 GiB of (graph-dominated) working set, so
-on a warmed box the measured ~9.8 GiB budget admits **two live sessions**; a
-third (which would need ~13.4 GiB) exceeds the budget and is refused. Admission
-is driven by this measured ledger, not a fixed slot count.
+on a warmed box the measured ~13.95 GiB budget admits **three live sessions**
+(3 × ~4.45 = ~13.4 GiB); a fourth exceeds the budget and is refused. The v0.2.3
+MXFP8_LT change lifted this cap from two to three by freeing the runtime repack
+cache (the prior build's post-warmup budget was ~9.8 GiB). Admission is driven by
+this measured ledger, not a fixed slot count.
 
 Long-context KV state is kept compact by default: the compressed-attention
 cache uses a bit-exact packed value layout (`DS4_ATTN_PACK`, on by default),
@@ -366,10 +384,11 @@ client resumes instead of re-prefilling. Sessions do **not** yet share a batched
 decode step (that is a planned throughput feature), so aggregate decode is
 roughly the single-stream rate divided across active sessions, while concurrent
 prefills overlap and scale. On the ~128 GB GB10 with ~85 GB of resident weights,
-the practical cap is **two live sessions on a warmed box** at a large context:
-each provisioned slot costs ~4.45 GiB of (graph-dominated) working set, admitted
-against a measured ~9.8 GiB budget, so a third session exceeds the budget and is
-refused (see Startup warmup and session admission). Each session's context
+the practical cap is **three live sessions on a warmed box** at a large context
+(as of v0.2.3, up from two): each provisioned slot costs ~4.45 GiB of
+(graph-dominated) working set, admitted against a measured ~13.95 GiB budget, so
+a fourth session exceeds the budget and is refused (see Startup warmup and
+session admission). Each session's context
 can be sized up to the model's 1M-token limit, and requests beyond the admission
 budget queue or are refused rather than driving the box out of memory.
 Two further guardrails keep a misbehaving client from wedging the server:
