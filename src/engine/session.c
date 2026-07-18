@@ -1,13 +1,20 @@
 #include "ds4_engine_internal.h"
 
 
-/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25: the
- * 2026-07-10 long-context sweep measured 0.25 > 0.35 at both 32k (22.42 vs
- * 21.20 eff t/s) and 128k (23.90 vs 22.08); 0.35 only wins at ~2k ctx
- * (24.46 vs ~23.2).  Acceptance falls with context depth, so the optimal
- * trim loosens — tuned for the long-context workloads this box serves.
+/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
+ * v0.2.2 default draft depth 3 the 2026-07-17 tau sweep found tau barely moves
+ * GREEDY throughput (only 3 positions to trim: full range within 1-3% and the
+ * peak wanders inside noise), but tau=0.25 clearly wins under T=1.0 SAMPLING
+ * (+25% structured, +10% prose vs verify-all), where the low-confidence tail is
+ * real.  The old "optimal trim loosens with depth" was a k=5 artifact — the
+ * real driver is acceptance rate, not depth, and it washes out at k=3.  Trim is
+ * exact and output-invariant on STRUCTURED, but narrowing the verify batch
+ * shifts float accumulation ~1 ULP and can flip near-tie greedy argmax on flat
+ * (prose) distributions (benign numerical tie, same class as yield-quench) — so
+ * tau is distribution-preserving but NOT byte-identical on greedy prose.
  * DS4_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off" disables (verify all
- * n_draft).  The principled fix is adaptive tau (docs/plans.md). */
+ * n_draft).  Adaptive tau is not worth building at k=3 (payoff ~2-6%, mostly
+ * captured by 0.25). */
 static float dspark_conf_sched_tau(void) {
     static float cached = -1.0f;
     if (cached < 0.0f) {
@@ -1644,7 +1651,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
      * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
      * disarmed, conf-sched trimming active). k=3 beats k=5 by +15% structured
-     * to +32% prose served decode; output is bit-identical (exact verify).
+     * to +32% prose served decode; distribution-preserving (exact verify) —
+     * byte-identical on structured, near-tie-equivalent on greedy prose (the
+     * verify-width change flips ~1-ULP argmax ties, same class as yield-quench).
      * The DSpark drafter forward is autoregressive, so its cost scales with the
      * chain length ON TOP of the verify rows — ms/accepted-token stays flat
      * ~41-46 ms across k, i.e. depth never amortizes, so shallower wins.
