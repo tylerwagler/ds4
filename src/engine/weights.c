@@ -218,29 +218,33 @@ bool routed_expert_gate_down_layout(
         uint64_t         *down_row_bytes) {
     /* NOTE: gate and down are NOT always the same type -- gate/up and down
      * formats pair freely per layer by design (see
-     * tensor_expect_routed_expert_combo). Only CUTLASS_MXFP4 requires gate==down. */
+     * tensor_expect_routed_expert_combo). Each side's layout is computed
+     * independently so MIXED layers (cutlass_mxfp4 on one side, iq2/q2k on the
+     * other) resolve correctly: the CUTLASS_MXFP4 side yields stride/split-point,
+     * the dp4a side yields ordinary expert/row byte counts. */
     if (!gate || !down) return false;
 
     if (gate->type == DS4_TENSOR_CUTLASS_MXFP4) {
-        uint64_t gate_sf, gate_stride, down_sf, down_stride;
+        uint64_t gate_sf, gate_stride;
         cutlass_mxfp4_expert_layout(gate->dim[0], gate->dim[1],
                                      gate_row_bytes, &gate_sf, &gate_stride);
-        cutlass_mxfp4_expert_layout(down->dim[0], down->dim[1],
-                                     down_row_bytes, &down_sf, &down_stride);
         *gate_expert_bytes = gate_stride;
-        *down_expert_bytes = down_stride;
-        return true;
+    } else {
+        *gate_row_bytes = routed_expert_row_bytes(gate);
+        if (*gate_row_bytes == 0 || gate->dim[1] > UINT64_MAX / *gate_row_bytes) return false;
+        *gate_expert_bytes = gate->dim[1] * *gate_row_bytes;
     }
 
-    *gate_row_bytes = routed_expert_row_bytes(gate);
-    *down_row_bytes = routed_expert_row_bytes(down);
-    if (*gate_row_bytes == 0 || *down_row_bytes == 0 ||
-        gate->dim[1] > UINT64_MAX / *gate_row_bytes ||
-        down->dim[1] > UINT64_MAX / *down_row_bytes) {
-        return false;
+    if (down->type == DS4_TENSOR_CUTLASS_MXFP4) {
+        uint64_t down_sf, down_stride;
+        cutlass_mxfp4_expert_layout(down->dim[0], down->dim[1],
+                                     down_row_bytes, &down_sf, &down_stride);
+        *down_expert_bytes = down_stride;
+    } else {
+        *down_row_bytes = routed_expert_row_bytes(down);
+        if (*down_row_bytes == 0 || down->dim[1] > UINT64_MAX / *down_row_bytes) return false;
+        *down_expert_bytes = down->dim[1] * *down_row_bytes;
     }
-    *gate_expert_bytes = gate->dim[1] * *gate_row_bytes;
-    *down_expert_bytes = down->dim[1] * *down_row_bytes;
     return true;
 }
 
@@ -259,23 +263,36 @@ static void tensor_expect_routed_expert_combo(
         const ds4_tensor *gate,
         const ds4_tensor *up,
         const ds4_tensor *down) {
+    /* gate/up must match (the fused gate+up kernels assume one format). Each of
+     * gate/up and down may independently be a dp4a quant (iq2_xxs/q2_k/mxfp4) OR
+     * CUTLASS_MXFP4 (type 40) -- the GPU MoE path handles all-cutlass (uniform,
+     * grouped/gemv), all-dp4a (heterogeneous), AND the two MIXED shapes
+     * (cutlass gate/up + iq2/q2k down; iq2/q2k gate/up + cutlass down) via
+     * per-projection dispatch. The ONE combo the GPU can't compose is CUTLASS
+     * mixed with the legacy 17-byte FP4_E2M1 (type 39) on the other side -- that
+     * dp4a format can't be read by CUTLASS and vice-versa; reject it fail-closed
+     * (it never occurs after the type-40 unification repack, which converts every
+     * type-39 mxfp4 to type-40). */
     const bool gate_up_pair = gate->type == up->type;
-    const bool cutlass = gate->type == DS4_TENSOR_CUTLASS_MXFP4;
-    const bool gate_ok = gate->type == DS4_TENSOR_IQ2_XXS ||
-                         gate->type == DS4_TENSOR_Q2_K ||
-                         gate->type == DS4_TENSOR_FP4_E2M1 ||
-                         cutlass;
-    const bool down_ok = cutlass
-        ? down->type == DS4_TENSOR_CUTLASS_MXFP4
-        : (down->type == DS4_TENSOR_IQ2_XXS ||
-           down->type == DS4_TENSOR_Q2_K ||
-           down->type == DS4_TENSOR_FP4_E2M1);
-    if (gate_up_pair && gate_ok && down_ok) return;
+    const bool gate_cut = gate->type == DS4_TENSOR_CUTLASS_MXFP4;
+    const bool down_cut = down->type == DS4_TENSOR_CUTLASS_MXFP4;
+    const bool gate_dp4a = gate->type == DS4_TENSOR_IQ2_XXS ||
+                           gate->type == DS4_TENSOR_Q2_K ||
+                           gate->type == DS4_TENSOR_FP4_E2M1;
+    const bool down_dp4a = down->type == DS4_TENSOR_IQ2_XXS ||
+                           down->type == DS4_TENSOR_Q2_K ||
+                           down->type == DS4_TENSOR_FP4_E2M1;
+    const bool gate_ok = gate_dp4a || gate_cut;
+    const bool down_ok = down_dp4a || down_cut;
+    /* the unhandled cross: CUTLASS on one side + legacy type-39 FP4 on the other */
+    const bool bad_mix = (gate_cut && down->type == DS4_TENSOR_FP4_E2M1) ||
+                         (down_cut && gate->type == DS4_TENSOR_FP4_E2M1);
+    if (gate_up_pair && gate_ok && down_ok && !bad_mix) return;
     fprintf(stderr,
             "ds4: unsupported routed expert quant combo at tensor %.*s: "
             "gate=%s up=%s down=%s; gate/up must match and be one of "
-            "iq2_xxs/q2_k/mxfp4/cutlass_mxfp4, down one of iq2_xxs/q2_k/mxfp4 "
-            "(cutlass_mxfp4 gate/up pairs only with cutlass_mxfp4 down); "
+            "iq2_xxs/q2_k/mxfp4/cutlass_mxfp4, down one of the same; a CUTLASS_MXFP4 "
+            "side may NOT pair with a legacy type-39 mxfp4 side; "
             "combos may differ per layer\n",
             (int)gate->name.len,
             gate->name.ptr,
