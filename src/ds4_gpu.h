@@ -23,6 +23,12 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
+/* Boot-time observability: the resolved gate/up MXFP4 tile width (NT=16 where
+ * the device accepts the dynamic-SMEM opt-in, else NT=8) -- the same cached
+ * value the mxfp4 prefill path launches at <1024u>.  Resolving it is idempotent
+ * (a single cudaFuncSetAttribute) and does not alter any generated token. */
+uint32_t ds4_gpu_moe_mxfp4_tile_width(void);
+
 /* Running total of live tensor-alloc bytes (owned allocations only, views
  * excluded).  Snapshot around a session create to measure its true resident
  * cost; the server ledger commits that actual. */
@@ -193,6 +199,12 @@ int ds4_gpu_matmul_mxfp8_tensor(
 /* Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
  * output head) by offset so the matmul above executes it; done once at load. */
 void ds4_gpu_register_fp8_weight(uint64_t weight_offset);
+
+/* Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
+ * device layout (de-interleaved E4M3 data + swizzled E8M0 scale) is already in
+ * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
+ * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
+void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset);
 
 /* Optional fused GPU operations.
  *
@@ -1043,6 +1055,38 @@ int ds4_cutlass_grouped_moe(
         int             padded_total,
         uint8_t        *scratch,
         size_t          scratch_bytes);
+
+/* Single-projection W4A8 GEMM for MIXED type-40 + iq2/q2k layers. Computes out[T,out_dim] =
+ * x[T,in_dim] . W[out_dim,in_dim]^T for ONE expert's type-40 CUTLASS weight (data at W_d, swizzled
+ * SFB at W_sf), packing x to E4M3 dynamic block-scaled activations -- bit-identical to a single
+ * projection of the uniform grouped path. Caller gathers x contiguously (T = tokens for that
+ * expert) and sizes scratch once via ds4_cutlass_proj_scratch_bytes(). No allocation, no sync. */
+size_t ds4_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
+int ds4_cutlass_proj_scratch(float *out, const float *x,
+        const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
+        uint8_t *scratch, size_t scratch_bytes);
+
+/* Grouped single-projection W4A8 GEMM for MIXED layers -- one device-built ptr-array grouped GEMM
+ * over 128-padded gathered activations: out[padded_total,out_dim] = x_gathered . W^T for every
+ * active expert (W_base+e*W_stride data, +W_data_bytes swizzled SFB). No host readback, no per-expert
+ * sync; bit-identical to the per-expert single-proj path (same pack + gather order + GEMM). Padding
+ * rows must be pre-zeroed. Caller sizes scratch once via ds4_cutlass_grouped_proj_scratch_bytes(). */
+size_t ds4_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim);
+int ds4_cutlass_grouped_proj(float *out, const float *x_gathered,
+        const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
+        int n_total_expert, int in_dim, int out_dim,
+        const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
+        uint8_t *scratch, size_t scratch_bytes);
+
+/* Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
+ * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
+ * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
+int ds4_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *selected, const float *rweights,
+        const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
+        float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim);
+int ds4_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *selected,
+        const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
+        int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim);
 
 /* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
  * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout

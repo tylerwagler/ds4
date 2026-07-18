@@ -201,6 +201,49 @@ void append_openai_usage_json(buf *b, const request *r,
 
 
 
+/* Additive per-response timing block (llama.cpp-ish field names for client
+ * familiarity, plus DS4 cache-split and DSpark extensions). Emits a leading
+ * ",\"timings\":{...}" so callers append it directly after the usage object.
+ * Pure metadata: every value comes from counters the worker already kept, and
+ * the rates are derived here with guarded divisions (a zero denominator omits
+ * the rate rather than emitting a non-finite number). Never affects sampling. */
+void append_openai_timings_json(buf *b, const request *r) {
+    const req_timings *t = r ? &r->timings : NULL;
+    if (!t || !t->valid) return;
+
+    int prefill_computed = t->prompt_n - t->cached_n;
+    if (prefill_computed < 0) prefill_computed = 0;
+
+    buf_puts(b, ",\"timings\":{");
+    buf_printf(b, "\"ttft_s\":%.6f", t->ttft_s);
+    buf_printf(b, ",\"prompt_n\":%d,\"cached_n\":%d,\"prefill_n\":%d",
+               t->prompt_n, t->cached_n, prefill_computed);
+    /* Prefill throughput is over the tokens actually computed (cache hits cost
+     * ~no kernel work); omit when nothing was computed or the interval is empty. */
+    if (prefill_computed > 0 && t->prefill_s > 0.0) {
+        buf_printf(b, ",\"prefill_per_second\":%.2f",
+                   (double)prefill_computed / t->prefill_s);
+    }
+    buf_printf(b, ",\"predicted_n\":%d", t->decode_n);
+    if (t->decode_n > 0 && t->decode_s > 0.0) {
+        buf_printf(b, ",\"predicted_per_second\":%.2f",
+                   (double)t->decode_n / t->decode_s);
+    }
+    /* DSpark speculative decode: accept-rate alpha and mean committed tokens per
+     * verify step, both scoped to THIS request (per-session counter deltas). */
+    if (t->spec_active && t->spec_draft > 0) {
+        buf_printf(b, ",\"spec_accept_rate\":%.4f",
+                   (double)t->spec_accepted / (double)t->spec_draft);
+    }
+    if (t->spec_active && t->spec_drafts > 0) {
+        buf_printf(b, ",\"spec_tokens_per_step\":%.4f",
+                   (double)t->spec_gen / (double)t->spec_drafts);
+    }
+    buf_putc(b, '}');
+}
+
+
+
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -217,6 +260,7 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_openai_timings_json(&b, r);
     buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);

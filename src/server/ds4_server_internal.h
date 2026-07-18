@@ -272,6 +272,29 @@ typedef struct {
     size_t max_len;
 } stop_list;
 
+/* Per-response timing metrics, surfaced in the additive "timings" object that
+ * sits next to "usage" on the OpenAI chat/completions response (and the final
+ * include_usage SSE chunk). Filled once by gen_step_finish from counters the
+ * worker already keeps (g->t0/decode_t0/first_token_t, prompt/completion
+ * counts, per-session DSpark deltas) — there is NO hot-path work here, and
+ * these fields never influence sampling/rng/logits. All rates are derived in
+ * the JSON emitter (guarded divisions), so a zero denominator omits a rate
+ * rather than emitting NaN/inf. */
+typedef struct {
+    bool valid;
+    double ttft_s;       /* wall time from request start to first emitted token */
+    double prefill_s;    /* wall time spent in prefill (request start -> decode start) */
+    double decode_s;     /* wall time spent decoding (decode start -> finish) */
+    int prompt_n;        /* total prompt tokens (prefill target) */
+    int cached_n;        /* prompt tokens served from a cache (<= prompt_n) */
+    int decode_n;        /* completion tokens emitted */
+    bool spec_active;    /* DSpark speculative decode ran this request */
+    uint64_t spec_accepted; /* accepted draft tokens (this request) */
+    uint64_t spec_draft;    /* proposed/verified draft tokens (this request) */
+    uint64_t spec_drafts;   /* draft rounds (this request) */
+    uint64_t spec_gen;      /* tokens emitted by the spec loop (this request) */
+} req_timings;
+
 typedef struct {
     req_kind kind;
     api_style api;
@@ -302,6 +325,7 @@ typedef struct {
     bool stream_include_usage;
     int cache_read_tokens;
     int cache_write_tokens;
+    req_timings timings;
     ds4_think_mode think_mode;
     bool has_tools;
     /* tool_choice="required" (OpenAI) / {"type":"any"|"tool"} (Anthropic):
@@ -1119,6 +1143,10 @@ bool sse_chunk(int fd, const request *r, const char *id, const char *text, const
 int clamp_usage_tokens(int value, int max);
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens);
+/* Emit the additive ",\"timings\":{...}" fragment (leading comma included) from
+ * r->timings, or nothing when r->timings.valid is false. Rates are derived here
+ * with guarded divisions; a zero denominator omits that rate. */
+void append_openai_timings_json(buf *b, const request *r);
 bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens);
 bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,

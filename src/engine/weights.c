@@ -105,6 +105,23 @@ static void tensor_expect_optional(
         uint64_t          d2) {
     if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
 }
+/* MXFP8 workhorse weight: either the classic interleaved type (FP8_E4M3, 38) or
+ * its pre-stored device layout (MXFP8_LT, 41). Both share dims and byte
+ * accounting; the FP8 matmul resolver dispatches on the registered offset. */
+static void tensor_expect_mxfp8(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (t->type == DS4_TENSOR_FP8_E4M3)
+        tensor_expect_layout(t, DS4_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
+    else if (t->type == DS4_TENSOR_MXFP8_LT)
+        tensor_expect_layout(t, DS4_TENSOR_MXFP8_LT, ndim, d0, d1, d2);
+    else
+        ds4_die("tensor has unsupported weight type; expected FP8_E4M3 or MXFP8_LT");
+}
 static void tensor_expect_plain_or_mxfp8(
         const ds4_tensor *t,
         uint32_t          ndim,
@@ -117,6 +134,13 @@ static void tensor_expect_plain_or_mxfp8(
     else if (t->type == DS4_TENSOR_FP8_E4M3)
         tensor_expect_layout(t, DS4_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
     else
+        /* Deliberately does NOT accept MXFP8_LT: the weights routed here
+         * (hc_attn_fn/hc_ffn_fn, ffn_gate_inp, attn/indexer compressors,
+         * output_hc_fn) take the PLAIN matmul path (gpu_graph_matmul_plain_tensor),
+         * which has no type-41 branch. Pre-storing one as MXFP8_LT would decode to
+         * garbage, so a future FP8 variant of these must fail FAST here at load,
+         * not silently pass. Only the tensor_expect_mxfp8 workhorse set (routed
+         * through cuda_fp8_mx_weight) may be MXFP8_LT. */
         ds4_die("tensor has unsupported weight type; expected F16 or FP8_E4M3");
 }
 
@@ -194,29 +218,33 @@ bool routed_expert_gate_down_layout(
         uint64_t         *down_row_bytes) {
     /* NOTE: gate and down are NOT always the same type -- gate/up and down
      * formats pair freely per layer by design (see
-     * tensor_expect_routed_expert_combo). Only CUTLASS_MXFP4 requires gate==down. */
+     * tensor_expect_routed_expert_combo). Each side's layout is computed
+     * independently so MIXED layers (cutlass_mxfp4 on one side, iq2/q2k on the
+     * other) resolve correctly: the CUTLASS_MXFP4 side yields stride/split-point,
+     * the dp4a side yields ordinary expert/row byte counts. */
     if (!gate || !down) return false;
 
     if (gate->type == DS4_TENSOR_CUTLASS_MXFP4) {
-        uint64_t gate_sf, gate_stride, down_sf, down_stride;
+        uint64_t gate_sf, gate_stride;
         cutlass_mxfp4_expert_layout(gate->dim[0], gate->dim[1],
                                      gate_row_bytes, &gate_sf, &gate_stride);
-        cutlass_mxfp4_expert_layout(down->dim[0], down->dim[1],
-                                     down_row_bytes, &down_sf, &down_stride);
         *gate_expert_bytes = gate_stride;
-        *down_expert_bytes = down_stride;
-        return true;
+    } else {
+        *gate_row_bytes = routed_expert_row_bytes(gate);
+        if (*gate_row_bytes == 0 || gate->dim[1] > UINT64_MAX / *gate_row_bytes) return false;
+        *gate_expert_bytes = gate->dim[1] * *gate_row_bytes;
     }
 
-    *gate_row_bytes = routed_expert_row_bytes(gate);
-    *down_row_bytes = routed_expert_row_bytes(down);
-    if (*gate_row_bytes == 0 || *down_row_bytes == 0 ||
-        gate->dim[1] > UINT64_MAX / *gate_row_bytes ||
-        down->dim[1] > UINT64_MAX / *down_row_bytes) {
-        return false;
+    if (down->type == DS4_TENSOR_CUTLASS_MXFP4) {
+        uint64_t down_sf, down_stride;
+        cutlass_mxfp4_expert_layout(down->dim[0], down->dim[1],
+                                     down_row_bytes, &down_sf, &down_stride);
+        *down_expert_bytes = down_stride;
+    } else {
+        *down_row_bytes = routed_expert_row_bytes(down);
+        if (*down_row_bytes == 0 || down->dim[1] > UINT64_MAX / *down_row_bytes) return false;
+        *down_expert_bytes = down->dim[1] * *down_row_bytes;
     }
-    *gate_expert_bytes = gate->dim[1] * *gate_row_bytes;
-    *down_expert_bytes = down->dim[1] * *down_row_bytes;
     return true;
 }
 
@@ -235,23 +263,36 @@ static void tensor_expect_routed_expert_combo(
         const ds4_tensor *gate,
         const ds4_tensor *up,
         const ds4_tensor *down) {
+    /* gate/up must match (the fused gate+up kernels assume one format). Each of
+     * gate/up and down may independently be a dp4a quant (iq2_xxs/q2_k/mxfp4) OR
+     * CUTLASS_MXFP4 (type 40) -- the GPU MoE path handles all-cutlass (uniform,
+     * grouped/gemv), all-dp4a (heterogeneous), AND the two MIXED shapes
+     * (cutlass gate/up + iq2/q2k down; iq2/q2k gate/up + cutlass down) via
+     * per-projection dispatch. The ONE combo the GPU can't compose is CUTLASS
+     * mixed with the legacy 17-byte FP4_E2M1 (type 39) on the other side -- that
+     * dp4a format can't be read by CUTLASS and vice-versa; reject it fail-closed
+     * (it never occurs after the type-40 unification repack, which converts every
+     * type-39 mxfp4 to type-40). */
     const bool gate_up_pair = gate->type == up->type;
-    const bool cutlass = gate->type == DS4_TENSOR_CUTLASS_MXFP4;
-    const bool gate_ok = gate->type == DS4_TENSOR_IQ2_XXS ||
-                         gate->type == DS4_TENSOR_Q2_K ||
-                         gate->type == DS4_TENSOR_FP4_E2M1 ||
-                         cutlass;
-    const bool down_ok = cutlass
-        ? down->type == DS4_TENSOR_CUTLASS_MXFP4
-        : (down->type == DS4_TENSOR_IQ2_XXS ||
-           down->type == DS4_TENSOR_Q2_K ||
-           down->type == DS4_TENSOR_FP4_E2M1);
-    if (gate_up_pair && gate_ok && down_ok) return;
+    const bool gate_cut = gate->type == DS4_TENSOR_CUTLASS_MXFP4;
+    const bool down_cut = down->type == DS4_TENSOR_CUTLASS_MXFP4;
+    const bool gate_dp4a = gate->type == DS4_TENSOR_IQ2_XXS ||
+                           gate->type == DS4_TENSOR_Q2_K ||
+                           gate->type == DS4_TENSOR_FP4_E2M1;
+    const bool down_dp4a = down->type == DS4_TENSOR_IQ2_XXS ||
+                           down->type == DS4_TENSOR_Q2_K ||
+                           down->type == DS4_TENSOR_FP4_E2M1;
+    const bool gate_ok = gate_dp4a || gate_cut;
+    const bool down_ok = down_dp4a || down_cut;
+    /* the unhandled cross: CUTLASS on one side + legacy type-39 FP4 on the other */
+    const bool bad_mix = (gate_cut && down->type == DS4_TENSOR_FP4_E2M1) ||
+                         (down_cut && gate->type == DS4_TENSOR_FP4_E2M1);
+    if (gate_up_pair && gate_ok && down_ok && !bad_mix) return;
     fprintf(stderr,
             "ds4: unsupported routed expert quant combo at tensor %.*s: "
             "gate=%s up=%s down=%s; gate/up must match and be one of "
-            "iq2_xxs/q2_k/mxfp4/cutlass_mxfp4, down one of iq2_xxs/q2_k/mxfp4 "
-            "(cutlass_mxfp4 gate/up pairs only with cutlass_mxfp4 down); "
+            "iq2_xxs/q2_k/mxfp4/cutlass_mxfp4, down one of the same; a CUTLASS_MXFP4 "
+            "side may NOT pair with a legacy type-39 mxfp4 side; "
             "combos may differ per layer\n",
             (int)gate->name.len,
             gate->name.ptr,
@@ -429,7 +470,7 @@ static void weights_validate_layout(
         if (w->output->type == DS4_TENSOR_BF16)
             tensor_expect_layout(w->output,      DS4_TENSOR_BF16, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
         else
-            tensor_expect_layout(w->output,      DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+            tensor_expect_mxfp8(w->output,       2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -444,14 +485,14 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+        tensor_expect_mxfp8(l->attn_q_a,        2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv,        DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+        tensor_expect_mxfp8(l->attn_q_b,        2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_mxfp8(l->attn_kv,         2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-        tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_FP8_E4M3, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_FP8_E4M3, 2, out_low_dim, DS4_N_EMBD, 0);
+        tensor_expect_mxfp8(l->attn_output_a,   2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_mxfp8(l->attn_output_b,   2, out_low_dim, DS4_N_EMBD, 0);
 
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -488,9 +529,9 @@ static void weights_validate_layout(
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_mxfp8(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (il < DS4_N_HASH_LAYER) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
@@ -889,6 +930,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case DS4_TENSOR_I32:
     case DS4_TENSOR_BF16:
     case DS4_TENSOR_FP8_E4M3:
+    case DS4_TENSOR_MXFP8_LT:
     case DS4_TENSOR_FP4_E2M1:
     case DS4_TENSOR_CUTLASS_MXFP4:
         return true;
@@ -1045,7 +1087,7 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
 
-    tensor_expect_layout(w->main_proj, DS4_TENSOR_FP8_E4M3, 2, 3ull * E, E, 0);
+    tensor_expect_mxfp8(w->main_proj, 2, 3ull * E, E, 0);
     tensor_expect_layout(w->main_norm, DS4_TENSOR_F32, 1, E, 0, 0);
 
     for (int li = 0; li < 3; li++) {
@@ -1054,15 +1096,15 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
         tensor_expect_layout(l->hc_attn_scale, DS4_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base, DS4_TENSOR_F32, 1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
-        tensor_expect_layout(l->attn_q_a, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_LORA_Q, 0);
+        tensor_expect_mxfp8(l->attn_q_a, 2, E, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm, DS4_TENSOR_F32, 1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b, DS4_TENSOR_FP8_E4M3, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_HEAD_DIM, 0);
+        tensor_expect_mxfp8(l->attn_q_b, 2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_mxfp8(l->attn_kv, 2, E, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks, DS4_TENSOR_F32, 1, DS4_N_HEAD, 0, 0);
-        tensor_expect_layout(l->attn_output_a, DS4_TENSOR_FP8_E4M3, 2,
+        tensor_expect_mxfp8(l->attn_output_a, 2,
                              DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_layout(l->attn_output_b, DS4_TENSOR_FP8_E4M3, 2, out_low_dim, E, 0);
+        tensor_expect_mxfp8(l->attn_output_b, 2, out_low_dim, E, 0);
         tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_ffn_scale, DS4_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base, DS4_TENSOR_F32, 1, hc_mix_dim, 0, 0);
@@ -1074,9 +1116,9 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w) {
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_FP8_E4M3, 2, E, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_FP8_E4M3, 2, DS4_N_FF_EXP, E, 0);
+        tensor_expect_mxfp8(l->ffn_gate_shexp, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_up_shexp,   2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_mxfp8(l->ffn_down_shexp, 2, DS4_N_FF_EXP, E, 0);
     }
 
     tensor_expect_layout(w->markov_w1, DS4_TENSOR_F32, 2, 256, V, 0);

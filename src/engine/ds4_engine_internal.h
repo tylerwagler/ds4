@@ -378,6 +378,16 @@ enum {
      * recognizes it; real per-expert offsets come from that helper, not
      * from the table's block_elems/block_bytes. */
     DS4_TENSOR_CUTLASS_MXFP4 = 40,
+    /* MXFP8_LT: the pre-store of DS4_TENSOR_FP8_E4M3 (type 38). Identical E4M3
+     * weights and E8M0 block scales, but stored in the EXACT device-side layout
+     * the runtime otherwise builds at first use: de-interleaved [in,out]
+     * col-major E4M3 data immediately followed by the mx_sfoff()-swizzled E8M0
+     * scale. On detection the FP8 matmul skips the per-weight cudaMalloc+convert
+     * and points cuBLASLt straight at the mmap (g_model_device_base+offset),
+     * freeing the ~6.4 GiB double-store. For 128-aligned shapes (out%128==0,
+     * (in/32)%4==0 -- true for every shipped weight) the total byte size equals
+     * the type-38 size exactly, so it shares the {32,33} table entry. */
+    DS4_TENSOR_MXFP8_LT = 41,
 };
 
 typedef struct {
@@ -1430,6 +1440,17 @@ struct ds4_session {
     float spec_quench_ewma;    /* EWMA of per-step margin (yield - guard) */
     uint32_t spec_quench_steps;/* fused spec steps this request */
     bool spec_quenched;        /* latched: plain decode for the remainder */
+    /* Per-SESSION mirror of the engine's cumulative DSpark counters. The engine
+     * copies are global (Prometheus /metrics, cross-request); these let the
+     * server compute a per-RESPONSE accept-rate/tokens-per-step by snapshotting
+     * at decode start and diffing at finish, which the global copies cannot give
+     * because decode quanta from concurrent sessions interleave on the single
+     * worker. Incremented alongside the engine counters in the fused verify
+     * loop; monotonic since session open (never reset per request). */
+    uint64_t spec_accepted_tokens;
+    uint64_t spec_draft_tokens;
+    uint64_t spec_num_drafts;
+    uint64_t spec_gen_tokens;
 };
 
 typedef struct {

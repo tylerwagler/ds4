@@ -40,6 +40,11 @@ static const gguf_type_info gguf_types[] = {
      * print; it makes tensor_nbytes() refuse (rather than silently
      * miscompute) if this type is ever routed through the generic path. */
     [40] = {"cutlass_mxfp4", 0, 0},
+    /* MXFP8_LT (pre-stored MXFP8): de-interleaved E4M3 data + swizzled E8M0
+     * scale. For the shipped 128-aligned shapes the total byte size equals the
+     * type-38 size (out*(in/32)*33), so it reuses the {32,33} accounting here
+     * and loads/mmaps through the generic path. See DS4_TENSOR_MXFP8_LT. */
+    [41] = {"mxfp8_lt", 32, 33},
 };
 
 
@@ -755,17 +760,25 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
      * ONLY registered tensors (per-tensor routing; unregistered offsets are
      * rejected at dispatch). Runs before the DIRECT_MODEL early-out so it
      * applies in the mmap path too. */
-    uint64_t n_fp8 = 0;
+    uint64_t n_fp8 = 0, n_fp8_lt = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->type == DS4_TENSOR_FP8_E4M3) {
             ds4_gpu_register_fp8_weight(t->abs_offset);
             n_fp8++;
+        } else if (t->type == DS4_TENSOR_MXFP8_LT) {
+            /* Same FP8 matmul path, but flag the offset as pre-stored so the
+             * resolver points cuBLASLt at the mmap instead of converting. */
+            ds4_gpu_register_fp8_weight(t->abs_offset);
+            ds4_gpu_register_fp8_lt_weight(t->abs_offset);
+            n_fp8++;
+            n_fp8_lt++;
         }
     }
     if (n_fp8 > 0)
-        fprintf(stderr, "ds4: %llu MXFP8 workhorse weights detected -> FP8 matmul path\n",
-                (unsigned long long)n_fp8);
+        fprintf(stderr, "ds4: %llu MXFP8 workhorse weights detected -> FP8 matmul path"
+                " (%llu pre-stored MXFP8_LT, zero-copy)\n",
+                (unsigned long long)n_fp8, (unsigned long long)n_fp8_lt);
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }

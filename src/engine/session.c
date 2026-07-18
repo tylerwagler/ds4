@@ -1,13 +1,20 @@
 #include "ds4_engine_internal.h"
 
 
-/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25: the
- * 2026-07-10 long-context sweep measured 0.25 > 0.35 at both 32k (22.42 vs
- * 21.20 eff t/s) and 128k (23.90 vs 22.08); 0.35 only wins at ~2k ctx
- * (24.46 vs ~23.2).  Acceptance falls with context depth, so the optimal
- * trim loosens — tuned for the long-context workloads this box serves.
+/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
+ * v0.2.2 default draft depth 3 the 2026-07-17 tau sweep found tau barely moves
+ * GREEDY throughput (only 3 positions to trim: full range within 1-3% and the
+ * peak wanders inside noise), but tau=0.25 clearly wins under T=1.0 SAMPLING
+ * (+25% structured, +10% prose vs verify-all), where the low-confidence tail is
+ * real.  The old "optimal trim loosens with depth" was a k=5 artifact — the
+ * real driver is acceptance rate, not depth, and it washes out at k=3.  Trim is
+ * exact and output-invariant on STRUCTURED, but narrowing the verify batch
+ * shifts float accumulation ~1 ULP and can flip near-tie greedy argmax on flat
+ * (prose) distributions (benign numerical tie, same class as yield-quench) — so
+ * tau is distribution-preserving but NOT byte-identical on greedy prose.
  * DS4_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off" disables (verify all
- * n_draft).  The principled fix is adaptive tau (docs/plans.md). */
+ * n_draft).  Adaptive tau is not worth building at k=3 (payoff ~2-6%, mostly
+ * captured by 0.25). */
 static float dspark_conf_sched_tau(void) {
     static float cached = -1.0f;
     if (cached < 0.0f) {
@@ -1644,7 +1651,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
      * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
      * disarmed, conf-sched trimming active). k=3 beats k=5 by +15% structured
-     * to +32% prose served decode; output is bit-identical (exact verify).
+     * to +32% prose served decode; distribution-preserving (exact verify) —
+     * byte-identical on structured, near-tie-equivalent on greedy prose (the
+     * verify-width change flips ~1-ULP argmax ties, same class as yield-quench).
      * The DSpark drafter forward is autoregressive, so its cost scales with the
      * chain length ON TOP of the verify rows — ms/accepted-token stays flat
      * ~41-46 ms across k, i.e. depth never amortizes, so shallower wins.
@@ -1824,6 +1833,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+
+        /* One MoE-tier boot line so a silent slow tier is no longer silent:
+         * resolved expert weight type (grouped-CUTLASS type-40 vs per-expert
+         * tiled type-39) + the resolved gate/up MXFP4 tile width (NT16/NT8).
+         * Reuses the bound-layer expert tensors and the CUDA tile-width
+         * accessor; log-only, runs once at open on every GPU serve. */
+        {
+            const ds4_layer_weights *ml = weights_first_bound_layer(&e->weights);
+            if (ml && ml->ffn_gate_exps && ml->ffn_down_exps) {
+                const uint32_t gt = ml->ffn_gate_exps->type;
+                const uint32_t dt = ml->ffn_down_exps->type;
+                /* The grouped/GEMV CUTLASS dispatch is entered only when BOTH
+                 * gate and down experts are type-40 (see the moe.cu batch
+                 * predicate); any other mix takes the per-expert tiled path. */
+                const char *tier = (gt == DS4_TENSOR_CUTLASS_MXFP4 &&
+                                    dt == DS4_TENSOR_CUTLASS_MXFP4)
+                                       ? "grouped-CUTLASS"
+                                       : "per-expert-tiled";
+                fprintf(stderr,
+                        "ds4: MoE expert tier: %s  gate=%s(%u) down=%s(%u) mxfp4 tile=NT%u\n",
+                        tier, tensor_type_name(gt), gt, tensor_type_name(dt), dt,
+                        ds4_gpu_moe_mxfp4_tile_width());
+            }
+        }
     }
 
     *out = e;
@@ -1871,6 +1904,25 @@ void ds4_engine_spec_metrics(ds4_engine *e, ds4_spec_metrics *out) {
     for (int i = 0; i < 16; i++) out->accepted_per_pos[i] = e->spec_accepted_per_pos[i];
     out->max_draft = e->dspark_draft_tokens;
     out->has_dspark = e->dspark_ready;
+}
+
+
+
+/* Per-SESSION cumulative DSpark counters (accepted/draft/drafts/gen). Same
+ * semantics as ds4_engine_spec_metrics but scoped to one session, so a caller
+ * can diff a snapshot across a single request for a per-response accept-rate.
+ * accepted_per_pos is left zero (the per-position waterfall stays a /metrics,
+ * cross-request concern). */
+void ds4_session_spec_metrics(const ds4_session *s, ds4_spec_metrics *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!s) return;
+    out->accepted_tokens = s->spec_accepted_tokens;
+    out->draft_tokens = s->spec_draft_tokens;
+    out->num_drafts = s->spec_num_drafts;
+    out->gen_tokens = s->spec_gen_tokens;
+    out->max_draft = s->engine ? s->engine->dspark_draft_tokens : 0;
+    out->has_dspark = s->engine ? s->engine->dspark_ready : false;
 }
 
 
@@ -2892,11 +2944,15 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * base token is always emitted; K drafts were verified this step and the
      * accepted prefix is [0,commit). num_drafts counts draft rounds only. */
     e->spec_gen_tokens += 1u + (uint64_t)commit;
+    s->spec_gen_tokens += 1u + (uint64_t)commit;
     if (K > 0) {
         e->spec_draft_tokens += K;
         e->spec_accepted_tokens += (uint64_t)commit;
         e->spec_num_drafts += 1u;
         for (int i = 0; i < commit && i < 16; i++) e->spec_accepted_per_pos[i]++;
+        s->spec_draft_tokens += K;
+        s->spec_accepted_tokens += (uint64_t)commit;
+        s->spec_num_drafts += 1u;
     }
 
     /* Yield-quench controller update (see the constants block up top). Uses
