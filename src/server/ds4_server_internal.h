@@ -44,6 +44,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Build-time version string (Makefile passes -DDS4_VERSION_STR from
+ * `git describe`); fall back to "unknown" for non-Makefile/ad-hoc builds. */
+#ifndef DS4_VERSION_STR
+#define DS4_VERSION_STR "unknown"
+#endif
+
 /* ---- shared macros ---- */
 
 
@@ -883,6 +889,7 @@ struct server {
     job *head;
     job *tail;
     bool stopping;
+    time_t started;                  /* wall-clock when the listener came up (uptime for /health) */
     int clients;
     /* /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
      * enqueued not yet bound to a slot; n_generating = jobs bound to slots

@@ -780,6 +780,7 @@ int main(int argc, char **argv) {
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
+    s.started = time(NULL);          /* uptime origin reported by /health */
     /* Slot 0 is provisioned here at the configured --ctx-size; the scheduler
      * provisions slots 1..cap-1 lazily under the same admission predicate. */
     s.n_slots = 1;
@@ -879,7 +880,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_listen_fd = lfd;
-    server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d (ds4 %s)",
+               cfg.host, cfg.port, DS4_VERSION_STR);
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);

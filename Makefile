@@ -5,6 +5,12 @@ DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 
+# Version string reported by /version, /health and the startup banner. Derived
+# from git so it never goes stale (e.g. "v0.2.3-8-gec51fb2", "-dirty" if the
+# tree has uncommitted changes); falls back to "unknown" outside a git checkout.
+DS4_VERSION_STR := $(shell git describe --tags --dirty --always 2>/dev/null || echo unknown)
+CFLAGS += -DDS4_VERSION_STR='"$(DS4_VERSION_STR)"'
+
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
