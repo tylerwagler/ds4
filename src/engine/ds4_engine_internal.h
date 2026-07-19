@@ -1284,6 +1284,47 @@ typedef struct {
 void ds4_sample_scratch_free(ds4_sample_scratch *s);
 
 
+/* Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
+ * pool-session's HOST per-conversation state (checkpoint token history, host
+ * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
+ * instance on ds4_session, so time-slicing classic/spec work across banks in
+ * one graph must save the leaving bank's carry and restore the entering bank's.
+ * gpu_graph_bank_repoint swaps the DEVICE views; this covers the HOST half the
+ * engine header (gpu_graph_bank_repoint contract) delegates to the caller.
+ * The three heap members are owned deep copies; every other field is a scalar
+ * mirror of the identically-named ds4_session field. */
+typedef struct ds4_bank_carry {
+    bool      valid;                 /* has this bank's state ever been saved */
+    /* heap-backed (owned): */
+    token_vec checkpoint;            /* deep copy of s->checkpoint */
+    float    *logits;                /* DS4_N_VOCAB floats, owned */
+    float    *dspark_pending_qrows;  /* dspark_pending_qrows_cap floats, owned */
+    uint32_t  dspark_pending_qrows_cap;
+    /* scalar mirrors: */
+    bool      checkpoint_valid;
+    bool      mseq_dirty;
+    int32_t   dspark_pending[16];
+    uint32_t  dspark_n_pending;
+    int32_t   dspark_pending_base;
+    int32_t   dspark_pending_pos;
+    int32_t   spec_carry_token;
+    bool      spec_carry_valid;
+    int32_t   spec_carry_pos;
+    float     spec_carry_temp, spec_carry_top_p, spec_carry_min_p;
+    int       spec_carry_top_k;
+    int32_t   dspark_pending_alt[16];
+    float     dspark_pending_conf[16];
+    bool      dspark_pending_sampled;
+    float     dspark_pending_q[16];
+    float     dspark_pending_temp, dspark_pending_top_p, dspark_pending_min_p;
+    int       dspark_pending_top_k;
+    float     spec_quench_debt, spec_quench_ewma;
+    uint32_t  spec_quench_steps;
+    bool      spec_quenched;
+    uint64_t  spec_accepted_tokens, spec_draft_tokens, spec_num_drafts, spec_gen_tokens;
+} ds4_bank_carry;
+
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_gpu_graph graph;
@@ -1451,6 +1492,11 @@ struct ds4_session {
     uint64_t spec_draft_tokens;
     uint64_t spec_num_drafts;
     uint64_t spec_gen_tokens;
+    /* Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
+     * allocated on the first ds4_session_bank_state_save; NULL / bank_carry_n==0
+     * when the pool is disabled (single-session use never touches it). */
+    ds4_bank_carry *bank_carry;
+    uint32_t bank_carry_n;
 };
 
 typedef struct {
@@ -2053,6 +2099,19 @@ ds4_gpu_tensor *gpu_graph_bank_index_state_score_view(ds4_gpu_graph *g, uint32_t
  * work so the scalars are that bank's counts again. */
 void gpu_graph_bank_counters_capture(ds4_gpu_graph *g, uint32_t bank);
 void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank);
+/* Tier-2 PATH A host-carry primitive (see ds4_bank_carry).  save copies the
+ * session's live HOST per-conversation state into bank's shadow AND captures
+ * the graph frontier counters (gpu_graph_bank_counters_capture).  restore
+ * repoints the device views to bank, installs its frontier counters, copies
+ * the shadow back into the session, and clears mseq_dirty (the cheap
+ * no-re-prefill resume: counters_install re-establishes per-bank truth, which
+ * is exactly what mseq_dirty guards).  Call save on the leaving bank before,
+ * and restore on the entering bank after, a bank switch — both only between
+ * fully synchronized forwards (the gpu_graph_bank_repoint contract).  restore
+ * returns false only on a bad bank id or OOM growing an owned buffer. */
+void ds4_session_bank_state_save(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank);
+void ds4_session_bank_carry_free(ds4_session *s);
 /* Arm one banked multiseq batched step over n_rows packed rows: pos[t] is
  * row t's absolute position, seq[t] its TRUE bank id.  Writes the host
  * mirrors + device descriptor arrays (lazily allocated), verifies the

@@ -2103,6 +2103,7 @@ void ds4_session_free(ds4_session *s) {
     gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     ds4_sample_scratch_free(&s->sample_scratch);
+    ds4_session_bank_carry_free(s);
     free(s->dspark_pending_qrows);
     free(s->logits);
     free(s);
@@ -2635,6 +2636,160 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
     return -1;
 }
 #undef DS4_MULTISEQ_ERR
+
+
+
+/* ===== Tier-2 PATH A: per-bank HOST carry (ds4_bank_carry) ================
+ *
+ * gpu_graph_bank_repoint swaps only the DEVICE cache views; the session's HOST
+ * per-conversation state (checkpoint history, host logits, the DSpark fused-
+ * loop / spec-carry shadow) is single-instance and must be saved for the bank
+ * we leave and restored for the bank we enter.  save/restore below are that
+ * host half; the graph frontier counters ride gpu_graph_bank_counters_*, and
+ * (Option F) the per-bank drafter ring rides gpu_graph_bank_repoint. */
+
+static void bank_carry_free_one(ds4_bank_carry *c) {
+    if (!c) return;
+    token_vec_free(&c->checkpoint);
+    free(c->logits);
+    free(c->dspark_pending_qrows);
+    memset(c, 0, sizeof(*c));
+}
+
+void ds4_session_bank_carry_free(ds4_session *s) {
+    if (!s || !s->bank_carry) return;
+    for (uint32_t i = 0; i < s->bank_carry_n; i++) bank_carry_free_one(&s->bank_carry[i]);
+    free(s->bank_carry);
+    s->bank_carry = NULL;
+    s->bank_carry_n = 0;
+}
+
+static bool bank_carry_ensure(ds4_session *s) {
+    const uint32_t n = gpu_graph_bank_pool_count(&s->graph);
+    if (s->bank_carry && s->bank_carry_n == n) return true;
+    if (s->bank_carry) ds4_session_bank_carry_free(s);
+    s->bank_carry = xcalloc(n, sizeof(*s->bank_carry));
+    s->bank_carry_n = n;
+    return true;
+}
+
+void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return;
+    if (!bank_carry_ensure(s)) return;
+    /* Graph frontier counters (attn/index comp; Option F also the drafter ring
+     * counters) are captured on the graph side so a later install re-arms this
+     * bank's per-bank truth. */
+    gpu_graph_bank_counters_capture(&s->graph, bank);
+    ds4_bank_carry *c = &s->bank_carry[bank];
+    /* heap-backed deep copies */
+    ds4_tokens_copy(&c->checkpoint, &s->checkpoint);
+    if (!c->logits) c->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    if (s->dspark_pending_qrows && s->dspark_pending_qrows_cap > 0) {
+        if (c->dspark_pending_qrows_cap < s->dspark_pending_qrows_cap) {
+            c->dspark_pending_qrows = xrealloc(
+                c->dspark_pending_qrows,
+                (size_t)s->dspark_pending_qrows_cap * sizeof(float));
+            c->dspark_pending_qrows_cap = s->dspark_pending_qrows_cap;
+        }
+        memcpy(c->dspark_pending_qrows, s->dspark_pending_qrows,
+               (size_t)s->dspark_pending_qrows_cap * sizeof(float));
+    }
+    /* scalar mirrors */
+    c->checkpoint_valid       = s->checkpoint_valid;
+    c->mseq_dirty             = s->mseq_dirty;
+    memcpy(c->dspark_pending, s->dspark_pending, sizeof(c->dspark_pending));
+    c->dspark_n_pending       = s->dspark_n_pending;
+    c->dspark_pending_base    = s->dspark_pending_base;
+    c->dspark_pending_pos     = s->dspark_pending_pos;
+    c->spec_carry_token       = s->spec_carry_token;
+    c->spec_carry_valid       = s->spec_carry_valid;
+    c->spec_carry_pos         = s->spec_carry_pos;
+    c->spec_carry_temp        = s->spec_carry_temp;
+    c->spec_carry_top_p       = s->spec_carry_top_p;
+    c->spec_carry_min_p       = s->spec_carry_min_p;
+    c->spec_carry_top_k       = s->spec_carry_top_k;
+    memcpy(c->dspark_pending_alt, s->dspark_pending_alt, sizeof(c->dspark_pending_alt));
+    memcpy(c->dspark_pending_conf, s->dspark_pending_conf, sizeof(c->dspark_pending_conf));
+    c->dspark_pending_sampled = s->dspark_pending_sampled;
+    memcpy(c->dspark_pending_q, s->dspark_pending_q, sizeof(c->dspark_pending_q));
+    c->dspark_pending_temp    = s->dspark_pending_temp;
+    c->dspark_pending_top_p   = s->dspark_pending_top_p;
+    c->dspark_pending_min_p   = s->dspark_pending_min_p;
+    c->dspark_pending_top_k   = s->dspark_pending_top_k;
+    c->spec_quench_debt       = s->spec_quench_debt;
+    c->spec_quench_ewma       = s->spec_quench_ewma;
+    c->spec_quench_steps      = s->spec_quench_steps;
+    c->spec_quenched          = s->spec_quenched;
+    c->spec_accepted_tokens   = s->spec_accepted_tokens;
+    c->spec_draft_tokens      = s->spec_draft_tokens;
+    c->spec_num_drafts        = s->spec_num_drafts;
+    c->spec_gen_tokens        = s->spec_gen_tokens;
+    c->valid = true;
+}
+
+bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
+    /* Point device views (incl. Option F drafter ring) at this bank, and
+     * re-arm its frontier counters — this is what makes clearing mseq_dirty
+     * cheap and safe (per-bank truth is re-established without a re-prefill). */
+    if (s->graph.banks.n_banks != 0 && !gpu_graph_bank_repoint(&s->graph, bank))
+        return false;
+    gpu_graph_bank_counters_install(&s->graph, bank);
+    if (!s->bank_carry || bank >= s->bank_carry_n || !s->bank_carry[bank].valid) {
+        /* No saved host state for a fresh bank: the counters_install above set
+         * the (zeroed) frontier; leave the session's host shadow as the caller
+         * primed it (a fresh sync just ran).  Clear the multiseq poison so
+         * classic work resumes. */
+        s->mseq_dirty = false;
+        return true;
+    }
+    ds4_bank_carry *c = &s->bank_carry[bank];
+    ds4_tokens_copy(&s->checkpoint, &c->checkpoint);
+    memcpy(s->logits, c->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    if (c->dspark_pending_qrows_cap > 0) {
+        if (s->dspark_pending_qrows_cap < c->dspark_pending_qrows_cap) {
+            s->dspark_pending_qrows = xrealloc(
+                s->dspark_pending_qrows,
+                (size_t)c->dspark_pending_qrows_cap * sizeof(float));
+            s->dspark_pending_qrows_cap = c->dspark_pending_qrows_cap;
+        }
+        memcpy(s->dspark_pending_qrows, c->dspark_pending_qrows,
+               (size_t)c->dspark_pending_qrows_cap * sizeof(float));
+    }
+    s->checkpoint_valid       = c->checkpoint_valid;
+    memcpy(s->dspark_pending, c->dspark_pending, sizeof(s->dspark_pending));
+    s->dspark_n_pending       = c->dspark_n_pending;
+    s->dspark_pending_base    = c->dspark_pending_base;
+    s->dspark_pending_pos     = c->dspark_pending_pos;
+    s->spec_carry_token       = c->spec_carry_token;
+    s->spec_carry_valid       = c->spec_carry_valid;
+    s->spec_carry_pos         = c->spec_carry_pos;
+    s->spec_carry_temp        = c->spec_carry_temp;
+    s->spec_carry_top_p       = c->spec_carry_top_p;
+    s->spec_carry_min_p       = c->spec_carry_min_p;
+    s->spec_carry_top_k       = c->spec_carry_top_k;
+    memcpy(s->dspark_pending_alt, c->dspark_pending_alt, sizeof(s->dspark_pending_alt));
+    memcpy(s->dspark_pending_conf, c->dspark_pending_conf, sizeof(s->dspark_pending_conf));
+    s->dspark_pending_sampled = c->dspark_pending_sampled;
+    memcpy(s->dspark_pending_q, c->dspark_pending_q, sizeof(s->dspark_pending_q));
+    s->dspark_pending_temp    = c->dspark_pending_temp;
+    s->dspark_pending_top_p   = c->dspark_pending_top_p;
+    s->dspark_pending_min_p   = c->dspark_pending_min_p;
+    s->dspark_pending_top_k   = c->dspark_pending_top_k;
+    s->spec_quench_debt       = c->spec_quench_debt;
+    s->spec_quench_ewma       = c->spec_quench_ewma;
+    s->spec_quench_steps      = c->spec_quench_steps;
+    s->spec_quenched          = c->spec_quenched;
+    s->spec_accepted_tokens   = c->spec_accepted_tokens;
+    s->spec_draft_tokens      = c->spec_draft_tokens;
+    s->spec_num_drafts        = c->spec_num_drafts;
+    s->spec_gen_tokens        = c->spec_gen_tokens;
+    /* Cheap resume: per-bank frontier truth is now installed, so the multiseq
+     * superset poison no longer applies to this bank. */
+    s->mseq_dirty = false;
+    return true;
+}
 
 
 
