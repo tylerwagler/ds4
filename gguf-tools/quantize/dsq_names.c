@@ -236,7 +236,31 @@ ds4q_type parse_type(const char *raw) {
 
 bool is_quantizable_target(ds4q_type type) {
     return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 ||
-           type == DS4Q_TYPE_CUTLASS_MXFP4 || ds4q_can_quantize(type);
+           type == DS4Q_TYPE_CUTLASS_MXFP4 || type == DS4Q_TYPE_MXFP8_LT ||
+           ds4q_can_quantize(type);
+}
+
+/* Whether a GGUF tensor may be stored as MXFP8_LT (type 41): only the workhorse
+ * weights that route through the engine's LT-aware FP8 resolver.  Matches on the
+ * base name (second-to-last dotted token) so both blk.N.* and dspark.N.* are
+ * covered.  Mirrors _WORKHORSE_BASES in tools/mxfp8_prestore/repack_mxfp8_lt.py
+ * byte-for-byte -- keep the two lists in sync. */
+bool is_mxfp8_lt_workhorse(const char *name) {
+    static const char *bases[] = {
+        "attn_q_a", "attn_q_b", "attn_kv", "attn_output_a", "attn_output_b",
+        "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+        "output", "main_proj", NULL,
+    };
+    const char *last = strrchr(name, '.');
+    if (!last) return false;               /* need at least one dot (base.suffix) */
+    const char *base_start = name;
+    for (const char *p = name; p < last; p++) if (*p == '.') base_start = p + 1;
+    const size_t base_len = (size_t)(last - base_start);
+    for (int i = 0; bases[i]; i++) {
+        if (strlen(bases[i]) == base_len && strncmp(base_start, bases[i], base_len) == 0)
+            return true;
+    }
+    return false;
 }
 
 /* --format-map: load a prisma_alloc.py manifest ({"tensor.name": "FMT", ...})

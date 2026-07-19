@@ -165,7 +165,7 @@ void ds4q_dequantize_mxfp4(const void *blocks, float *out, int64_t n) {
  * The swizzle is the same one the engine uses for cuBLASLt MX block scales
  * (mx_sfoff in src/cuda/ds4_cuda_matmul.cu) and matches CUTLASS
  * Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB. ---- */
-static inline size_t ds4q_mx_sfoff(int64_t row, int64_t kb, int64_t kbp) {
+size_t ds4q_mx_sfoff(int64_t row, int64_t kb, int64_t kbp) {
     return (size_t)((row / 128) * (kbp / 4) + kb / 4) * 512
          + (size_t)(row % 32) * 16
          + (size_t)((row % 128) / 32) * 4
@@ -198,6 +198,57 @@ void ds4q_pack_cutlass_mxfp4(const uint8_t *e2m1, const uint8_t *e8m0,
     for (int64_t r = 0; r < nrows; r++) {
         for (int64_t kb = 0; kb < kb_n; kb++) {
             sf[ds4q_mx_sfoff(r, kb, kb_pad)] = e8m0[(size_t)r * (size_t)kb_n + (size_t)kb];
+        }
+    }
+}
+
+/* ---- MXFP8_LT (type 41): the pre-swizzled FP8 workhorse layout.  Mirrors the
+ * device buffer the runtime otherwise builds at first use from a type-38 weight
+ * (see DS4_TENSOR_MXFP8_LT).  Input is the type-38 payload for a tensor of shape
+ * [nrows=out, ncols=in]: nrows*KB blocks of [E8M0][32 x E4M3] (KB = in/32).
+ * Output is the E4M3 data de-interleaved to [out,in] row-major (== [in,out]
+ * col-major) followed by the mx_sfoff-swizzled E8M0 scale, zero-padded to
+ * rup(out,128) x KBp.  Byte-identical to repack_tensor() in
+ * tools/mxfp8_prestore/repack_mxfp8_lt.py.  For 128-aligned shapes
+ * (out%128==0, KB%4==0 -- every shipped workhorse) the total equals the type-38
+ * size exactly, so it is an in-place layout change. ---- */
+size_t ds4q_mxfp8_lt_sf_bytes(int64_t nrows, int64_t ncols) {
+    const int64_t rows_pad = (nrows + 127) / 128 * 128;
+    const int64_t kb_pad = (ncols / 32 + 3) / 4 * 4;
+    return (size_t)rows_pad * (size_t)kb_pad;
+}
+
+size_t ds4q_mxfp8_lt_bytes(int64_t nrows, int64_t ncols) {
+    return (size_t)nrows * (size_t)ncols + ds4q_mxfp8_lt_sf_bytes(nrows, ncols);
+}
+
+void ds4q_pack_mxfp8_lt(const uint8_t *fp8_blocks, void *dst,
+                        int64_t nrows, int64_t ncols) {
+    if (ncols % 32 != 0) {
+        fprintf(stderr, "ds4-quantize: mxfp8_lt ncols %lld is not divisible by 32\n",
+                (long long)ncols);
+        exit(1);
+    }
+    const int64_t kb_n = ncols / 32;
+    /* The LT size equals the type-38 size only for 128-aligned shapes; a
+     * non-aligned tensor would grow past its gguf slot and corrupt offsets. */
+    if (nrows % 128 != 0 || kb_n % 4 != 0) {
+        fprintf(stderr, "ds4-quantize: mxfp8_lt shape [in=%lld,out=%lld] is not "
+                "128-aligned (out%%128=%lld, KB%%4=%lld)\n",
+                (long long)ncols, (long long)nrows,
+                (long long)(nrows % 128), (long long)(kb_n % 4));
+        exit(1);
+    }
+    const size_t data_bytes = (size_t)nrows * (size_t)ncols;
+    uint8_t *data = (uint8_t *)dst;
+    uint8_t *sf = data + data_bytes;
+    const int64_t kb_pad = (kb_n + 3) / 4 * 4;
+    memset(sf, 0, ds4q_mxfp8_lt_sf_bytes(nrows, ncols));
+    for (int64_t r = 0; r < nrows; r++) {
+        for (int64_t kb = 0; kb < kb_n; kb++) {
+            const uint8_t *blk = fp8_blocks + ((size_t)r * (size_t)kb_n + (size_t)kb) * 33;
+            memcpy(data + (size_t)r * (size_t)ncols + (size_t)kb * 32, blk + 1, 32);
+            sf[ds4q_mx_sfoff(r, kb, kb_pad)] = blk[0];
         }
     }
 }

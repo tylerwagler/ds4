@@ -108,14 +108,19 @@ static float dspark_conf_sched_tau(void) {
 #define DS4_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
 
 /* Served plain-decode ms/token vs request depth: piecewise-linear through the
- * measured 2026-07-15 depth table, clamped at the ends. The bottom clamp
- * over-estimates plain and biases AGAINST quenching (conservative for the
- * no-spurious-quench gates). The TOP clamp is the opposite: beyond 38k it
- * under-estimates plain (last-segment slope ~0.2 ms/1k would give ~87 ms at
- * 100k vs the clamped 74.5), inflating the guard ~17% and biasing TOWARD
- * quenching exactly where spec advantage is already marginal. Bounded and
- * accepted for now; extrapolate the last segment if deep-context quenches
- * ever look spurious. */
+ * measured 2026-07-15 depth table. The bottom clamp over-estimates plain and
+ * biases AGAINST quenching (conservative for the no-spurious-quench gates).
+ * The top is EXTRAPOLATED along the last measured segment (was a flat clamp):
+ * beyond 38k the flat value under-estimated plain (last-segment slope
+ * ~0.20 ms/1k gives ~87 ms at 100k vs the clamped 74.5), which inflated the
+ * guard ~17% and biased TOWARD quenching exactly where spec advantage is
+ * already marginal. Plain ms/token keeps rising ~linearly with KV depth, so
+ * projecting the last segment tracks the physics far better than flat-lining.
+ * The projection is held flat past ~256k (DS4_QUENCH_PLAIN_CAP_POS): that is
+ * well beyond the measured range, so rather than extrapolate ms/token without
+ * limit we bound it at the 256k value (~118 ms). Deterministic (constants
+ * only) so the quench point stays reproducible for a fixed token stream. */
+#define DS4_QUENCH_PLAIN_CAP_POS 256000.0f
 static float spec_quench_plain_ms(int pos) {
     static const float px[4] = { 300.0f, 2300.0f, 9300.0f, 38000.0f };
     static const float py[4] = { 59.7f, 67.3f, 68.7f, 74.5f };
@@ -125,7 +130,10 @@ static float spec_quench_plain_ms(int pos) {
         if (p <= px[i])
             return py[i - 1] + (py[i] - py[i - 1]) * (p - px[i - 1]) /
                                    (px[i] - px[i - 1]);
-    return py[3];
+    /* pos > 38000: extend the last segment's slope, capped at the 256k value. */
+    const float slope = (py[3] - py[2]) / (px[3] - px[2]);
+    const float q = p < DS4_QUENCH_PLAIN_CAP_POS ? p : DS4_QUENCH_PLAIN_CAP_POS;
+    return py[3] + slope * (q - px[3]);
 }
 
 static float spec_quench_guard(uint32_t n_batch, int pos) {
@@ -599,12 +607,32 @@ static int payload_read_raw_row(FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    /* Report the routed-expert precision tier actually present, derived from
+     * the loaded tensor types (was hardcoded 2, which under-reported the mixed
+     * IQ2 + MXFP4/type-40 build as pure 2-bit). Any 4-bit routed format
+     * (MXFP4 E2M1 / CUTLASS type-40) anywhere in gate/up/down makes this a
+     * 4-bit-tier model; otherwise the 2-bit floor (IQ2_XXS / Q2_K); 0 if no
+     * routed experts. The kvstore snapshot-compat guards accept {2,4} and
+     * ds4_engine_model_id() is a compile-time constant, so this is the only
+     * model-variant discriminator in the disk-KV key — a value change
+     * invalidates old snapshots (one-time re-prefill; fine in dev). */
+    int bits = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
-        if (!gate) continue;
-        return 2;
+        const ds4_tensor *proj[3] = {
+            e->weights.layer[il].ffn_gate_exps,
+            e->weights.layer[il].ffn_up_exps,
+            e->weights.layer[il].ffn_down_exps,
+        };
+        for (int k = 0; k < 3; k++) {
+            const ds4_tensor *t = proj[k];
+            if (!t) continue;
+            if (t->type == DS4_TENSOR_FP4_E2M1 ||
+                t->type == DS4_TENSOR_CUTLASS_MXFP4)
+                return 4;
+            if (bits == 0) bits = 2;
+        }
     }
-    return 0;
+    return bits;
 }
 
 

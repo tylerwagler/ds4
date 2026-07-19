@@ -53,7 +53,12 @@ const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
      * and ds4q_can_quantize false by design -- the expert generation path
      * packs it explicitly via ds4q_pack_cutlass_mxfp4. */
     [DS4Q_TYPE_CUTLASS_MXFP4] = { "cutlass_mxfp4", 32, 0, false, false },
-    [DS4Q_TYPE_Q1_0]    = { "q1_0",      128,  18, false, false },
+    /* MXFP8_LT shares the type-38 {32,33} geometry: for the 128-aligned
+     * workhorse shapes it targets, the de-interleaved E4M3 data plus the
+     * padded swizzled SF tile total exactly KB*33 bytes/row, so ds4q_row_size
+     * gives the right slot size.  can_quantize is false -- f32_to_type packs it
+     * explicitly via ds4q_pack_mxfp8_lt after a type-38 quantize pass. */
+    [DS4Q_TYPE_MXFP8_LT] = { "mxfp8_lt", 32, 33, false, false },
 };
 
 float ds4q_f32_from_bits(uint32_t bits) {

@@ -56,7 +56,12 @@ typedef enum {
     DS4Q_TYPE_CUTLASS_MXFP4 = 40, /* per-expert CUTLASS B layout: E2M1 data
                                    * (K-major, byte-verbatim from source) +
                                    * Blackwell 128x4 swizzled E8M0 SF tile */
-    DS4Q_TYPE_Q1_0    = 41,
+    DS4Q_TYPE_MXFP8_LT = 41,   /* pre-swizzled FP8 workhorse layout: the type-38
+                                * E4M3 weights + E8M0 scales stored in the exact
+                                * device layout the engine builds at first use
+                                * (de-interleaved [in,out] col-major E4M3 data +
+                                * mx_sfoff-swizzled E8M0 scale). Wire-matches the
+                                * engine's DS4_TENSOR_MXFP8_LT. */
     DS4Q_TYPE_COUNT   = 42,
 } ds4q_type;
 
@@ -84,6 +89,23 @@ size_t ds4q_cutlass_mxfp4_sf_bytes(int64_t nrows, int64_t ncols);
 size_t ds4q_cutlass_mxfp4_bytes(int64_t nrows, int64_t ncols);
 void ds4q_pack_cutlass_mxfp4(const uint8_t *e2m1, const uint8_t *e8m0,
                              void *dst, int64_t nrows, int64_t ncols);
+
+/* MXFP8_LT (type 41) helpers.  One workhorse tensor of shape [nrows=out(N),
+ * ncols=in(K)] packs as E4M3 data (nrows*ncols bytes, de-interleaved from the
+ * type-38 [E8M0][32 x E4M3] blocks to [out,in] row-major) followed by the
+ * mx_sfoff-swizzled E8M0 scale (rows padded to 128, K-blocks padded to 4).
+ * Byte-identical to repack_tensor() in tools/mxfp8_prestore/repack_mxfp8_lt.py
+ * and to the engine's DS4_TENSOR_MXFP8_LT device layout. */
+size_t ds4q_mxfp8_lt_sf_bytes(int64_t nrows, int64_t ncols);
+size_t ds4q_mxfp8_lt_bytes(int64_t nrows, int64_t ncols);
+void ds4q_pack_mxfp8_lt(const uint8_t *fp8_blocks, void *dst,
+                        int64_t nrows, int64_t ncols);
+
+/* The canonical Blackwell 128x4 scale-factor swizzle, shared by the CUTLASS
+ * MXFP4 and MXFP8_LT packers.  Byte-identical to the __device__ mx_sfoff in
+ * src/cuda/ds4_cuda_matmul.cu and build_scale_dest_index() in
+ * tools/mxfp8_prestore/repack_mxfp8_lt.py. */
+size_t ds4q_mx_sfoff(int64_t row, int64_t kb, int64_t kbp);
 void ds4q_quantize_init(ds4q_type type);
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
