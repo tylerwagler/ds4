@@ -2126,8 +2126,8 @@ void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank);
  * and restore on the entering bank after, a bank switch — both only between
  * fully synchronized forwards (the gpu_graph_bank_repoint contract).  restore
  * returns false only on a bad bank id or OOM growing an owned buffer. */
-void ds4_session_bank_state_save(ds4_session *s, uint32_t bank);
-bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank);
+/* ds4_session_bank_state_save/restore + ds4_session_bank_count/repoint are the
+ * public server-facing API (declared in ds4.h). */
 void ds4_session_bank_carry_free(ds4_session *s);
 /* Arm one banked multiseq batched step over n_rows packed rows: pos[t] is
  * row t's absolute position, seq[t] its TRUE bank id.  Writes the host

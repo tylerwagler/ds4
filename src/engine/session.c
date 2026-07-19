@@ -2673,6 +2673,17 @@ static bool bank_carry_ensure(ds4_session *s) {
     return true;
 }
 
+int ds4_session_bank_count(ds4_session *s) {
+    return s ? (int)gpu_graph_bank_pool_count(&s->graph) : 0;
+}
+
+int ds4_session_bank_repoint(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return 1;
+    /* Pool disabled: bank 0 is the classic tensors, nothing to repoint. */
+    if (s->graph.banks.n_banks == 0) return bank == 0 ? 0 : 1;
+    return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
+}
+
 void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return;
     if (!bank_carry_ensure(s)) return;

@@ -323,6 +323,28 @@ typedef struct {
 int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen);
+/* Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
+ * hosts up to N co-scheduled conversations as banks; each server slot maps to a
+ * bank id.  The pool size is chosen at session create (DS4_MSEQ_BANKS today);
+ * ds4_session_bank_count reports it (1 when not pooled).
+ *
+ * A conversation lives in ONE bank for its lifetime.  To do classic/spec work
+ * on bank b the caller repoints the device views AND restores b's host carry;
+ * ds4_session_bank_restore does both (+ clears the multiseq poison cheaply, no
+ * re-prefill).  ds4_session_bank_save snapshots the live bank before switching
+ * away.  Typical server flow:
+ *   prefill:  ds4_session_bank_repoint(s,b); ds4_session_invalidate(s);
+ *             ds4_session_sync(s, prompt, ...); ds4_session_bank_save(s,b);
+ *   decode 1: ds4_session_bank_state_restore(s,b);
+ *             ds4_session_generate_speculative(...);
+ *             ds4_session_bank_state_save(s,b);
+ *   decode N: ds4_session_decode_multiseq(s, reqs, N, ...) over the live banks
+ *             (each captured via bank_state_save first); sample per row on host.
+ * repoint/save/restore must run only between fully synchronized forwards. */
+int  ds4_session_bank_count(ds4_session *s);
+int  ds4_session_bank_repoint(ds4_session *s, uint32_t bank);
+void ds4_session_bank_state_save(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank);
 int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,
