@@ -29,6 +29,7 @@ __pycache__/
 /tests/cuda_long_context_smoke
 /tests/multiseq_frontier_gate
 /tests/multiseq_decode_gate
+/tests/bank_spec_gate
 /tests/prefill_bitexact_gate
 /tests/spec_sampling_gate
 /gguf-tools/test_quants
