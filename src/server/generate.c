@@ -800,6 +800,20 @@ struct gen_state {
     bool dspark_spec_enabled;
     dsml_decode_tracker dsml_tracker;
 
+    /* Tier-2 batched-decode lane state (worker_batched_decode_quantum). A slot
+     * becomes batch_active when it joins the shared multiseq lane; it stays
+     * there until it finishes (no mid-conversation batched->classic switch, so
+     * no stale-logits hazard). batch_feed_token is the next token to commit at
+     * batch_feed_pos (the bank's KV frontier); batch_pending holds the tokens
+     * committed via multiseq since the bank's last host-checkpoint save, to be
+     * reconciled onto the checkpoint when the slot returns to a classic op
+     * (finish/store). */
+    bool batch_active;
+    bool batch_feed_valid;
+    int  batch_feed_token;
+    int  batch_feed_pos;
+    ds4_tokens batch_pending;
+
     /* deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;
 };
@@ -2122,6 +2136,7 @@ static void gen_state_free(server *s, session_slot *sl) {
     buf_free(&g->text);
     ds4_tokens_free(&g->effective_prompt);
     ds4_tokens_free(&g->cold_prefix);
+    ds4_tokens_free(&g->batch_pending);
     free(g->disk_cache_path);
     slot_writer_free(&g->writer);
     free(g);
@@ -2158,6 +2173,19 @@ static void generate_job_step(server *s, session_slot *sl) {
      * live bank may be someone else's; switch back to ours. No-op in classic
      * mode / when already live. */
     server_bank_switch(s, sl->bank);
+    /* Tier-2: a slot leaving the batched lane (now at GEN_FINISH) has its bank
+     * installed above (bank_state_restore cleared the multiseq poison and
+     * installed the driver-maintained device counters); catch the host
+     * checkpoint up to the tokens multiseq committed, so gen_step_finish's
+     * store/continuation see the true frontier. */
+    if (g->batch_active) {
+        if (g->batch_pending.len > 0)
+            ds4_session_note_committed_tokens(sl->sess, g->batch_pending.v,
+                                              g->batch_pending.len);
+        ds4_tokens_free(&g->batch_pending);
+        g->batch_active = false;
+        g->batch_feed_valid = false;
+    }
     /* The installed slot writer is worker-thread-local and shared across
      * slots; re-install this slot's writer so send_all() routes through the
      * right deferral queue after another slot (or a fresh bind) was serviced
@@ -2336,9 +2364,14 @@ static void server_bank_switch(server *s, int bank) {
     if (bank == s->live_bank) return;             /* already installed */
     ds4_session *pool = s->slots[0].sess;
     /* Snapshot the outgoing bank so its carry stays readable while idle, and
-     * record its committed frontier for metrics/routing. */
-    s->slots[s->live_bank].committed_pos = ds4_session_pos(pool);
-    ds4_session_bank_state_save(pool, (uint32_t)s->live_bank);
+     * record its committed frontier for metrics/routing. live_bank < 0 is the
+     * post-batched-quantum sentinel: the pool holds no single bank's clean
+     * state (multiseq left a cross-bank superset), so there is nothing safe to
+     * save — just install the target (bank_state_restore clears the poison). */
+    if (s->live_bank >= 0) {
+        s->slots[s->live_bank].committed_pos = ds4_session_pos(pool);
+        ds4_session_bank_state_save(pool, (uint32_t)s->live_bank);
+    }
     ds4_session_bank_state_restore(pool, (uint32_t)bank);
     s->live_bank = bank;
     s->slots[bank].committed_pos = ds4_session_pos(pool);
@@ -3094,6 +3127,121 @@ static void worker_finish_slot(server *s, session_slot *sl) {
  * than the DSpark ≤17-token fused burst) and are deliberate single-thread
  * design: the CUDA-state audit (ds4_server_internal.h) rules out a second
  * GPU thread, and both happen only at a scheduling boundary. */
+/* A slot is eligible for the batched (plain multiseq) decode lane when it is in
+ * steady-state decode and is NOT a tool-call request. Tool requests keep the
+ * classic lane: their structured payload uses temperature-0 gating and the
+ * think/tool recovery paths, which are plain-decode-by-contract absent from the
+ * batched path. Prefill/init/finish slots are serviced per-slot as usual. */
+static bool slot_is_batchable_decode(const session_slot *sl) {
+    const gen_state *g = sl->gen;
+    return sl->active_job && g && g->phase == GEN_DECODE &&
+           !(g->j->req.kind == REQ_CHAT && g->j->req.has_tools);
+}
+
+/* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up
+ * to DS4_SERVER_DECODE_QUANTUM_TOKENS steps across every supplied decode slot.
+ * Each slot samples its OWN logits row with its OWN sampler/RNG and streams
+ * through gen_emit_token (the shared emit path), so per-request
+ * output/stop/streaming is byte-identical in shape to the classic lane; only the
+ * forward numerics differ (batched vs single-token path — a pre-existing,
+ * co-scheduling-NEUTRAL property proven by the multiseq gate). Plain decode
+ * only. Slots that stop are set to GEN_FINISH and dropped; the worker finishes
+ * them via the per-slot path, which reconciles their host checkpoint against the
+ * tokens committed here. Leaves the pool multiseq-poisoned with live_bank = -1
+ * so the next server_bank_switch does a real bank restore. */
+static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) {
+    if (n <= 0) return;
+    ds4_session *pool = s->slots[0].sess;
+    const int vocab = ds4_engine_logits_width(s->engine);
+
+    /* ENTRY: a slot not yet in the batch samples its first feed token from its
+     * bank's current classic logits while that bank is briefly live. */
+    for (int i = 0; i < n; i++) {
+        session_slot *sl = dec[i];
+        gen_state *g = sl->gen;
+        if (g->batch_feed_valid) continue;
+        server_bank_switch(s, sl->bank);
+        float temp, top_p, min_p; int top_k;
+        gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+        g->batch_feed_token =
+            ds4_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_pos = ds4_session_pos(pool);
+        g->batch_feed_valid = true;
+        g->batch_active = true;
+    }
+
+    float *logits = server_xmalloc((size_t)n * (size_t)vocab * sizeof(float));
+    ds4_multiseq_req reqs[DS4_SESSION_POOL_CAP];
+    int live_idx[DS4_SESSION_POOL_CAP];
+
+    for (int step = 0; step < DS4_SERVER_DECODE_QUANTUM_TOKENS; step++) {
+        int m = 0;
+        for (int i = 0; i < n && m < DS4_SESSION_POOL_CAP; i++) {
+            session_slot *sl = dec[i];
+            gen_state *g = sl->gen;
+            if (!g->batch_feed_valid) continue;            /* already stopped */
+            if (g_stop_requested || g->completion >= g->max_tokens) {
+                g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
+            }
+            if (g->batch_feed_pos >= ds4_session_ctx(pool)) {
+                g->batch_feed_valid = false; g->finish = "length";
+                g->phase = GEN_FINISH; continue;
+            }
+            reqs[m].bank = sl->bank;
+            reqs[m].pos = g->batch_feed_pos;
+            reqs[m].token = g->batch_feed_token;
+            live_idx[m] = i;
+            m++;
+        }
+        if (m == 0) break;
+
+        char err[96];
+        const int rc = ds4_session_decode_multiseq(pool, reqs, (uint32_t)m,
+                                                    logits, (uint32_t)m * vocab,
+                                                    err, sizeof(err));
+        s->live_bank = -1;   /* pool is multiseq-poisoned: no clean live bank */
+        if (rc != 0) {
+            for (int q = 0; q < m; q++) {
+                gen_state *g = dec[live_idx[q]]->gen;
+                g->finish = "error";
+                snprintf(g->err, sizeof(g->err), "batched decode failed: %s", err);
+                g->batch_feed_valid = false;
+                g->phase = GEN_FINISH;
+            }
+            break;
+        }
+
+        for (int q = 0; q < m; q++) {
+            session_slot *sl = dec[live_idx[q]];
+            gen_state *g = sl->gen;
+            const int committed = g->batch_feed_token; /* committed at batch_feed_pos */
+            g->batch_feed_pos++;
+            sl->committed_pos = g->batch_feed_pos;
+            ds4_tokens_push(&g->batch_pending, committed);
+            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+            /* Route THIS slot's stream writes through its own deferral queue
+             * (the worker-thread-local writer is shared across slots). */
+            slot_writer_install(&g->writer);
+            if (gen_emit_token(s, sl, committed)) {
+                g->batch_feed_valid = false;
+                g->phase = GEN_FINISH;
+                continue;
+            }
+            const float *row = logits + (size_t)q * (size_t)vocab;
+            float temp, top_p, min_p; int top_k;
+            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            g->batch_feed_token =
+                ds4_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+        }
+    }
+    free(logits);
+    const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+    for (int i = 0; i < n; i++) {
+        dec[i]->last_serviced_us = now_us;
+        if (dec[i]->gen) slot_writer_flush(&dec[i]->gen->writer);
+    }
+}
+
 void *worker_main(void *arg) {
     server *s = arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */
@@ -3116,6 +3264,65 @@ void *worker_main(void *arg) {
             const bool quit = !s->head && s->stopping;
             pthread_mutex_unlock(&s->mu);
             if (quit) break;
+            continue;
+        }
+
+        /* Tier-2 three-way lane (§5). Gather steady-state batchable decode slots.
+         * n_batched > 0 means a batch is already in flight — those slots stay
+         * batched until they finish (no mid-conversation batched->classic switch,
+         * which would need stale-logits reconciliation). The batched lane engages
+         * when the batchable decode count exceeds spec_max_live, OR whenever a
+         * batch is already active. Otherwise the classic per-slot round-robin
+         * runs unchanged: n_active==1 -> spec (N=1 byte-identical), n<=spec_max_live
+         * -> spec time-slice. Env DS4_SERVER_SPEC_MAX_LIVE tunes the crossover. */
+        session_slot *dec[DS4_SESSION_POOL_CAP];
+        int n_dec = 0, n_batched = 0;
+        if (s->pool_banks > 0) {
+            for (int i = 0; i < s->n_slots; i++) {
+                if (slot_is_batchable_decode(&s->slots[i])) {
+                    dec[n_dec++] = &s->slots[i];
+                    if (s->slots[i].gen->batch_active) n_batched++;
+                }
+            }
+        }
+        const bool use_batched =
+            s->pool_banks > 0 && n_dec >= 1 &&
+            (n_dec > s->spec_max_live || n_batched > 0);
+
+        if (use_batched) {
+            worker_batched_decode_quantum(s, dec, n_dec);
+            /* Finish any slot the batched quantum stopped (per-slot path
+             * reconciles its checkpoint). Then also advance ONE non-decode
+             * active slot (prefill/init/finish) so prompt ingest never starves
+             * behind a long batched decode. */
+            for (int i = 0; i < n_dec; i++) {
+                session_slot *d = dec[i];
+                if (d->gen && d->gen->phase != GEN_DECODE) {
+                    generate_job_step(s, d);
+                    if (d->gen) slot_writer_flush(&d->gen->writer);
+                    d->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+                    if (!d->gen || d->gen->phase == GEN_DONE)
+                        worker_finish_slot(s, d);
+                }
+            }
+            session_slot *other = NULL;
+            for (int k = 0; k < s->n_slots; k++) {
+                session_slot *c = &s->slots[(rr + k) % s->n_slots];
+                if (c->active_job && !slot_is_batchable_decode(c) &&
+                    !(c->gen && c->gen->batch_active)) {
+                    other = c;
+                    rr = (int)(c - s->slots) + 1;
+                    break;
+                }
+            }
+            if (other && other->gen && other->gen->phase != GEN_DONE) {
+                generate_job_step(s, other);
+                if (other->gen) slot_writer_flush(&other->gen->writer);
+                other->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+                if (!other->gen || other->gen->phase == GEN_DONE)
+                    worker_finish_slot(s, other);
+            }
+            server_publish_metrics_snapshot(s);
             continue;
         }
 

@@ -2844,6 +2844,11 @@ int ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
     return i;
 }
 
+void ds4_session_note_committed_tokens(ds4_session *s, const int *toks, int n) {
+    if (!s || !toks || n <= 0) return;
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, toks[i]);
+}
+
 
 
 static float dspark_base_top1_prob(const float *logits, int n) {

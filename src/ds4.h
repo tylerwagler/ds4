@@ -357,6 +357,15 @@ int  ds4_session_bank_pos(ds4_session *s, uint32_t bank);
 const ds4_tokens *ds4_session_bank_tokens(ds4_session *s, uint32_t bank);
 int  ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
                                     const ds4_tokens *prompt);
+/* Tier-2: reconcile the host checkpoint after a run of ds4_session_decode_multiseq
+ * steps advanced the LIVE (just bank_state_restore'd) bank's device KV frontier
+ * without touching the host token history. Append the tokens multiseq committed,
+ * in order, so ds4_session_pos/_tokens/_common_prefix and any subsequent classic
+ * eval/sync/store see the true frontier. Pure host bookkeeping — no eval, no
+ * CUDA. The device per-bank counters are already correct (the multiseq driver
+ * maintained them and bank_state_restore installed them); this only catches the
+ * host checkpoint up to them. */
+void ds4_session_note_committed_tokens(ds4_session *s, const int *toks, int n);
 int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,
