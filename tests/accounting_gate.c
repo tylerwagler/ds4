@@ -212,6 +212,48 @@ int main(int argc, char **argv) {
                 (double)touched_grown / GIB, (double)phys_used / GIB, ok ? "OK" : "OVERCOUNT");
     }
 
+    /* RECLAIM-ACTUALLY-HAPPENS (increment 2a gate): the eviction guard's reclaim
+     * primitive is a DIRECT cudaFree of one bank's OWN comp/index allocations.
+     * Prove it returns physical on GB10 (Step-1: ~15 ms/GiB; refutes the #50
+     * "cudaFree doesn't return" pessimism) by freeing bank 0's split slabs here
+     * and checking cudaMemGetInfo free rises by ~the bank's touched bytes. Runs
+     * LAST (the session is torn down right after); the freed slots are nulled so
+     * gpu_graph_free does not double-free. */
+    if (s->graph.banks.n_banks) {
+        ds4_gpu_graph *g = &s->graph;
+        (void)ds4_gpu_synchronize();
+        const uint64_t touched_bank0 = ds4_session_touched_kv_bytes(s); /* only bank 0 prefilled */
+        uint64_t f_before = 0, tt = 0;
+        ds4_gpu_mem_info(&f_before, &tt);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ds4_gpu_tensor_free(g->banks.comp[il][0]);
+            g->banks.comp[il][0] = NULL;
+            if (ds4_layer_compress_ratio(il) == 4) {
+                ds4_gpu_tensor_free(g->banks.index[il][0]);
+                g->banks.index[il][0] = NULL;
+            }
+        }
+        (void)ds4_gpu_synchronize();
+        uint64_t f_after = 0;
+        ds4_gpu_mem_info(&f_after, &tt);
+        const int64_t reclaimed = (int64_t)f_after - (int64_t)f_before;
+        /* Physical returned must be ~the bank's touched comp/index (page-rounded);
+         * require it be POSITIVE and within tolerance of touched (not zero — the
+         * arena-pooled failure mode gate-3 exists to catch). */
+        const int64_t tol = (int64_t)(256ull * 1024 * 1024);
+        const int64_t tol_rel = (int64_t)(0.15 * (double)touched_bank0);
+        const int64_t tol_eff = tol > tol_rel ? tol : tol_rel;
+        const int64_t rdiff = reclaimed - (int64_t)touched_bank0;
+        const int reclaim_ok = reclaimed > 0 && rdiff <= tol_eff && rdiff >= -tol_eff;
+        if (!reclaim_ok) fail = 1;
+        fprintf(stderr,
+                "accounting_gate: RECLAIM bank0 cudaFree: reclaimed=%.3f GiB "
+                "vs touched=%.3f GiB (diff=%.1f MiB, tol=%.0f MiB) -> %s\n",
+                (double)reclaimed / GIB, (double)touched_bank0 / GIB,
+                (double)rdiff / (1024.0 * 1024.0), (double)tol_eff / (1024.0 * 1024.0),
+                reclaim_ok ? "OK (physical returned)" : "FAIL (no reclaim)");
+    }
+
     free(toks);
     fprintf(stderr, "accounting_gate: %s\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
