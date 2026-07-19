@@ -125,6 +125,11 @@ def make_kvs(cfg):
 # GGML type IDs matching ds4's ds4q_type / DS4_TENSOR_*
 FP8_E4M3 = 38
 MXFP4 = 39
+# The DSpark workhorse weights (attn q/kv/output, shared experts, main_proj)
+# ship pre-swizzled as MXFP8_LT (type 41) so the engine mmaps the layout
+# instead of rebuilding it at first use. deepseek4-quantize packs it natively;
+# same E4M3 weights + E8M0 scales as FP8_E4M3, just the device layout.
+MXFP8_LT = 41
 
 def main():
     import argparse
@@ -159,7 +164,7 @@ def main():
         if hf_c is not None: return (hf_c, hf_r)
         return (hf_r,)
 
-    add('dspark.main_proj.weight', 2, gguf(E, 3*E), FP8_E4M3)
+    add('dspark.main_proj.weight', 2, gguf(E, 3*E), MXFP8_LT)
     add('dspark.main_norm.weight', 1, gguf(E), 30)
 
     LAYER_MAP = [
@@ -172,17 +177,17 @@ def main():
         ('hc_ffn_fn.weight',        gguf(HC_MIX, NHC*E), 1),
         ('hc_ffn_scale.weight',     gguf(3),       0),
         ('attn_sinks.weight',       gguf(H),       0),
-        ('attn_q_a.weight',         gguf(Q, E),    FP8_E4M3),
+        ('attn_q_a.weight',         gguf(Q, E),    MXFP8_LT),
         ('attn_q_a_norm.weight',    gguf(Q),       30),
-        ('attn_q_b.weight',         gguf(H*D, Q),  FP8_E4M3),
-        ('attn_kv.weight',          gguf(D, E),    FP8_E4M3),
+        ('attn_q_b.weight',         gguf(H*D, Q),  MXFP8_LT),
+        ('attn_kv.weight',          gguf(D, E),    MXFP8_LT),
         ('attn_kv_a_norm.weight',   gguf(D),       30),
-        ('attn_output_a.weight',    gguf(O*OG, E), FP8_E4M3),
-        ('attn_output_b.weight',    gguf(E, O*OG), FP8_E4M3),
+        ('attn_output_a.weight',    gguf(O*OG, E), MXFP8_LT),
+        ('attn_output_b.weight',    gguf(E, O*OG), MXFP8_LT),
         ('ffn_gate_inp.weight',     gguf(R, E),    30),
-        ('ffn_gate_shexp.weight',   gguf(F, E),    FP8_E4M3),
-        ('ffn_up_shexp.weight',     gguf(F, E),    FP8_E4M3),
-        ('ffn_down_shexp.weight',   gguf(E, F),    FP8_E4M3),
+        ('ffn_gate_shexp.weight',   gguf(F, E),    MXFP8_LT),
+        ('ffn_up_shexp.weight',     gguf(F, E),    MXFP8_LT),
+        ('ffn_down_shexp.weight',   gguf(E, F),    MXFP8_LT),
     ]
 
     for li in range(3):

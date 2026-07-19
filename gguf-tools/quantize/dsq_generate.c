@@ -25,6 +25,20 @@ byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
         ds4q_f32_to_bf16_row(src, (uint16_t *)out.data, n);
         return out;
     }
+    if (type == DS4Q_TYPE_MXFP8_LT) {
+        /* Quantize to the plain type-38 block layout, then swizzle it into the
+         * pre-stored device layout (ds4q_pack_mxfp8_lt) in one pass. */
+        if (ncols % 32 != 0) die("mxfp8_lt ncols is not divisible by 32");
+        const int64_t nrows = n / ncols;
+        const size_t tmp_size = (size_t)nrows * ds4q_row_size(DS4Q_TYPE_FP8_E4M3, ncols);
+        uint8_t *tmp = xmalloc(tmp_size);
+        ds4q_quantize_chunk(DS4Q_TYPE_FP8_E4M3, src, tmp, 0, nrows, ncols, NULL);
+        out.size = ds4q_mxfp8_lt_bytes(nrows, ncols);
+        out.data = xmalloc(out.size);
+        ds4q_pack_mxfp8_lt(tmp, out.data, nrows, ncols);
+        free(tmp);
+        return out;
+    }
     if (!ds4q_can_quantize(type)) die("unsupported quant target type");
     if (ncols % ds4q_block_size(type) != 0) die("ncols is not divisible by quant block size");
     const int64_t nrows = n / ncols;
@@ -105,6 +119,16 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
     }
     if (target == DS4Q_TYPE_CUTLASS_MXFP4)
         die("cutlass_mxfp4 is only supported for routed-expert tensors");
+    /* Only the workhorse weights (attn q/kv/output, shared experts, output
+     * head, main_proj) route through the engine's MXFP8_LT-aware FP8 resolver;
+     * any other tensor stored as type 41 would decode to garbage on the plain
+     * matmul path, so refuse it here (mirrors _WORKHORSE_BASES in
+     * tools/mxfp8_prestore/repack_mxfp8_lt.py). */
+    if (target == DS4Q_TYPE_MXFP8_LT && !is_mxfp8_lt_workhorse(gguf_name)) {
+        fprintf(stderr, "error: mxfp8_lt is only valid for workhorse tensors "
+                "(attn/shared/output/main_proj), not %s\n", gguf_name);
+        exit(1);
+    }
     if (!is_quantizable_target(target)) die("unsupported regular target type");
     int64_t n = 0;
     float *f32 = NULL;

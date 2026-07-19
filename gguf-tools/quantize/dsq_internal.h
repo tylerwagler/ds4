@@ -304,6 +304,7 @@ int tensor_n_dims(const tensor_meta *t);
 ds4q_type policy_type(const quant_policy *p, const char *name, const tensor_meta *tmpl);
 ds4q_type parse_type(const char *raw);
 bool is_quantizable_target(ds4q_type type);
+bool is_mxfp8_lt_workhorse(const char *name);
 void policy_load_format_map(quant_policy *p, const char *path);
 
 /* dsq_generate.c */

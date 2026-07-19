@@ -38,9 +38,30 @@ BLOCK = {
     # -> no SF tile padding), so the DP budget math is unchanged.
     "CUTLASS_MXFP4": (32, 17),
     "FP8_E4M3":(32,  33),   # 8.25
+    # Pre-swizzled FP8 workhorse layout (type 41).  Same E4M3 weights + E8M0
+    # scales as FP8_E4M3, just stored in the engine's device layout -- identical
+    # 8.25 bpw / byte size, so the budget math is unchanged.
+    "MXFP8_LT":(32,  33),   # 8.25
     "F16":     ( 1,   2),
     "F32":     ( 1,   4),
 }
+
+# Workhorse weights that route through the engine's MXFP8_LT-aware FP8 resolver:
+# attn q/kv/output, shared experts, the output head, main_proj.  Any OTHER FP8
+# tensor must stay FP8_E4M3 (plain matmul path).  Match on the base name
+# (second-to-last dotted token) so both blk.N.* and dspark.N.* are covered.
+# Mirrors _WORKHORSE_BASES in tools/mxfp8_prestore/repack_mxfp8_lt.py and
+# is_mxfp8_lt_workhorse() in gguf-tools/quantize/dsq_names.c -- keep in sync.
+_WORKHORSE_BASES = frozenset({
+    "attn_q_a", "attn_q_b", "attn_kv", "attn_output_a", "attn_output_b",
+    "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+    "output", "main_proj",
+})
+
+def is_workhorse(name):
+    parts = name.split(".")
+    base = parts[-2] if len(parts) >= 2 else parts[0]
+    return base in _WORKHORSE_BASES
 # Candidate presets. Each MoE layer picks one: cheap (IQ2_XXS/Q2_K) or rich
 # (CUTLASS_MXFP4 all three, byte-lossless vs the HF source).  No
 # Q4_K/Q3_K/Q5_K/Q6_K/Q8_0 — those are no longer producible or servable.
@@ -79,7 +100,13 @@ def candidates(t):
     if t["family"] == "routed_expert":
         role = expert_role(t["name"])
         return [PRESETS[p][role] for p in PRESET_ORDER]
-    return [t["type"]] if t["type"] in BLOCK else ["F16"]
+    fmt = t["type"] if t["type"] in BLOCK else "F16"
+    # Workhorse FP8 weights ship as the pre-swizzled MXFP8_LT (type 41), packed
+    # natively by deepseek4-quantize so the engine mmaps the layout instead of
+    # rebuilding it at first use.  Non-workhorse FP8 stays FP8_E4M3.
+    if fmt == "FP8_E4M3" and is_workhorse(t["name"]):
+        fmt = "MXFP8_LT"
+    return [fmt]
 
 def synth_sens(t):
     n = t["name"]; s = 1.0
