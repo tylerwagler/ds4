@@ -1,0 +1,218 @@
+/* Tier-2 ACCOUNTING-EXACTNESS gate (task #55 overcommit/preemption, increment 1).
+ *
+ * Proves the exact-frontier touched-KV number (ds4_session_touched_kv_bytes /
+ * gpu_graph_touched_kv_bytes) that the increment-2 eviction guard will TRIGGER
+ * on can be trusted: it must track the REAL physical footprint of the
+ * demand-paged comp/index caches, measured independently via cudaMemGetInfo
+ * (ds4_gpu_mem_info) on GB10 unified memory.
+ *
+ * METHOD.  A pooled session (comp/index are cudaMallocManaged, physical on
+ * touch — DS4_MSEQ_BANKS>=2) has bank 0 prefilled through INCREASING fill
+ * levels.  At each level we read BOTH (a) the frontier-derived touched-KV and
+ * (b) cudaMemGetInfo free.  We compare the INCREMENTAL deltas between
+ * consecutive levels:
+ *
+ *     phys_delta   = free[i-1] - free[i]        (physical materialized by growth)
+ *     touched_delta = touched[i] - touched[i-1]  (frontier-sum growth, comp+index)
+ *
+ * The incremental form CANCELS the fixed eager floor and the bounded raw ring
+ * (which saturates after raw_cap tokens), isolating the demand-paged comp/index
+ * growth — exactly what touched-KV counts.  PASS if |phys_delta - touched_delta|
+ * is within a small tolerance (host-page rounding + a little UVM slack).  A gross
+ * mismatch means the accounting cannot be used as the guard's trigger.
+ *
+ * The whole-run absolute check (touched[last] <= phys_used_total) is also
+ * reported: the frontier-sum must never OVERCOUNT the physical it stands in for.
+ *
+ * MODEL-DEPENDENT and GPU-resident; run manually on the GB10 under the memory
+ * discipline (see the Makefile cuda-accounting-gate target) — NOT part of
+ * `make test`.  Increment 1 keeps fills MODEST (default peak ~64k tokens,
+ * ~1-2 GiB physical) — well under budget; it does not exercise eviction.
+ *
+ * usage: DS4_MSEQ_BANKS=2 ./tests/accounting_gate MODEL [L1 L2 L3 ...]
+ *        (levels in tokens, ascending; default 8192 24576 65536)
+ */
+#include "ds4.h"
+#include "ds4_engine_internal.h"
+#include "ds4_gpu.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+
+static const double GIB = 1024.0 * 1024.0 * 1024.0;
+
+static char *read_file(const char *path, size_t *len_out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *buf = malloc((size_t)n + 1);
+    if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
+    fclose(fp);
+    buf[n] = '\0';
+    if (len_out) *len_out = (size_t)n;
+    return buf;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [L1 L2 L3 ...]\n", argv[0]); return 2; }
+
+    /* Fill levels (ascending). */
+    int levels[16];
+    int n_levels = 0;
+    if (argc > 2) {
+        for (int i = 2; i < argc && n_levels < 16; i++) levels[n_levels++] = atoi(argv[i]);
+    } else {
+        levels[n_levels++] = 8192;
+        levels[n_levels++] = 24576;
+        levels[n_levels++] = 65536;
+    }
+    for (int i = 1; i < n_levels; i++) {
+        if (levels[i] <= levels[i - 1]) { fprintf(stderr, "levels must ascend\n"); return 2; }
+    }
+    const int peak = levels[n_levels - 1];
+    const int ctx = peak + 4096;   /* headroom over the deepest fill */
+
+    ds4_engine *e = NULL;
+    ds4_engine_options opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.model_path = argv[1];
+    opt.backend = DS4_BACKEND_CUDA;
+    if (ds4_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+
+    /* Base tokens to tile the long fill from (content is irrelevant to the
+     * comp/index physical footprint — the frontier is position-driven). */
+    size_t text_len = 0;
+    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
+    ds4_tokens base;
+    memset(&base, 0, sizeof(base));
+    ds4_tokenize_text(e, text, &base);
+    free(text);
+    if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
+
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+
+    const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
+    fprintf(stderr, "accounting_gate: pool banks=%u ctx=%d peak=%d "
+                    "attn_row=%" PRIu64 " idx_row=%" PRIu64 "\n",
+            pool, ctx, peak, gpu_graph_attn_comp_cache_row_bytes(),
+            gpu_graph_idx_fp4_enabled() ? DS4_ENGINE_IDXFP4_ROWBYTES
+                                        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    if (pool < 2) {
+        fprintf(stderr, "accounting_gate: WARNING pool<2 — comp/index may be "
+                        "device-resident (not demand-paged); set DS4_MSEQ_BANKS>=2\n");
+    }
+
+    /* A tiled token buffer of `peak` tokens, prefixes reused as we grow. */
+    int *toks = malloc((size_t)peak * sizeof(int));
+    if (!toks) { fprintf(stderr, "oom\n"); return 1; }
+    for (int i = 0; i < peak; i++) toks[i] = base.v[i % base.len];
+
+    /* WARMUP: the FIRST prefill also materializes the one-time lazy working set
+     * (chunk-sized batch buffers ~4 GiB, DSpark bulk_h, logits) — a ~6 GiB
+     * physical jump that is NOT comp/index and would pollute the first
+     * increment. Prefill a short warmup so the measured baseline is fully warm;
+     * every subsequent increment is then pure demand-paged comp/index growth. */
+    {
+        const int warm = 2048 < levels[0] ? 2048 : levels[0] / 2;
+        ds4_tokens p;
+        memset(&p, 0, sizeof(p));
+        p.v = toks;
+        p.len = p.cap = warm;
+        char err[256];
+        if (ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+            fprintf(stderr, "accounting_gate: warmup sync to %d failed: %s\n", warm, err);
+            return 1;
+        }
+        gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+        (void)ds4_gpu_synchronize();
+        fprintf(stderr, "accounting_gate: warmup prefill %d tokens done\n", warm);
+    }
+
+    uint64_t free_prev = 0, total0 = 0;
+    uint64_t touched_prev = 0;
+    uint64_t free0 = 0;
+    (void)ds4_gpu_synchronize();
+    ds4_gpu_mem_info(&free0, &total0);
+    free_prev = free0;
+    touched_prev = ds4_session_touched_kv_bytes(s);
+    const uint64_t touched_base0 = touched_prev;
+
+    int fail = 0;
+    fprintf(stderr, "accounting_gate: warm baseline free=%.3f GiB total=%.3f GiB touched=%.3f GiB\n",
+            (double)free0 / GIB, (double)total0 / GIB, (double)touched_prev / GIB);
+
+    for (int i = 0; i < n_levels; i++) {
+        const int len = levels[i];
+        ds4_tokens p;
+        memset(&p, 0, sizeof(p));
+        p.v = toks;               /* prefix [0,len) of the tiled buffer */
+        p.len = p.cap = len;
+        char err[256];
+        if (ds4_session_sync(s, &p, err, sizeof(err)) != 0) {
+            fprintf(stderr, "accounting_gate: sync to %d failed: %s\n", len, err);
+            fail = 1;
+            break;
+        }
+        /* Capture the current bank's frontier so idle-bank readers agree; the
+         * touched getter already uses the live layer_n_comp for the cur bank. */
+        gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
+        (void)ds4_gpu_synchronize();
+
+        uint64_t free_now = 0, total_now = 0;
+        ds4_gpu_mem_info(&free_now, &total_now);
+        const uint64_t touched = ds4_session_touched_kv_bytes(s);
+
+        const int64_t phys_delta = (int64_t)free_prev - (int64_t)free_now;      /* physical grew */
+        const int64_t touched_delta = (int64_t)touched - (int64_t)touched_prev; /* frontier grew */
+        const int64_t diff = phys_delta - touched_delta;
+        const double rel = touched_delta > 0 ? (double)diff / (double)touched_delta : 0.0;
+
+        /* Tolerance: host-page rounding + UVM slack. Managed pages fault in at
+         * (up to) 2 MiB granularity per bank/layer lane, and MemAvailable can
+         * wobble; allow the LARGER of 256 MiB or 12% of the increment. */
+        const int64_t tol = (int64_t)(256ull * 1024 * 1024);
+        const int64_t tol_rel = (int64_t)(0.12 * (double)touched_delta);
+        const int64_t tol_eff = tol > tol_rel ? tol : tol_rel;
+
+        const int ok = (diff <= tol_eff) && (diff >= -tol_eff);
+        if (!ok) fail = 1;
+        fprintf(stderr,
+                "accounting_gate: fill %7d: touched=%.3f GiB (+%.3f) phys_used=%.3f GiB (+%.3f) "
+                "| dphys=%.3f GiB dtouched=%.3f GiB diff=%.1f MiB (%.1f%%) tol=%.0f MiB -> %s\n",
+                len,
+                (double)touched / GIB, (double)touched_delta / GIB,
+                (double)(free0 - free_now) / GIB, (double)phys_delta / GIB,
+                (double)phys_delta / GIB, (double)touched_delta / GIB,
+                (double)diff / (1024.0 * 1024.0), rel * 100.0,
+                (double)tol_eff / (1024.0 * 1024.0),
+                ok ? "OK" : "MISMATCH");
+
+        free_prev = free_now;
+        touched_prev = touched;
+    }
+
+    /* Absolute never-overcount check: the final frontier-sum must not exceed the
+     * total physical the run consumed. */
+    {
+        uint64_t free_now = 0, total_now = 0;
+        ds4_gpu_mem_info(&free_now, &total_now);
+        const uint64_t phys_used = free0 > free_now ? free0 - free_now : 0;
+        const uint64_t touched = ds4_session_touched_kv_bytes(s);
+        const uint64_t touched_grown = touched - touched_base0;   /* since warm baseline */
+        const int ok = touched_grown <= phys_used + (uint64_t)(256ull * 1024 * 1024);
+        if (!ok) fail = 1;
+        fprintf(stderr, "accounting_gate: final touched grown since baseline=%.3f GiB "
+                        "<= phys_used=%.3f GiB : %s\n",
+                (double)touched_grown / GIB, (double)phys_used / GIB, ok ? "OK" : "OVERCOUNT");
+    }
+
+    free(toks);
+    fprintf(stderr, "accounting_gate: %s\n", fail ? "FAIL" : "PASS");
+    return fail ? 1 : 0;
+}
