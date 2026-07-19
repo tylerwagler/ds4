@@ -2121,6 +2121,30 @@ uint64_t ds4_session_touched_kv_bytes(const ds4_session *s) {
     return gpu_graph_touched_kv_bytes(&s->graph);
 }
 
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore.  The caller
+ * (server guard) must have snapshotted the bank's KV to DISK before evict (host
+ * RAM reclaims nothing on unified memory) and repointed away from it; and after
+ * restore-alloc it reloads the KV H2D from that snapshot. */
+bool ds4_session_bank_free_physical(ds4_session *s, uint32_t bank) {
+    if (!s) return false;
+    return gpu_graph_bank_free_physical(&s->graph, bank);
+}
+
+bool ds4_session_bank_alloc_physical(ds4_session *s, uint32_t bank) {
+    if (!s) return false;
+    return gpu_graph_bank_alloc_physical(&s->graph, bank);
+}
+
+bool ds4_session_bank_is_evicted(const ds4_session *s, uint32_t bank) {
+    if (!s) return false;
+    return gpu_graph_bank_is_evicted(&s->graph, bank);
+}
+
+uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank) {
+    if (!s) return 0;
+    return gpu_graph_bank_touched_kv_bytes(&s->graph, bank);
+}
+
 
 
 void ds4_session_free(ds4_session *s) {

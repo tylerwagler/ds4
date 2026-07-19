@@ -2113,6 +2113,13 @@ uint32_t gpu_graph_bank_pool_count(const ds4_gpu_graph *g);
  * the per-bank compressor frontier. See the definitions in gpu_diag.c. */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
 uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g);
+uint64_t gpu_graph_bank_touched_kv_bytes(const ds4_gpu_graph *g, uint32_t bank);
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore reclaim
+ * primitives (direct cudaFree / cudaMallocManaged of one bank's split comp/index
+ * + base-table rebuild). See gpu_diag.c. */
+bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank);
+bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank);
+bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank);
 /* Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */

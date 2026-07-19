@@ -636,6 +636,91 @@ static bool gpu_graph_bank_slabs_alloc(
 
 
 
+/* Write one bank's entry in the comp/index base-pointer tables (device arrays).
+ * A NULL slab nulls the entry so a stray batched-kernel read of an evicted bank
+ * faults instead of touching freed pages. */
+static bool bank_bases_set(ds4_gpu_graph *g, uint32_t il, uint32_t bank,
+                           ds4_gpu_tensor *comp_slab, ds4_gpu_tensor *index_slab) {
+    ds4_bank_slabs *b = &g->banks;
+    bool ok = true;
+    if (b->comp_bases[il]) {
+        void *cp = comp_slab ? ds4_gpu_tensor_device_ptr(comp_slab) : NULL;
+        ok = ds4_gpu_tensor_write(b->comp_bases[il], (uint64_t)bank * sizeof(void *),
+                                  &cp, sizeof(void *)) != 0;
+    }
+    if (ok && b->index_bases[il]) {
+        void *ip = index_slab ? ds4_gpu_tensor_device_ptr(index_slab) : NULL;
+        ok = ds4_gpu_tensor_write(b->index_bases[il], (uint64_t)bank * sizeof(void *),
+                                  &ip, sizeof(void *)) != 0;
+    }
+    return ok;
+}
+
+/* Tier-2 task #55 increment 2b — EVICTION RECLAIM primitive. Free ONE idle bank's
+ * own comp/index physical by a DIRECT cudaFree of its per-bank split allocations
+ * (the only primitive that returns physical on GB10; Step-1/2a reclaim gate).
+ * Nulls the slab pointers and their base-table entries. MUST NOT be the installed
+ * (cur) bank — the caller repoints away first; refuses otherwise. The eager raw
+ * ring + state lanes (contiguous, bounded floor) are NOT freed and survive the
+ * evict/restore cycle in place. */
+bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    if (bank == g->banks.cur_bank) return false;   /* never free the installed bank */
+    ds4_bank_slabs *b = &g->banks;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        ds4_gpu_tensor_free(b->comp[il][bank]);
+        b->comp[il][bank] = NULL;
+        if (ratio == 4) {
+            ds4_gpu_tensor_free(b->index[il][bank]);
+            b->index[il][bank] = NULL;
+        }
+        ok = ok && bank_bases_set(g, il, bank, NULL, NULL);
+    }
+    return ok;
+}
+
+/* Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted
+ * bank's comp/index physical (fresh cudaMallocManaged: VA reserved, physical on
+ * touch) and rebuild its base-table entries to the new pointers. The caller then
+ * reloads the bank's KV (H2D from the disk snapshot) into these. Idempotent: a
+ * slab already present is left untouched. Returns false on OOM. */
+bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    ds4_bank_slabs *b = &g->banks;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        if (!b->comp[il][bank]) {
+            b->comp[il][bank] = ds4_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
+            ok = b->comp[il][bank] != NULL;
+        }
+        if (ok && ratio == 4 && !b->index[il][bank]) {
+            b->index[il][bank] = ds4_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
+            ok = b->index[il][bank] != NULL;
+        }
+        if (ok) ok = bank_bases_set(g, il, bank, b->comp[il][bank],
+                                    ratio == 4 ? b->index[il][bank] : NULL);
+    }
+    return ok;
+}
+
+/* True when `bank`'s comp/index physical is currently freed (evicted) — the
+ * server checks this before restoring on a returning request. */
+bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_layer_compress_ratio(il) == 0) continue;
+        return g->banks.comp[il][bank] == NULL;   /* freed in lockstep across layers */
+    }
+    return false;
+}
+
+
+
 /* Re-install the graph's per-layer cache views onto `bank`.  Pure host-side
  * pointer surgery (view wrappers are freed/recreated; no device work), so the
  * caller must guarantee the device is idle with respect to the previous
@@ -857,29 +942,40 @@ void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank) {
  * the classic single-session frontier (layer_n_comp) is summed. Only the ctx-
  * scaled comp/index are counted; the eager raw ring + state lanes are the fixed
  * floor and are already resident (not part of the growing touched set). */
-uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g) {
+/* Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
+ * from its compressor frontier.  cur bank reads the live layer_n_comp; idle banks
+ * read their captured ms_n_comp.  The increment-2b guard uses this for the
+ * per-bank Δ projection and the smallest-frontier victim tie-break. */
+uint64_t gpu_graph_bank_touched_kv_bytes(const ds4_gpu_graph *g, uint32_t bank) {
     if (!g) return 0;
+    const uint32_t nb = gpu_graph_bank_pool_count(g);
+    if (bank >= nb) return 0;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
         ? DS4_ENGINE_IDXFP4_ROWBYTES
         : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-    const uint32_t nb = gpu_graph_bank_pool_count(g);
     const uint32_t cur = g->banks.n_banks ? g->banks.cur_bank : 0u;
     uint64_t bytes = 0;
-    for (uint32_t b = 0; b < nb; b++) {
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            const uint32_t ratio = ds4_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint32_t ncomp = (b == cur) ? g->layer_n_comp[il]
-                                              : g->ms_n_comp[b][il];
-            bytes += (uint64_t)ncomp * attn_row;
-            if (ratio == 4) {
-                const uint32_t nidx = (b == cur) ? g->layer_n_index_comp[il]
-                                                 : g->ms_n_index_comp[b][il];
-                bytes += (uint64_t)nidx * idx_row;
-            }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint32_t ncomp = (bank == cur) ? g->layer_n_comp[il]
+                                             : g->ms_n_comp[bank][il];
+        bytes += (uint64_t)ncomp * attn_row;
+        if (ratio == 4) {
+            const uint32_t nidx = (bank == cur) ? g->layer_n_index_comp[il]
+                                                : g->ms_n_index_comp[bank][il];
+            bytes += (uint64_t)nidx * idx_row;
         }
     }
+    return bytes;
+}
+
+uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g) {
+    if (!g) return 0;
+    const uint32_t nb = gpu_graph_bank_pool_count(g);
+    uint64_t bytes = 0;
+    for (uint32_t b = 0; b < nb; b++) bytes += gpu_graph_bank_touched_kv_bytes(g, b);
     return bytes;
 }
 

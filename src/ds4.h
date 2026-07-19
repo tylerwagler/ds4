@@ -194,6 +194,18 @@ uint64_t ds4_engine_demand_paged_bytes_per_bank(ds4_engine *e, int ctx_size);
  * For the current bank the live frontier is used; idle banks use their captured
  * frontier — capture the current bank first if you need it fully current. */
 uint64_t ds4_session_touched_kv_bytes(const ds4_session *s);
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
+ * eviction guard. free_physical: DIRECT cudaFree of one idle bank's split comp/index
+ * (reclaims physical on GB10); caller must have snapshotted the bank's KV to DISK
+ * first (host RAM reclaims nothing on unified memory) and repointed away from it.
+ * alloc_physical: reallocate that bank's comp/index (VA; physical on touch) + rebuild
+ * the base-pointer table; caller then reloads KV H2D from the disk snapshot.
+ * is_evicted: whether a bank's physical is currently freed. bank_touched_kv_bytes:
+ * one bank's exact resident comp/index KV from its frontier (guard Δ + victim pick). */
+bool ds4_session_bank_free_physical(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_alloc_physical(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_is_evicted(const ds4_session *s, uint32_t bank);
+uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any
