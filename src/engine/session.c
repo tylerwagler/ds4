@@ -2804,6 +2804,47 @@ bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
 
 
 
+/* ===== Tier-2 per-bank frontier READERS (server routing/metrics) ==========
+ *
+ * A bank-pooled server shares one ds4_session across N conversation banks, so
+ * ds4_session_pos / _tokens / _common_prefix (which read the single live host
+ * checkpoint) describe ONLY the currently-installed bank.  Reading them for a
+ * non-live bank returns the wrong conversation's frontier.  These readers give
+ * the correct per-bank answer without repointing the device or disturbing the
+ * live bank: the live bank (banks.cur_bank) reads the authoritative live
+ * checkpoint; every other bank reads its saved host carry (which the server
+ * keeps current for idle banks by bank_state_save'ing at job end).  Pure host
+ * reads — no CUDA, safe on the worker thread at routing/publish time. */
+static const ds4_tokens *bank_frontier_tokens(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return NULL;
+    const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
+    if (bank == cur) return s->checkpoint_valid ? &s->checkpoint : NULL;
+    if (s->bank_carry && bank < s->bank_carry_n &&
+        s->bank_carry[bank].valid && s->bank_carry[bank].checkpoint_valid)
+        return &s->bank_carry[bank].checkpoint;
+    return NULL;
+}
+
+int ds4_session_bank_pos(ds4_session *s, uint32_t bank) {
+    const ds4_tokens *t = bank_frontier_tokens(s, bank);
+    return t ? t->len : 0;
+}
+
+const ds4_tokens *ds4_session_bank_tokens(ds4_session *s, uint32_t bank) {
+    return bank_frontier_tokens(s, bank);
+}
+
+int ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
+                                   const ds4_tokens *prompt) {
+    const ds4_tokens *t = bank_frontier_tokens(s, bank);
+    if (!t || !prompt) return 0;
+    int n = t->len < prompt->len ? t->len : prompt->len;
+    int i = 0;
+    while (i < n && t->v[i] == prompt->v[i]) i++;
+    return i;
+}
+
+
 
 static float dspark_base_top1_prob(const float *logits, int n) {
     float m = logits[0];

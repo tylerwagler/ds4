@@ -345,6 +345,18 @@ int  ds4_session_bank_count(ds4_session *s);
 int  ds4_session_bank_repoint(ds4_session *s, uint32_t bank);
 void ds4_session_bank_state_save(ds4_session *s, uint32_t bank);
 bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank);
+/* Per-bank frontier readers for a bank-pooled session: the committed length,
+ * token history, and common-prefix-with-prompt of ONE bank, correct even when
+ * that bank is not the currently-installed one (the live bank reads the live
+ * checkpoint; others read their saved host carry).  ds4_session_pos/_tokens/
+ * _common_prefix describe only the live bank, so server routing and /metrics
+ * must use these for non-active banks.  Pure host reads (no CUDA); the caller
+ * must keep idle banks' carries current (bank_state_save at job end). Return
+ * 0 / NULL for an out-of-range or never-populated bank. */
+int  ds4_session_bank_pos(ds4_session *s, uint32_t bank);
+const ds4_tokens *ds4_session_bank_tokens(ds4_session *s, uint32_t bank);
+int  ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
+                                    const ds4_tokens *prompt);
 int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,
