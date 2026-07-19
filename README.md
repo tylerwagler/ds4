@@ -53,6 +53,13 @@ This fork also stands on:
 - **[PrismaQuant](https://github.com/RobTand/prismaquant)** (Rob Tand) — the
   measured-KL mixed-precision quant allocation approach used to build this
   fork's GGUFs (see `gguf-tools/prisma/`).
+- **[REAP](https://arxiv.org/abs/2510.13999)** (Router-weighted Expert
+  Activation Pruning) — the expert-pruning method behind the production build's
+  25%-pruned routed experts.
+- **[eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4)**
+  — the REAP-25 (LiveCodeBench-50-calibrated) DeepSeek-V4-Flash expert-survivor
+  set, vendored as index metadata in `gguf-tools/reap/` and used by the v5mx
+  build's REAP transplant.
 
 ## Status
 
@@ -85,6 +92,11 @@ next sections.
   how the calibration prompt corpus is generated.
 - [gguf-tools/prisma/README.md](gguf-tools/prisma/README.md): measured-KL
   per-layer expert-format allocation, used to build the mixed-quant GGUFs.
+- [gguf-tools/reap/README.md](gguf-tools/reap/README.md): the vendored REAP-25
+  expert-survivor map and the Path-B transplant tool.
+- [REPRODUCE.md](REPRODUCE.md): the full end-to-end build DAG for the shipped
+  v5mx GGUF (templates → oracle → REAP transplant → imatrix → allocation →
+  mixed-quant → DSpark merge).
 - [docs/MODEL_CARD.md](docs/MODEL_CARD.md): synopsis of the official DeepSeek
   V4 model card, with the architecture details that matter for DS4.
 - [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
@@ -144,7 +156,11 @@ A few things this fork's GGUFs do beyond upstream:
 - **REAP expert pruning.** Production GGUFs are REAP expert-pruned: expert
   tensors are dense-trimmed to a per-layer survivor count while the router
   stays padded to the full expert count. This trades a small quality margin
-  for significant residency headroom on the GB10.
+  for significant residency headroom on the GB10. The survivor set is the
+  REAP-25 (LiveCodeBench-50-calibrated) prune published by
+  [eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4),
+  vendored and transplanted per `gguf-tools/reap/` (full build DAG in
+  [REPRODUCE.md](REPRODUCE.md)).
 - **Merged DSpark drafter.** The speculative drafter's tensors ship inside
   the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
   speculative decoding section below.
