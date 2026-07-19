@@ -859,8 +859,21 @@ typedef struct {
     uint64_t astate_bank_bytes[DS4_MAX_LAYER];/* attn compressor frontier lane */
     uint64_t istate_bank_bytes[DS4_MAX_LAYER];/* indexer compressor frontier lane */
     ds4_gpu_tensor *raw[DS4_MAX_LAYER];
-    ds4_gpu_tensor *comp[DS4_MAX_LAYER];
-    ds4_gpu_tensor *index[DS4_MAX_LAYER];
+    /* Tier-2 task #55 (increment 2a): the ctx-scaled comp/index caches are now
+     * ONE cudaMallocManaged allocation PER BANK (comp[il][bank]) instead of one
+     * n_banks*bank_bytes slab — so the increment-2 eviction guard can cudaFree a
+     * single idle bank's physical directly (the only reclaim primitive that
+     * returns memory on GB10; Step-1). The stride stays UNIFORM 1M (comp_bank_bytes
+     * is per-layer, bank-independent) — this is NOT B-full (no variable caps). The
+     * seq_id-scattered batched-decode READ kernels can no longer address a bank as
+     * base + seq_id*comp_cap across one slab, so they take a per-bank BASE-POINTER
+     * table (comp_bases[il]/index_bases[il]): a device array of the n_banks
+     * comp[il][*]->ptr, indexed by seq_id[t]. NULL when the pool is disabled
+     * (single-session paths use the repointed view). */
+    ds4_gpu_tensor *comp[DS4_MAX_LAYER][DS4_MSEQ_MAX];
+    ds4_gpu_tensor *index[DS4_MAX_LAYER][DS4_MSEQ_MAX];
+    ds4_gpu_tensor *comp_bases[DS4_MAX_LAYER];  /* [n_banks] device ptr array: comp[il][b]->ptr */
+    ds4_gpu_tensor *index_bases[DS4_MAX_LAYER]; /* [n_banks] device ptr array: index[il][b]->ptr */
     ds4_gpu_tensor *askv[DS4_MAX_LAYER];
     ds4_gpu_tensor *assc[DS4_MAX_LAYER];
     ds4_gpu_tensor *iskv[DS4_MAX_LAYER];
@@ -2106,6 +2119,11 @@ uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g);
 ds4_gpu_tensor *gpu_graph_bank_raw_pool(ds4_gpu_graph *g, uint32_t il);
 ds4_gpu_tensor *gpu_graph_bank_attn_comp_pool(ds4_gpu_graph *g, uint32_t il);
 ds4_gpu_tensor *gpu_graph_bank_index_comp_pool(ds4_gpu_graph *g, uint32_t il);
+/* Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,
+ * indexed by seq_id) the batched READ kernels use in place of base +
+ * seq_id*comp_cap over one slab. NULL when the pool is disabled. */
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_bases(ds4_gpu_graph *g, uint32_t il);
+ds4_gpu_tensor *gpu_graph_bank_index_comp_bases(ds4_gpu_graph *g, uint32_t il);
 /* Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */

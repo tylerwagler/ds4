@@ -1636,6 +1636,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               index_scale,
                                                                               sp_view, ss_view,
+                                                                              mseq ? gpu_graph_bank_index_comp_bases(g, il) : NULL,
                                                                               mseq ? g->layer_comp_cap[il] : 0,
                                                                               mseq ? nb : 1) != 0;
                     if (ok && index_stage_profile) {
@@ -1702,6 +1703,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   DS4_N_HEAD_DIM,
                                                                                   (uint32_t)gpu_graph_raw_f16_enabled(),
                                                                                   sp_view, ss_view,
+                                                                                  mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
                                                                                   mseq ? g->layer_comp_cap[il] : 0,
                                                                                   mseq ? nb : 1) != 0;
                         if (ok && index_stage_profile) {
@@ -1749,6 +1751,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           (uint32_t)gpu_graph_raw_f16_enabled(),
                                                                           mseq ? g->batch_positions : NULL,
                                                                           mseq ? g->batch_seq_id : NULL,
+                                                                          mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
                                                                           mseq ? g->layer_comp_cap[il] : 0,
                                                                           mseq ? nb : 1) != 0;
             }
@@ -1803,7 +1806,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           DS4_N_INDEXER_HEAD_DIM,
                                                                           ratio,
                                                                           index_scale,
-                                                                          NULL, NULL, 0, 1) != 0;
+                                                                          NULL, NULL, NULL, 0, 1) != 0;
                 if (ok && index_stage_profile) {
                     ok = gpu_graph_indexer_stage_profile_boundary("score",
                                                                     il,
@@ -1864,7 +1867,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
                                                                               (uint32_t)gpu_graph_raw_f16_enabled(),
-                                                                              NULL, NULL, 0, 1) != 0;
+                                                                              NULL, NULL, NULL, 0, 1) != 0;
                     if (ok && index_stage_profile) {
                         ok = gpu_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -2011,7 +2014,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
                                                                               (uint32_t)gpu_graph_raw_f16_enabled(),
-                                                                              NULL, NULL, 0, 1) != 0;
+                                                                              NULL, NULL, NULL, 0, 1) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,

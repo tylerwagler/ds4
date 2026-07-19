@@ -139,8 +139,14 @@ void gpu_graph_free(ds4_gpu_graph *g) {
      * these when the pool was enabled; view frees release no memory). */
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->banks.raw[il]);
-        ds4_gpu_tensor_free(g->banks.comp[il]);
-        ds4_gpu_tensor_free(g->banks.index[il]);
+        /* Per-bank split comp/index allocations (increment 2a): each bank is its
+         * own cudaMallocManaged so the eviction guard can cudaFree it directly. */
+        for (uint32_t bk = 0; bk < DS4_MSEQ_MAX; bk++) {
+            ds4_gpu_tensor_free(g->banks.comp[il][bk]);
+            ds4_gpu_tensor_free(g->banks.index[il][bk]);
+        }
+        ds4_gpu_tensor_free(g->banks.comp_bases[il]);
+        ds4_gpu_tensor_free(g->banks.index_bases[il]);
         ds4_gpu_tensor_free(g->banks.askv[il]);
         ds4_gpu_tensor_free(g->banks.assc[il]);
         ds4_gpu_tensor_free(g->banks.iskv[il]);
