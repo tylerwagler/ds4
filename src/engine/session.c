@@ -2110,6 +2110,17 @@ uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
                                           e->dspark_ready, (uint32_t)n_banks);
 }
 
+uint64_t ds4_engine_demand_paged_bytes_per_bank(ds4_engine *e, int ctx_size) {
+    if (!e || ctx_size <= 0) return 0;
+    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    return gpu_graph_demand_paged_bytes_per_bank((uint32_t)ctx_size);
+}
+
+uint64_t ds4_session_touched_kv_bytes(const ds4_session *s) {
+    if (!s) return 0;
+    return gpu_graph_touched_kv_bytes(&s->graph);
+}
+
 
 
 void ds4_session_free(ds4_session *s) {

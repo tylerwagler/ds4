@@ -2094,6 +2094,12 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank);
 /* Effective pool size for banked kernel launches: banks.n_banks, or 1 when
  * the pool is disabled (the classic tensors act as bank 0). */
 uint32_t gpu_graph_bank_pool_count(const ds4_gpu_graph *g);
+/* Tier-2 overcommit (task #55): demand-paged comp+index VA bytes for ONE bank at
+ * a context (the overcommit-reserved, physical-on-touch part); and the EXACT
+ * touched (physically resident) demand-paged KV summed over the whole pool from
+ * the per-bank compressor frontier. See the definitions in gpu_diag.c. */
+uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
+uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g);
 /* Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */

@@ -182,6 +182,18 @@ uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size);
  * >= 1; 1 is the classic single-session cost. */
 uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
                                               int n_banks);
+/* Tier-2 overcommit (task #55): demand-paged comp+index bytes for ONE bank at a
+ * context — the physical-on-touch VA the overcommit auto-size reserves but does
+ * NOT charge at admission (only the eager floor is charged). 0 if no session
+ * could be priced. */
+uint64_t ds4_engine_demand_paged_bytes_per_bank(ds4_engine *e, int ctx_size);
+/* Tier-2 overcommit (task #55): EXACT touched (physically resident) demand-paged
+ * KV bytes across the pool, summed from the per-bank compressor frontier
+ * (deterministic; no MemAvailable). The eviction guard triggers on this; the
+ * accounting-exactness gate proves it matches the physical cudaMemGetInfo delta.
+ * For the current bank the live frontier is used; idle banks use their captured
+ * frontier — capture the current bank first if you need it fully current. */
+uint64_t ds4_session_touched_kv_bytes(const ds4_session *s);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any

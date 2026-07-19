@@ -440,6 +440,33 @@ uint64_t gpu_graph_session_bytes_banked(
 
 
 
+/* Tier-2 overcommit (task #55, increment 1): the DEMAND-PAGED (cudaMallocManaged,
+ * physical-on-touch) bytes of ONE bank's ctx-scaled comp + index caches at the
+ * given context.  This is exactly the comp/index portion of
+ * gpu_graph_kv_cache_bytes_for_context (steering.c) MINUS the eager raw ring —
+ * the part the overcommit auto-size reserves as VA only and does NOT charge at
+ * admission (the eager floor is charged; physical materializes as the frontier
+ * grows, tracked by gpu_graph_touched_kv_bytes).  Row widths track the ACTUAL
+ * packed storage (DS4_ATTN_PACK attn comp + MXFP4 indexer), matching the slab
+ * allocator in gpu_graph_bank_slabs_alloc. */
+uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
+        bytes += comp_cap * attn_row;
+        if (ratio == 4) bytes += comp_cap * idx_row;
+    }
+    return bytes;
+}
+
+
+
 /* DS4_KV_MANAGED: measurement override for the managed-vs-device placement of
  * the PERSISTENT KV caches (raw ring + attn/index comp caches), for the
  * multi-session UVM over-provisioning design (plan addendum 2026-07-14 —
@@ -766,6 +793,44 @@ void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank) {
     for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
     g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
     g->dspark_prompt_lo = g->ms_dspark_prompt_lo[bank];
+}
+
+/* Tier-2 overcommit (task #55, increment 1): EXACT touched (physically resident)
+ * demand-paged KV bytes across the whole pool — Σ over live banks Σ over layers
+ * of (comp frontier rows × comp row bytes + index frontier rows × index row
+ * bytes).  Deterministic from the position-driven compressor frontier; no
+ * cudaMemGetInfo / MemAvailable.  This is the number the increment-2 eviction
+ * guard triggers on, and the accounting-exactness gate proves it tracks the real
+ * physical delta.  The CURRENT bank's frontier is live in layer_n_comp /
+ * layer_n_index_comp; idle banks keep their frontier in ms_n_comp / ms_n_index_comp
+ * (captured on switch-away).  Pool disabled (n_banks==0) → pool_count 1, cur 0 →
+ * the classic single-session frontier (layer_n_comp) is summed. Only the ctx-
+ * scaled comp/index are counted; the eager raw ring + state lanes are the fixed
+ * floor and are already resident (not part of the growing touched set). */
+uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g) {
+    if (!g) return 0;
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint32_t nb = gpu_graph_bank_pool_count(g);
+    const uint32_t cur = g->banks.n_banks ? g->banks.cur_bank : 0u;
+    uint64_t bytes = 0;
+    for (uint32_t b = 0; b < nb; b++) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            const uint32_t ncomp = (b == cur) ? g->layer_n_comp[il]
+                                              : g->ms_n_comp[b][il];
+            bytes += (uint64_t)ncomp * attn_row;
+            if (ratio == 4) {
+                const uint32_t nidx = (b == cur) ? g->layer_n_index_comp[il]
+                                                 : g->ms_n_index_comp[b][il];
+                bytes += (uint64_t)nidx * idx_row;
+            }
+        }
+    }
+    return bytes;
 }
 
 bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
