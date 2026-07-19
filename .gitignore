@@ -40,3 +40,4 @@ __pycache__/
 
 # --- working files (see CLAUDE.md: all temp/scratch files live here) ---
 /temp/
+/tests/bank_evict_restore_gate
