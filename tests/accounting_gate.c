@@ -113,13 +113,17 @@ int main(int argc, char **argv) {
     if (!toks) { fprintf(stderr, "oom\n"); return 1; }
     for (int i = 0; i < peak; i++) toks[i] = base.v[i % base.len];
 
-    /* WARMUP: the FIRST prefill also materializes the one-time lazy working set
-     * (chunk-sized batch buffers ~4 GiB, DSpark bulk_h, logits) — a ~6 GiB
-     * physical jump that is NOT comp/index and would pollute the first
-     * increment. Prefill a short warmup so the measured baseline is fully warm;
-     * every subsequent increment is then pure demand-paged comp/index growth. */
+    /* WARMUP: the FIRST prefill materializes the one-time lazy working set — not
+     * just the chunk-sized batch buffers/DSpark/logits, but also the FULL-WIDTH
+     * (prefill_cap) cutlass MXFP4 expert workspace, which only appears once a
+     * full-width chunk runs (~0.7 GiB extra on the type-40 model). A short 2048
+     * warmup never runs a full chunk, so that workspace polluted the first
+     * increment. Warm up with the ENTIRE first level (multiple full-width chunks),
+     * measure the baseline there, and assert on the subsequent increments — each
+     * is then pure demand-paged comp/index growth. */
+    if (n_levels < 2) { fprintf(stderr, "accounting_gate: need >=2 fill levels\n"); return 2; }
     {
-        const int warm = 2048 < levels[0] ? 2048 : levels[0] / 2;
+        const int warm = levels[0];
         ds4_tokens p;
         memset(&p, 0, sizeof(p));
         p.v = toks;
@@ -147,7 +151,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "accounting_gate: warm baseline free=%.3f GiB total=%.3f GiB touched=%.3f GiB\n",
             (double)free0 / GIB, (double)total0 / GIB, (double)touched_prev / GIB);
 
-    for (int i = 0; i < n_levels; i++) {
+    for (int i = 1; i < n_levels; i++) {   /* level 0 is the warm baseline */
         const int len = levels[i];
         ds4_tokens p;
         memset(&p, 0, sizeof(p));
