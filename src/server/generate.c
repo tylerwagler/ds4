@@ -10,7 +10,11 @@
  * bank first. No-op in classic mode or when `bank` is already live. Called at
  * the top of every per-slot worker op (gen_begin, generate_job_step,
  * worker_evict_one) so all sl->sess touches inside that op are live-correct. */
-static void server_bank_switch(server *s, int bank);
+/* Returns false only when the target is a guard-spilled bank whose restore FAILED
+ * (KV unrecoverable): the bank is NOT installed and cur_bank is unchanged, so the
+ * caller MUST fail the request rather than sample/commit on the wrong bank's KV
+ * (review finding 1). True on success (or classic mode / no-op). */
+static bool server_bank_switch(server *s, int bank);
 /* Bank-aware common-prefix of `sl` against `prompt` (scheduling reads). */
 static int server_slot_common_prefix(const server *s, const session_slot *sl,
                                      const ds4_tokens *prompt);
@@ -891,8 +895,15 @@ static void gen_begin(server *s, session_slot *sl) {
     job *j = g->j;
     /* Tier-2: install this slot's bank before ANY sl->sess touch below (all the
      * pos/common-prefix/tokens reads and the prefill sync run against the live
-     * bank). No-op in classic mode / when already live. */
-    server_bank_switch(s, sl->bank);
+     * bank). No-op in classic mode / when already live. Finding 1: a failed spill
+     * restore (KV unrecoverable) must fail the request, not run against another
+     * bank's KV. */
+    if (!server_bank_switch(s, sl->bank)) {
+        snprintf(g->err, sizeof g->err,
+                 "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        gen_prefill_fail(s, sl);
+        return;
+    }
     const int old_pos = ds4_session_pos(sl->sess);
     const int common = ds4_session_common_prefix(sl->sess, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -2171,8 +2182,15 @@ static void generate_job_step(server *s, session_slot *sl) {
     /* Tier-2: install this slot's bank before any engine work this quantum.
      * After another slot (or a fresh bind) was serviced in between, the pool's
      * live bank may be someone else's; switch back to ours. No-op in classic
-     * mode / when already live. */
-    server_bank_switch(s, sl->bank);
+     * mode / when already live. Finding 1: fail the request on a failed spill
+     * restore rather than run engine work against the wrong bank's KV. */
+    if (!server_bank_switch(s, sl->bank)) {
+        snprintf(g->err, sizeof g->err,
+                 "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return;
+    }
     /* Tier-2: a slot leaving the batched lane (now at GEN_FINISH) has its bank
      * installed above (bank_state_restore cleared the multiseq poison and
      * installed the driver-maintained device counters); catch the host
@@ -2362,10 +2380,10 @@ typedef enum {
  * is installed. Defined below (near the guard); forward-declared for the switch. */
 static bool server_bank_restore_spilled(server *s, int bank);
 
-static void server_bank_switch(server *s, int bank) {
-    if (s->pool_banks <= 0) return;               /* classic mode */
-    if (bank < 0 || bank >= s->pool_banks) return;
-    if (bank == s->live_bank && !s->slots[bank].spilled) return; /* already installed */
+static bool server_bank_switch(server *s, int bank) {
+    if (s->pool_banks <= 0) return true;          /* classic mode */
+    if (bank < 0 || bank >= s->pool_banks) return true;
+    if (bank == s->live_bank && !s->slots[bank].spilled) return true; /* already installed */
     ds4_session *pool = s->slots[0].sess;
     /* Snapshot the outgoing bank so its carry stays readable while idle, and
      * record its committed frontier for metrics/routing. live_bank < 0 is the
@@ -2377,13 +2395,16 @@ static void server_bank_switch(server *s, int bank) {
         ds4_session_bank_state_save(pool, (uint32_t)s->live_bank);
     }
     /* Tier-2 2b: a guard-spilled target has no physical — reallocate + reload its
-     * KV bit-identically from disk before installing (the reload-stall cost). */
+     * KV bit-identically from disk before installing (the reload-stall cost). On
+     * restore failure the bank is NOT installed and cur_bank is unchanged; return
+     * false so the caller fails the request (finding 1). */
     if (s->slots[bank].spilled) {
-        if (!server_bank_restore_spilled(s, bank)) return;   /* failed — leave state; request errors */
+        if (!server_bank_restore_spilled(s, bank)) return false;
     }
     ds4_session_bank_state_restore(pool, (uint32_t)bank);
     s->live_bank = bank;
     s->slots[bank].committed_pos = ds4_session_pos(pool);
+    return true;
 }
 
 int server_slot_frontier_pos(const server *s, const session_slot *sl) {
@@ -2436,8 +2457,10 @@ static session_slot *provision_bank(server *s, provision_refusal *refusal) {
     session_slot *sl = &s->slots[idx];
     ds4_session *pool = s->slots[0].sess;
     /* Install and reset the bank to an empty conversation with a valid (empty)
-     * host carry, so routing/metrics read pos 0 and gen_begin cold-prefills. */
-    server_bank_switch(s, idx);
+     * host carry, so routing/metrics read pos 0 and gen_begin cold-prefills. A
+     * free (SLOT_EVICTED) bank is never guard-spilled (spilled banks keep their
+     * sess), so this switch never restores — the result is unconditionally true. */
+    (void)server_bank_switch(s, idx);
     ds4_session_invalidate(pool);
     ds4_session_bank_state_save(pool, (uint32_t)idx);
     sl->sess = pool;
@@ -2903,12 +2926,14 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
     session_slot *sl = &s->slots[vi];
 
     /* Tier-2: install the victim's bank so the snapshot store below reads its
-     * OWN frontier (not the pool's live cursor). No-op in classic mode. */
-    server_bank_switch(s, sl->bank);
-    const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
+     * OWN frontier (not the pool's live cursor). server_bank_switch restores a
+     * guard-spilled victim first; if that restore fails we cannot snapshot its KV,
+     * so skip it (this path is discarding the conversation anyway). */
+    const bool switched = server_bank_switch(s, sl->bank);
+    const ds4_tokens *tokens = switched ? ds4_session_tokens(sl->sess) : NULL;
     const int live_tokens = tokens ? tokens->len : 0;
     bool stored = false;
-    if (s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
+    if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         stored = kv_cache_store_current(s, sl, "evict");
     }
     if (!stored && live_tokens > 0) {
@@ -2970,6 +2995,17 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
     sl->tokens_emitted = 0;
     sl->last_serviced_us = 0;
     sl->continued_last_store_tokens = 0;
+    /* Tier-2 2b: a slot being evicted for reuse must not carry a stale guard-spill
+     * flag or leave an orphan spill file (invariant: physical freed IFF spilled).
+     * server_bank_switch above restored a spilled victim (physical present, flag
+     * cleared); belt-and-suspenders in case that restore failed. */
+    if (s->pool_banks > 0 && sl->spilled) {
+        char spath[600];
+        snprintf(spath, sizeof spath, "%s/spill-bank-%u.kv", s->spill_dir, (unsigned)sl->bank);
+        remove(spath);
+        (void)ds4_session_bank_alloc_physical(s->slots[0].sess, sl->bank); /* empty physical for reuse */
+        sl->spilled = false;
+    }
     pthread_mutex_lock(&s->mu);
     s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
     const uint64_t committed_now = s->kv_committed_bytes;
@@ -3200,7 +3236,7 @@ static bool server_bank_restore_spilled(server *s, int bank) {
 static bool server_spill_bank(server *s, session_slot *victim) {
     ds4_session *pool = s->slots[0].sess;
     const uint32_t vb = victim->bank;
-    server_bank_switch(s, (int)vb);               /* install victim (not spilled yet) */
+    (void)server_bank_switch(s, (int)vb);         /* victim never spilled (pick excludes) → true */
     char path[600];
     snprintf(path, sizeof path, "%s/spill-bank-%u.kv", s->spill_dir, vb);
     FILE *fp = fopen(path, "wb");
@@ -3222,9 +3258,15 @@ static bool server_spill_bank(server *s, session_slot *victim) {
     ds4_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
     if (!ds4_session_bank_state_restore(pool, 0)) { remove(path); return false; }
     s->live_bank = 0;
+    /* Finding 4: free_physical returns false ONLY on a precondition refusal (nothing
+     * freed, bank still live) — abort the spill and drop the unused disk snapshot.
+     * A true return means the bank IS evicted (slabs freed), so mark it spilled
+     * unconditionally — no half-evicted state (spilled=false over freed slabs). */
     if (!ds4_session_bank_free_physical(pool, vb)) {
-        server_log(DS4_LOG_WARNING, "ds4-server: guard: free_physical bank %u failed", vb);
-        return false;                              /* KV is on disk; leave not-spilled */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: guard: free_physical bank %u refused (still cur?) — spill aborted", vb);
+        remove(path);
+        return false;
     }
     victim->spilled = true;
     victim->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
@@ -3268,6 +3310,11 @@ static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
             pool, (uint32_t)DS4_SERVER_DECODE_QUANTUM_TOKENS);
     const uint64_t delta = (uint64_t)n * dpb;      /* all n live banks grow */
     const uint64_t bound = s->guard_touched_budget;
+    /* Finding 2: free_physical zeroes a spilled bank's frontier so touched drops
+     * after each spill — the loop then re-evaluates and evicts exactly the minimum
+     * (usually ONE) per breach, NOT the whole idle set (the cascade bug). The
+     * per-quantum count log lets the smoke assert no cascade. */
+    int spilled_this_quantum = 0;
     for (;;) {
         const uint64_t projected = ds4_session_touched_kv_bytes(pool) + delta;
         if (projected <= bound) break;             /* fits */
@@ -3289,6 +3336,14 @@ static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
             break;
         }
         if (!server_spill_bank(s, &s->slots[vi])) break;   /* spill failed — stop */
+        spilled_this_quantum++;
+    }
+    if (spilled_this_quantum > 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: guard: spilled %d bank(s) this quantum (touched now %.2f GiB / %.2f GiB)",
+                   spilled_this_quantum,
+                   (double)ds4_session_touched_kv_bytes(pool) / (1024.0*1024.0*1024.0),
+                   (double)bound / (1024.0*1024.0*1024.0));
     }
 }
 
@@ -3317,7 +3372,16 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
         session_slot *sl = dec[i];
         gen_state *g = sl->gen;
         if (g->batch_feed_valid) continue;
-        server_bank_switch(s, sl->bank);
+        /* Finding 1: a failed spill restore must NOT sample this slot's feed token
+         * on another bank's KV — fail the slot cleanly and drop it from the batch. */
+        if (!server_bank_switch(s, sl->bank)) {
+            snprintf(g->err, sizeof g->err,
+                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+            g->finish = "error";
+            g->batch_feed_valid = false;
+            g->phase = GEN_FINISH;
+            continue;
+        }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token =

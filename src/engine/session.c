@@ -2228,13 +2228,23 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
         if (fread(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv load: count read"); return 1; }
         comp_cnt[il] = cnt[0]; idx_cnt[il] = cnt[1];
     }
-    if (!gpu_graph_bank_alloc_physical(g, bank)) { payload_set_err(err, errlen, "bank kv load: alloc_physical OOM"); return 1; }
-    if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
+    /* Review finding 3 — TRANSACTIONAL restore. Validate every frontier count
+     * against the per-layer cap BEFORE any device change: a short read or corrupt
+     * header must never leave the bank advertising row counts over unwritten KV
+     * (an OOB managed read on the next decode). */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->ms_n_comp[bank][il] = comp_cnt[il];
-        g->ms_n_index_comp[bank][il] = idx_cnt[il];
+        if (ds4_layer_compress_ratio(il) == 0) continue;
+        if (comp_cnt[il] > g->layer_comp_cap[il] || idx_cnt[il] > g->layer_comp_cap[il]) {
+            payload_set_err(err, errlen,
+                            "bank kv load: frontier count exceeds cap (corrupt snapshot)");
+            return 1;
+        }
     }
-    gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
+    if (!gpu_graph_bank_alloc_physical(g, bank)) { payload_set_err(err, errlen, "bank kv load: alloc_physical OOM"); return 1; }
+    /* H2D every row into the bank's OWN views (which address comp[il][bank]
+     * directly — no repoint) BEFORE touching the live frontier. On any read/H2D
+     * failure the bank's ms counters stay 0 (from free_physical) so it advertises
+     * an EMPTY frontier — no OOB — and the caller fails the request. */
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
         ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
@@ -2264,6 +2274,16 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
             }
         }
     }
+    /* Every row is now on-device — COMMIT: repoint (make bank live), then install
+     * the frontier. This is the single point after which the bank advertises its
+     * rows, and each is backed by written KV. If repoint fails the ms counters stay
+     * 0 (empty, safe). */
+    if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->ms_n_comp[bank][il] = comp_cnt[il];
+        g->ms_n_index_comp[bank][il] = idx_cnt[il];
+    }
+    gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
     return 0;
 }
 

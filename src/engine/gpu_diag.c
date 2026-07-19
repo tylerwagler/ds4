@@ -659,15 +659,25 @@ static bool bank_bases_set(ds4_gpu_graph *g, uint32_t il, uint32_t bank,
 /* Tier-2 task #55 increment 2b — EVICTION RECLAIM primitive. Free ONE idle bank's
  * own comp/index physical by a DIRECT cudaFree of its per-bank split allocations
  * (the only primitive that returns physical on GB10; Step-1/2a reclaim gate).
- * Nulls the slab pointers and their base-table entries. MUST NOT be the installed
- * (cur) bank — the caller repoints away first; refuses otherwise. The eager raw
- * ring + state lanes (contiguous, bounded floor) are NOT freed and survive the
- * evict/restore cycle in place. */
+ * Nulls the slab pointers and their base-table entries, and ZEROES this bank's
+ * frontier counters (ms_n_comp/ms_n_index_comp) so touched_kv_bytes stops counting
+ * a freed bank — else the guard's projected never drops after a spill and it
+ * cascades, evicting every idle bank on one breach (review finding 2). The disk
+ * snapshot preserves the real counts for restore. MUST NOT be the installed (cur)
+ * bank — the caller repoints away first. The eager raw ring + state lanes
+ * (contiguous, bounded floor) are NOT freed and survive the cycle in place.
+ *
+ * Contract (review finding 4 — no ambiguous half-evicted state): returns FALSE
+ * ONLY on a precondition refusal (bad args / cur bank) where NOTHING was freed and
+ * the bank stays live. Once freeing begins it returns TRUE — the bank IS physically
+ * evicted; a base-table device-write failure is logged HARD but does not un-evict
+ * the bank (the stale table entry is never read while the bank is evicted, and
+ * restore rebuilds it), so the caller can unconditionally mark it spilled. */
 bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank) {
     if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
-    if (bank == g->banks.cur_bank) return false;   /* never free the installed bank */
+    if (bank == g->banks.cur_bank) return false;   /* precondition: never free cur */
     ds4_bank_slabs *b = &g->banks;
-    bool ok = true;
+    bool table_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -677,9 +687,17 @@ bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank) {
             ds4_gpu_tensor_free(b->index[il][bank]);
             b->index[il][bank] = NULL;
         }
-        ok = ok && bank_bases_set(g, il, bank, NULL, NULL);
+        table_ok = bank_bases_set(g, il, bank, NULL, NULL) && table_ok;
+        /* Finding 2: a freed bank contributes 0 resident KV. */
+        g->ms_n_comp[bank][il] = 0;
+        g->ms_n_index_comp[bank][il] = 0;
     }
-    return ok;
+    if (!table_ok) {
+        fprintf(stderr,
+                "ds4: WARNING free_physical bank %u: base-table NULL device-write "
+                "failed (CUDA); bank IS evicted, table is rebuilt on restore\n", bank);
+    }
+    return true;   /* bank is physically evicted (slabs freed) */
 }
 
 /* Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted

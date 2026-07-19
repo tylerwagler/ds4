@@ -178,6 +178,71 @@ int main(int argc, char **argv) {
           sum_after, sum_before);
     fprintf(stderr, "evict_restore_gate: restored checksum=%016" PRIx64 " (bit-identical: %s)\n",
             sum_after, sum_after == sum_before ? "YES" : "NO");
+
+    /* ===== Review finding 2 — a freed bank stops counting toward touched (so the
+     * guard evicts exactly the minimum, not the whole idle set / cascade). Prefill
+     * bank 1 too; with bank 0 cur, free bank 1 and assert touched drops by EXACTLY
+     * bank 1's frontier (bank 0's contribution remains). ===== */
+    CHECK(ds4_session_bank_state_restore(s, 1), "finding2: repoint to bank 1");
+    ds4_session_invalidate(s);   /* clear the carried-over bank-0 checkpoint so the
+                                  * sync actually prefills bank 1 from scratch */
+    { ds4_tokens p1; memset(&p1, 0, sizeof p1); p1.v = toks; p1.len = p1.cap = L;
+      char e2[256];
+      CHECK(ds4_session_sync(s, &p1, e2, sizeof e2) == 0, "finding2: bank1 sync: %s", e2); }
+    gpu_graph_bank_counters_capture(&s->graph, 1);
+    CHECK(ds4_session_bank_pos(s, 1) == L, "finding2: bank1 prefill pos=%d != %d (test setup)",
+          ds4_session_bank_pos(s, 1), L);
+    CHECK(ds4_session_bank_state_restore(s, 0), "finding2: repoint back to bank 0");
+    (void)ds4_gpu_synchronize();
+    const uint64_t t_b0 = ds4_session_bank_touched_kv_bytes(s, 0);
+    const uint64_t t_b1 = ds4_session_bank_touched_kv_bytes(s, 1);
+    const uint64_t t_both = ds4_session_touched_kv_bytes(s);
+    CHECK(t_both == t_b0 + t_b1, "finding2: pool touched (%.3f) != bank0+bank1 (%.3f+%.3f) GiB",
+          (double)t_both/GIB, (double)t_b0/GIB, (double)t_b1/GIB);
+    CHECK(ds4_session_bank_free_physical(s, 1), "finding2: free bank 1 (cur is 0)");
+    const uint64_t t_after = ds4_session_touched_kv_bytes(s);
+    CHECK(t_after == t_b0,
+          "finding2 (CASCADE BUG): touched after free bank1 = %.3f GiB, expected bank0-only %.3f GiB "
+          "— a freed bank still counts, so the guard would spill every idle bank on one breach",
+          (double)t_after/GIB, (double)t_b0/GIB);
+    fprintf(stderr, "evict_restore_gate: finding-2 no-cascade: touched both=%.3f -> after free bank1=%.3f "
+            "(bank0=%.3f) : %s\n", (double)t_both/GIB, (double)t_after/GIB, (double)t_b0/GIB,
+            t_after == t_b0 ? "OK" : "FAIL");
+
+    /* ===== Review finding 3 — a corrupt/short snapshot must fail kv_load SAFELY:
+     * validate counts <= cap, don't install rows over unwritten KV. Bank 1 is now
+     * freed (frontier 0). ===== */
+    const char *cpath = "/home/tyler/Projects/AI/temp/tier2-inc1/corrupt.kvsnap";
+    /* (a) count > cap. */
+    { FILE *fp = fopen(cpath, "wb");
+      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)DS4_N_LAYER };
+      fwrite(hdr, sizeof hdr, 1, fp);
+      for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) { uint32_t c[2] = { 0xFFFFFFFFu, 0u }; fwrite(c, sizeof c, 1, fp); }
+      fclose(fp);
+      fp = fopen(cpath, "rb");
+      const int rc = ds4_session_bank_kv_load(s, 1, fp, err, sizeof err);
+      fclose(fp);
+      CHECK(rc != 0, "finding3(a): kv_load ACCEPTED a count > cap");
+      CHECK(ds4_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(a): bank1 advertises rows after failed load");
+      fprintf(stderr, "evict_restore_gate: finding-3(a) count>cap rejected: rc=%d touched(1)=%.3f : %s\n",
+              rc, (double)ds4_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
+    /* (b) truncated: valid small counts but the row bytes are missing (short read). */
+    { FILE *fp = fopen(cpath, "wb");
+      uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)DS4_N_LAYER };
+      fwrite(hdr, sizeof hdr, 1, fp);
+      for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+          uint32_t c[2] = { ds4_layer_compress_ratio(il) ? 4u : 0u, 0u }; fwrite(c, sizeof c, 1, fp); }
+      /* no row data written -> fread of rows fails */
+      fclose(fp);
+      fp = fopen(cpath, "rb");
+      const int rc = ds4_session_bank_kv_load(s, 1, fp, err, sizeof err);
+      fclose(fp);
+      CHECK(rc != 0, "finding3(b): kv_load ACCEPTED a truncated file");
+      CHECK(ds4_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(b): bank1 advertises rows after truncated load");
+      fprintf(stderr, "evict_restore_gate: finding-3(b) truncated rejected: rc=%d touched(1)=%.3f : %s\n",
+              rc, (double)ds4_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
+    remove(cpath);
+
     remove(snap_path);
     free(toks);
     fprintf(stderr, "EVICT-RESTORE GATE: %s\n", g_fail ? "FAIL" : "PASS");
