@@ -2145,6 +2145,123 @@ uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank) {
     return gpu_graph_bank_touched_kv_bytes(&s->graph, bank);
 }
 
+/* Tier-2 task #55 increment 2b — RAW per-bank comp/index KV disk snapshot. The
+ * eviction guard's bit-identical mechanism (the transcript-keyed kv_cache is a
+ * semantic prefix-reuse cache, NOT a bitwise continuation — evict-restore-gate
+ * proved raw D2H->H2D is the only bit-identical path). D2H each layer's frontier
+ * rows to a TRANSIENT staging buffer, write to `fp`, and FREE it immediately —
+ * holding KV in host RAM reclaims nothing (unified pool). Precondition: `bank`
+ * is the installed (cur) bank so its live frontier is captured. */
+#define DS4_BANK_KV_MAGIC   0x4B564232u   /* "KVB2" */
+#define DS4_BANK_KV_VERSION 1u
+
+int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp,
+                             char *err, size_t errlen) {
+    if (!s || !fp) { payload_set_err(err, errlen, "bank kv save: bad args"); return 1; }
+    ds4_gpu_graph *g = &s->graph;
+    if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
+        payload_set_err(err, errlen, "bank kv save: no pool / bad bank"); return 1;
+    }
+    gpu_graph_bank_counters_capture(g, bank);   /* ms_n_*[bank] <- live layer_n_* */
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint32_t hdr[4] = { DS4_BANK_KV_MAGIC, DS4_BANK_KV_VERSION, bank, (uint32_t)DS4_N_LAYER };
+    if (fwrite(hdr, sizeof hdr, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: header write"); return 1; }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t cnt[2] = { g->ms_n_comp[bank][il], g->ms_n_index_comp[bank][il] };
+        if (fwrite(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: count write"); return 1; }
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t csz = (uint64_t)g->ms_n_comp[bank][il] * attn_row;
+        if (csz) {
+            uint8_t *buf = xmalloc((size_t)csz);
+            ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+            int ok = v && ds4_gpu_tensor_read(v, 0, buf, csz) != 0;
+            ds4_gpu_tensor_free(v);
+            if (ok) ok = fwrite(buf, 1, (size_t)csz, fp) == (size_t)csz;
+            free(buf);   /* TRANSIENT: freed before free_physical so RAM is reclaimed */
+            if (!ok) { payload_set_err(err, errlen, "bank kv save: comp D2H/write"); return 1; }
+        }
+        if (ratio == 4) {
+            const uint64_t isz = (uint64_t)g->ms_n_index_comp[bank][il] * idx_row;
+            if (isz) {
+                uint8_t *buf = xmalloc((size_t)isz);
+                ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                int ok = v && ds4_gpu_tensor_read(v, 0, buf, isz) != 0;
+                ds4_gpu_tensor_free(v);
+                if (ok) ok = fwrite(buf, 1, (size_t)isz, fp) == (size_t)isz;
+                free(buf);
+                if (!ok) { payload_set_err(err, errlen, "bank kv save: index D2H/write"); return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Restore a bank's comp/index KV from a raw snapshot: realloc physical (+base
+ * table rebuild), reinstall the frontier counters, and H2D each layer's rows.
+ * Leaves `bank` installed (cur). Host conversation state (checkpoint/pos) is the
+ * caller's bank_carry, restored separately by ds4_session_bank_state_restore. */
+int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
+                             char *err, size_t errlen) {
+    if (!s || !fp) { payload_set_err(err, errlen, "bank kv load: bad args"); return 1; }
+    ds4_gpu_graph *g = &s->graph;
+    if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
+        payload_set_err(err, errlen, "bank kv load: no pool / bad bank"); return 1;
+    }
+    uint32_t hdr[4];
+    if (fread(hdr, sizeof hdr, 1, fp) != 1 || hdr[0] != DS4_BANK_KV_MAGIC ||
+        hdr[1] != DS4_BANK_KV_VERSION || hdr[3] != (uint32_t)DS4_N_LAYER) {
+        payload_set_err(err, errlen, "bank kv load: bad header"); return 1;
+    }
+    uint32_t comp_cnt[DS4_MAX_LAYER] = {0}, idx_cnt[DS4_MAX_LAYER] = {0};
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t cnt[2];
+        if (fread(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv load: count read"); return 1; }
+        comp_cnt[il] = cnt[0]; idx_cnt[il] = cnt[1];
+    }
+    if (!gpu_graph_bank_alloc_physical(g, bank)) { payload_set_err(err, errlen, "bank kv load: alloc_physical OOM"); return 1; }
+    if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->ms_n_comp[bank][il] = comp_cnt[il];
+        g->ms_n_index_comp[bank][il] = idx_cnt[il];
+    }
+    gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t csz = (uint64_t)comp_cnt[il] * attn_row;
+        if (csz) {
+            uint8_t *buf = xmalloc((size_t)csz);
+            int ok = fread(buf, 1, (size_t)csz, fp) == (size_t)csz;
+            if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+                      ok = v && ds4_gpu_tensor_write(v, 0, buf, csz) != 0;
+                      ds4_gpu_tensor_free(v); }
+            free(buf);
+            if (!ok) { payload_set_err(err, errlen, "bank kv load: comp read/H2D"); return 1; }
+        }
+        if (ratio == 4) {
+            const uint64_t isz = (uint64_t)idx_cnt[il] * idx_row;
+            if (isz) {
+                uint8_t *buf = xmalloc((size_t)isz);
+                int ok = fread(buf, 1, (size_t)isz, fp) == (size_t)isz;
+                if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                          ok = v && ds4_gpu_tensor_write(v, 0, buf, isz) != 0;
+                          ds4_gpu_tensor_free(v); }
+                free(buf);
+                if (!ok) { payload_set_err(err, errlen, "bank kv load: index read/H2D"); return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
 
 
 void ds4_session_free(ds4_session *s) {

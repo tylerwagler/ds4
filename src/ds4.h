@@ -206,6 +206,12 @@ bool ds4_session_bank_free_physical(ds4_session *s, uint32_t bank);
 bool ds4_session_bank_alloc_physical(ds4_session *s, uint32_t bank);
 bool ds4_session_bank_is_evicted(const ds4_session *s, uint32_t bank);
 uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank);
+/* Raw per-bank comp/index KV disk snapshot (the eviction guard's bit-identical
+ * mechanism; the D2H staging is transient — freed before free_physical). save:
+ * precondition bank is installed (cur). load: reallocs physical + rebuilds the
+ * base table + reinstalls counters, leaving bank installed. Return 0 on success. */
+int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
+int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any
