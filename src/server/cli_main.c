@@ -286,18 +286,21 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 
 
-/* Tier-2 overcommit (task #55, increment 1). DS4_OVERCOMMIT=1/on/true switches
- * the pool auto-size from "N-bank pool must fit the budget in FULL" to "only the
- * EAGER floor (raw ring + state lanes + shared) for N banks must fit; the
- * ctx-scaled comp/index are VA-only, demand-paged, and NOT charged at
- * admission". This lets a large --ctx (e.g. 1M) come up with N>1 banks all
- * 1M-CAPABLE. OFF by default — DELIBERATELY: without the increment-2 proactive
- * eviction guard, banks that actually grow toward 1M can exceed the physical
- * budget, so overcommit is opt-in until the guard lands. DS4_MSEQ_BANKS still
- * pins and bypasses. Read once at startup, never on a hot path. */
+/* Tier-2 overcommit (task #55). DS4_OVERCOMMIT switches the pool auto-size from
+ * "N-bank pool must fit the budget in FULL" to "only the EAGER floor (raw ring +
+ * state lanes + shared) for N banks must fit; the ctx-scaled comp/index are
+ * VA-only, demand-paged, and NOT charged at admission". This lets a large --ctx
+ * (e.g. the 1M default) come up with N>1 banks all 1M-CAPABLE, each paying only
+ * for the KV it actually touches. DEFAULT ON as of v0.3.0: the increment-2
+ * proactive eviction guard has landed (generate.c worker_batched_decode_quantum),
+ * so banks that grow toward 1M are bounded by LRU-idle eviction before the
+ * physical budget is breached. DS4_OVERCOMMIT=0/off/false reverts to classic
+ * full-charge admission; DS4_MSEQ_BANKS still pins and bypasses auto-sizing.
+ * Read once at startup, never on a hot path. */
 static bool server_overcommit_enabled(void) {
     const char *v = getenv("DS4_OVERCOMMIT");
-    return v && (v[0] == '1' || !strcasecmp(v, "on") || !strcasecmp(v, "true"));
+    if (!v || !v[0]) return true; /* default ON (v0.3.0) */
+    return !(v[0] == '0' || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
 }
 
 /* Optional per-bank touched-KV reservation for the overcommit fit: the ctx whose
@@ -547,12 +550,15 @@ static server_config parse_options(int argc, char **argv) {
         },
         .host = "0.0.0.0",
         .port = 8000,
-        /* Tier-2 default: 128k context so the pool auto-sizes to the full
-         * 4-bank batching tier with comfortable headroom (measured fit: 4 banks
-         * = 7.07 GiB vs the ~14 GiB budget). Batching is ON by default. An
-         * operator who needs a single 1M-context session passes --ctx 1048576,
-         * which auto-sizes to N=1 (exact classic single-session behavior). */
-        .ctx_size = 131072,
+        /* v0.3.0 default: 1M context with overcommit ON (see
+         * server_overcommit_enabled). Every session is grow-to-1M-capable, but
+         * the ctx-scaled KV is demand-paged, so a short session pays only for
+         * what it touches — admission charges just the eager floor (~4 banks come
+         * up at ~6.4 GiB, NOT 4x the 1M worst case), and the increment-2 eviction
+         * guard bounds banks that actually grow toward 1M. An operator who wants
+         * a hard per-session cap passes a smaller --ctx; DS4_OVERCOMMIT=0 reverts
+         * to classic full-charge admission (1M => N=1 single session). */
+        .ctx_size = 1048576,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
