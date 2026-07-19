@@ -32,7 +32,7 @@ QUANTIZE_OBJS := $(QUANTIZE_SRCS:.c=.o)
 QUANTS_SRCS := quants_common.c quants_fp.c quants_kquants.c
 QUANTS_OBJS := $(QUANTS_SRCS:.c=.o)
 
-.PHONY: all clean quality-score test test-cutlass-mxfp4
+.PHONY: all clean quality-score test test-cutlass-mxfp4 test-mxfp8-lt sfcmp
 
 all: deepseek4-quantize
 
@@ -59,6 +59,32 @@ test-cutlass-mxfp4: deepseek4-quantize
 	    --compare-tensor dspark.0.ffn_down_exps.weight | tee /tmp/dsq-t40-down.txt
 	grep -q '^byte_compare: OK' /tmp/dsq-t40-down.txt
 	@echo "cutlass_mxfp4 byte-compare: OK"
+
+# Prove the native MXFP8_LT (type 41) packer is byte-identical to the numpy
+# reference repack (tools/mxfp8_prestore/repack_mxfp8_lt.py) that the retired
+# post-hoc bandaid used. Self-contained: synthesizes a type-38 workhorse block,
+# packs it both ways, and diffs. No model, no GPU.
+quantize/tests/mxfp8_lt_emit: quantize/tests/mxfp8_lt_emit.c $(QUANTS_OBJS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -o $@ quantize/tests/mxfp8_lt_emit.c $(QUANTS_OBJS) -lm -pthread
+
+test-mxfp8-lt: quantize/tests/mxfp8_lt_emit
+	./quantize/tests/mxfp8_lt_emit 256 128 /tmp/mxfp8lt-38.bin /tmp/mxfp8lt-c.bin
+	python3 quantize/tests/mxfp8_lt_ref.py 256 128 /tmp/mxfp8lt-38.bin /tmp/mxfp8lt-py.bin
+	cmp /tmp/mxfp8lt-c.bin /tmp/mxfp8lt-py.bin
+	./quantize/tests/mxfp8_lt_emit 1024 256 /tmp/mxfp8lt-38b.bin /tmp/mxfp8lt-cb.bin
+	python3 quantize/tests/mxfp8_lt_ref.py 1024 256 /tmp/mxfp8lt-38b.bin /tmp/mxfp8lt-pyb.bin
+	cmp /tmp/mxfp8lt-cb.bin /tmp/mxfp8lt-pyb.bin
+	@echo "mxfp8_lt byte-compare: OK"
+
+# CUTLASS Sm120 block-scaled SFB/SFA layout proof (the artifact that pins the
+# swizzle to CUTLASS's own tile_atom_to_shape_SFB). Needs nvcc + the CUTLASS
+# pin; override CUTLASS_DIR if it lives elsewhere. Host-only run (no kernel).
+CUTLASS_DIR ?= $(abspath ..)/cutlass
+CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
+sfcmp: quantize/tests/sfcmp.cu
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda \
+	    $(CUTLASS_INC) -o quantize/tests/sfcmp quantize/tests/sfcmp.cu
+	@echo "built quantize/tests/sfcmp (run it to dump the SFB/SFA layouts)"
 
 quantize/%.o: quantize/%.c quantize/dsq_internal.h quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -Iquantize -c -o $@ $<

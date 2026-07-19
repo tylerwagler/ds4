@@ -1,3 +1,7 @@
 deepseek4-quantize
 quality-testing/score_official
 quality-testing/data/
+
+# test binaries
+quantize/tests/mxfp8_lt_emit
+quantize/tests/sfcmp

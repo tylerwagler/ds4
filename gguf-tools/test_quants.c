@@ -161,6 +161,81 @@ int main(void) {
         free(e2m1); free(e8m0); free(blob);
     }
 
+    /* G8 guard: the mx_sfoff swizzle is triplicated byte-identically across
+     * CUDA (src/cuda/ds4_cuda_matmul.cu), C (ds4q_mx_sfoff), and numpy
+     * (build_scale_dest_index in repack_mxfp8_lt.py). Assert the C copy agrees
+     * with an INDEPENDENT recomputation of the numpy formula over a grid of
+     * (row, kb, KBp), so a future edit to one copy can't silently diverge. */
+    {
+        int off_bad = 0;
+        const int64_t kbps[] = { 4, 8, 12, 32, 132 };
+        for (size_t ki = 0; ki < sizeof(kbps) / sizeof(kbps[0]) && off_bad < 8; ki++) {
+            const int64_t KBp = kbps[ki];
+            for (int64_t o = 0; o < 320 && off_bad < 8; o++) {
+                for (int64_t kb = 0; kb < KBp && off_bad < 8; kb++) {
+                    /* exact transcription of numpy build_scale_dest_index */
+                    size_t want = (size_t)(((o / 128) * (KBp / 4) + (kb / 4)) * 512
+                                  + (o % 32) * 16 + ((o % 128) / 32) * 4 + (kb % 4));
+                    if (ds4q_mx_sfoff(o, kb, KBp) != want) {
+                        off_bad++;
+                        printf("FAIL: ds4q_mx_sfoff(%lld,%lld,%lld)=%zu want %zu\n",
+                               (long long)o, (long long)kb, (long long)KBp,
+                               ds4q_mx_sfoff(o, kb, KBp), want);
+                    }
+                }
+            }
+        }
+        CHECK(off_bad == 0, "ds4q_mx_sfoff diverged from the numpy formula on %d point(s)", off_bad);
+    }
+
+    /* MXFP8_LT (type 41) pack invariants (mirrors the type-40 checks above):
+     *   1. sizing: data = out*in, SF = rup(out,128)*rup(KB,4); for 128-aligned
+     *      shapes the total equals the type-38 size (out*KB*33);
+     *   2. the E4M3 data region is the type-38 blocks de-interleaved to [out,in];
+     *   3. the SF swizzle is a bijection into the padded tile and unswizzles
+     *      back to the source E8M0 scales exactly. */
+    {
+        const int64_t OUT = 256, IN = 128;          /* 128-aligned workhorse shape */
+        const int64_t KB = IN / 32;                 /* 4 */
+        CHECK(ds4q_mxfp8_lt_sf_bytes(OUT, IN) == (size_t)(OUT * KB),
+              "mxfp8_lt sf_bytes(256,128)=%zu want %lld",
+              ds4q_mxfp8_lt_sf_bytes(OUT, IN), (long long)(OUT * KB));
+        CHECK(ds4q_mxfp8_lt_bytes(OUT, IN) == (size_t)(OUT * KB * 33),
+              "mxfp8_lt bytes(256,128)=%zu want type-38 size %lld",
+              ds4q_mxfp8_lt_bytes(OUT, IN), (long long)(OUT * KB * 33));
+
+        const size_t raw_bytes = (size_t)(OUT * KB * 33);
+        const size_t db = (size_t)(OUT * IN);
+        uint8_t *raw = malloc(raw_bytes);
+        uint8_t *blob = malloc(ds4q_mxfp8_lt_bytes(OUT, IN));
+        for (size_t i = 0; i < raw_bytes; i++) raw[i] = (uint8_t)(rnd() * 256);
+        for (int64_t b = 0; b < OUT * KB; b++)                 /* E8M0 in [1,254] */
+            raw[(size_t)b * 33] = (uint8_t)(1 + (int)(rnd() * 253));
+        ds4q_pack_mxfp8_lt(raw, blob, OUT, IN);
+
+        int data_bad = 0;
+        for (int64_t r = 0; r < OUT && data_bad < 4; r++)
+            for (int64_t kb = 0; kb < KB; kb++)
+                if (memcmp(blob + (size_t)(r * IN + kb * 32),
+                           raw + ((size_t)(r * KB + kb)) * 33 + 1, 32) != 0) { data_bad++; break; }
+        CHECK(data_bad == 0, "mxfp8_lt data region not de-interleaved E4M3 (%d row(s))", data_bad);
+
+        const uint8_t *sf = blob + db;
+        const size_t sb = ds4q_mxfp8_lt_sf_bytes(OUT, IN);
+        size_t nonzero = 0;
+        for (size_t i = 0; i < sb; i++) if (sf[i]) nonzero++;
+        CHECK(nonzero == (size_t)(OUT * KB),
+              "mxfp8_lt SF nonzero %zu want %lld (swizzle not injective)",
+              nonzero, (long long)(OUT * KB));
+        int sf_bad = 0;
+        const int64_t kbp = (KB + 3) / 4 * 4;
+        for (int64_t r = 0; r < OUT && sf_bad < 8; r++)
+            for (int64_t kb = 0; kb < KB; kb++)
+                if (sf[ds4q_mx_sfoff(r, kb, kbp)] != raw[((size_t)(r * KB + kb)) * 33]) { sf_bad++; break; }
+        CHECK(sf_bad == 0, "mxfp8_lt SF unswizzle mismatch on %d row(s)", sf_bad);
+        free(raw); free(blob);
+    }
+
     free(x);
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("OK\n");
