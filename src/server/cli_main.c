@@ -814,13 +814,18 @@ int main(int argc, char **argv) {
     s.pool_banks = pool_banks > 1 ? pool_banks : 0;
     s.live_bank = 0;
     /* Three-way scheduler knob (worker_main): decode banks <= spec_max_live run
-     * the per-bank spec/plain time-slice lane; more than that batch. The §2.2
-     * crossover measured the batched lane losing to spec time-slicing at N=2 and
-     * winning at N>=3, so default to 2 (spec through N=2). Env-overridable so the
-     * real-server crossover measurement can retune it without a rebuild. */
+     * the per-bank spec/plain time-slice lane; more than that batch. DATA-SET
+     * from the multiseq gate on THIS v5mx build (2026-07-18, DS4_MSEQ_BANKS=3,
+     * 512 tok/session, engine-level): batched N=1/2/3 = 16.2/22.85/27.92 t/s
+     * aggregate vs spec-time-slice 16.88/16.86/16.65. v5mx's ~55-62% spec accept
+     * means time-slicing yields no aggregate gain past N=1, so batching wins from
+     * N=2 (+36% at N=2). The crossover is therefore at 1, NOT the plan's stale
+     * §2.2 "3" (that was the 86%-accept compact model). Default 1 = spec only
+     * when alone (N=1 byte-identical), batch at N>=2. Env DS4_SERVER_SPEC_MAX_LIVE
+     * retunes without a rebuild (e.g. =2 to force spec through N=2). */
     {
         const char *sm = getenv("DS4_SERVER_SPEC_MAX_LIVE");
-        int v = sm ? atoi(sm) : 2;
+        int v = sm ? atoi(sm) : 1;
         if (v < 1) v = 1;
         if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
         s.spec_max_live = v;

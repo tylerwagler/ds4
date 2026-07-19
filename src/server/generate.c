@@ -3155,7 +3155,15 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
     const int vocab = ds4_engine_logits_width(s->engine);
 
     /* ENTRY: a slot not yet in the batch samples its first feed token from its
-     * bank's current classic logits while that bank is briefly live. */
+     * bank's current classic logits while that bank is briefly live, then
+     * CAPTURES its per-bank frontier counters (ms_n_comp[bank]) that the
+     * multiseq driver's position-true check reads. The explicit save is
+     * essential: server_bank_switch only captures the OUTGOING bank, so a bank
+     * entering the batch while it is already the live bank (e.g. it just
+     * prefilled and was never switched away) would otherwise carry a STALE
+     * ms_n_comp and the driver would reject the step ("frontier not
+     * position-true"). Redundant when the bank was captured on a prior
+     * switch-away — but harmless (same value). */
     for (int i = 0; i < n; i++) {
         session_slot *sl = dec[i];
         gen_state *g = sl->gen;
@@ -3166,6 +3174,7 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
         g->batch_feed_token =
             ds4_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
         g->batch_feed_pos = ds4_session_pos(pool);
+        ds4_session_bank_state_save(pool, (uint32_t)sl->bank);
         g->batch_feed_valid = true;
         g->batch_active = true;
     }
