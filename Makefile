@@ -41,7 +41,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
 
 all: help
 
@@ -131,8 +131,13 @@ cuda-accounting-gate: tests/accounting_gate
 
 # Tier-2 increment 2b bank evict/restore bit-identity + reclaim gate (the
 # memory-safety core; no OOM risk). See tests/bank_evict_restore_gate.c.
-cuda-evict-restore-gate: tests/bank_evict_restore_gate
+cuda-evict-restore-gate: tests/bank_evict_restore_gate tests/bank_fork_gate
 	DS4_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate $(FRONTIER_MODEL)
+
+# Tier-2 PATH-A full-prefix fork gate (plan-33 inc A): fork==cold oracle. See
+# tests/bank_fork_gate.c. MODEL-DEPENDENT, needs DS4_MSEQ_BANKS>=3.
+cuda-fork-gate: tests/bank_fork_gate
+	DS4_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
 
 # Prefill bit-exactness gate (the D2R acceptance gate; see the header of
 # tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,
@@ -252,6 +257,9 @@ tests/accounting_gate.o: tests/accounting_gate.c src/engine/ds4_engine_internal.
 tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.c
 
+tests/bank_fork_gate.o: tests/bank_fork_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_fork_gate.c
+
 # Public-API only (ds4.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
 # DS4_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
@@ -291,6 +299,9 @@ tests/accounting_gate: tests/accounting_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 tests/bank_evict_restore_gate: tests/bank_evict_restore_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/bank_fork_gate: tests/bank_fork_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -307,5 +318,5 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/accounting_gate tests/bank_evict_restore_gate
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate

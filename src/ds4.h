@@ -215,6 +215,17 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp, char *err,
 /* Conservative per-bank comp/index growth over one q-token decode quantum (the
  * guard's Delta term; over-charges the index side so the guard fires early). */
 uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q);
+/* Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment A) — FULL-PREFIX fork.
+ * Clone bank `src`'s committed KV + host carry into bank `dst` (dst continues src's
+ * conversation; the caller re-prefills only the divergent suffix). VALIDATES the
+ * request tokens[0..n_cached) against src's committed history BEFORE any device
+ * write (mismatch/short history -> refuse, non-zero return -> caller cold-prefills);
+ * n_cached must equal src's committed length (full-prefix). Pins src against the
+ * eviction guard for the clone. Returns 0 on success. fork_pinned: whether a bank
+ * is currently mid-fork (the guard's victim picker must skip it). */
+int  ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
+                           const int *tokens, int n_cached);
+bool ds4_session_bank_fork_pinned(const ds4_session *s, uint32_t bank);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any

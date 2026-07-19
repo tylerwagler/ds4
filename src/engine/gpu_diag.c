@@ -737,6 +737,59 @@ bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank) {
     return false;
 }
 
+/* Tier-2 PATH-A FULL-PREFIX FORK (plan-33 increment A). Device-side D2D clone of
+ * bank `src`'s entire committed KV into bank `dst`: per layer the raw ring (whole
+ * bank region — position-indexed, stale slots harmlessly copied), the comp
+ * frontier rows (ms_n_comp[src] rows at offset 0 of the split alloc), the ratio-4
+ * index frontier rows, and the attn/index compressor state lanes; the per-bank
+ * frontier counters are mirrored src->dst. No captured-graph invalidation (pure
+ * D2D + host counters). The CALLER (ds4_session_bank_fork) has already memcmp-
+ * validated the request prefix against src's committed history and pinned src
+ * against eviction — this routine performs the copy only. Refuses if src is
+ * evicted (no physical to clone; the caller restores from disk first) and
+ * reallocs dst if it was freed. Returns false on a bad geometry / copy error. */
+bool gpu_graph_bank_fork_copy(ds4_gpu_graph *g, uint32_t src, uint32_t dst) {
+    if (!g || g->banks.n_banks == 0) return false;
+    if (src >= g->banks.n_banks || dst >= g->banks.n_banks || src == dst) return false;
+    if (gpu_graph_bank_is_evicted(g, src)) return false;   /* caller restores src first */
+    if (gpu_graph_bank_is_evicted(g, dst) && !gpu_graph_bank_alloc_physical(g, dst)) return false;
+    ds4_bank_slabs *b = &g->banks;
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        /* Raw ring: copy the whole bank region (bounded by raw_cap; the ring is
+         * position-indexed so any stale slots are never read at dst's pos). */
+        ok = ds4_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
+                                 b->raw[il], (uint64_t)src * b->raw_bank_bytes,
+                                 b->raw_bank_bytes) != 0;
+        g->ms_n_comp[dst][il] = g->ms_n_comp[src][il];
+        g->ms_n_index_comp[dst][il] = g->ms_n_index_comp[src][il];
+        if (!ok || ratio == 0) continue;
+        const uint64_t csz = (uint64_t)g->ms_n_comp[src][il] * attn_row;
+        if (ok && csz) ok = ds4_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0, csz) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(b->askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                         b->askv[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                         b->astate_bank_bytes[il]) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(b->assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                         b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                         b->astate_bank_bytes[il]) != 0;
+        if (ratio == 4) {
+            const uint64_t isz = (uint64_t)g->ms_n_index_comp[src][il] * idx_row;
+            if (ok && isz) ok = ds4_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0, isz) != 0;
+            if (ok) ok = ds4_gpu_tensor_copy(b->iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                             b->iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                             b->istate_bank_bytes[il]) != 0;
+            if (ok) ok = ds4_gpu_tensor_copy(b->issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                             b->issc[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                             b->istate_bank_bytes[il]) != 0;
+        }
+    }
+    return ok;
+}
+
 
 
 /* Re-install the graph's per-layer cache views onto `bank`.  Pure host-side

@@ -2150,6 +2150,88 @@ uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q) {
     return gpu_graph_quantum_growth_bytes_per_bank(q);
 }
 
+static bool bank_carry_ensure(ds4_session *s);   /* defined below */
+
+/* Tier-2 PATH-A (plan-33 inc A) — deep-copy one bank carry into another (src's
+ * conversation continues on dst). Reuses d's owned heap buffers; no alias/leak. */
+static void bank_carry_copy(ds4_bank_carry *d, const ds4_bank_carry *sc) {
+    token_vec d_ck = d->checkpoint;              /* keep d's own token buffer */
+    float   *d_logits = d->logits;
+    float   *d_qrows = d->dspark_pending_qrows;
+    uint32_t d_qcap = d->dspark_pending_qrows_cap;
+    *d = *sc;                                    /* scalars + (aliased) heap ptrs — fixed below */
+    d->checkpoint = d_ck;
+    ds4_tokens_copy(&d->checkpoint, &sc->checkpoint);
+    d->logits = d_logits ? d_logits : xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (sc->logits) memcpy(d->logits, sc->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    d->dspark_pending_qrows = d_qrows;
+    d->dspark_pending_qrows_cap = d_qcap;
+    if (sc->dspark_pending_qrows && sc->dspark_pending_qrows_cap > 0) {
+        if (d->dspark_pending_qrows_cap < sc->dspark_pending_qrows_cap) {
+            d->dspark_pending_qrows = xrealloc(d->dspark_pending_qrows,
+                (size_t)sc->dspark_pending_qrows_cap * sizeof(float));
+            d->dspark_pending_qrows_cap = sc->dspark_pending_qrows_cap;
+        }
+        memcpy(d->dspark_pending_qrows, sc->dspark_pending_qrows,
+               (size_t)sc->dspark_pending_qrows_cap * sizeof(float));
+    }
+}
+
+/* Tier-2 PATH-A FULL-PREFIX FORK (plan-33 increment A). Clone bank `src`'s
+ * committed KV + host carry into bank `dst` so dst continues src's conversation,
+ * then the caller re-prefills only the divergent suffix. STRUCTURAL ANTI-
+ * CONTAMINATION: memcmp the request's tokens[0..n_cached) against src's committed
+ * history BEFORE any device write — a mismatch (or a shorter/absent history)
+ * REFUSES (return non-zero) so the caller cold-prefills; the fork never runs on a
+ * non-matching source. Increment A is full-prefix only: n_cached must equal src's
+ * committed length (a shorter shared prefix is the partial case, increment C).
+ * Pins src against the eviction guard for the duration of the clone. Returns 0 on
+ * success, non-zero on refusal/failure (caller falls back to cold prefill). */
+int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
+                          const int *tokens, int n_cached) {
+    if (!s || !tokens || n_cached < 0) return 1;
+    ds4_gpu_graph *g = &s->graph;
+    if (g->banks.n_banks == 0 || src >= g->banks.n_banks ||
+        dst >= g->banks.n_banks || src == dst) return 1;
+    /* 1. VALIDATE against src's committed history BEFORE any device write. */
+    const uint32_t cur = g->banks.n_banks ? g->banks.cur_bank : 0u;
+    const token_vec *hist = NULL;
+    if (src == cur) {
+        hist = s->checkpoint_valid ? &s->checkpoint : NULL;
+    } else if (s->bank_carry && src < s->bank_carry_n &&
+               s->bank_carry[src].valid && s->bank_carry[src].checkpoint_valid) {
+        hist = &s->bank_carry[src].checkpoint;
+    }
+    if (!hist || (int)hist->len != n_cached) return 1;      /* full-prefix only */
+    for (int i = 0; i < n_cached; i++) {
+        if (hist->v[i] != tokens[i]) return 1;              /* mismatch -> cold */
+    }
+    /* 2. Eviction pin src (the guard's victim picker must not free it mid-clone). */
+    g->fork_pin[src] = 1u;
+    /* 3. src must have physical to clone (inc A refuses an evicted source). */
+    if (gpu_graph_bank_is_evicted(g, src)) { g->fork_pin[src] = 0u; return 1; }
+    if (src == cur) gpu_graph_bank_counters_capture(g, src);  /* current frontier */
+    /* 4-5. Device D2D clone (allocs dst physical if freed, mirrors counters). */
+    if (!gpu_graph_bank_fork_copy(g, src, dst)) { g->fork_pin[src] = 0u; return 1; }
+    /* 6. Copy src host carry -> dst so dst owns src's conversation state. */
+    if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
+    if (src == cur) ds4_session_bank_state_save(s, src);      /* refresh from live session */
+    if (src < s->bank_carry_n && dst < s->bank_carry_n) {
+        bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
+    }
+    /* 7. Full fork has no ratio-4 boundary stash — keep the emit hook inactive. */
+    g->ms_emit_keep[dst] = 0u;
+    /* 8. (dst suffix KV-growth admission charge is the server's job in a later
+     *    increment; the engine clone copies existing KV, touching nothing new.) */
+    g->fork_pin[src] = 0u;
+    return 0;
+}
+
+bool ds4_session_bank_fork_pinned(const ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
+    return s->graph.fork_pin[bank] != 0u;
+}
+
 /* Tier-2 task #55 increment 2b — RAW per-bank comp/index KV disk snapshot. The
  * eviction guard's bit-identical mechanism (the transcript-keyed kv_cache is a
  * semantic prefix-reuse cache, NOT a bitwise continuation — evict-restore-gate

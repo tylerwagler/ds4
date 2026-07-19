@@ -1160,6 +1160,15 @@ typedef struct {
     uint32_t ms_dspark_n_raw[DS4_MSEQ_MAX][3];
     uint32_t ms_dspark_prompt_n[DS4_MSEQ_MAX];
     uint32_t ms_dspark_prompt_lo[DS4_MSEQ_MAX];
+    /* Tier-2 PATH-A partial-prefix KV-reuse (plan-33). Net-new. ms_emit_keep[bank]
+     * is the ratio-4 boundary-row restore threshold: 0 = inactive (increment A
+     * full-prefix fork clears it; increment C's partial cut sets R/4+1 and the
+     * emit hook overwrites the recomputed boundary row with the packed stash while
+     * row0 < it). fork_pin[bank] is a transient eviction pin so the guard's victim
+     * picker cannot free_physical a source bank mid-clone (plan-33 anti-corruption
+     * guarantee). Both zero-initialised with the graph. */
+    uint32_t ms_emit_keep[DS4_MSEQ_MAX];
+    uint8_t  fork_pin[DS4_MSEQ_MAX];
     int32_t *ms_positions;
     int32_t *ms_seq_id;
     ds4_gpu_tensor *batch_positions;
@@ -2121,6 +2130,9 @@ uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q);
 bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank);
 bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank);
 bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank);
+/* Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
+ * KV into dst + mirror frontier counters. Caller validates + pins src first. */
+bool gpu_graph_bank_fork_copy(ds4_gpu_graph *g, uint32_t src, uint32_t dst);
 /* Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */

@@ -2921,6 +2921,15 @@ static bool worker_eviction_could_help(server *s, const job *j,
  * conversation because the freed KV can never be read again. Returns false
  * when nothing is evictable. Worker thread only. */
 static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
+    /* plan-33: protect any bank that is a live fork SOURCE mid-clone from disk
+     * eviction (belt-and-suspenders — fork and evict are both worker-thread ops
+     * and never interleave, but the invariant "a pinned source is never freed"
+     * must hold for both eviction paths). */
+    if (s->pool_banks > 0 && s->slots[0].sess) {
+        for (int i = 1; i < s->n_slots && i < DS4_SESSION_POOL_CAP; i++) {
+            if (ds4_session_bank_fork_pinned(s->slots[0].sess, s->slots[i].bank)) protect[i] = true;
+        }
+    }
     const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect);
     if (vi < 0) return false;
     session_slot *sl = &s->slots[vi];
@@ -3291,6 +3300,8 @@ static int server_guard_pick_victim(server *s, session_slot **dec, int n) {
     for (int i = 1; i < s->n_slots; i++) {         /* bank 0 pinned */
         session_slot *sl = &s->slots[i];
         if (!sl->sess || sl->spilled || sl->active_job) continue;
+        /* plan-33: never free a bank that is a live fork SOURCE mid-clone. */
+        if (ds4_session_bank_fork_pinned(pool, sl->bank)) continue;
         bool live = false;
         for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
         if (live) continue;
