@@ -354,6 +354,69 @@ static bool check_stale_classic_fails_loud(void) {
     return ok;
 }
 
+/* Tier-1 SPEC lane timing (the mode-switch crossover measurement — plan
+ * §2.2/§2.3: "MEASURE the N=2 boundary, do NOT hardcode 3").  This is the lane
+ * the scheduler picks at n<=2: n INDEPENDENT sessions (each its own graph — the
+ * Tier-1 time-slice model, NOT banks), fused DSpark speculation, round-robin
+ * one generate_speculative quantum per session until each has emitted >= steps
+ * tokens.  Timed apples-to-apples with multi_run's batched lane (aggregate =
+ * emitted/elapsed) so the crossover is measured on THIS v0.2.3 build rather
+ * than assumed.  Greedy (temp=0): exact-under-argmax spec, so each session's
+ * stream matches its solo reference.  Returns false (caller skips + reports)
+ * if the engine has no drafter — the DS4_GATE_NO_DSPARK / --no-dspark config,
+ * where the scheduler has no spec lane and batches at every width. */
+static bool spec_timeslice_run(int n, int steps, double *secs,
+                               uint64_t *out_emitted) {
+    if (!ds4_engine_has_dspark(g_e)) return false;
+    ds4_session *ss[GATE_MAX_N];
+    memset(ss, 0, sizeof(ss));
+    char err[256];
+    bool ok = true;
+    for (int k = 0; k < n && ok; k++) {
+        if (ds4_session_create(&ss[k], g_e, 4096) != 0) { ok = false; break; }
+        ds4_tokens p;
+        ok = make_prompt(k, &p);
+        if (ok && ds4_session_sync(ss[k], &p, err, sizeof(err)) != 0) {
+            fprintf(stderr, "spec populate %d failed: %s\n", k, err);
+            ok = false;
+        }
+        ds4_tokens_free(&p);
+    }
+    uint64_t emitted_total = 0;
+    if (ok) {
+        int emitted[GATE_MAX_N];
+        memset(emitted, 0, sizeof(emitted));
+        int acc[32];
+        uint64_t rng = 0x2545F4914F6CDD1Dull;
+        const int eos = ds4_token_eos(g_e);
+        const double t0 = now_s();
+        bool more = true;
+        while (ok && more) {
+            more = false;
+            for (int k = 0; k < n && ok; k++) {
+                if (emitted[k] >= steps) continue;
+                const int ntok = ds4_session_generate_speculative(
+                        ss[k], 0.0f, 0, 1.0f, 0.0f, &rng,
+                        steps - emitted[k], eos, acc,
+                        (int)(sizeof(acc) / sizeof(acc[0])), err, sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "spec %d failed: %s\n", k, err);
+                    ok = false;
+                    break;
+                }
+                if (ntok == 0) { emitted[k] = steps; continue; } /* eos/stall: retire */
+                emitted[k] += ntok;
+                emitted_total += (uint64_t)ntok;
+                if (emitted[k] < steps) more = true;
+            }
+        }
+        if (secs) *secs = now_s() - t0;
+    }
+    for (int k = 0; k < n; k++) if (ss[k]) ds4_session_free(ss[k]);
+    if (out_emitted) *out_emitted = emitted_total;
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL [MAXN] [STEPS]\n", argv[0]);
@@ -451,6 +514,29 @@ int main(int argc, char **argv) {
                        (double)flip_gap[k]);
             }
         }
+    }
+
+    /* Tier-1 SPEC lane vs the batched lane above: the mode-switch crossover,
+     * measured on this build (plan §2.2/§2.3 mandate — do NOT hardcode 3).
+     * Informational, like the batched throughput lines; compare SPEC N=k
+     * aggregate against the "N=k ... aggregate" batched line above.  Skipped
+     * with no drafter (the scheduler then batches at every width). */
+    if (ds4_engine_has_dspark(g_e)) {
+        for (int n = 1; n <= maxn; n++) {
+            double secs = 0.0;
+            uint64_t emitted = 0;
+            if (spec_timeslice_run(n, steps, &secs, &emitted) && secs > 0.0) {
+                printf("SPEC N=%d: %llu tokens (%d session(s) time-sliced) in "
+                       "%.1fs -> aggregate %.2f tok/s (%.2f tok/s/session)\n",
+                       n, (unsigned long long)emitted, n, secs,
+                       (double)emitted / secs, (double)emitted / secs / n);
+            } else {
+                printf("SPEC N=%d: spec lane run failed/unavailable\n", n);
+            }
+        }
+    } else {
+        printf("SPEC lane: skipped (no drafter — scheduler batches at every "
+               "width in this config)\n");
     }
 
     /* HARD GATE: co-scheduling neutrality — bank k's stream must not depend

@@ -1317,6 +1317,15 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 
 
 
+/* Raw device pointer WITHOUT a synchronize — for building device pointer tables
+ * (Tier-2 per-bank comp/index base tables) at allocation time, where the caller
+ * controls ordering. Do NOT use to read tensor contents on the host. */
+extern "C" void *ds4_gpu_tensor_device_ptr(const ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->ptr : NULL;
+}
+
+
+
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;

@@ -41,7 +41,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
 
 all: help
 
@@ -112,6 +112,27 @@ cuda-multiseq-gate: tests/multiseq_decode_gate
 # Shorter (N=2, 64 steps): this is a config gate, not a throughput run.
 cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
 	DS4_MSEQ_BANKS=2 DS4_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
+
+# Tier-2 PATH A / Option F: fused DSpark speculation on a BANK (N=1 spec-on-
+# bank == classic, N=2 spec-time-slice with warm per-bank rings, mseq_dirty
+# cheap resume).  See tests/bank_spec_gate.c.  MODEL-DEPENDENT, drafter-merged
+# model, same memory discipline as the gates above; hold temp/gpu.lock.
+cuda-bank-spec-gate: tests/bank_spec_gate
+	DS4_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 128
+
+# Tier-2 overcommit accounting-exactness gate (task #55, increment 1): the
+# exact-frontier touched-KV number the eviction guard triggers on must track the
+# real cudaMemGetInfo physical delta of the demand-paged comp/index growth.  See
+# tests/accounting_gate.c.  MODEL-DEPENDENT, same memory discipline as the gates
+# above (hold temp/gpu.lock, drop_caches, no other ds4 process); fills stay
+# modest (peak ~64k tokens) and do not exercise eviction.
+cuda-accounting-gate: tests/accounting_gate
+	DS4_MSEQ_BANKS=2 ./tests/accounting_gate $(FRONTIER_MODEL)
+
+# Tier-2 increment 2b bank evict/restore bit-identity + reclaim gate (the
+# memory-safety core; no OOM risk). See tests/bank_evict_restore_gate.c.
+cuda-evict-restore-gate: tests/bank_evict_restore_gate
+	DS4_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate $(FRONTIER_MODEL)
 
 # Prefill bit-exactness gate (the D2R acceptance gate; see the header of
 # tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,
@@ -222,6 +243,15 @@ tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.c src/engine/ds4_en
 tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.c
 
+tests/bank_spec_gate.o: tests/bank_spec_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_spec_gate.c
+
+tests/accounting_gate.o: tests/accounting_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/accounting_gate.c
+
+tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.c
+
 # Public-API only (ds4.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
 # DS4_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
@@ -252,6 +282,15 @@ tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/ds4_help.o 
 tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/bank_spec_gate: tests/bank_spec_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/accounting_gate: tests/accounting_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/bank_evict_restore_gate: tests/bank_evict_restore_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -268,5 +307,5 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/accounting_gate tests/bank_evict_restore_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate

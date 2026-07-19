@@ -311,7 +311,7 @@ void thinking_live_remember(server *s, session_slot *sl, const char *visible_tex
     visible_live_clear_locked(&sl->thinking_live);
     sl->thinking_live.visible_text = xstrdup(visible_text);
     sl->thinking_live.visible_len = strlen(visible_text);
-    sl->thinking_live.live_tokens = ds4_session_pos(sl->sess);
+    sl->thinking_live.live_tokens = server_slot_frontier_pos(s, sl);
     sl->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -330,7 +330,7 @@ void responses_live_remember(server *s, session_slot *sl, const char *visible_te
             id_list_push_unique(&sl->responses_live.call_ids, calls->v[i].id);
         }
     }
-    sl->responses_live.live_tokens = ds4_session_pos(sl->sess);
+    sl->responses_live.live_tokens = server_slot_frontier_pos(s, sl);
     sl->responses_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -344,7 +344,7 @@ void anthropic_live_remember(server *s, session_slot *sl, const tool_calls *call
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
-    sl->anthropic_live.live_tokens = ds4_session_pos(sl->sess);
+    sl->anthropic_live.live_tokens = server_slot_frontier_pos(s, sl);
     sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -463,7 +463,9 @@ static session_slot *live_slot_for_ids(server *s, const stop_list *ids,
         session_slot *sl = &s->slots[i];
         const live_tool_state *st = anthropic ? &sl->anthropic_live
                                               : &sl->responses_live;
-        const int pos = sl->sess ? ds4_session_pos(sl->sess) : -1;
+        /* Bank-aware: match against THIS slot's bank frontier, not the pool's
+         * live cursor (Tier-2 shared pool). -1 for an unprovisioned slot. */
+        const int pos = sl->sess ? server_slot_frontier_pos(s, sl) : -1;
         if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
     }
     pthread_mutex_unlock(&s->tool_mu);

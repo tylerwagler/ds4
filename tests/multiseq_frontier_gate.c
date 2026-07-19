@@ -178,19 +178,20 @@ static bool run_step(ds4_session *s, const step_row *rows, uint32_t n) {
     return ok;
 }
 
-/* D2H read of bank rows [first, first+count) of a comp cache slab. */
+/* D2H read of bank rows [first, first+count) of a comp cache.  Increment 2a: the
+ * comp/index caches are now ONE allocation PER BANK, so read through the per-bank
+ * view accessor (comp[il][bank] at offset 0) instead of pool + bank*stride. */
 static bool read_bank_rows(ds4_gpu_graph *g, int index_cache, uint32_t il,
                            uint32_t bank, uint32_t first, uint32_t count,
                            void *out, uint64_t row_bytes) {
-    ds4_gpu_tensor *slab = index_cache ? gpu_graph_bank_index_comp_pool(g, il)
-                                       : gpu_graph_bank_attn_comp_pool(g, il);
-    const uint64_t bank_bytes = g->banks.n_banks
-        ? (index_cache ? g->banks.index_bank_bytes[il] : g->banks.comp_bank_bytes[il])
-        : 0;
-    if (!slab) return false;
-    return ds4_gpu_tensor_read(slab,
-                               (uint64_t)bank * bank_bytes + (uint64_t)first * row_bytes,
-                               out, (uint64_t)count * row_bytes) != 0;
+    ds4_gpu_tensor *view = index_cache ? gpu_graph_bank_index_comp_view(g, il, bank)
+                                       : gpu_graph_bank_attn_comp_view(g, il, bank);
+    if (!view) return false;
+    const bool ok = ds4_gpu_tensor_read(view,
+                                        (uint64_t)first * row_bytes,
+                                        out, (uint64_t)count * row_bytes) != 0;
+    ds4_gpu_tensor_free(view);
+    return ok;
 }
 
 static uint64_t attn_row_bytes(void) { return gpu_graph_attn_comp_cache_row_bytes(); }

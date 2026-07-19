@@ -39,6 +39,8 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+/* Raw device pointer without a synchronize (for building device pointer tables). */
+void *ds4_gpu_tensor_device_ptr(const ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
@@ -154,6 +156,7 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         float                   scale,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
@@ -744,6 +747,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
@@ -773,6 +777,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 

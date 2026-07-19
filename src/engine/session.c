@@ -2096,6 +2096,197 @@ uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size) {
                                    e->dspark_ready);
 }
 
+uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
+                                              int n_banks) {
+    if (!e || ctx_size <= 0 || n_banks < 1) return 0;
+    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
+                                                                  e->prefill_chunk);
+    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
+    if (!shape_layer) return 0;
+    return gpu_graph_session_bytes_banked(&e->weights, shape_layer, raw_cap,
+                                          (uint32_t)ctx_size, prefill_cap,
+                                          e->dspark_ready, (uint32_t)n_banks);
+}
+
+uint64_t ds4_engine_demand_paged_bytes_per_bank(ds4_engine *e, int ctx_size) {
+    if (!e || ctx_size <= 0) return 0;
+    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    return gpu_graph_demand_paged_bytes_per_bank((uint32_t)ctx_size);
+}
+
+uint64_t ds4_session_touched_kv_bytes(const ds4_session *s) {
+    if (!s) return 0;
+    return gpu_graph_touched_kv_bytes(&s->graph);
+}
+
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore.  The caller
+ * (server guard) must have snapshotted the bank's KV to DISK before evict (host
+ * RAM reclaims nothing on unified memory) and repointed away from it; and after
+ * restore-alloc it reloads the KV H2D from that snapshot. */
+bool ds4_session_bank_free_physical(ds4_session *s, uint32_t bank) {
+    if (!s) return false;
+    return gpu_graph_bank_free_physical(&s->graph, bank);
+}
+
+bool ds4_session_bank_alloc_physical(ds4_session *s, uint32_t bank) {
+    if (!s) return false;
+    return gpu_graph_bank_alloc_physical(&s->graph, bank);
+}
+
+bool ds4_session_bank_is_evicted(const ds4_session *s, uint32_t bank) {
+    if (!s) return false;
+    return gpu_graph_bank_is_evicted(&s->graph, bank);
+}
+
+uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank) {
+    if (!s) return 0;
+    return gpu_graph_bank_touched_kv_bytes(&s->graph, bank);
+}
+
+uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q) {
+    (void)s;
+    return gpu_graph_quantum_growth_bytes_per_bank(q);
+}
+
+/* Tier-2 task #55 increment 2b — RAW per-bank comp/index KV disk snapshot. The
+ * eviction guard's bit-identical mechanism (the transcript-keyed kv_cache is a
+ * semantic prefix-reuse cache, NOT a bitwise continuation — evict-restore-gate
+ * proved raw D2H->H2D is the only bit-identical path). D2H each layer's frontier
+ * rows to a TRANSIENT staging buffer, write to `fp`, and FREE it immediately —
+ * holding KV in host RAM reclaims nothing (unified pool). Precondition: `bank`
+ * is the installed (cur) bank so its live frontier is captured. */
+#define DS4_BANK_KV_MAGIC   0x4B564232u   /* "KVB2" */
+#define DS4_BANK_KV_VERSION 1u
+
+int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp,
+                             char *err, size_t errlen) {
+    if (!s || !fp) { payload_set_err(err, errlen, "bank kv save: bad args"); return 1; }
+    ds4_gpu_graph *g = &s->graph;
+    if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
+        payload_set_err(err, errlen, "bank kv save: no pool / bad bank"); return 1;
+    }
+    gpu_graph_bank_counters_capture(g, bank);   /* ms_n_*[bank] <- live layer_n_* */
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint32_t hdr[4] = { DS4_BANK_KV_MAGIC, DS4_BANK_KV_VERSION, bank, (uint32_t)DS4_N_LAYER };
+    if (fwrite(hdr, sizeof hdr, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: header write"); return 1; }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t cnt[2] = { g->ms_n_comp[bank][il], g->ms_n_index_comp[bank][il] };
+        if (fwrite(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: count write"); return 1; }
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t csz = (uint64_t)g->ms_n_comp[bank][il] * attn_row;
+        if (csz) {
+            uint8_t *buf = xmalloc((size_t)csz);
+            ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+            int ok = v && ds4_gpu_tensor_read(v, 0, buf, csz) != 0;
+            ds4_gpu_tensor_free(v);
+            if (ok) ok = fwrite(buf, 1, (size_t)csz, fp) == (size_t)csz;
+            free(buf);   /* TRANSIENT: freed before free_physical so RAM is reclaimed */
+            if (!ok) { payload_set_err(err, errlen, "bank kv save: comp D2H/write"); return 1; }
+        }
+        if (ratio == 4) {
+            const uint64_t isz = (uint64_t)g->ms_n_index_comp[bank][il] * idx_row;
+            if (isz) {
+                uint8_t *buf = xmalloc((size_t)isz);
+                ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                int ok = v && ds4_gpu_tensor_read(v, 0, buf, isz) != 0;
+                ds4_gpu_tensor_free(v);
+                if (ok) ok = fwrite(buf, 1, (size_t)isz, fp) == (size_t)isz;
+                free(buf);
+                if (!ok) { payload_set_err(err, errlen, "bank kv save: index D2H/write"); return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Restore a bank's comp/index KV from a raw snapshot: realloc physical (+base
+ * table rebuild), reinstall the frontier counters, and H2D each layer's rows.
+ * Leaves `bank` installed (cur). Host conversation state (checkpoint/pos) is the
+ * caller's bank_carry, restored separately by ds4_session_bank_state_restore. */
+int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
+                             char *err, size_t errlen) {
+    if (!s || !fp) { payload_set_err(err, errlen, "bank kv load: bad args"); return 1; }
+    ds4_gpu_graph *g = &s->graph;
+    if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
+        payload_set_err(err, errlen, "bank kv load: no pool / bad bank"); return 1;
+    }
+    uint32_t hdr[4];
+    if (fread(hdr, sizeof hdr, 1, fp) != 1 || hdr[0] != DS4_BANK_KV_MAGIC ||
+        hdr[1] != DS4_BANK_KV_VERSION || hdr[3] != (uint32_t)DS4_N_LAYER) {
+        payload_set_err(err, errlen, "bank kv load: bad header"); return 1;
+    }
+    uint32_t comp_cnt[DS4_MAX_LAYER] = {0}, idx_cnt[DS4_MAX_LAYER] = {0};
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t cnt[2];
+        if (fread(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv load: count read"); return 1; }
+        comp_cnt[il] = cnt[0]; idx_cnt[il] = cnt[1];
+    }
+    /* Review finding 3 — TRANSACTIONAL restore. Validate every frontier count
+     * against the per-layer cap BEFORE any device change: a short read or corrupt
+     * header must never leave the bank advertising row counts over unwritten KV
+     * (an OOB managed read on the next decode). */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_layer_compress_ratio(il) == 0) continue;
+        if (comp_cnt[il] > g->layer_comp_cap[il] || idx_cnt[il] > g->layer_comp_cap[il]) {
+            payload_set_err(err, errlen,
+                            "bank kv load: frontier count exceeds cap (corrupt snapshot)");
+            return 1;
+        }
+    }
+    if (!gpu_graph_bank_alloc_physical(g, bank)) { payload_set_err(err, errlen, "bank kv load: alloc_physical OOM"); return 1; }
+    /* H2D every row into the bank's OWN views (which address comp[il][bank]
+     * directly — no repoint) BEFORE touching the live frontier. On any read/H2D
+     * failure the bank's ms counters stay 0 (from free_physical) so it advertises
+     * an EMPTY frontier — no OOB — and the caller fails the request. */
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t csz = (uint64_t)comp_cnt[il] * attn_row;
+        if (csz) {
+            uint8_t *buf = xmalloc((size_t)csz);
+            int ok = fread(buf, 1, (size_t)csz, fp) == (size_t)csz;
+            if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
+                      ok = v && ds4_gpu_tensor_write(v, 0, buf, csz) != 0;
+                      ds4_gpu_tensor_free(v); }
+            free(buf);
+            if (!ok) { payload_set_err(err, errlen, "bank kv load: comp read/H2D"); return 1; }
+        }
+        if (ratio == 4) {
+            const uint64_t isz = (uint64_t)idx_cnt[il] * idx_row;
+            if (isz) {
+                uint8_t *buf = xmalloc((size_t)isz);
+                int ok = fread(buf, 1, (size_t)isz, fp) == (size_t)isz;
+                if (ok) { ds4_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
+                          ok = v && ds4_gpu_tensor_write(v, 0, buf, isz) != 0;
+                          ds4_gpu_tensor_free(v); }
+                free(buf);
+                if (!ok) { payload_set_err(err, errlen, "bank kv load: index read/H2D"); return 1; }
+            }
+        }
+    }
+    /* Every row is now on-device — COMMIT: repoint (make bank live), then install
+     * the frontier. This is the single point after which the bank advertises its
+     * rows, and each is backed by written KV. If repoint fails the ms counters stay
+     * 0 (empty, safe). */
+    if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->ms_n_comp[bank][il] = comp_cnt[il];
+        g->ms_n_index_comp[bank][il] = idx_cnt[il];
+    }
+    gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
+    return 0;
+}
+
 
 
 void ds4_session_free(ds4_session *s) {
@@ -2103,6 +2294,7 @@ void ds4_session_free(ds4_session *s) {
     gpu_graph_free(&s->graph);
     token_vec_free(&s->checkpoint);
     ds4_sample_scratch_free(&s->sample_scratch);
+    ds4_session_bank_carry_free(s);
     free(s->dspark_pending_qrows);
     free(s->logits);
     free(s);
@@ -2636,6 +2828,217 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
 }
 #undef DS4_MULTISEQ_ERR
 
+
+
+/* ===== Tier-2 PATH A: per-bank HOST carry (ds4_bank_carry) ================
+ *
+ * gpu_graph_bank_repoint swaps only the DEVICE cache views; the session's HOST
+ * per-conversation state (checkpoint history, host logits, the DSpark fused-
+ * loop / spec-carry shadow) is single-instance and must be saved for the bank
+ * we leave and restored for the bank we enter.  save/restore below are that
+ * host half; the graph frontier counters ride gpu_graph_bank_counters_*, and
+ * (Option F) the per-bank drafter ring rides gpu_graph_bank_repoint. */
+
+static void bank_carry_free_one(ds4_bank_carry *c) {
+    if (!c) return;
+    token_vec_free(&c->checkpoint);
+    free(c->logits);
+    free(c->dspark_pending_qrows);
+    memset(c, 0, sizeof(*c));
+}
+
+void ds4_session_bank_carry_free(ds4_session *s) {
+    if (!s || !s->bank_carry) return;
+    for (uint32_t i = 0; i < s->bank_carry_n; i++) bank_carry_free_one(&s->bank_carry[i]);
+    free(s->bank_carry);
+    s->bank_carry = NULL;
+    s->bank_carry_n = 0;
+}
+
+static bool bank_carry_ensure(ds4_session *s) {
+    const uint32_t n = gpu_graph_bank_pool_count(&s->graph);
+    if (s->bank_carry && s->bank_carry_n == n) return true;
+    if (s->bank_carry) ds4_session_bank_carry_free(s);
+    s->bank_carry = xcalloc(n, sizeof(*s->bank_carry));
+    s->bank_carry_n = n;
+    return true;
+}
+
+int ds4_session_bank_count(ds4_session *s) {
+    return s ? (int)gpu_graph_bank_pool_count(&s->graph) : 0;
+}
+
+int ds4_session_bank_repoint(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return 1;
+    /* Pool disabled: bank 0 is the classic tensors, nothing to repoint. */
+    if (s->graph.banks.n_banks == 0) return bank == 0 ? 0 : 1;
+    return gpu_graph_bank_repoint(&s->graph, bank) ? 0 : 1;
+}
+
+void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return;
+    if (!bank_carry_ensure(s)) return;
+    /* Graph frontier counters (attn/index comp; Option F also the drafter ring
+     * counters) are captured on the graph side so a later install re-arms this
+     * bank's per-bank truth. */
+    gpu_graph_bank_counters_capture(&s->graph, bank);
+    ds4_bank_carry *c = &s->bank_carry[bank];
+    /* heap-backed deep copies */
+    ds4_tokens_copy(&c->checkpoint, &s->checkpoint);
+    if (!c->logits) c->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    if (s->dspark_pending_qrows && s->dspark_pending_qrows_cap > 0) {
+        if (c->dspark_pending_qrows_cap < s->dspark_pending_qrows_cap) {
+            c->dspark_pending_qrows = xrealloc(
+                c->dspark_pending_qrows,
+                (size_t)s->dspark_pending_qrows_cap * sizeof(float));
+            c->dspark_pending_qrows_cap = s->dspark_pending_qrows_cap;
+        }
+        memcpy(c->dspark_pending_qrows, s->dspark_pending_qrows,
+               (size_t)s->dspark_pending_qrows_cap * sizeof(float));
+    }
+    /* scalar mirrors */
+    c->checkpoint_valid       = s->checkpoint_valid;
+    c->mseq_dirty             = s->mseq_dirty;
+    memcpy(c->dspark_pending, s->dspark_pending, sizeof(c->dspark_pending));
+    c->dspark_n_pending       = s->dspark_n_pending;
+    c->dspark_pending_base    = s->dspark_pending_base;
+    c->dspark_pending_pos     = s->dspark_pending_pos;
+    c->spec_carry_token       = s->spec_carry_token;
+    c->spec_carry_valid       = s->spec_carry_valid;
+    c->spec_carry_pos         = s->spec_carry_pos;
+    c->spec_carry_temp        = s->spec_carry_temp;
+    c->spec_carry_top_p       = s->spec_carry_top_p;
+    c->spec_carry_min_p       = s->spec_carry_min_p;
+    c->spec_carry_top_k       = s->spec_carry_top_k;
+    memcpy(c->dspark_pending_alt, s->dspark_pending_alt, sizeof(c->dspark_pending_alt));
+    memcpy(c->dspark_pending_conf, s->dspark_pending_conf, sizeof(c->dspark_pending_conf));
+    c->dspark_pending_sampled = s->dspark_pending_sampled;
+    memcpy(c->dspark_pending_q, s->dspark_pending_q, sizeof(c->dspark_pending_q));
+    c->dspark_pending_temp    = s->dspark_pending_temp;
+    c->dspark_pending_top_p   = s->dspark_pending_top_p;
+    c->dspark_pending_min_p   = s->dspark_pending_min_p;
+    c->dspark_pending_top_k   = s->dspark_pending_top_k;
+    c->spec_quench_debt       = s->spec_quench_debt;
+    c->spec_quench_ewma       = s->spec_quench_ewma;
+    c->spec_quench_steps      = s->spec_quench_steps;
+    c->spec_quenched          = s->spec_quenched;
+    c->spec_accepted_tokens   = s->spec_accepted_tokens;
+    c->spec_draft_tokens      = s->spec_draft_tokens;
+    c->spec_num_drafts        = s->spec_num_drafts;
+    c->spec_gen_tokens        = s->spec_gen_tokens;
+    c->valid = true;
+}
+
+bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
+    /* Point device views (incl. Option F drafter ring) at this bank, and
+     * re-arm its frontier counters — this is what makes clearing mseq_dirty
+     * cheap and safe (per-bank truth is re-established without a re-prefill). */
+    if (s->graph.banks.n_banks != 0 && !gpu_graph_bank_repoint(&s->graph, bank))
+        return false;
+    gpu_graph_bank_counters_install(&s->graph, bank);
+    if (!s->bank_carry || bank >= s->bank_carry_n || !s->bank_carry[bank].valid) {
+        /* No saved host state for a fresh bank: the counters_install above set
+         * the (zeroed) frontier; leave the session's host shadow as the caller
+         * primed it (a fresh sync just ran).  Clear the multiseq poison so
+         * classic work resumes. */
+        s->mseq_dirty = false;
+        return true;
+    }
+    ds4_bank_carry *c = &s->bank_carry[bank];
+    ds4_tokens_copy(&s->checkpoint, &c->checkpoint);
+    memcpy(s->logits, c->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    if (c->dspark_pending_qrows_cap > 0) {
+        if (s->dspark_pending_qrows_cap < c->dspark_pending_qrows_cap) {
+            s->dspark_pending_qrows = xrealloc(
+                s->dspark_pending_qrows,
+                (size_t)c->dspark_pending_qrows_cap * sizeof(float));
+            s->dspark_pending_qrows_cap = c->dspark_pending_qrows_cap;
+        }
+        memcpy(s->dspark_pending_qrows, c->dspark_pending_qrows,
+               (size_t)c->dspark_pending_qrows_cap * sizeof(float));
+    }
+    s->checkpoint_valid       = c->checkpoint_valid;
+    memcpy(s->dspark_pending, c->dspark_pending, sizeof(s->dspark_pending));
+    s->dspark_n_pending       = c->dspark_n_pending;
+    s->dspark_pending_base    = c->dspark_pending_base;
+    s->dspark_pending_pos     = c->dspark_pending_pos;
+    s->spec_carry_token       = c->spec_carry_token;
+    s->spec_carry_valid       = c->spec_carry_valid;
+    s->spec_carry_pos         = c->spec_carry_pos;
+    s->spec_carry_temp        = c->spec_carry_temp;
+    s->spec_carry_top_p       = c->spec_carry_top_p;
+    s->spec_carry_min_p       = c->spec_carry_min_p;
+    s->spec_carry_top_k       = c->spec_carry_top_k;
+    memcpy(s->dspark_pending_alt, c->dspark_pending_alt, sizeof(s->dspark_pending_alt));
+    memcpy(s->dspark_pending_conf, c->dspark_pending_conf, sizeof(s->dspark_pending_conf));
+    s->dspark_pending_sampled = c->dspark_pending_sampled;
+    memcpy(s->dspark_pending_q, c->dspark_pending_q, sizeof(s->dspark_pending_q));
+    s->dspark_pending_temp    = c->dspark_pending_temp;
+    s->dspark_pending_top_p   = c->dspark_pending_top_p;
+    s->dspark_pending_min_p   = c->dspark_pending_min_p;
+    s->dspark_pending_top_k   = c->dspark_pending_top_k;
+    s->spec_quench_debt       = c->spec_quench_debt;
+    s->spec_quench_ewma       = c->spec_quench_ewma;
+    s->spec_quench_steps      = c->spec_quench_steps;
+    s->spec_quenched          = c->spec_quenched;
+    s->spec_accepted_tokens   = c->spec_accepted_tokens;
+    s->spec_draft_tokens      = c->spec_draft_tokens;
+    s->spec_num_drafts        = c->spec_num_drafts;
+    s->spec_gen_tokens        = c->spec_gen_tokens;
+    /* Cheap resume: per-bank frontier truth is now installed, so the multiseq
+     * superset poison no longer applies to this bank. */
+    s->mseq_dirty = false;
+    return true;
+}
+
+
+
+/* ===== Tier-2 per-bank frontier READERS (server routing/metrics) ==========
+ *
+ * A bank-pooled server shares one ds4_session across N conversation banks, so
+ * ds4_session_pos / _tokens / _common_prefix (which read the single live host
+ * checkpoint) describe ONLY the currently-installed bank.  Reading them for a
+ * non-live bank returns the wrong conversation's frontier.  These readers give
+ * the correct per-bank answer without repointing the device or disturbing the
+ * live bank: the live bank (banks.cur_bank) reads the authoritative live
+ * checkpoint; every other bank reads its saved host carry (which the server
+ * keeps current for idle banks by bank_state_save'ing at job end).  Pure host
+ * reads — no CUDA, safe on the worker thread at routing/publish time. */
+static const ds4_tokens *bank_frontier_tokens(ds4_session *s, uint32_t bank) {
+    if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return NULL;
+    const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
+    if (bank == cur) return s->checkpoint_valid ? &s->checkpoint : NULL;
+    if (s->bank_carry && bank < s->bank_carry_n &&
+        s->bank_carry[bank].valid && s->bank_carry[bank].checkpoint_valid)
+        return &s->bank_carry[bank].checkpoint;
+    return NULL;
+}
+
+int ds4_session_bank_pos(ds4_session *s, uint32_t bank) {
+    const ds4_tokens *t = bank_frontier_tokens(s, bank);
+    return t ? t->len : 0;
+}
+
+const ds4_tokens *ds4_session_bank_tokens(ds4_session *s, uint32_t bank) {
+    return bank_frontier_tokens(s, bank);
+}
+
+int ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
+                                   const ds4_tokens *prompt) {
+    const ds4_tokens *t = bank_frontier_tokens(s, bank);
+    if (!t || !prompt) return 0;
+    int n = t->len < prompt->len ? t->len : prompt->len;
+    int i = 0;
+    while (i < n && t->v[i] == prompt->v[i]) i++;
+    return i;
+}
+
+void ds4_session_note_committed_tokens(ds4_session *s, const int *toks, int n) {
+    if (!s || !toks || n <= 0) return;
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, toks[i]);
+}
 
 
 

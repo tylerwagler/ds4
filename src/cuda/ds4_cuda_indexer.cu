@@ -72,6 +72,7 @@ __global__ static void indexer_scores_kernel(
         int fp4,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
+        const void * const * __restrict__ index_bank_ptrs,
         uint32_t comp_cap,
         uint32_t n_banks) {
     uint32_t c = blockIdx.x;
@@ -90,13 +91,18 @@ __global__ static void indexer_scores_kernel(
             return;
         }
     }
-    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
+    /* Per-bank index base (see attention_decode_mixed_kernel): base-pointer table
+     * → separate per-bank allocation at LOCAL row; NULL → classic seq_id*comp_cap. */
+    const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
+    const float *index_src = index_bank_ptrs ? (const float *)index_bank_ptrs[sid_b] : index_comp;
+    const uint64_t comp_base = index_bank_ptrs ? 0u
+                             : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
         float dot = 0.0f;
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
-            dot += qh[d] * idx_comp_load_dev(index_comp, fp4, comp_base + c, d, head_dim);
+            dot += qh[d] * idx_comp_load_dev(index_src, fp4, comp_base + c, d, head_dim);
         __shared__ float partial[256];
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -133,6 +139,7 @@ __global__ static void indexer_score_one_direct_kernel(
         int fp4,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
+        const void * const * __restrict__ index_bank_ptrs,
         uint32_t comp_cap,
         uint32_t n_banks) {
     const uint32_t c = blockIdx.x;
@@ -153,11 +160,15 @@ __global__ static void indexer_score_one_direct_kernel(
             return;
         }
     }
-    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[0] * comp_cap : 0u;
+    /* Per-bank index base (see indexer_scores_kernel). */
+    const uint32_t sid_b = seq_id ? (uint32_t)seq_id[0] : 0u;
+    const float *index_src = index_bank_ptrs ? (const float *)index_bank_ptrs[sid_b] : index_comp;
+    const uint64_t comp_base = index_bank_ptrs ? 0u
+                             : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
 
     __shared__ float krow[128];
     __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_comp, fp4, comp_base + c, tid, 128u);
+    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_src, fp4, comp_base + c, tid, 128u);
     __syncthreads();
 
     /* Per-warp accumulation: warp w owns heads w, w+4, ..., w+60 and keeps a
@@ -859,6 +870,7 @@ static int indexer_scores_launch(
         uint32_t                causal,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     const int fp4 = g_indexer_fp4;
@@ -883,7 +895,10 @@ static int indexer_scores_launch(
                 n_tokens, n_banks, comp_cap, n_comp, ratio, causal);
         return 0;
     }
-    const uint64_t comp_rows_min = descr ? (uint64_t)n_banks * comp_cap
+    /* Per-bank split: index_comp is bank 0's comp_cap-row allocation when the
+     * base-pointer table is present (see attention_decode_batch_launch). */
+    const uint64_t comp_rows_min = (descr && index_bank_ptrs) ? (uint64_t)comp_cap
+                                 : descr ? (uint64_t)n_banks * comp_cap
                                          : (uint64_t)n_comp;
     const uint64_t comp_bytes = fp4
         ? comp_rows_min * DS4_MXKV_FP4_ROWBYTES(128u)
@@ -900,6 +915,8 @@ static int indexer_scores_launch(
     if (causal && ratio == 0) return 0;
     const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
+    const void * const *index_bank_ptrs_ptr =
+        (descr && index_bank_ptrs) ? (const void * const *)index_bank_ptrs->ptr : NULL;
     const uint32_t kernel_n_banks = descr ? n_banks : 1u;
     static const int no_direct_one = getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") != NULL;
     static const int no_wmma = getenv("DS4_CUDA_NO_INDEXER_WMMA") != NULL;
@@ -911,6 +928,7 @@ static int indexer_scores_launch(
                                                          n_comp, pos0, ratio,
                                                          scale, causal ? 1 : 0, fp4,
                                                          positions_ptr, seq_id_ptr,
+                                                         index_bank_ptrs_ptr,
                                                          comp_cap, kernel_n_banks);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
@@ -934,6 +952,7 @@ static int indexer_scores_launch(
                                          n_comp, n_tokens, pos0, n_head,
                                          head_dim, ratio, scale, causal ? 1 : 0, fp4,
                                          positions_ptr, seq_id_ptr,
+                                         index_bank_ptrs_ptr,
                                          comp_cap, kernel_n_banks);
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
 }
@@ -951,7 +970,7 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0,
-                                 NULL, NULL, 0, 1);
+                                 NULL, NULL, NULL, 0, 1);
 }
 
 
@@ -969,7 +988,7 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
                                  n_head, head_dim, ratio, scale, 1,
-                                 NULL, NULL, 0, 1);
+                                 NULL, NULL, NULL, 0, 1);
 }
 
 
@@ -988,11 +1007,12 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
         float                   scale,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
                                  n_head, head_dim, ratio, scale, 1,
-                                 positions, seq_id, comp_cap, n_banks);
+                                 positions, seq_id, index_bank_ptrs, comp_cap, n_banks);
 }
 
 

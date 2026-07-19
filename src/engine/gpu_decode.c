@@ -1095,6 +1095,7 @@ bool gpu_graph_encode_decode_layer(
                                                                 index_scale,
                                                                 g->descr_diag_pos,
                                                                 g->descr_diag_seq,
+                                                                NULL, /* n_banks==1 diag: installed bank view */
                                                                 g->layer_comp_cap[il],
                                                                 1) != 0;
                 } else if (ok) {
@@ -1212,6 +1213,7 @@ bool gpu_graph_encode_decode_layer(
                     raw_f16,
                     descr_diag ? g->descr_diag_pos : NULL,
                     descr_diag ? g->descr_diag_seq : NULL,
+                    NULL, /* n_banks==1 diag: installed bank view is the operand */
                     descr_diag ? g->layer_comp_cap[il] : 0,
                     1) != 0;
             if (ok && decode_index_stage_profile) {
@@ -1241,6 +1243,7 @@ bool gpu_graph_encode_decode_layer(
                     DS4_N_HEAD, DS4_N_HEAD_DIM,
                     0, raw_f16,
                     g->descr_diag_pos, g->descr_diag_seq,
+                    NULL, /* n_banks==1 diag: installed bank view is the operand */
                     g->layer_comp_cap[il], 1) != 0;
         } else {
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,

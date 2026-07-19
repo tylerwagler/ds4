@@ -292,6 +292,19 @@ uint64_t gpu_graph_session_bytes(
         uint32_t                 ctx_size,
         uint32_t                 prefill_cap,
         bool                     enable_spec) {
+    return gpu_graph_session_bytes_banked(weights, layer, raw_cap, ctx_size,
+                                          prefill_cap, enable_spec,
+                                          gpu_graph_bank_pool_n());
+}
+
+uint64_t gpu_graph_session_bytes_banked(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_spec,
+        uint32_t                 n_banks_in) {
     gpu_graph_dims dz;
     gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
     const uint64_t pc = dz.prefill_cap;
@@ -302,7 +315,7 @@ uint64_t gpu_graph_session_bytes(
      * KV placement policy the allocator itself uses.  In bank-pool mode the
      * persistent KV slabs (and the per-bank compressor state lanes below)
      * scale with the pool size; everything else is shared by all banks. */
-    const uint64_t n_banks = gpu_graph_bank_pool_n();
+    const uint64_t n_banks = n_banks_in < 1u ? 1u : n_banks_in;
     uint64_t kv_cache_bytes = 0;
     uint64_t total = gpu_graph_context_bytes_for_kv_policy(
             dz.ctx_size, dz.raw_cap, dz.prefill_cap, &kv_cache_bytes);
@@ -401,10 +414,13 @@ uint64_t gpu_graph_session_bytes(
     if (enable_spec) {
         total += 3ull * DS4_N_EMBD * f32;                 /* dspark_target_h[3] */
         total += 3ull * 17 * DS4_N_EMBD * f32;            /* dspark_target_h_batch[3] */
-        total += 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * f32; /* dspark_raw_cache[3] */
+        /* Option F: dspark_raw_cache[3] + dspark_prompt_h[3] are BANKED slabs
+         * (n_banks lanes) so the N=2 spec-time-slice lane keeps a warm ring per
+         * bank; the rest of the drafter state is shared across banks. */
+        total += (uint64_t)n_banks * 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * f32; /* dspark_raw_cache[3] */
         total += (uint64_t)DS4_N_EMBD * f32;              /* dspark_main_x */
         total += 3ull * pc * DS4_N_EMBD * f32;            /* dspark_bulk_h[3] */
-        total += 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * f32; /* dspark_prompt_h[3] */
+        total += (uint64_t)n_banks * 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * f32; /* dspark_prompt_h[3] */
         const uint64_t attn_w = 2ull * DS4_N_HEAD_DIM;
         const uint64_t idx_w = 2ull * DS4_N_INDEXER_HEAD_DIM;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -420,6 +436,33 @@ uint64_t gpu_graph_session_bytes(
         total += (uint64_t)DS4_N_VOCAB * f32;             /* dspark_markov_logits */
     }
     return total;
+}
+
+
+
+/* Tier-2 overcommit (task #55, increment 1): the DEMAND-PAGED (cudaMallocManaged,
+ * physical-on-touch) bytes of ONE bank's ctx-scaled comp + index caches at the
+ * given context.  This is exactly the comp/index portion of
+ * gpu_graph_kv_cache_bytes_for_context (steering.c) MINUS the eager raw ring —
+ * the part the overcommit auto-size reserves as VA only and does NOT charge at
+ * admission (the eager floor is charged; physical materializes as the frontier
+ * grows, tracked by gpu_graph_touched_kv_bytes).  Row widths track the ACTUAL
+ * packed storage (DS4_ATTN_PACK attn comp + MXFP4 indexer), matching the slab
+ * allocator in gpu_graph_bank_slabs_alloc. */
+uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
+        bytes += comp_cap * attn_row;
+        if (ratio == 4) bytes += comp_cap * idx_row;
+    }
+    return bytes;
 }
 
 
@@ -539,14 +582,23 @@ static bool gpu_graph_bank_slabs_alloc(
         b->comp_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
                                  gpu_graph_attn_comp_cache_row_bytes();
         b->astate_bank_bytes[il] = attn_lane;
-        /* ctx-scaled comp slabs are always managed in pool mode: unified-
-         * memory demand paging keeps short banks from paying worst-case
-         * residency (the VMM adaptation, see ds4_bank_slabs). */
-        b->comp[il] = ds4_gpu_tensor_alloc_managed(
-                (uint64_t)n_banks * b->comp_bank_bytes[il]);
+        /* Increment 2a: one cudaMallocManaged PER BANK (not one n_banks*bytes
+         * slab) so the eviction guard can cudaFree a single idle bank's physical
+         * directly. Uniform stride (comp_bank_bytes[il] is bank-independent). */
+        void *comp_ptr_h[DS4_MSEQ_MAX];
+        for (uint32_t bk = 0; ok && bk < n_banks; bk++) {
+            b->comp[il][bk] = ds4_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
+            ok = b->comp[il][bk] != NULL;
+            if (ok) comp_ptr_h[bk] = ds4_gpu_tensor_device_ptr(b->comp[il][bk]);
+        }
         b->askv[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
         b->assc[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
-        ok = b->comp[il] && b->askv[il] && b->assc[il] &&
+        /* Device base-pointer table (indexed by seq_id) the batched READ kernels
+         * use instead of base + seq_id*comp_cap over one slab. */
+        if (ok) b->comp_bases[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
+        ok = ok && b->askv[il] && b->assc[il] && b->comp_bases[il] &&
+             ds4_gpu_tensor_write(b->comp_bases[il], 0, comp_ptr_h,
+                                  (uint64_t)n_banks * sizeof(void *)) &&
              gpu_tensor_fill_f32(b->askv[il], 0.0f,
                                  (uint64_t)n_banks * attn_width * attn_rows) &&
              gpu_tensor_fill_f32(b->assc[il], DS4_NEG_INF,
@@ -561,11 +613,18 @@ static bool gpu_graph_bank_slabs_alloc(
             b->index_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
                                       index_row_bytes;
             b->istate_bank_bytes[il] = index_lane;
-            b->index[il] = ds4_gpu_tensor_alloc_managed(
-                    (uint64_t)n_banks * b->index_bank_bytes[il]);
+            void *index_ptr_h[DS4_MSEQ_MAX];
+            for (uint32_t bk = 0; ok && bk < n_banks; bk++) {
+                b->index[il][bk] = ds4_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
+                ok = b->index[il][bk] != NULL;
+                if (ok) index_ptr_h[bk] = ds4_gpu_tensor_device_ptr(b->index[il][bk]);
+            }
             b->iskv[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
             b->issc[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
-            ok = b->index[il] && b->iskv[il] && b->issc[il] &&
+            if (ok) b->index_bases[il] = ds4_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
+            ok = ok && b->iskv[il] && b->issc[il] && b->index_bases[il] &&
+                 ds4_gpu_tensor_write(b->index_bases[il], 0, index_ptr_h,
+                                      (uint64_t)n_banks * sizeof(void *)) &&
                  gpu_tensor_fill_f32(b->iskv[il], 0.0f,
                                      (uint64_t)n_banks * index_width * index_rows) &&
                  gpu_tensor_fill_f32(b->issc[il], DS4_NEG_INF,
@@ -573,6 +632,109 @@ static bool gpu_graph_bank_slabs_alloc(
         }
     }
     return ok;
+}
+
+
+
+/* Write one bank's entry in the comp/index base-pointer tables (device arrays).
+ * A NULL slab nulls the entry so a stray batched-kernel read of an evicted bank
+ * faults instead of touching freed pages. */
+static bool bank_bases_set(ds4_gpu_graph *g, uint32_t il, uint32_t bank,
+                           ds4_gpu_tensor *comp_slab, ds4_gpu_tensor *index_slab) {
+    ds4_bank_slabs *b = &g->banks;
+    bool ok = true;
+    if (b->comp_bases[il]) {
+        void *cp = comp_slab ? ds4_gpu_tensor_device_ptr(comp_slab) : NULL;
+        ok = ds4_gpu_tensor_write(b->comp_bases[il], (uint64_t)bank * sizeof(void *),
+                                  &cp, sizeof(void *)) != 0;
+    }
+    if (ok && b->index_bases[il]) {
+        void *ip = index_slab ? ds4_gpu_tensor_device_ptr(index_slab) : NULL;
+        ok = ds4_gpu_tensor_write(b->index_bases[il], (uint64_t)bank * sizeof(void *),
+                                  &ip, sizeof(void *)) != 0;
+    }
+    return ok;
+}
+
+/* Tier-2 task #55 increment 2b — EVICTION RECLAIM primitive. Free ONE idle bank's
+ * own comp/index physical by a DIRECT cudaFree of its per-bank split allocations
+ * (the only primitive that returns physical on GB10; Step-1/2a reclaim gate).
+ * Nulls the slab pointers and their base-table entries, and ZEROES this bank's
+ * frontier counters (ms_n_comp/ms_n_index_comp) so touched_kv_bytes stops counting
+ * a freed bank — else the guard's projected never drops after a spill and it
+ * cascades, evicting every idle bank on one breach (review finding 2). The disk
+ * snapshot preserves the real counts for restore. MUST NOT be the installed (cur)
+ * bank — the caller repoints away first. The eager raw ring + state lanes
+ * (contiguous, bounded floor) are NOT freed and survive the cycle in place.
+ *
+ * Contract (review finding 4 — no ambiguous half-evicted state): returns FALSE
+ * ONLY on a precondition refusal (bad args / cur bank) where NOTHING was freed and
+ * the bank stays live. Once freeing begins it returns TRUE — the bank IS physically
+ * evicted; a base-table device-write failure is logged HARD but does not un-evict
+ * the bank (the stale table entry is never read while the bank is evicted, and
+ * restore rebuilds it), so the caller can unconditionally mark it spilled. */
+bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    if (bank == g->banks.cur_bank) return false;   /* precondition: never free cur */
+    ds4_bank_slabs *b = &g->banks;
+    bool table_ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        ds4_gpu_tensor_free(b->comp[il][bank]);
+        b->comp[il][bank] = NULL;
+        if (ratio == 4) {
+            ds4_gpu_tensor_free(b->index[il][bank]);
+            b->index[il][bank] = NULL;
+        }
+        table_ok = bank_bases_set(g, il, bank, NULL, NULL) && table_ok;
+        /* Finding 2: a freed bank contributes 0 resident KV. */
+        g->ms_n_comp[bank][il] = 0;
+        g->ms_n_index_comp[bank][il] = 0;
+    }
+    if (!table_ok) {
+        fprintf(stderr,
+                "ds4: WARNING free_physical bank %u: base-table NULL device-write "
+                "failed (CUDA); bank IS evicted, table is rebuilt on restore\n", bank);
+    }
+    return true;   /* bank is physically evicted (slabs freed) */
+}
+
+/* Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted
+ * bank's comp/index physical (fresh cudaMallocManaged: VA reserved, physical on
+ * touch) and rebuild its base-table entries to the new pointers. The caller then
+ * reloads the bank's KV (H2D from the disk snapshot) into these. Idempotent: a
+ * slab already present is left untouched. Returns false on OOM. */
+bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    ds4_bank_slabs *b = &g->banks;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        if (!b->comp[il][bank]) {
+            b->comp[il][bank] = ds4_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
+            ok = b->comp[il][bank] != NULL;
+        }
+        if (ok && ratio == 4 && !b->index[il][bank]) {
+            b->index[il][bank] = ds4_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
+            ok = b->index[il][bank] != NULL;
+        }
+        if (ok) ok = bank_bases_set(g, il, bank, b->comp[il][bank],
+                                    ratio == 4 ? b->index[il][bank] : NULL);
+    }
+    return ok;
+}
+
+/* True when `bank`'s comp/index physical is currently freed (evicted) — the
+ * server checks this before restoring on a returning request. */
+bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank) {
+    if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_layer_compress_ratio(il) == 0) continue;
+        return g->banks.comp[il][bank] == NULL;   /* freed in lockstep across layers */
+    }
+    return false;
 }
 
 
@@ -598,8 +760,7 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank) {
         ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
         ds4_gpu_tensor_free(g->layer_attn_state_score[il]);
         g->layer_attn_comp_cache[il] = ds4_gpu_tensor_view(
-                b->comp[il], (uint64_t)bank * b->comp_bank_bytes[il],
-                b->comp_bank_bytes[il]);
+                b->comp[il][bank], 0, b->comp_bank_bytes[il]);
         g->layer_attn_state_kv[il] = ds4_gpu_tensor_view(
                 b->askv[il], (uint64_t)bank * b->astate_bank_bytes[il],
                 b->astate_bank_bytes[il]);
@@ -613,8 +774,7 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank) {
             ds4_gpu_tensor_free(g->layer_index_state_kv[il]);
             ds4_gpu_tensor_free(g->layer_index_state_score[il]);
             g->layer_index_comp_cache[il] = ds4_gpu_tensor_view(
-                    b->index[il], (uint64_t)bank * b->index_bank_bytes[il],
-                    b->index_bank_bytes[il]);
+                    b->index[il][bank], 0, b->index_bank_bytes[il]);
             g->layer_index_state_kv[il] = ds4_gpu_tensor_view(
                     b->iskv[il], (uint64_t)bank * b->istate_bank_bytes[il],
                     b->istate_bank_bytes[il]);
@@ -623,6 +783,23 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank) {
                     b->istate_bank_bytes[il]);
             ok = g->layer_index_comp_cache[il] && g->layer_index_state_kv[il] &&
                  g->layer_index_state_score[il];
+        }
+    }
+    /* Option F: swap the per-bank DSpark drafter ring views (present only when
+     * the drafter is loaded and the ring was banked).  Same host-only pointer
+     * surgery as the KV views above, so the spec path transparently reads the
+     * active bank's warm window. */
+    if (ok && b->dspark_raw[0]) {
+        for (int i = 0; i < 3 && ok; i++) {
+            ds4_gpu_tensor_free(g->dspark_raw_cache[i]);
+            ds4_gpu_tensor_free(g->dspark_prompt_h[i]);
+            g->dspark_raw_cache[i] = ds4_gpu_tensor_view(
+                    b->dspark_raw[i], (uint64_t)bank * b->dspark_raw_bank_bytes,
+                    b->dspark_raw_bank_bytes);
+            g->dspark_prompt_h[i] = ds4_gpu_tensor_view(
+                    b->dspark_prompt[i], (uint64_t)bank * b->dspark_prompt_bank_bytes,
+                    b->dspark_prompt_bank_bytes);
+            ok = g->dspark_raw_cache[i] && g->dspark_prompt_h[i];
         }
     }
     /* Stale pointer hygiene (mirrors gpu_graph_free). */
@@ -653,14 +830,32 @@ ds4_gpu_tensor *gpu_graph_bank_raw_pool(ds4_gpu_graph *g, uint32_t il) {
     return g->banks.n_banks ? g->banks.raw[il] : g->layer_raw_cache[il];
 }
 
+/* Nominal comp/index operand for the batched attention/indexer wrappers. With
+ * per-bank split allocations there is no single slab; the batched (descriptor)
+ * path addresses banks through the base-pointer table (below), so this returns
+ * bank 0's allocation as the nominal typed operand (its per-bank size drives the
+ * wrappers' buffer-size validation). Pool disabled → the classic tensor. */
 ds4_gpu_tensor *gpu_graph_bank_attn_comp_pool(ds4_gpu_graph *g, uint32_t il) {
     if (!g || il >= DS4_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.comp[il] : g->layer_attn_comp_cache[il];
+    return g->banks.n_banks ? g->banks.comp[il][0] : g->layer_attn_comp_cache[il];
 }
 
 ds4_gpu_tensor *gpu_graph_bank_index_comp_pool(ds4_gpu_graph *g, uint32_t il) {
     if (!g || il >= DS4_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.index[il] : g->layer_index_comp_cache[il];
+    return g->banks.n_banks ? g->banks.index[il][0] : g->layer_index_comp_cache[il];
+}
+
+/* Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,
+ * indexed by seq_id) the batched READ kernels use in place of base +
+ * seq_id*comp_cap. NULL when the pool is disabled. */
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_bases(ds4_gpu_graph *g, uint32_t il) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    return g->banks.n_banks ? g->banks.comp_bases[il] : NULL;
+}
+
+ds4_gpu_tensor *gpu_graph_bank_index_comp_bases(ds4_gpu_graph *g, uint32_t il) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    return g->banks.n_banks ? g->banks.index_bases[il] : NULL;
 }
 
 /* One accessor body for all six per-(bank,layer) view kinds: a fresh view of
@@ -681,14 +876,32 @@ static ds4_gpu_tensor *bank_lane_view(ds4_gpu_graph *g,
     return ds4_gpu_tensor_view(slab, (uint64_t)bank * lane_bytes[il], lane_bytes[il]);
 }
 
+/* Per-bank comp/index view: with split allocations the bank's whole allocation
+ * IS its lane (offset 0), so it bypasses the contiguous-slab bank_lane_view. */
+static ds4_gpu_tensor *bank_split_view(ds4_gpu_graph *g,
+                                       ds4_gpu_tensor *bank_slab,
+                                       const uint64_t *lane_bytes,
+                                       ds4_gpu_tensor *classic,
+                                       uint32_t il, uint32_t bank) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    if (g->banks.n_banks == 0) {
+        if (bank != 0 || !classic) return NULL;
+        return ds4_gpu_tensor_view(classic, 0, ds4_gpu_tensor_bytes(classic));
+    }
+    if (bank >= g->banks.n_banks || !bank_slab) return NULL;
+    return ds4_gpu_tensor_view(bank_slab, 0, lane_bytes[il]);
+}
+
 ds4_gpu_tensor *gpu_graph_bank_attn_comp_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
-    return bank_lane_view(g, g->banks.comp[il], g->banks.comp_bank_bytes,
-                          g->layer_attn_comp_cache[il], il, bank);
+    return bank_split_view(g, g->banks.n_banks ? g->banks.comp[il][bank] : NULL,
+                           g->banks.comp_bank_bytes,
+                           g->layer_attn_comp_cache[il], il, bank);
 }
 
 ds4_gpu_tensor *gpu_graph_bank_index_comp_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
-    return bank_lane_view(g, g->banks.index[il], g->banks.index_bank_bytes,
-                          g->layer_index_comp_cache[il], il, bank);
+    return bank_split_view(g, g->banks.n_banks ? g->banks.index[il][bank] : NULL,
+                           g->banks.index_bank_bytes,
+                           g->layer_index_comp_cache[il], il, bank);
 }
 
 ds4_gpu_tensor *gpu_graph_bank_attn_state_kv_view(ds4_gpu_graph *g, uint32_t il, uint32_t bank) {
@@ -717,6 +930,11 @@ void gpu_graph_bank_counters_capture(ds4_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = g->layer_n_comp[il];
         g->ms_n_index_comp[bank][il] = g->layer_n_index_comp[il];
     }
+    /* Option F: the drafter-ring frontier is per-bank too (device rings live in
+     * banks.dspark_*), so it rides the same capture/install hand-off. */
+    for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[bank][i] = g->dspark_n_raw[i];
+    g->ms_dspark_prompt_n[bank] = g->dspark_prompt_n;
+    g->ms_dspark_prompt_lo[bank] = g->dspark_prompt_lo;
 }
 
 void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank) {
@@ -725,6 +943,77 @@ void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank) {
         g->layer_n_comp[il] = g->ms_n_comp[bank][il];
         g->layer_n_index_comp[il] = g->ms_n_index_comp[bank][il];
     }
+    for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
+    g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
+    g->dspark_prompt_lo = g->ms_dspark_prompt_lo[bank];
+}
+
+/* Tier-2 overcommit (task #55, increment 1): EXACT touched (physically resident)
+ * demand-paged KV bytes across the whole pool — Σ over live banks Σ over layers
+ * of (comp frontier rows × comp row bytes + index frontier rows × index row
+ * bytes).  Deterministic from the position-driven compressor frontier; no
+ * cudaMemGetInfo / MemAvailable.  This is the number the increment-2 eviction
+ * guard triggers on, and the accounting-exactness gate proves it tracks the real
+ * physical delta.  The CURRENT bank's frontier is live in layer_n_comp /
+ * layer_n_index_comp; idle banks keep their frontier in ms_n_comp / ms_n_index_comp
+ * (captured on switch-away).  Pool disabled (n_banks==0) → pool_count 1, cur 0 →
+ * the classic single-session frontier (layer_n_comp) is summed. Only the ctx-
+ * scaled comp/index are counted; the eager raw ring + state lanes are the fixed
+ * floor and are already resident (not part of the growing touched set). */
+/* Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
+ * from its compressor frontier.  cur bank reads the live layer_n_comp; idle banks
+ * read their captured ms_n_comp.  The increment-2b guard uses this for the
+ * per-bank Δ projection and the smallest-frontier victim tie-break. */
+uint64_t gpu_graph_bank_touched_kv_bytes(const ds4_gpu_graph *g, uint32_t bank) {
+    if (!g) return 0;
+    const uint32_t nb = gpu_graph_bank_pool_count(g);
+    if (bank >= nb) return 0;
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES
+        : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint32_t cur = g->banks.n_banks ? g->banks.cur_bank : 0u;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint32_t ncomp = (bank == cur) ? g->layer_n_comp[il]
+                                             : g->ms_n_comp[bank][il];
+        bytes += (uint64_t)ncomp * attn_row;
+        if (ratio == 4) {
+            const uint32_t nidx = (bank == cur) ? g->layer_n_index_comp[il]
+                                                : g->ms_n_index_comp[bank][il];
+            bytes += (uint64_t)nidx * idx_row;
+        }
+    }
+    return bytes;
+}
+
+uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g) {
+    if (!g) return 0;
+    const uint32_t nb = gpu_graph_bank_pool_count(g);
+    uint64_t bytes = 0;
+    for (uint32_t b = 0; b < nb; b++) bytes += gpu_graph_bank_touched_kv_bytes(g, b);
+    return bytes;
+}
+
+/* Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over one
+ * decode quantum of `q` tokens: Σ_layers( ceil(q/ratio)·comp_row + q·index_row ).
+ * The index term charges q (not ceil(q/ratio)) rows — a deliberate over-estimate
+ * so the guard fires EARLY (safe side). Position-independent, so total Δ =
+ * n_live_growing_banks × this. */
+uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q) {
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        bytes += (uint64_t)((q + ratio - 1u) / ratio) * attn_row;
+        if (ratio == 4) bytes += (uint64_t)q * idx_row;
+    }
+    return bytes;
 }
 
 bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
@@ -1091,7 +1380,7 @@ bool gpu_graph_alloc_raw_cap(
             const uint64_t comp_row_bytes = gpu_graph_attn_comp_cache_row_bytes();
             if (banked) {
                 g->layer_attn_comp_cache[il] = ds4_gpu_tensor_view(
-                        g->banks.comp[il], 0, g->banks.comp_bank_bytes[il]);
+                        g->banks.comp[il][0], 0, g->banks.comp_bank_bytes[il]);
                 g->layer_attn_state_kv[il] = ds4_gpu_tensor_view(
                         g->banks.askv[il], 0, g->banks.astate_bank_bytes[il]);
                 g->layer_attn_state_score[il] = ds4_gpu_tensor_view(
@@ -1125,7 +1414,7 @@ bool gpu_graph_alloc_raw_cap(
                     : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
                 if (banked) {
                     g->layer_index_comp_cache[il] = ds4_gpu_tensor_view(
-                            g->banks.index[il], 0, g->banks.index_bank_bytes[il]);
+                            g->banks.index[il][0], 0, g->banks.index_bank_bytes[il]);
                     g->layer_index_state_kv[il] = ds4_gpu_tensor_view(
                             g->banks.iskv[il], 0, g->banks.istate_bank_bytes[il]);
                     g->layer_index_state_score[il] = ds4_gpu_tensor_view(
@@ -1337,8 +1626,22 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
          * (17 = the spec block clamp of 16 drafts + first_token). */
         g->dspark_target_h_batch[i] = ds4_gpu_tensor_alloc(
             (uint64_t)17 * DS4_N_EMBD * sizeof(float));
-        g->dspark_raw_cache[i] = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
+        /* Option F: bank the drafter ring when the pool is enabled — one
+         * bank-major slab, dspark_raw_cache[i] becomes bank 0's view (repoint
+         * swaps it). */
+        if (g->banks.n_banks != 0) {
+            g->banks.dspark_raw_bank_bytes =
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float);
+            g->banks.dspark_raw[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)g->banks.n_banks * g->banks.dspark_raw_bank_bytes);
+            g->dspark_raw_cache[i] = g->banks.dspark_raw[i]
+                ? ds4_gpu_tensor_view(g->banks.dspark_raw[i], 0,
+                                      g->banks.dspark_raw_bank_bytes)
+                : NULL;
+        } else {
+            g->dspark_raw_cache[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
+        }
         g->dspark_n_raw[i] = 0;
         ok = ok && g->dspark_target_h[i] && g->dspark_target_h_batch[i] &&
              g->dspark_raw_cache[i];
@@ -1359,8 +1662,19 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
     /* Prompt-window ring: last <=128 prompt positions' anchor hiddens. */
     g->dspark_prompt_n = 0;
     for (int i = 0; i < 3; i++) {
-        g->dspark_prompt_h[i] = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float));
+        if (g->banks.n_banks != 0) {
+            g->banks.dspark_prompt_bank_bytes =
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float);
+            g->banks.dspark_prompt[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)g->banks.n_banks * g->banks.dspark_prompt_bank_bytes);
+            g->dspark_prompt_h[i] = g->banks.dspark_prompt[i]
+                ? ds4_gpu_tensor_view(g->banks.dspark_prompt[i], 0,
+                                      g->banks.dspark_prompt_bank_bytes)
+                : NULL;
+        } else {
+            g->dspark_prompt_h[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float));
+        }
         ok = ok && g->dspark_prompt_h[i];
     }
     /* Stage-B no-replay rollback: per-position compressor projection saves for

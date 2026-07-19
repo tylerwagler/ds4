@@ -859,12 +859,35 @@ typedef struct {
     uint64_t astate_bank_bytes[DS4_MAX_LAYER];/* attn compressor frontier lane */
     uint64_t istate_bank_bytes[DS4_MAX_LAYER];/* indexer compressor frontier lane */
     ds4_gpu_tensor *raw[DS4_MAX_LAYER];
-    ds4_gpu_tensor *comp[DS4_MAX_LAYER];
-    ds4_gpu_tensor *index[DS4_MAX_LAYER];
+    /* Tier-2 task #55 (increment 2a): the ctx-scaled comp/index caches are now
+     * ONE cudaMallocManaged allocation PER BANK (comp[il][bank]) instead of one
+     * n_banks*bank_bytes slab — so the increment-2 eviction guard can cudaFree a
+     * single idle bank's physical directly (the only reclaim primitive that
+     * returns memory on GB10; Step-1). The stride stays UNIFORM 1M (comp_bank_bytes
+     * is per-layer, bank-independent) — this is NOT B-full (no variable caps). The
+     * seq_id-scattered batched-decode READ kernels can no longer address a bank as
+     * base + seq_id*comp_cap across one slab, so they take a per-bank BASE-POINTER
+     * table (comp_bases[il]/index_bases[il]): a device array of the n_banks
+     * comp[il][*]->ptr, indexed by seq_id[t]. NULL when the pool is disabled
+     * (single-session paths use the repointed view). */
+    ds4_gpu_tensor *comp[DS4_MAX_LAYER][DS4_MSEQ_MAX];
+    ds4_gpu_tensor *index[DS4_MAX_LAYER][DS4_MSEQ_MAX];
+    ds4_gpu_tensor *comp_bases[DS4_MAX_LAYER];  /* [n_banks] device ptr array: comp[il][b]->ptr */
+    ds4_gpu_tensor *index_bases[DS4_MAX_LAYER]; /* [n_banks] device ptr array: index[il][b]->ptr */
     ds4_gpu_tensor *askv[DS4_MAX_LAYER];
     ds4_gpu_tensor *assc[DS4_MAX_LAYER];
     ds4_gpu_tensor *iskv[DS4_MAX_LAYER];
     ds4_gpu_tensor *issc[DS4_MAX_LAYER];
+    /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
+     * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
+     * gpu_graph_init_dspark_target only when the pool is enabled AND the
+     * drafter is loaded; the graph's dspark_raw_cache[i]/dspark_prompt_h[i]
+     * become bank views into these, swapped by gpu_graph_bank_repoint so the
+     * spec path transparently uses the active bank's ring.  NULL otherwise. */
+    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * head_dim * f32 */
+    uint64_t dspark_prompt_bank_bytes;   /* DRAFT_WINDOW * n_embd  * f32 */
+    ds4_gpu_tensor *dspark_raw[3];       /* N * dspark_raw_bank_bytes */
+    ds4_gpu_tensor *dspark_prompt[3];    /* N * dspark_prompt_bank_bytes */
 } ds4_bank_slabs;
 
 typedef struct {
@@ -1130,6 +1153,13 @@ typedef struct {
      * multiseq step; NULL in production single-session serving. */
     uint32_t ms_n_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
     uint32_t ms_n_index_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
+    /* Tier-2 Option F: per-bank DSpark drafter-ring frontier counters (the
+     * device rings themselves are banked slabs, ds4_bank_slabs.dspark_*).
+     * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
+     * window under N=2 spec-time-slice — the whole point of Option F. */
+    uint32_t ms_dspark_n_raw[DS4_MSEQ_MAX][3];
+    uint32_t ms_dspark_prompt_n[DS4_MSEQ_MAX];
+    uint32_t ms_dspark_prompt_lo[DS4_MSEQ_MAX];
     int32_t *ms_positions;
     int32_t *ms_seq_id;
     ds4_gpu_tensor *batch_positions;
@@ -1282,6 +1312,47 @@ typedef struct {
 } ds4_sample_scratch;
 
 void ds4_sample_scratch_free(ds4_sample_scratch *s);
+
+
+/* Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
+ * pool-session's HOST per-conversation state (checkpoint token history, host
+ * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
+ * instance on ds4_session, so time-slicing classic/spec work across banks in
+ * one graph must save the leaving bank's carry and restore the entering bank's.
+ * gpu_graph_bank_repoint swaps the DEVICE views; this covers the HOST half the
+ * engine header (gpu_graph_bank_repoint contract) delegates to the caller.
+ * The three heap members are owned deep copies; every other field is a scalar
+ * mirror of the identically-named ds4_session field. */
+typedef struct ds4_bank_carry {
+    bool      valid;                 /* has this bank's state ever been saved */
+    /* heap-backed (owned): */
+    token_vec checkpoint;            /* deep copy of s->checkpoint */
+    float    *logits;                /* DS4_N_VOCAB floats, owned */
+    float    *dspark_pending_qrows;  /* dspark_pending_qrows_cap floats, owned */
+    uint32_t  dspark_pending_qrows_cap;
+    /* scalar mirrors: */
+    bool      checkpoint_valid;
+    bool      mseq_dirty;
+    int32_t   dspark_pending[16];
+    uint32_t  dspark_n_pending;
+    int32_t   dspark_pending_base;
+    int32_t   dspark_pending_pos;
+    int32_t   spec_carry_token;
+    bool      spec_carry_valid;
+    int32_t   spec_carry_pos;
+    float     spec_carry_temp, spec_carry_top_p, spec_carry_min_p;
+    int       spec_carry_top_k;
+    int32_t   dspark_pending_alt[16];
+    float     dspark_pending_conf[16];
+    bool      dspark_pending_sampled;
+    float     dspark_pending_q[16];
+    float     dspark_pending_temp, dspark_pending_top_p, dspark_pending_min_p;
+    int       dspark_pending_top_k;
+    float     spec_quench_debt, spec_quench_ewma;
+    uint32_t  spec_quench_steps;
+    bool      spec_quenched;
+    uint64_t  spec_accepted_tokens, spec_draft_tokens, spec_num_drafts, spec_gen_tokens;
+} ds4_bank_carry;
 
 
 struct ds4_session {
@@ -1451,6 +1522,11 @@ struct ds4_session {
     uint64_t spec_draft_tokens;
     uint64_t spec_num_drafts;
     uint64_t spec_gen_tokens;
+    /* Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
+     * allocated on the first ds4_session_bank_state_save; NULL / bank_carry_n==0
+     * when the pool is disabled (single-session use never touches it). */
+    ds4_bank_carry *bank_carry;
+    uint32_t bank_carry_n;
 };
 
 typedef struct {
@@ -2031,12 +2107,31 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank);
 /* Effective pool size for banked kernel launches: banks.n_banks, or 1 when
  * the pool is disabled (the classic tensors act as bank 0). */
 uint32_t gpu_graph_bank_pool_count(const ds4_gpu_graph *g);
+/* Tier-2 overcommit (task #55): demand-paged comp+index VA bytes for ONE bank at
+ * a context (the overcommit-reserved, physical-on-touch part); and the EXACT
+ * touched (physically resident) demand-paged KV summed over the whole pool from
+ * the per-bank compressor frontier. See the definitions in gpu_diag.c. */
+uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
+uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g);
+uint64_t gpu_graph_bank_touched_kv_bytes(const ds4_gpu_graph *g, uint32_t bank);
+uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q);
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore reclaim
+ * primitives (direct cudaFree / cudaMallocManaged of one bank's split comp/index
+ * + base-table rebuild). See gpu_diag.c. */
+bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank);
+bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank);
+bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank);
 /* Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */
 ds4_gpu_tensor *gpu_graph_bank_raw_pool(ds4_gpu_graph *g, uint32_t il);
 ds4_gpu_tensor *gpu_graph_bank_attn_comp_pool(ds4_gpu_graph *g, uint32_t il);
 ds4_gpu_tensor *gpu_graph_bank_index_comp_pool(ds4_gpu_graph *g, uint32_t il);
+/* Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,
+ * indexed by seq_id) the batched READ kernels use in place of base +
+ * seq_id*comp_cap over one slab. NULL when the pool is disabled. */
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_bases(ds4_gpu_graph *g, uint32_t il);
+ds4_gpu_tensor *gpu_graph_bank_index_comp_bases(ds4_gpu_graph *g, uint32_t il);
 /* Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */
@@ -2053,6 +2148,19 @@ ds4_gpu_tensor *gpu_graph_bank_index_state_score_view(ds4_gpu_graph *g, uint32_t
  * work so the scalars are that bank's counts again. */
 void gpu_graph_bank_counters_capture(ds4_gpu_graph *g, uint32_t bank);
 void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank);
+/* Tier-2 PATH A host-carry primitive (see ds4_bank_carry).  save copies the
+ * session's live HOST per-conversation state into bank's shadow AND captures
+ * the graph frontier counters (gpu_graph_bank_counters_capture).  restore
+ * repoints the device views to bank, installs its frontier counters, copies
+ * the shadow back into the session, and clears mseq_dirty (the cheap
+ * no-re-prefill resume: counters_install re-establishes per-bank truth, which
+ * is exactly what mseq_dirty guards).  Call save on the leaving bank before,
+ * and restore on the entering bank after, a bank switch — both only between
+ * fully synchronized forwards (the gpu_graph_bank_repoint contract).  restore
+ * returns false only on a bad bank id or OOM growing an owned buffer. */
+/* ds4_session_bank_state_save/restore + ds4_session_bank_count/repoint are the
+ * public server-facing API (declared in ds4.h). */
+void ds4_session_bank_carry_free(ds4_session *s);
 /* Arm one banked multiseq batched step over n_rows packed rows: pos[t] is
  * row t's absolute position, seq[t] its TRUE bank id.  Writes the host
  * mirrors + device descriptor arrays (lazily allocated), verifies the
@@ -2102,6 +2210,18 @@ uint64_t gpu_graph_session_bytes(
         uint32_t                 ctx_size,
         uint32_t                 prefill_cap,
         bool                     enable_spec);
+/* Same, but priced for an EXPLICIT bank-pool size instead of reading
+ * DS4_MSEQ_BANKS — the fit-table / auto-sizing path (cli_main) evaluates many
+ * (n_banks, ctx) candidates before the env is committed. n_banks == 0 or 1 is
+ * the classic single-session layout. */
+uint64_t gpu_graph_session_bytes_banked(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_spec,
+        uint32_t                 n_banks);
 bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
 bool gpu_graph_alloc(
         ds4_gpu_graph *g,

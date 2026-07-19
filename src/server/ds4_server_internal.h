@@ -839,7 +839,20 @@ typedef struct gen_state gen_state;
  * reusable hole (sess == NULL, state SLOT_EVICTED) below the n_slots
  * high-water mark. */
 typedef struct {
-    ds4_session *sess;                    /* live session; NULL until admitted */
+    ds4_session *sess;                    /* live session; NULL until admitted.
+                                             Tier-2: in bank-pool mode EVERY live
+                                             slot's sess points at the ONE pool
+                                             session (slots[0].sess); the slot is
+                                             distinguished by `bank` below. */
+    uint32_t     bank;                    /* Tier-2: this slot's bank id in the
+                                             shared pool (slot i -> bank i). 0 in
+                                             classic (non-pooled) mode. */
+    int          committed_pos;           /* Tier-2: this bank's committed KV
+                                             frontier length (== ds4_session_pos
+                                             when this bank is the live one).
+                                             Kept current at every op boundary so
+                                             routing/metrics can read a non-live
+                                             bank's position without a bank swap. */
     struct job  *active_job;              /* request bound to this slot, or NULL */
     gen_state   *gen;                     /* resumable state for active_job */
     slot_state   state;
@@ -854,6 +867,12 @@ typedef struct {
      * the shared ds4_kvstore keeps one continued_last_store_tokens field, but
      * the schedule it tracks belongs to this slot's conversation. */
     int          continued_last_store_tokens;
+    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
+     * bank's comp/index PHYSICAL was cudaFree'd (raw KV bit-identical on disk at
+     * <spill_dir>/spill-bank-<bank>.kv) while its conversation stays bound here; it
+     * is restored (alloc_physical + kv_load) before this slot next decodes. Distinct
+     * from SLOT_EVICTED (which frees the bank for a DIFFERENT conversation). */
+    bool         spilled;
     /* Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
@@ -870,8 +889,35 @@ struct server {
      * published under mu for readers on client threads). */
     session_slot slots[DS4_SESSION_POOL_CAP];
     int          n_slots;            /* provisioned slots (worker-owned; published under mu) */
+    /* Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
+     * shared-pool flip is active: all live slots share slots[0].sess and each
+     * owns one bank; `live_bank` is the bank whose device views + host carry are
+     * currently installed on that session (server_bank_switch lazily saves the
+     * old and restores the new). `spec_max_live` is the three-way scheduler knob
+     * (generate.c worker_main): n_active decode banks <= spec_max_live take the
+     * per-bank spec/plain time-slice lane, n_active > spec_max_live take the
+     * batched multiseq lane. 0 in classic mode. */
+    int          pool_banks;
+    int          live_bank;
+    int          spec_max_live;
+    uint64_t     bank_marginal_bytes; /* Tier-2: per-bank ledger charge in pooled
+                                         mode (even split of the admitted pool
+                                         cost; conservative, demand-paged reality
+                                         is smaller). 0 in classic mode. */
     uint64_t     kv_budget_bytes;    /* admission ceiling computed at startup */
     uint64_t     kv_committed_bytes; /* sum of est_cost_bytes over live slots (under mu) */
+    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
+     * gates the whole mechanism (on iff overcommit sized N>1 banks and a spill dir
+     * exists). `guard_touched_budget` is the resident-KV ceiling the guard keeps
+     * touched_kv under = kv_budget − eager_reserved (banks may grow to 1M but total
+     * physical is bounded); `guard_eager_bytes` the eager floor already resident.
+     * `guard_evictions` counts spills for metrics. `spill_dir` is a LOCAL fast-disk
+     * scratch (NOT the NAS; NOT tmpfs — either would defeat physical reclaim). */
+    bool         guard_enabled;
+    uint64_t     guard_touched_budget;
+    uint64_t     guard_eager_bytes;
+    uint64_t     guard_evictions;
+    char         spill_dir[512];
     /* Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
      * DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.c; immutable after
@@ -1426,6 +1472,14 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * leaking budget forever) if the pairing ever underflows (defined in
  * generate.c; unit-tested in cli_main.c). */
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
+/* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
+ * is the currently-installed bank of the shared pool session (a non-live bank
+ * reads its saved host carry via ds4_session_bank_pos; the live bank reads the
+ * live checkpoint). In classic (non-pooled) mode == ds4_session_pos(sl->sess).
+ * Worker-thread scheduling reads AND the client/worker tool-id lookups use this
+ * instead of ds4_session_pos so a non-live bank's frontier is never misread as
+ * the pool's live cursor (defined in generate.c). */
+int server_slot_frontier_pos(const server *s, const session_slot *sl);
 /* LRU eviction victim: least-recently-serviced idle provisioned slot,
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot

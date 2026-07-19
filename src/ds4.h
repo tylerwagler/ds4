@@ -177,6 +177,44 @@ ds4_context_memory ds4_context_memory_estimate_packed(
  * number admission control must use.  Returns 0 if no session could be
  * created (no graph backend / weights not loaded). */
 uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size);
+/* Same, priced for an EXPLICIT bank-pool size (Tier-2 auto-sizing): the server
+ * evaluates the (banks, ctx) fit table before committing DS4_MSEQ_BANKS. n_banks
+ * >= 1; 1 is the classic single-session cost. */
+uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
+                                              int n_banks);
+/* Tier-2 overcommit (task #55): demand-paged comp+index bytes for ONE bank at a
+ * context — the physical-on-touch VA the overcommit auto-size reserves but does
+ * NOT charge at admission (only the eager floor is charged). 0 if no session
+ * could be priced. */
+uint64_t ds4_engine_demand_paged_bytes_per_bank(ds4_engine *e, int ctx_size);
+/* Tier-2 overcommit (task #55): EXACT touched (physically resident) demand-paged
+ * KV bytes across the pool, summed from the per-bank compressor frontier
+ * (deterministic; no MemAvailable). The eviction guard triggers on this; the
+ * accounting-exactness gate proves it matches the physical cudaMemGetInfo delta.
+ * For the current bank the live frontier is used; idle banks use their captured
+ * frontier — capture the current bank first if you need it fully current. */
+uint64_t ds4_session_touched_kv_bytes(const ds4_session *s);
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
+ * eviction guard. free_physical: DIRECT cudaFree of one idle bank's split comp/index
+ * (reclaims physical on GB10); caller must have snapshotted the bank's KV to DISK
+ * first (host RAM reclaims nothing on unified memory) and repointed away from it.
+ * alloc_physical: reallocate that bank's comp/index (VA; physical on touch) + rebuild
+ * the base-pointer table; caller then reloads KV H2D from the disk snapshot.
+ * is_evicted: whether a bank's physical is currently freed. bank_touched_kv_bytes:
+ * one bank's exact resident comp/index KV from its frontier (guard Δ + victim pick). */
+bool ds4_session_bank_free_physical(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_alloc_physical(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_is_evicted(const ds4_session *s, uint32_t bank);
+uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank);
+/* Raw per-bank comp/index KV disk snapshot (the eviction guard's bit-identical
+ * mechanism; the D2H staging is transient — freed before free_physical). save:
+ * precondition bank is installed (cur). load: reallocs physical + rebuilds the
+ * base table + reinstalls counters, leaving bank installed. Return 0 on success. */
+int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
+int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
+/* Conservative per-bank comp/index growth over one q-token decode quantum (the
+ * guard's Delta term; over-charges the index side so the guard fires early). */
+uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any
@@ -323,6 +361,49 @@ typedef struct {
 int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen);
+/* Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
+ * hosts up to N co-scheduled conversations as banks; each server slot maps to a
+ * bank id.  The pool size is chosen at session create (DS4_MSEQ_BANKS today);
+ * ds4_session_bank_count reports it (1 when not pooled).
+ *
+ * A conversation lives in ONE bank for its lifetime.  To do classic/spec work
+ * on bank b the caller repoints the device views AND restores b's host carry;
+ * ds4_session_bank_restore does both (+ clears the multiseq poison cheaply, no
+ * re-prefill).  ds4_session_bank_save snapshots the live bank before switching
+ * away.  Typical server flow:
+ *   prefill:  ds4_session_bank_repoint(s,b); ds4_session_invalidate(s);
+ *             ds4_session_sync(s, prompt, ...); ds4_session_bank_save(s,b);
+ *   decode 1: ds4_session_bank_state_restore(s,b);
+ *             ds4_session_generate_speculative(...);
+ *             ds4_session_bank_state_save(s,b);
+ *   decode N: ds4_session_decode_multiseq(s, reqs, N, ...) over the live banks
+ *             (each captured via bank_state_save first); sample per row on host.
+ * repoint/save/restore must run only between fully synchronized forwards. */
+int  ds4_session_bank_count(ds4_session *s);
+int  ds4_session_bank_repoint(ds4_session *s, uint32_t bank);
+void ds4_session_bank_state_save(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank);
+/* Per-bank frontier readers for a bank-pooled session: the committed length,
+ * token history, and common-prefix-with-prompt of ONE bank, correct even when
+ * that bank is not the currently-installed one (the live bank reads the live
+ * checkpoint; others read their saved host carry).  ds4_session_pos/_tokens/
+ * _common_prefix describe only the live bank, so server routing and /metrics
+ * must use these for non-active banks.  Pure host reads (no CUDA); the caller
+ * must keep idle banks' carries current (bank_state_save at job end). Return
+ * 0 / NULL for an out-of-range or never-populated bank. */
+int  ds4_session_bank_pos(ds4_session *s, uint32_t bank);
+const ds4_tokens *ds4_session_bank_tokens(ds4_session *s, uint32_t bank);
+int  ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
+                                    const ds4_tokens *prompt);
+/* Tier-2: reconcile the host checkpoint after a run of ds4_session_decode_multiseq
+ * steps advanced the LIVE (just bank_state_restore'd) bank's device KV frontier
+ * without touching the host token history. Append the tokens multiseq committed,
+ * in order, so ds4_session_pos/_tokens/_common_prefix and any subsequent classic
+ * eval/sync/store see the true frontier. Pure host bookkeeping — no eval, no
+ * CUDA. The device per-bank counters are already correct (the multiseq driver
+ * maintained them and bank_state_restore installed them); this only catches the
+ * host checkpoint up to them. */
+void ds4_session_note_committed_tokens(ds4_session *s, const int *toks, int n);
 int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,
