@@ -979,6 +979,25 @@ uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g) {
     return bytes;
 }
 
+/* Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over one
+ * decode quantum of `q` tokens: Σ_layers( ceil(q/ratio)·comp_row + q·index_row ).
+ * The index term charges q (not ceil(q/ratio)) rows — a deliberate over-estimate
+ * so the guard fires EARLY (safe side). Position-independent, so total Δ =
+ * n_live_growing_banks × this. */
+uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q) {
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        bytes += (uint64_t)((q + ratio - 1u) / ratio) * attn_row;
+        if (ratio == 4) bytes += (uint64_t)q * idx_row;
+    }
+    return bytes;
+}
+
 bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
                                    const int32_t *seq, uint32_t n_rows,
                                    bool capture_cur) {

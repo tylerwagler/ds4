@@ -861,6 +861,12 @@ typedef struct {
      * the shared ds4_kvstore keeps one continued_last_store_tokens field, but
      * the schedule it tracks belongs to this slot's conversation. */
     int          continued_last_store_tokens;
+    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
+     * bank's comp/index PHYSICAL was cudaFree'd (raw KV bit-identical on disk at
+     * <spill_dir>/spill-bank-<bank>.kv) while its conversation stays bound here; it
+     * is restored (alloc_physical + kv_load) before this slot next decodes. Distinct
+     * from SLOT_EVICTED (which frees the bank for a DIFFERENT conversation). */
+    bool         spilled;
     /* Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
@@ -894,6 +900,18 @@ struct server {
                                          is smaller). 0 in classic mode. */
     uint64_t     kv_budget_bytes;    /* admission ceiling computed at startup */
     uint64_t     kv_committed_bytes; /* sum of est_cost_bytes over live slots (under mu) */
+    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
+     * gates the whole mechanism (on iff overcommit sized N>1 banks and a spill dir
+     * exists). `guard_touched_budget` is the resident-KV ceiling the guard keeps
+     * touched_kv under = kv_budget − eager_reserved (banks may grow to 1M but total
+     * physical is bounded); `guard_eager_bytes` the eager floor already resident.
+     * `guard_evictions` counts spills for metrics. `spill_dir` is a LOCAL fast-disk
+     * scratch (NOT the NAS; NOT tmpfs — either would defeat physical reclaim). */
+    bool         guard_enabled;
+    uint64_t     guard_touched_budget;
+    uint64_t     guard_eager_bytes;
+    uint64_t     guard_evictions;
+    char         spill_dir[512];
     /* Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
      * DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.c; immutable after

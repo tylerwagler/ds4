@@ -992,6 +992,52 @@ int main(int argc, char **argv) {
         s.kv_committed_bytes = session_actual;
         s.slots[0].est_cost_bytes = session_actual;
     }
+    /* Tier-2 task #55 increment 2b — proactive-eviction guard. Enabled only under
+     * overcommit with N>1 banks (banks are 1M-capable but total physical is
+     * bounded). The guard keeps touched (demand-paged) KV under budget − eager by
+     * spilling LRU-idle banks to local fast disk + cudaFree; a returning bank
+     * reloads bit-identically. Decisions use the deterministic touched accounting,
+     * NEVER the coarse cudaMemGetInfo gauge. DS4_SERVER_KV_BUDGET_OVERRIDE (bytes)
+     * lowers the budget for the memory-safety smoke so the guard fires at modest
+     * fills while the box stays far from real OOM. */
+    if (overcommit && s.pool_banks > 0) {
+        uint64_t budget = kv_budget_final;
+        const char *ov = getenv("DS4_SERVER_KV_BUDGET_OVERRIDE");
+        if (ov && ov[0]) {
+            unsigned long long b = strtoull(ov, NULL, 10);
+            if (b > 0) { budget = (uint64_t)b;
+                server_log(DS4_LOG_WARNING,
+                    "ds4-server: guard: KV budget OVERRIDDEN to %.2f GiB (test hook)",
+                    (double)budget / (1024.0*1024.0*1024.0)); }
+        }
+        s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident */
+        s.guard_touched_budget = budget > s.guard_eager_bytes
+                               ? budget - s.guard_eager_bytes : 0;
+        /* Direct touched-budget override (bytes) for the memory-safety smoke: sets
+         * the resident demand-paged-KV ceiling the guard keeps under, so it fires
+         * at a precise modest fill while the box stays far from real OOM. */
+        const char *tb = getenv("DS4_SERVER_GUARD_TOUCHED_BUDGET");
+        if (tb && tb[0]) {
+            unsigned long long b = strtoull(tb, NULL, 10);
+            if (b > 0) { s.guard_touched_budget = (uint64_t)b;
+                server_log(DS4_LOG_WARNING,
+                    "ds4-server: guard: touched budget OVERRIDDEN to %.3f GiB (test hook)",
+                    (double)s.guard_touched_budget / (1024.0*1024.0*1024.0)); }
+        }
+        const char *sd = getenv("DS4_SERVER_SPILL_DIR");
+        snprintf(s.spill_dir, sizeof s.spill_dir, "%s",
+                 (sd && sd[0]) ? sd : "./ds4-spill");
+        (void)mkdir(s.spill_dir, 0700);                   /* best-effort; may exist */
+        s.guard_enabled = (s.guard_touched_budget > 0);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: Tier-2 2b guard %s: touched budget %.2f GiB "
+                   "(kv budget %.2f − eager %.2f), spill dir %s",
+                   s.guard_enabled ? "ENABLED" : "DISABLED (no touched headroom)",
+                   (double)s.guard_touched_budget / (1024.0*1024.0*1024.0),
+                   (double)budget / (1024.0*1024.0*1024.0),
+                   (double)s.guard_eager_bytes / (1024.0*1024.0*1024.0),
+                   s.spill_dir);
+    }
     s.slots[0].sess = session;
     s.slots[0].state = SLOT_IDLE;
     s.slots[0].ctx_size = cfg.ctx_size;

@@ -2114,6 +2114,7 @@ uint32_t gpu_graph_bank_pool_count(const ds4_gpu_graph *g);
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
 uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g);
 uint64_t gpu_graph_bank_touched_kv_bytes(const ds4_gpu_graph *g, uint32_t bank);
+uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q);
 /* Tier-2 task #55 increment 2b — per-bank physical evict/restore reclaim
  * primitives (direct cudaFree / cudaMallocManaged of one bank's split comp/index
  * + base-table rebuild). See gpu_diag.c. */

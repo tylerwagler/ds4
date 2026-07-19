@@ -2145,6 +2145,11 @@ uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank) {
     return gpu_graph_bank_touched_kv_bytes(&s->graph, bank);
 }
 
+uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q) {
+    (void)s;
+    return gpu_graph_quantum_growth_bytes_per_bank(q);
+}
+
 /* Tier-2 task #55 increment 2b — RAW per-bank comp/index KV disk snapshot. The
  * eviction guard's bit-identical mechanism (the transcript-keyed kv_cache is a
  * semantic prefix-reuse cache, NOT a bitwise continuation — evict-restore-gate

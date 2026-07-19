@@ -2358,19 +2358,28 @@ typedef enum {
  * no-op in classic mode. The switch-away save is what keeps every idle bank's
  * carry current, so the per-bank frontier readers (ds4_session_bank_*) and
  * server_slot_frontier_pos are always correct for non-live banks. */
+/* Tier-2 2b: restore a guard-spilled bank's physical + raw KV from disk before it
+ * is installed. Defined below (near the guard); forward-declared for the switch. */
+static bool server_bank_restore_spilled(server *s, int bank);
+
 static void server_bank_switch(server *s, int bank) {
     if (s->pool_banks <= 0) return;               /* classic mode */
     if (bank < 0 || bank >= s->pool_banks) return;
-    if (bank == s->live_bank) return;             /* already installed */
+    if (bank == s->live_bank && !s->slots[bank].spilled) return; /* already installed */
     ds4_session *pool = s->slots[0].sess;
     /* Snapshot the outgoing bank so its carry stays readable while idle, and
      * record its committed frontier for metrics/routing. live_bank < 0 is the
      * post-batched-quantum sentinel: the pool holds no single bank's clean
      * state (multiseq left a cross-bank superset), so there is nothing safe to
      * save — just install the target (bank_state_restore clears the poison). */
-    if (s->live_bank >= 0) {
+    if (s->live_bank >= 0 && s->live_bank != bank) {
         s->slots[s->live_bank].committed_pos = ds4_session_pos(pool);
         ds4_session_bank_state_save(pool, (uint32_t)s->live_bank);
+    }
+    /* Tier-2 2b: a guard-spilled target has no physical — reallocate + reload its
+     * KV bit-identically from disk before installing (the reload-stall cost). */
+    if (s->slots[bank].spilled) {
+        if (!server_bank_restore_spilled(s, bank)) return;   /* failed — leave state; request errors */
     }
     ds4_session_bank_state_restore(pool, (uint32_t)bank);
     s->live_bank = bank;
@@ -3149,10 +3158,150 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * them via the per-slot path, which reconciles their host checkpoint against the
  * tokens committed here. Leaves the pool multiseq-poisoned with live_bank = -1
  * so the next server_bank_switch does a real bank restore. */
+/* ==== Tier-2 task #55 increment 2b: proactive-eviction guard =================
+ *
+ * At each decode-quantum boundary, if the live banks growing by one quantum would
+ * push total resident KV past the budget, SPILL the LRU-idle smallest-frontier
+ * bank: its comp/index KV -> local fast disk (raw, bit-identical), then cudaFree
+ * its physical (the only primitive that returns physical on GB10; 2a/2b gates).
+ * The conversation stays bound to the slot and is restored (alloc + reload) on its
+ * next decode via server_bank_switch. Decisions use the DETERMINISTIC touched
+ * accounting + MemAvailable floor backstop, never the coarse cudaMemGetInfo gauge.
+ * Worker thread only. */
+
+static bool server_bank_restore_spilled(server *s, int bank) {
+    ds4_session *pool = s->slots[0].sess;
+    char path[600];
+    snprintf(path, sizeof path, "%s/spill-bank-%d.kv", s->spill_dir, bank);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: restore open %s failed: %s",
+                   path, strerror(errno));
+        return false;
+    }
+    char err[128];
+    const double t0 = server_now_sec();
+    const int rc = ds4_session_bank_kv_load(pool, (uint32_t)bank, fp, err, sizeof err);
+    fclose(fp);
+    if (rc != 0) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: kv_load bank %d failed: %s", bank, err);
+        return false;
+    }
+    s->slots[bank].spilled = false;
+    remove(path);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: guard RESTORED bank %d from disk (%.1f ms reload stall)",
+               bank, (server_now_sec() - t0) * 1e3);
+    return true;
+}
+
+/* Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
+ * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical. */
+static bool server_spill_bank(server *s, session_slot *victim) {
+    ds4_session *pool = s->slots[0].sess;
+    const uint32_t vb = victim->bank;
+    server_bank_switch(s, (int)vb);               /* install victim (not spilled yet) */
+    char path[600];
+    snprintf(path, sizeof path, "%s/spill-bank-%u.kv", s->spill_dir, vb);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: spill open %s failed: %s",
+                   path, strerror(errno));
+        return false;
+    }
+    char err[128];
+    const double t0 = server_now_sec();
+    const int rc = ds4_session_bank_kv_save(pool, vb, fp, err, sizeof err);
+    const int fc = fclose(fp);
+    if (rc != 0 || fc != 0) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: kv_save bank %u failed: %s",
+                   vb, rc ? err : "close");
+        remove(path);
+        return false;
+    }
+    ds4_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
+    if (!ds4_session_bank_state_restore(pool, 0)) { remove(path); return false; }
+    s->live_bank = 0;
+    if (!ds4_session_bank_free_physical(pool, vb)) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: free_physical bank %u failed", vb);
+        return false;                              /* KV is on disk; leave not-spilled */
+    }
+    victim->spilled = true;
+    victim->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+    s->guard_evictions++;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: guard EVICTED bank %u -> disk (%.1f ms save, physical freed); "
+               "touched %.2f GiB / budget %.2f GiB, evictions %llu",
+               vb, (server_now_sec() - t0) * 1e3,
+               (double)ds4_session_touched_kv_bytes(pool) / gib,
+               (double)s->guard_touched_budget / gib,
+               (unsigned long long)s->guard_evictions);
+    return true;
+}
+
+/* LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
+ * set, no active job, not already spilled. -1 if none. */
+static int server_guard_pick_victim(server *s, session_slot **dec, int n) {
+    ds4_session *pool = s->slots[0].sess;
+    int best = -1;
+    uint64_t best_us = UINT64_MAX, best_touched = UINT64_MAX;
+    for (int i = 1; i < s->n_slots; i++) {         /* bank 0 pinned */
+        session_slot *sl = &s->slots[i];
+        if (!sl->sess || sl->spilled || sl->active_job) continue;
+        bool live = false;
+        for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
+        if (live) continue;
+        const uint64_t t = ds4_session_bank_touched_kv_bytes(pool, sl->bank);
+        if (sl->last_serviced_us < best_us ||
+            (sl->last_serviced_us == best_us && t < best_touched)) {
+            best = i; best_us = sl->last_serviced_us; best_touched = t;
+        }
+    }
+    return best;
+}
+
+static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
+    if (!s->guard_enabled || s->pool_banks <= 0 || n <= 0) return;
+    ds4_session *pool = s->slots[0].sess;
+    const uint64_t dpb = ds4_session_quantum_growth_bytes_per_bank(
+            pool, (uint32_t)DS4_SERVER_DECODE_QUANTUM_TOKENS);
+    const uint64_t delta = (uint64_t)n * dpb;      /* all n live banks grow */
+    const uint64_t bound = s->guard_touched_budget;
+    for (;;) {
+        const uint64_t projected = ds4_session_touched_kv_bytes(pool) + delta;
+        if (projected <= bound) break;             /* fits */
+        const int vi = server_guard_pick_victim(s, dec, n);
+        if (vi < 0) {
+            /* No idle victim: back-pressure — proceed and let the live floor guard.
+             * (Evicting a LIVE growing bank would thrash; the MemAvailable watchdog
+             * is the hard backstop.) */
+            static uint64_t last_warn_us;
+            const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+            if (now_us - last_warn_us > 5000000ull) {
+                last_warn_us = now_us;
+                const double gib = 1024.0 * 1024.0 * 1024.0;
+                server_log(DS4_LOG_WARNING,
+                    "ds4-server: guard: projected touched %.2f GiB > budget %.2f GiB but NO "
+                    "idle victim — back-pressure (MemAvailable floor is the backstop)",
+                    (double)projected / gib, (double)bound / gib);
+            }
+            break;
+        }
+        if (!server_spill_bank(s, &s->slots[vi])) break;   /* spill failed — stop */
+    }
+}
+
 static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) {
     if (n <= 0) return;
     ds4_session *pool = s->slots[0].sess;
     const int vocab = ds4_engine_logits_width(s->engine);
+
+    /* Tier-2 2b: proactive-eviction guard — BEFORE the weight sweep grows the live
+     * banks, spill LRU-idle banks if this quantum's projected growth would breach
+     * the resident-KV budget. A dec bank that was spilled while idle is restored
+     * transparently by server_bank_switch in the ENTRY loop below. */
+    server_guard_maybe_evict(s, dec, n);
 
     /* ENTRY: a slot not yet in the batch samples its first feed token from its
      * bank's current classic logits while that bank is briefly live, then
