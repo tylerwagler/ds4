@@ -20,7 +20,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 OUT="${1:?usage: collect.sh <out_dir> [model] [port] [ctx] [driver args...]}"
-MODEL="${2:-gguf/ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf}"
+MODEL="${2:-gguf/model.gguf}"
 PORT="${3:-8077}"
 CTX="${4:-36864}"
 shift $(( $# < 4 ? $# : 4 ))

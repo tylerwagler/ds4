@@ -1,7 +1,7 @@
 #!/bin/bash
 set -u
 WT=/home/tyler/Projects/AI/temp/wt-prof
-MODEL=/home/tyler/Projects/AI/ds4-gb10/gguf/ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf
+MODEL=/home/tyler/Projects/AI/ds4-gb10/gguf/model.gguf
 cd "$WT"
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 ./ds4-bench -m "$MODEL" --prompt-file speed-bench/promessi_sposi.txt --cuda \
