@@ -5,6 +5,18 @@
 
 
 
+/* Tier-2 shared-pool bank switch (defined lower, near provision_slot). Installs
+ * `bank`'s device views + host carry on the pool session, saving the outgoing
+ * bank first. No-op in classic mode or when `bank` is already live. Called at
+ * the top of every per-slot worker op (gen_begin, generate_job_step,
+ * worker_evict_one) so all sl->sess touches inside that op are live-correct. */
+static void server_bank_switch(server *s, int bank);
+/* Bank-aware common-prefix of `sl` against `prompt` (scheduling reads). */
+static int server_slot_common_prefix(const server *s, const session_slot *sl,
+                                     const ds4_tokens *prompt);
+
+
+
 static bool thinking_tail_ends_with(const thinking_state *st, const char *s) {
     int n = (int)strlen(s);
     return st->tail_len >= n && !memcmp(st->tail + st->tail_len - n, s, (size_t)n);
@@ -863,6 +875,10 @@ static void gen_prefill_fail(server *s, session_slot *sl) {
 static void gen_begin(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
     job *j = g->j;
+    /* Tier-2: install this slot's bank before ANY sl->sess touch below (all the
+     * pos/common-prefix/tokens reads and the prefill sync run against the live
+     * bank). No-op in classic mode / when already live. */
+    server_bank_switch(s, sl->bank);
     const int old_pos = ds4_session_pos(sl->sess);
     const int common = ds4_session_common_prefix(sl->sess, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -2137,6 +2153,11 @@ static void generate_job_begin(server *s, session_slot *sl, job *j) {
 /* Advance the job by one quantum. */
 static void generate_job_step(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
+    /* Tier-2: install this slot's bank before any engine work this quantum.
+     * After another slot (or a fresh bind) was serviced in between, the pool's
+     * live bank may be someone else's; switch back to ours. No-op in classic
+     * mode / when already live. */
+    server_bank_switch(s, sl->bank);
     /* The installed slot writer is worker-thread-local and shared across
      * slots; re-install this slot's writer so send_all() routes through the
      * right deferral queue after another slot (or a fresh bind) was serviced
@@ -2301,8 +2322,108 @@ typedef enum {
                                       chain on (same physical pressure) */
 } provision_refusal;
 
+/* ===== Tier-2 shared-pool bank plumbing =================================== */
+
+/* Lazy bank switch on the shared pool session. server_bank_switch(s, b) saves
+ * the currently-installed bank's host carry + frontier counters and installs
+ * bank b's (device views + carry). Idempotent when b is already live, and a
+ * no-op in classic mode. The switch-away save is what keeps every idle bank's
+ * carry current, so the per-bank frontier readers (ds4_session_bank_*) and
+ * server_slot_frontier_pos are always correct for non-live banks. */
+static void server_bank_switch(server *s, int bank) {
+    if (s->pool_banks <= 0) return;               /* classic mode */
+    if (bank < 0 || bank >= s->pool_banks) return;
+    if (bank == s->live_bank) return;             /* already installed */
+    ds4_session *pool = s->slots[0].sess;
+    /* Snapshot the outgoing bank so its carry stays readable while idle, and
+     * record its committed frontier for metrics/routing. */
+    s->slots[s->live_bank].committed_pos = ds4_session_pos(pool);
+    ds4_session_bank_state_save(pool, (uint32_t)s->live_bank);
+    ds4_session_bank_state_restore(pool, (uint32_t)bank);
+    s->live_bank = bank;
+    s->slots[bank].committed_pos = ds4_session_pos(pool);
+}
+
+int server_slot_frontier_pos(const server *s, const session_slot *sl) {
+    if (!sl || !sl->sess) return 0;
+    if (s->pool_banks > 0) return ds4_session_bank_pos(sl->sess, sl->bank);
+    return ds4_session_pos(sl->sess);
+}
+
+static int server_slot_common_prefix(const server *s, const session_slot *sl,
+                                     const ds4_tokens *prompt) {
+    if (!sl || !sl->sess) return 0;
+    if (s->pool_banks > 0)
+        return ds4_session_bank_common_prefix(sl->sess, sl->bank, prompt);
+    return ds4_session_common_prefix(sl->sess, prompt);
+}
+
+/* Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
+ * the whole n-bank pool was allocated and admitted ONCE at startup, so this is
+ * pure host bookkeeping — find a free bank slot, install it, reset it to an
+ * empty conversation (so gen_begin sees pos 0 / no stale prefix), and charge
+ * the even-split per-bank marginal to the ledger. The only runtime pressure is
+ * the demand-paged comp/index pages a bank touches as it fills; the belt-and-
+ * suspenders MemAvailable floor still guards each provision. Returns NULL with
+ * *refusal set on a full pool or a tight box (never on a create/admission
+ * failure — there is no runtime create). */
+static session_slot *provision_bank(server *s, provision_refusal *refusal) {
+    *refusal = PROVISION_OK;
+    int idx = -1;
+    for (int i = 1; i < s->pool_banks; i++) {     /* bank 0 == slot 0, pinned */
+        if (!s->slots[i].sess) { idx = i; break; }
+    }
+    if (idx < 0) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
+    /* Belt-and-suspenders: refuse if the box is physically tight (fail closed on
+     * an unreadable gauge), matching provision_slot. The marginal is what the
+     * bank may still demand-page as it fills. */
+    const uint64_t avail = server_mem_available_bytes();
+    if (avail == 0 || !server_mem_floor_admits(avail, s->bank_marginal_bytes)) {
+        static bool warned; /* single worker thread */
+        if (!warned) {
+            warned = true;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: bank provisioning refused: MemAvailable %.2f GiB "
+                       "below floor for marginal %.2f GiB (job queued)",
+                       (double)avail / (1024.0 * 1024.0 * 1024.0),
+                       (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+        *refusal = PROVISION_REFUSED_MEM_FLOOR;
+        return NULL;
+    }
+    session_slot *sl = &s->slots[idx];
+    ds4_session *pool = s->slots[0].sess;
+    /* Install and reset the bank to an empty conversation with a valid (empty)
+     * host carry, so routing/metrics read pos 0 and gen_begin cold-prefills. */
+    server_bank_switch(s, idx);
+    ds4_session_invalidate(pool);
+    ds4_session_bank_state_save(pool, (uint32_t)idx);
+    sl->sess = pool;
+    sl->bank = (uint32_t)idx;
+    sl->committed_pos = 0;
+    sl->state = SLOT_IDLE;
+    sl->ctx_size = s->slots[0].ctx_size;          /* every bank shares pool ctx */
+    sl->est_cost_bytes = s->bank_marginal_bytes;
+    sl->tokens_emitted = 0;
+    sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+    sl->continued_last_store_tokens = 0;
+    pthread_mutex_lock(&s->mu);
+    s->kv_committed_bytes += s->bank_marginal_bytes;
+    if (idx >= s->n_slots) s->n_slots = idx + 1;
+    pthread_mutex_unlock(&s->mu);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: provisioned bank %d (pooled) marginal=%.2f GiB "
+               "total committed=%.2f GiB / %.2f GiB",
+               idx,
+               (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_committed_bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+    return sl;
+}
+
 static session_slot *provision_slot(server *s, int ctx,
                                     provision_refusal *refusal) {
+    if (s->pool_banks > 0) { (void)ctx; return provision_bank(s, refusal); }
     *refusal = PROVISION_OK;
     int idx = -1;
     for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) {
@@ -2527,12 +2648,12 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
         if (sl->ctx_size < needed) continue;
         const size_t visible =
             thinking_live_binds_prompt(s, sl, &j->req,
-                                       ds4_session_pos(sl->sess));
+                                       server_slot_frontier_pos(s, sl));
         if (visible > bound_visible) {
             bound_visible = visible;
             bound = sl;
         }
-        const int common = ds4_session_common_prefix(sl->sess, &j->req.prompt);
+        const int common = server_slot_common_prefix(s, sl, &j->req.prompt);
         if (common > best_common) {
             best_common = common;
             best = sl;
@@ -2541,14 +2662,14 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
     if (bound) return bound;
     const bool best_clobbers_warm_state =
         best && server_slot_match_is_trivial(best_common,
-                                             ds4_session_pos(best->sess),
+                                             server_slot_frontier_pos(s, best),
                                              s->slot_trivial_common_tokens);
     if (!best || best_clobbers_warm_state) {
         if (best_clobbers_warm_state) {
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: slot routing: best match is trivial "
                        "(common=%d pos=%d threshold=%d); preferring a fresh slot",
-                       best_common, ds4_session_pos(best->sess),
+                       best_common, server_slot_frontier_pos(s, best),
                        s->slot_trivial_common_tokens);
         }
         session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j),
@@ -2739,6 +2860,9 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
     if (vi < 0) return false;
     session_slot *sl = &s->slots[vi];
 
+    /* Tier-2: install the victim's bank so the snapshot store below reads its
+     * OWN frontier (not the pool's live cursor). No-op in classic mode. */
+    server_bank_switch(s, sl->bank);
     const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
     const int live_tokens = tokens ? tokens->len : 0;
     bool stored = false;
@@ -2762,25 +2886,37 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
     anthropic_live_clear(s, sl);
     thinking_live_clear(s, sl);
 
-    /* Free the session and verify, against the allocator's ground-truth
-     * counter, that the bytes the ledger is about to release actually came
-     * back (the create-side twin of server_reconciled_session_cost). */
     const uint64_t committed = sl->est_cost_bytes;
-    const uint64_t alloc_before = ds4_gpu_tensor_alloc_bytes_current();
-    ds4_session_free(sl->sess);
-    const uint64_t alloc_after = ds4_gpu_tensor_alloc_bytes_current();
-    const uint64_t freed =
-        alloc_before > alloc_after ? alloc_before - alloc_after : 0;
-    if (committed > 0 &&
-        (freed > committed + committed / 10 ||
-         committed > freed + freed / 10))
-    {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: EVICTION FREED-BYTES DRIFT >10%%: ledger releases "
-                   "%.2f GiB but the allocator freed %.2f GiB — session teardown "
-                   "is leaking or freeing unaccounted allocations",
-                   (double)committed / (1024.0 * 1024.0 * 1024.0),
-                   (double)freed / (1024.0 * 1024.0 * 1024.0));
+    uint64_t freed = 0;
+    if (s->pool_banks > 0) {
+        /* Pooled mode: the pool session persists (it is slots[0].sess, shared by
+         * every bank). "Evicting" bank vi means reset it to an empty
+         * conversation and drop its host carry so a fresh conversation can reuse
+         * it — no ds4_session_free (that would tear down the whole pool). The
+         * demand-paged comp/index pages this bank touched stay resident; the
+         * ledger releases only this bank's even-split marginal. */
+        ds4_session_invalidate(sl->sess);
+        ds4_session_bank_state_save(sl->sess, (uint32_t)sl->bank);
+        freed = committed; /* logical release; no allocator delta to verify */
+    } else {
+        /* Classic mode: free the session and verify, against the allocator's
+         * ground-truth counter, that the bytes the ledger is about to release
+         * actually came back (create-side twin of server_reconciled_session_cost). */
+        const uint64_t alloc_before = ds4_gpu_tensor_alloc_bytes_current();
+        ds4_session_free(sl->sess);
+        const uint64_t alloc_after = ds4_gpu_tensor_alloc_bytes_current();
+        freed = alloc_before > alloc_after ? alloc_before - alloc_after : 0;
+        if (committed > 0 &&
+            (freed > committed + committed / 10 ||
+             committed > freed + freed / 10))
+        {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: EVICTION FREED-BYTES DRIFT >10%%: ledger releases "
+                       "%.2f GiB but the allocator freed %.2f GiB — session teardown "
+                       "is leaking or freeing unaccounted allocations",
+                       (double)committed / (1024.0 * 1024.0 * 1024.0),
+                       (double)freed / (1024.0 * 1024.0 * 1024.0));
+        }
     }
     const int evicted_ctx = sl->ctx_size;
     sl->sess = NULL;
@@ -2911,7 +3047,9 @@ void server_publish_metrics_snapshot(server *s) {
     ds4_engine_spec_metrics(s->engine, &m);
     pthread_mutex_lock(&s->mu);
     for (int i = 0; i < s->n_slots; i++) {
-        s->m_slot_pos[i] = s->slots[i].sess ? ds4_session_pos(s->slots[i].sess) : 0;
+        /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
+         * live cursor (server_slot_frontier_pos). Pure host read, no CUDA. */
+        s->m_slot_pos[i] = server_slot_frontier_pos(s, &s->slots[i]);
         s->m_slot_ctx[i] = s->slots[i].ctx_size;
     }
     s->m_spec = m;

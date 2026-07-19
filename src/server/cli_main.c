@@ -359,13 +359,20 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    /* Tier-2: in pooled mode every live slot's sess aliases slots[0].sess (the
+     * one pool session), so free it ONCE (via slot 0) and never per-slot — a
+     * per-slot free would double-free the pool. In classic mode each slot owns
+     * its own session and all are freed. */
+    ds4_session *pool = s->pool_banks > 0 ? s->slots[0].sess : NULL;
     for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) {
         live_tool_state_free(&s->slots[i].responses_live);
         live_tool_state_free(&s->slots[i].anthropic_live);
         visible_live_free(&s->slots[i].thinking_live);
-        ds4_session_free(s->slots[i].sess);
+        if (s->slots[i].sess && s->slots[i].sess != pool)
+            ds4_session_free(s->slots[i].sess);
         s->slots[i].sess = NULL;
     }
+    if (pool) ds4_session_free(pool);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -671,6 +678,23 @@ int main(int argc, char **argv) {
                        cfg.ctx_size,
                        cfg.engine.prefill_chunk);
 
+    /* Tier-2 shared pool: size the bank pool for the server BEFORE the first
+     * session-cost query (gpu_graph_bank_pool_n caches DS4_MSEQ_BANKS on first
+     * read, and ds4_engine_session_cost_bytes below is that first read). Default
+     * to DS4_SESSION_POOL_CAP banks so the single pooled session can host up to
+     * that many concurrent conversations, each on its own bank. The whole
+     * n-bank pool's eager cost is priced by the admission check below and
+     * allocated ONCE at the slot-0 create — no runtime allocation thereafter, so
+     * bank provisioning is pure host bookkeeping. An operator can pin
+     * DS4_MSEQ_BANKS=1 to restore the classic single-session layout exactly
+     * (N=1 byte-identical), or a smaller value to trade concurrency for
+     * per-session headroom / a larger --ctx-size. */
+    if (!getenv("DS4_MSEQ_BANKS")) {
+        char banks[8];
+        snprintf(banks, sizeof(banks), "%d", DS4_SESSION_POOL_CAP);
+        setenv("DS4_MSEQ_BANKS", banks, 1);
+    }
+
     /* Admission control (Tier 1 §1.4): compute the session budget from the
      * real resident weight footprint and the TRUE per-session cost (full graph
      * + prefill working set + drafter state, ds4_engine_session_cost_bytes),
@@ -780,15 +804,53 @@ int main(int argc, char **argv) {
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
-    /* Slot 0 is provisioned here at the configured --ctx-size; the scheduler
-     * provisions slots 1..cap-1 lazily under the same admission predicate. */
+    /* Slot 0 is provisioned here at the configured --ctx-size. Tier-2: if the
+     * created session is bank-pooled (DS4_MSEQ_BANKS>1), slot 0 IS the shared
+     * pool and every other slot maps to one of its banks; the scheduler
+     * provisions banks 1..pool_banks-1 lazily as pure host bookkeeping. In
+     * classic mode (pool_banks==0) slots 1..cap-1 are lazily created sessions
+     * under the admission predicate, exactly as before. */
+    const int pool_banks = ds4_session_bank_count(session);
+    s.pool_banks = pool_banks > 1 ? pool_banks : 0;
+    s.live_bank = 0;
+    /* Three-way scheduler knob (worker_main): decode banks <= spec_max_live run
+     * the per-bank spec/plain time-slice lane; more than that batch. The §2.2
+     * crossover measured the batched lane losing to spec time-slicing at N=2 and
+     * winning at N>=3, so default to 2 (spec through N=2). Env-overridable so the
+     * real-server crossover measurement can retune it without a rebuild. */
+    {
+        const char *sm = getenv("DS4_SERVER_SPEC_MAX_LIVE");
+        int v = sm ? atoi(sm) : 2;
+        if (v < 1) v = 1;
+        if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
+        s.spec_max_live = v;
+    }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;
-    s.kv_committed_bytes = session_actual;
+    for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) s.slots[i].bank = (uint32_t)i;
+    if (s.pool_banks > 0) {
+        /* Even-split per-bank ledger charge: the whole pool's admitted cost
+         * spread across its banks (conservative — demand-paged reality is
+         * smaller). Startup commits bank 0's share; each provisioned bank adds
+         * one share, so committed == session_est only when all banks are live,
+         * and that sum was already verified <= budget above. */
+        s.bank_marginal_bytes = session_est / (uint64_t)pool_banks;
+        s.kv_committed_bytes = s.bank_marginal_bytes;
+        s.slots[0].est_cost_bytes = s.bank_marginal_bytes;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: Tier-2 shared pool ACTIVE: %d banks, "
+                   "spec_max_live=%d, per-bank marginal %.2f GiB "
+                   "(pool resident actual %.2f GiB)",
+                   pool_banks, s.spec_max_live,
+                   (double)s.bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
+                   (double)session_actual / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        s.kv_committed_bytes = session_actual;
+        s.slots[0].est_cost_bytes = session_actual;
+    }
     s.slots[0].sess = session;
     s.slots[0].state = SLOT_IDLE;
     s.slots[0].ctx_size = cfg.ctx_size;
-    s.slots[0].est_cost_bytes = session_actual;
     /* Slot-routing trivial-match threshold (choose_slot_for_job): the token
      * depth at which a shared prefix stops meaning "same rendered template
      * header" and starts meaning "same conversation". Derived once per model
@@ -938,6 +1000,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < s.n_slots; i++) {
         session_slot *sl = &s.slots[i];
         if (!sl->sess) continue;
+        /* Tier-2: install this slot's bank so tokens/store read ITS frontier,
+         * not the pool's last-live cursor (worker has joined; single-threaded). */
+        if (s.pool_banks > 0) ds4_session_bank_state_restore(sl->sess, sl->bank);
         const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
         if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
             server_log(DS4_LOG_KVCACHE,
