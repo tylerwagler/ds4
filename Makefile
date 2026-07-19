@@ -35,7 +35,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
 
 all: help
 
@@ -106,6 +106,13 @@ cuda-multiseq-gate: tests/multiseq_decode_gate
 # Shorter (N=2, 64 steps): this is a config gate, not a throughput run.
 cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
 	DS4_MSEQ_BANKS=2 DS4_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
+
+# Tier-2 PATH A / Option F: fused DSpark speculation on a BANK (N=1 spec-on-
+# bank == classic, N=2 spec-time-slice with warm per-bank rings, mseq_dirty
+# cheap resume).  See tests/bank_spec_gate.c.  MODEL-DEPENDENT, drafter-merged
+# model, same memory discipline as the gates above; hold temp/gpu.lock.
+cuda-bank-spec-gate: tests/bank_spec_gate
+	DS4_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 128
 
 # Prefill bit-exactness gate (the D2R acceptance gate; see the header of
 # tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,
@@ -216,6 +223,9 @@ tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.c src/engine/ds4_en
 tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.c
 
+tests/bank_spec_gate.o: tests/bank_spec_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_spec_gate.c
+
 # Public-API only (ds4.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
 # DS4_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
@@ -244,6 +254,9 @@ tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/ds4_help.o 
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/bank_spec_gate: tests/bank_spec_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)
