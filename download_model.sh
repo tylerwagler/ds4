@@ -6,7 +6,7 @@ set -e
 # attention/shared/head, and the DSpark drafter merged in-file (auto-enabled
 # on load). The repo is public; no token is required for the download.
 REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
-V5MX_FILE="ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf"
+V5MX_FILE="ds4flash-v5mx-reap25-type40-mxfp8lt-dspark-v1.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}

@@ -156,9 +156,9 @@ has a single target:
 ./download_model.sh v5mx   # measured-allocation release build, ~91 GB on disk
 ```
 
-This downloads `ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf`
+This downloads `ds4flash-v5mx-reap25-type40-mxfp8lt-dspark-v1.gguf`
 (91,321,404,640 bytes, sha256
-`86d7d83d49b0dd212db822c609f1bdca9085718602fbec226cb9c9245f73dff0`) from
+`000974720296f2cad17ac0525796f4bb9ceaac9f4015ed61af3fba445dfb1039`) from
 <https://huggingface.co/twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF>,
 stores it under `./gguf/`, and updates `./ds4flash.gguf` to point at it. The
 script prefers the Xet-aware Hugging Face CLI (`hf download`, chunk-deduplicated

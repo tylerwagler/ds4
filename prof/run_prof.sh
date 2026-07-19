@@ -4,7 +4,7 @@
 set -u
 WT=/home/tyler/Projects/AI/temp/wt-prof
 OUT=/home/tyler/Projects/AI/temp
-MODEL=/home/tyler/Projects/AI/ds4-gb10/gguf/ds4flash-v5mx-reap25-mxfp8head-dspark-v1.gguf
+MODEL=/home/tyler/Projects/AI/ds4-gb10/gguf/model.gguf
 PROMPT=$WT/speed-bench/promessi_sposi.txt
 cd "$WT" || exit 1
 
