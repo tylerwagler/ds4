@@ -1361,6 +1361,205 @@ static void gen_resolve_sampling(const request *req, float *temperature,
 
 
 
+/* Emit one already-decoded token into the response stream: append it to the
+ * accumulated text, feed the thinking/DSML trackers, run stop-string and
+ * tool-marker detection, and drive every active protocol stream projection
+ * (plain SSE / OpenAI / Anthropic / Responses). Returns true when the decode
+ * loop must STOP after this token (EOS, a stop string, a completed tool_calls
+ * block, or a client write error), with g->finish (and g->err on error) set.
+ *
+ * Factored out of gen_step_decode's per-token inner loop (plan Tier-2 Step 5)
+ * so both drivers share ONE emit path: the classic spec/plain decode loop
+ * below AND the batched multi-session scatter (which samples each live bank's
+ * row on the host, then calls this to stream that bank's slot). It touches
+ * ONLY host state hung off sl->gen + j->req + the client fd — no engine/CUDA
+ * call except ds4_token_text and the tool-recovery sync (chat_think_tool_
+ * recovery, which the batched path never reaches because n>=2 is plain,
+ * tool-gated decode by contract). Behavior for the single-session path is
+ * byte-identical to the pre-factoring inner loop. */
+static bool gen_emit_token(server *s, session_slot *sl, int token) {
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    if (token == ds4_token_eos(s->engine)) {
+        g->finish = "stop";
+        return true;
+    }
+
+    size_t piece_len = 0;
+    char *piece = ds4_token_text(s->engine, token, &piece_len);
+    g->completion++;
+
+    trace_piece(s, g->trace_id, piece, piece_len);
+    buf_append(&g->text, piece, piece_len);
+    thinking_state_feed(&g->thinking, piece, piece_len);
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
+    }
+
+    size_t stop_pos = 0, stop_len = 0;
+    bool hit_stop = stop_list_find_from(&j->req.stops, g->text.ptr,
+                                        g->stop_scan_from,
+                                        &stop_pos, &stop_len);
+    size_t stream_len = hit_stop ?
+        stop_pos : stop_list_stream_safe_len(&j->req.stops, g->text.len);
+    if (stream_len > g->text.len) stream_len = g->text.len;
+    stream_len = utf8_stream_safe_len(g->text.ptr, g->plain_stream_pos,
+                                      stream_len, hit_stop);
+    if (!hit_stop && j->req.stops.max_len > 1) {
+        const size_t hold = j->req.stops.max_len - 1;
+        g->stop_scan_from = g->text.len > hold ? g->text.len - hold : 0;
+    }
+
+    if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
+        char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
+        bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
+        free(delta);
+        if (!ok) {
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "client stream write failed");
+            free(piece);
+            return true;
+        }
+        g->plain_stream_pos = stream_len;
+    }
+    if (j->req.stream && j->req.api == API_ANTHROPIC &&
+        !anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
+                                     &g->anthropic_live, g->text.ptr, stream_len,
+                                     false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return true;
+    }
+    if (g->openai_live_chat &&
+        !openai_sse_stream_update(j->fd, s, &j->req, g->id,
+                                  &g->openai_live, g->text.ptr, stream_len,
+                                  false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return true;
+    }
+    if (g->responses_live_chat &&
+        !responses_sse_stream_update(j->fd, &j->req,
+                                     &g->responses_live, g->text.ptr, stream_len,
+                                     false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return true;
+    }
+    free(piece);
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        if (g->thinking_gates_tool_markers && g->thinking.inside) {
+            /* A DSML block inside reasoning is not executable.  This is
+             * the live guard: do not let a quoted or mistaken marker in
+             * <think> stop decoding as a real tool call.  A complete
+             * stanza opening, however, almost always means the model
+             * forgot to close its thinking; recover by forcing the
+             * close so the model restarts the call on the executable
+             * side. */
+            const int recovered = g->think_tool_recovery_enabled ?
+                chat_think_tool_recovery(s, sl, &g->text, &g->thinking,
+                                         &g->think_recovery_scan_from,
+                                         &g->completion, g->max_tokens,
+                                         g->err, sizeof(g->err)) : 0;
+            if (recovered < 0) {
+                g->finish = "error";
+                return true;
+            }
+            if (recovered) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
+                           "forced </think> after %d generated tokens",
+                           g->ctx_span,
+                           g->req_flags[0] ? " " : "",
+                           g->req_flags,
+                           g->completion);
+                trace_event(s, g->trace_id,
+                            "think tool recovery after %d generated tokens",
+                            g->completion);
+                dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
+                g->tool_scan_waiting_for_think_close = true;
+            } else {
+                g->tool_scan_waiting_for_think_close = true;
+                g->tool_scan_from = g->text.len;
+            }
+        } else {
+            if (g->tool_scan_waiting_for_think_close) {
+                const char *think_end = find_last_substr(g->text.ptr, "</think>");
+                g->tool_scan_from = think_end ? (size_t)((think_end + 8) - g->text.ptr) : g->text.len;
+                if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
+                g->tool_scan_waiting_for_think_close = false;
+            }
+            if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
+            const char *tool_scan = g->text.ptr ? g->text.ptr + g->tool_scan_from : "";
+            bool orphan_end = false;
+            bool old_start = g->saw_tool_start;
+            bool old_end = g->saw_tool_end;
+            observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
+            if (orphan_end && !g->saw_orphan_tool_end) {
+                g->saw_orphan_tool_end = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
+                           g->ctx_span,
+                           g->req_flags[0] ? " " : "",
+                           g->req_flags,
+                           g->completion);
+                trace_event(s, g->trace_id,
+                            "ignored orphan tool-call end marker after %d generated tokens",
+                            g->completion);
+            }
+            if (g->saw_tool_start && !old_start) {
+                trace_event(s, g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
+            }
+            if (g->saw_tool_end && !old_end) {
+                trace_event(s, g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
+            }
+            const size_t marker_hold = 80;
+            size_t hold_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
+            if (hold_from > g->tool_scan_from) g->tool_scan_from = hold_from;
+            if (s->trace && g->completion >= g->next_tool_progress) {
+                trace_event(s, g->trace_id,
+                            "progress gen=%d dsml_start=%d dsml_end=%d",
+                            g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
+                g->next_tool_progress += 128;
+            }
+        }
+    }
+
+    if (g->completion >= g->next_decode_log) {
+        log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
+                            g->responses_protocol,
+                            j->req.has_tools,
+                            g->thinking.inside,
+                            g->saw_tool_start,
+                            g->saw_tool_end,
+                            g->decode_t0,
+                            &g->last_decode_log_t,
+                            &g->last_decode_log_completion);
+        g->next_decode_log += 50;
+    }
+
+    if (hit_stop) {
+        (void)stop_len;
+        g->finish = "stop";
+        g->text.len = stop_pos;
+        g->text.ptr[g->text.len] = '\0';
+        ds4_session_invalidate(sl->sess);
+        return true;
+    }
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->saw_tool_end) {
+        g->finish = "tool_calls";
+        return true;
+    }
+    return false;
+}
+
+
+
 /* One decode quantum: run the sampling loop for at most
  * DS4_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
  * state parked in gen_state. The session is untouched between quanta, so
@@ -1428,187 +1627,7 @@ static void gen_step_decode(server *s, session_slot *sl) {
         if (g->first_token_t == 0.0 && ntok > 0) g->first_token_t = server_now_sec();
 
         for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
-            token = toks[ti];
-            if (token == ds4_token_eos(s->engine)) {
-                g->finish = "stop";
-                stop_decode = true;
-                break;
-            }
-
-            size_t piece_len = 0;
-            char *piece = ds4_token_text(s->engine, token, &piece_len);
-            g->completion++;
-
-            trace_piece(s, g->trace_id, piece, piece_len);
-            buf_append(&g->text, piece, piece_len);
-            thinking_state_feed(&g->thinking, piece, piece_len);
-            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-            }
-
-            size_t stop_pos = 0, stop_len = 0;
-            bool hit_stop = stop_list_find_from(&j->req.stops, g->text.ptr,
-                                                g->stop_scan_from,
-                                                &stop_pos, &stop_len);
-            size_t stream_len = hit_stop ?
-                stop_pos : stop_list_stream_safe_len(&j->req.stops, g->text.len);
-            if (stream_len > g->text.len) stream_len = g->text.len;
-            stream_len = utf8_stream_safe_len(g->text.ptr, g->plain_stream_pos,
-                                              stream_len, hit_stop);
-            if (!hit_stop && j->req.stops.max_len > 1) {
-                const size_t hold = j->req.stops.max_len - 1;
-                g->stop_scan_from = g->text.len > hold ? g->text.len - hold : 0;
-            }
-
-            if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
-                char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
-                bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
-                free(delta);
-                if (!ok) {
-                    g->finish = "error";
-                    snprintf(g->err, sizeof(g->err), "client stream write failed");
-                    free(piece);
-                    stop_decode = true;
-                    break;
-                }
-                g->plain_stream_pos = stream_len;
-            }
-            if (j->req.stream && j->req.api == API_ANTHROPIC &&
-                !anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
-                                             &g->anthropic_live, g->text.ptr, stream_len,
-                                             false)) {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            if (g->openai_live_chat &&
-                !openai_sse_stream_update(j->fd, s, &j->req, g->id,
-                                          &g->openai_live, g->text.ptr, stream_len,
-                                          false)) {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            if (g->responses_live_chat &&
-                !responses_sse_stream_update(j->fd, &j->req,
-                                             &g->responses_live, g->text.ptr, stream_len,
-                                             false)) {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            free(piece);
-
-            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                if (g->thinking_gates_tool_markers && g->thinking.inside) {
-                    /* A DSML block inside reasoning is not executable.  This is
-                     * the live guard: do not let a quoted or mistaken marker in
-                     * <think> stop decoding as a real tool call.  A complete
-                     * stanza opening, however, almost always means the model
-                     * forgot to close its thinking; recover by forcing the
-                     * close so the model restarts the call on the executable
-                     * side. */
-                    const int recovered = g->think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, sl, &g->text, &g->thinking,
-                                                 &g->think_recovery_scan_from,
-                                                 &g->completion, g->max_tokens,
-                                                 g->err, sizeof(g->err)) : 0;
-                    if (recovered < 0) {
-                        g->finish = "error";
-                        stop_decode = true;
-                        break;
-                    }
-                    if (recovered) {
-                        server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
-                                   "forced </think> after %d generated tokens",
-                                   g->ctx_span,
-                                   g->req_flags[0] ? " " : "",
-                                   g->req_flags,
-                                   g->completion);
-                        trace_event(s, g->trace_id,
-                                    "think tool recovery after %d generated tokens",
-                                    g->completion);
-                        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-                        g->tool_scan_waiting_for_think_close = true;
-                    } else {
-                        g->tool_scan_waiting_for_think_close = true;
-                        g->tool_scan_from = g->text.len;
-                    }
-                } else {
-                    if (g->tool_scan_waiting_for_think_close) {
-                        const char *think_end = find_last_substr(g->text.ptr, "</think>");
-                        g->tool_scan_from = think_end ? (size_t)((think_end + 8) - g->text.ptr) : g->text.len;
-                        if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-                        g->tool_scan_waiting_for_think_close = false;
-                    }
-                    if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-                    const char *tool_scan = g->text.ptr ? g->text.ptr + g->tool_scan_from : "";
-                    bool orphan_end = false;
-                    bool old_start = g->saw_tool_start;
-                    bool old_end = g->saw_tool_end;
-                    observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
-                    if (orphan_end && !g->saw_orphan_tool_end) {
-                        g->saw_orphan_tool_end = true;
-                        server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
-                                   g->ctx_span,
-                                   g->req_flags[0] ? " " : "",
-                                   g->req_flags,
-                                   g->completion);
-                        trace_event(s, g->trace_id,
-                                    "ignored orphan tool-call end marker after %d generated tokens",
-                                    g->completion);
-                    }
-                    if (g->saw_tool_start && !old_start) {
-                        trace_event(s, g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
-                    }
-                    if (g->saw_tool_end && !old_end) {
-                        trace_event(s, g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
-                    }
-                    const size_t marker_hold = 80;
-                    size_t hold_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
-                    if (hold_from > g->tool_scan_from) g->tool_scan_from = hold_from;
-                    if (s->trace && g->completion >= g->next_tool_progress) {
-                        trace_event(s, g->trace_id,
-                                    "progress gen=%d dsml_start=%d dsml_end=%d",
-                                    g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
-                        g->next_tool_progress += 128;
-                    }
-                }
-            }
-
-            if (g->completion >= g->next_decode_log) {
-                log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
-                                    g->responses_protocol,
-                                    j->req.has_tools,
-                                    g->thinking.inside,
-                                    g->saw_tool_start,
-                                    g->saw_tool_end,
-                                    g->decode_t0,
-                                    &g->last_decode_log_t,
-                                    &g->last_decode_log_completion);
-                g->next_decode_log += 50;
-            }
-
-            if (hit_stop) {
-                (void)stop_len;
-                g->finish = "stop";
-                g->text.len = stop_pos;
-                g->text.ptr[g->text.len] = '\0';
-                ds4_session_invalidate(sl->sess);
-                stop_decode = true;
-                break;
-            }
-
-            if (j->req.kind == REQ_CHAT && j->req.has_tools && g->saw_tool_end) {
-                g->finish = "tool_calls";
+            if (gen_emit_token(s, sl, toks[ti])) {
                 stop_decode = true;
                 break;
             }
