@@ -286,6 +286,35 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 
 
+/* Tier-2 overcommit (task #55, increment 1). DS4_OVERCOMMIT=1/on/true switches
+ * the pool auto-size from "N-bank pool must fit the budget in FULL" to "only the
+ * EAGER floor (raw ring + state lanes + shared) for N banks must fit; the
+ * ctx-scaled comp/index are VA-only, demand-paged, and NOT charged at
+ * admission". This lets a large --ctx (e.g. 1M) come up with N>1 banks all
+ * 1M-CAPABLE. OFF by default — DELIBERATELY: without the increment-2 proactive
+ * eviction guard, banks that actually grow toward 1M can exceed the physical
+ * budget, so overcommit is opt-in until the guard lands. DS4_MSEQ_BANKS still
+ * pins and bypasses. Read once at startup, never on a hot path. */
+static bool server_overcommit_enabled(void) {
+    const char *v = getenv("DS4_OVERCOMMIT");
+    return v && (v[0] == '1' || !strcasecmp(v, "on") || !strcasecmp(v, "true"));
+}
+
+/* Optional per-bank touched-KV reservation for the overcommit fit: the ctx whose
+ * demand-paged comp/index cost is charged per bank at admission (headroom so a
+ * bank that grows to this depth was pre-admitted). Default 0 => pure overcommit
+ * (charge only the eager floor). Clamped to non-negative; garbage => 0. */
+static int server_overcommit_reserve_ctx(void) {
+    const char *v = getenv("DS4_OVERCOMMIT_RESERVE_CTX");
+    if (!v || !v[0]) return 0;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v || (end && *end != '\0') || n < 0 || n > INT_MAX) return 0;
+    return (int)n;
+}
+
+
+
 static void log_context_memory(ds4_backend backend,
                                int         ctx_size,
                                uint32_t    prefill_chunk) {
@@ -700,6 +729,29 @@ int main(int argc, char **argv) {
      * DS4_MSEQ_BANKS on first read); the fit probe uses the _banked cost variant,
      * which prices an explicit N without touching that cache. */
     const int pool_auto_max = DS4_SESSION_POOL_CAP; /* throughput saturates ~4 */
+
+    /* Tier-2 overcommit (task #55, increment 1). Precompute the per-bank split of
+     * the banked session cost into an EAGER floor (raw ring + state lanes +
+     * dspark-banked) and a DEMAND-PAGED comp/index term (VA-only, physical on
+     * touch). The cost is exactly affine in N: banked(N) = shared + N*(eager +
+     * demand), so eager = (banked(2)-banked(1)) - demand and shared = banked(1) -
+     * (banked(2)-banked(1)). Overcommit charges only shared + N*eager (+ optional
+     * touched reserve) at admission, so a huge --ctx yields N>1 banks instead of
+     * N=1. OFF by default (opt-in until the increment-2 eviction guard lands). */
+    const bool overcommit = server_overcommit_enabled();
+    uint64_t oc_shared = 0, oc_eager_pb = 0, oc_expect_pb = 0, oc_demand_pb = 0;
+    if (overcommit) {
+        const uint64_t banked1 = ds4_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 1);
+        const uint64_t banked2 = ds4_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 2);
+        const uint64_t marginal = banked2 > banked1 ? banked2 - banked1 : 0;
+        oc_demand_pb = ds4_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size);
+        oc_eager_pb = marginal > oc_demand_pb ? marginal - oc_demand_pb : 0;
+        oc_shared = banked1 > marginal ? banked1 - marginal : 0;
+        const int reserve_ctx = server_overcommit_reserve_ctx();
+        oc_expect_pb = reserve_ctx > 0
+            ? ds4_engine_demand_paged_bytes_per_bank(engine, reserve_ctx) : 0;
+    }
+
     if (getenv("DS4_MSEQ_BANKS")) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: Tier-2 pool: DS4_MSEQ_BANKS pinned by operator "
@@ -731,25 +783,61 @@ int main(int argc, char **argv) {
                        "%d-bank %.2f GiB)",
                        ref_ctx[ci], fitN, cost1, fitN, costN);
         }
-        /* Auto-derive N for the requested ctx: largest N (1..cap) whose N-bank
-         * pool fits the budget (which already reserves overhead + the 4 GiB
-         * floor). Always at least 1, so no ctx ever fails to start here. */
+        /* Auto-derive N for the requested ctx: largest N (1..cap) whose cost fits
+         * the budget (which already reserves overhead + the 4 GiB floor). Always
+         * at least 1, so no ctx ever fails to start here. Overcommit charges only
+         * the eager floor + reserve; the classic path charges the full N-bank
+         * cost (so a huge ctx yields N=1). */
+        const double gib = 1024.0 * 1024.0 * 1024.0;
         int chosen = 1;
-        for (int N = pool_auto_max; N >= 1; N--) {
-            const uint64_t c =
-                ds4_engine_session_cost_bytes_banked(engine, cfg.ctx_size, N);
-            if (c > 0 && server_kv_admits(kv_budget, 0, c)) { chosen = N; break; }
+        if (overcommit) {
+            for (int N = pool_auto_max; N >= 1; N--) {
+                const uint64_t cost = oc_shared + (uint64_t)N * (oc_eager_pb + oc_expect_pb);
+                if (server_kv_admits(kv_budget, 0, cost)) { chosen = N; break; }
+            }
+        } else {
+            for (int N = pool_auto_max; N >= 1; N--) {
+                const uint64_t c =
+                    ds4_engine_session_cost_bytes_banked(engine, cfg.ctx_size, N);
+                if (c > 0 && server_kv_admits(kv_budget, 0, c)) { chosen = N; break; }
+            }
         }
         char banks[8];
         snprintf(banks, sizeof(banks), "%d", chosen);
         setenv("DS4_MSEQ_BANKS", banks, 1);
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: Tier-2 pool auto-sized to %d bank(s) for --ctx %d "
-                   "(batching %s)", chosen, cfg.ctx_size,
-                   chosen > 1 ? "ON" : "OFF (single-session, ctx too large for a pool)");
+        if (overcommit) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: Tier-2 OVERCOMMIT auto-sized to %d bank(s) for --ctx %d: "
+                       "eager floor %.2f GiB/bank + reserve %.2f GiB/bank charged; "
+                       "demand-paged VA %.2f GiB/bank reserved (physical on touch, NOT "
+                       "charged); shared %.2f GiB; admission est %.2f GiB (batching %s)",
+                       chosen, cfg.ctx_size,
+                       (double)oc_eager_pb / gib, (double)oc_expect_pb / gib,
+                       (double)oc_demand_pb / gib, (double)oc_shared / gib,
+                       (double)(oc_shared + (uint64_t)chosen * (oc_eager_pb + oc_expect_pb)) / gib,
+                       chosen > 1 ? "ON" : "OFF");
+        } else {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: Tier-2 pool auto-sized to %d bank(s) for --ctx %d "
+                       "(batching %s)", chosen, cfg.ctx_size,
+                       chosen > 1 ? "ON" : "OFF (single-session, ctx too large for a pool)");
+        }
     }
 
-    const uint64_t session_est = ds4_engine_session_cost_bytes(engine, cfg.ctx_size);
+    /* Full N-bank cost prices what the allocator will ACTUALLY reserve (incl. the
+     * demand-paged VA, which cudaMallocManaged counts at full size). Under
+     * overcommit, admission is gated on the eager-floor est instead so the pool
+     * comes up at N>1; the full est is kept for the est-vs-actual reconcile below
+     * (it matches the measured resident, so no false drift warning). */
+    const uint64_t full_banked_est = ds4_engine_session_cost_bytes(engine, cfg.ctx_size);
+    uint64_t overcommit_admission_est = 0;
+    if (overcommit) {
+        const char *nb = getenv("DS4_MSEQ_BANKS");
+        long finalN = nb && nb[0] ? strtol(nb, NULL, 10) : 1;
+        if (finalN < 1) finalN = 1;
+        overcommit_admission_est = oc_shared + (uint64_t)finalN * (oc_eager_pb + oc_expect_pb);
+    }
+    const uint64_t session_est = overcommit ? overcommit_admission_est : full_banked_est;
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
                "overhead=%.1f GiB, floor=%.1f GiB, budget=%.1f GiB",
@@ -781,9 +869,13 @@ int main(int argc, char **argv) {
     }
     /* Reconcile the estimate with what the allocator really did and commit the
      * ACTUAL to the ledger (>10% drift means the sizing code in gpu_diag.c has
-     * fallen out of sync with the allocator — fix that, not the ledger). */
+     * fallen out of sync with the allocator — fix that, not the ledger). Under
+     * overcommit the admission est is the eager floor only; reconcile against the
+     * FULL banked est so it still matches the measured resident (which counts the
+     * demand-paged managed VA at full size) — no false drift warning. */
     const uint64_t session_actual =
-        server_reconciled_session_cost(0, cfg.ctx_size, session_est,
+        server_reconciled_session_cost(0, cfg.ctx_size,
+                                       overcommit ? full_banked_est : session_est,
                                        ds4_session_resident_bytes(session));
 
     /* Materialize the lazy first-generation CUDA working set BEFORE deriving
