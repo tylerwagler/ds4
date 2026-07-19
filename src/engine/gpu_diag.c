@@ -292,6 +292,19 @@ uint64_t gpu_graph_session_bytes(
         uint32_t                 ctx_size,
         uint32_t                 prefill_cap,
         bool                     enable_spec) {
+    return gpu_graph_session_bytes_banked(weights, layer, raw_cap, ctx_size,
+                                          prefill_cap, enable_spec,
+                                          gpu_graph_bank_pool_n());
+}
+
+uint64_t gpu_graph_session_bytes_banked(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_spec,
+        uint32_t                 n_banks_in) {
     gpu_graph_dims dz;
     gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
     const uint64_t pc = dz.prefill_cap;
@@ -302,7 +315,7 @@ uint64_t gpu_graph_session_bytes(
      * KV placement policy the allocator itself uses.  In bank-pool mode the
      * persistent KV slabs (and the per-bank compressor state lanes below)
      * scale with the pool size; everything else is shared by all banks. */
-    const uint64_t n_banks = gpu_graph_bank_pool_n();
+    const uint64_t n_banks = n_banks_in < 1u ? 1u : n_banks_in;
     uint64_t kv_cache_bytes = 0;
     uint64_t total = gpu_graph_context_bytes_for_kv_policy(
             dz.ctx_size, dz.raw_cap, dz.prefill_cap, &kv_cache_bytes);

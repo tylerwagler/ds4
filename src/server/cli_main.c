@@ -518,7 +518,12 @@ static server_config parse_options(int argc, char **argv) {
         },
         .host = "0.0.0.0",
         .port = 8000,
-        .ctx_size = 1048576,
+        /* Tier-2 default: 128k context so the pool auto-sizes to the full
+         * 4-bank batching tier with comfortable headroom (measured fit: 4 banks
+         * = 7.07 GiB vs the ~14 GiB budget). Batching is ON by default. An
+         * operator who needs a single 1M-context session passes --ctx 1048576,
+         * which auto-sizes to N=1 (exact classic single-session behavior). */
+        .ctx_size = 131072,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
@@ -678,23 +683,6 @@ int main(int argc, char **argv) {
                        cfg.ctx_size,
                        cfg.engine.prefill_chunk);
 
-    /* Tier-2 shared pool: size the bank pool for the server BEFORE the first
-     * session-cost query (gpu_graph_bank_pool_n caches DS4_MSEQ_BANKS on first
-     * read, and ds4_engine_session_cost_bytes below is that first read). Default
-     * to DS4_SESSION_POOL_CAP banks so the single pooled session can host up to
-     * that many concurrent conversations, each on its own bank. The whole
-     * n-bank pool's eager cost is priced by the admission check below and
-     * allocated ONCE at the slot-0 create — no runtime allocation thereafter, so
-     * bank provisioning is pure host bookkeeping. An operator can pin
-     * DS4_MSEQ_BANKS=1 to restore the classic single-session layout exactly
-     * (N=1 byte-identical), or a smaller value to trade concurrency for
-     * per-session headroom / a larger --ctx-size. */
-    if (!getenv("DS4_MSEQ_BANKS")) {
-        char banks[8];
-        snprintf(banks, sizeof(banks), "%d", DS4_SESSION_POOL_CAP);
-        setenv("DS4_MSEQ_BANKS", banks, 1);
-    }
-
     /* Admission control (Tier 1 §1.4): compute the session budget from the
      * real resident weight footprint and the TRUE per-session cost (full graph
      * + prefill working set + drafter state, ds4_engine_session_cost_bytes),
@@ -702,6 +690,65 @@ int main(int argc, char **argv) {
      * predicate for every lazily provisioned slot. */
     const uint64_t weights_resident = ds4_engine_weights_resident_bytes(engine);
     const uint64_t kv_budget = server_kv_budget_bytes(weights_resident);
+
+    /* Tier-2 pool auto-sizing (batching ON by default, auto-fit). Batching is
+     * the default: the bank count is DERIVED from --ctx so a moderate ctx yields
+     * a multi-bank pool while a huge ctx (e.g. 1M) correctly yields N=1 (exact
+     * classic behavior, no startup failure). DS4_MSEQ_BANKS, when set, PINS the
+     * count and skips auto-sizing. This runs BEFORE the first
+     * ds4_engine_session_cost_bytes call (gpu_graph_bank_pool_n caches
+     * DS4_MSEQ_BANKS on first read); the fit probe uses the _banked cost variant,
+     * which prices an explicit N without touching that cache. */
+    const int pool_auto_max = DS4_SESSION_POOL_CAP; /* throughput saturates ~4 */
+    if (getenv("DS4_MSEQ_BANKS")) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: Tier-2 pool: DS4_MSEQ_BANKS pinned by operator "
+                   "(auto-sizing skipped)");
+    } else {
+        /* Fit table across reference contexts — how many banks (1..cap) fit
+         * within the admission budget at each ctx. Operator-facing sizing aid. */
+        static const int ref_ctx[] = {32768, 65536, 131072, 262144, 524288, 1048576};
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: Tier-2 pool fit table (budget %.1f GiB, cap %d banks):",
+                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0), pool_auto_max);
+        for (size_t ci = 0; ci < sizeof(ref_ctx) / sizeof(ref_ctx[0]); ci++) {
+            const double cost1 =
+                (double)ds4_engine_session_cost_bytes_banked(engine, ref_ctx[ci], 1)
+                / (1024.0 * 1024.0 * 1024.0);
+            int fitN = 1;
+            double costN = cost1;
+            for (int N = pool_auto_max; N >= 1; N--) {
+                const uint64_t c =
+                    ds4_engine_session_cost_bytes_banked(engine, ref_ctx[ci], N);
+                if (c > 0 && server_kv_admits(kv_budget, 0, c)) {
+                    fitN = N;
+                    costN = (double)c / (1024.0 * 1024.0 * 1024.0);
+                    break;
+                }
+            }
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server:   ctx %7d: fits %d bank(s) (1-bank %.2f GiB, "
+                       "%d-bank %.2f GiB)",
+                       ref_ctx[ci], fitN, cost1, fitN, costN);
+        }
+        /* Auto-derive N for the requested ctx: largest N (1..cap) whose N-bank
+         * pool fits the budget (which already reserves overhead + the 4 GiB
+         * floor). Always at least 1, so no ctx ever fails to start here. */
+        int chosen = 1;
+        for (int N = pool_auto_max; N >= 1; N--) {
+            const uint64_t c =
+                ds4_engine_session_cost_bytes_banked(engine, cfg.ctx_size, N);
+            if (c > 0 && server_kv_admits(kv_budget, 0, c)) { chosen = N; break; }
+        }
+        char banks[8];
+        snprintf(banks, sizeof(banks), "%d", chosen);
+        setenv("DS4_MSEQ_BANKS", banks, 1);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: Tier-2 pool auto-sized to %d bank(s) for --ctx %d "
+                   "(batching %s)", chosen, cfg.ctx_size,
+                   chosen > 1 ? "ON" : "OFF (single-session, ctx too large for a pool)");
+    }
+
     const uint64_t session_est = ds4_engine_session_cost_bytes(engine, cfg.ctx_size);
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "

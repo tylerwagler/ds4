@@ -2096,6 +2096,20 @@ uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size) {
                                    e->dspark_ready);
 }
 
+uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
+                                              int n_banks) {
+    if (!e || ctx_size <= 0 || n_banks < 1) return 0;
+    if (!ds4_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
+                                                                  e->prefill_chunk);
+    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
+    if (!shape_layer) return 0;
+    return gpu_graph_session_bytes_banked(&e->weights, shape_layer, raw_cap,
+                                          (uint32_t)ctx_size, prefill_cap,
+                                          e->dspark_ready, (uint32_t)n_banks);
+}
+
 
 
 void ds4_session_free(ds4_session *s) {

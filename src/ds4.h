@@ -177,6 +177,11 @@ ds4_context_memory ds4_context_memory_estimate_packed(
  * number admission control must use.  Returns 0 if no session could be
  * created (no graph backend / weights not loaded). */
 uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size);
+/* Same, priced for an EXPLICIT bank-pool size (Tier-2 auto-sizing): the server
+ * evaluates the (banks, ctx) fit table before committing DS4_MSEQ_BANKS. n_banks
+ * >= 1; 1 is the classic single-session cost. */
+uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
+                                              int n_banks);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any

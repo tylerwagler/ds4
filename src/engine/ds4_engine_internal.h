@@ -2178,6 +2178,18 @@ uint64_t gpu_graph_session_bytes(
         uint32_t                 ctx_size,
         uint32_t                 prefill_cap,
         bool                     enable_spec);
+/* Same, but priced for an EXPLICIT bank-pool size instead of reading
+ * DS4_MSEQ_BANKS — the fit-table / auto-sizing path (cli_main) evaluates many
+ * (n_banks, ctx) candidates before the env is committed. n_banks == 0 or 1 is
+ * the classic single-session layout. */
+uint64_t gpu_graph_session_bytes_banked(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_spec,
+        uint32_t                 n_banks);
 bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
 bool gpu_graph_alloc(
         ds4_gpu_graph *g,
