@@ -865,6 +865,16 @@ typedef struct {
     ds4_gpu_tensor *assc[DS4_MAX_LAYER];
     ds4_gpu_tensor *iskv[DS4_MAX_LAYER];
     ds4_gpu_tensor *issc[DS4_MAX_LAYER];
+    /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
+     * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
+     * gpu_graph_init_dspark_target only when the pool is enabled AND the
+     * drafter is loaded; the graph's dspark_raw_cache[i]/dspark_prompt_h[i]
+     * become bank views into these, swapped by gpu_graph_bank_repoint so the
+     * spec path transparently uses the active bank's ring.  NULL otherwise. */
+    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * head_dim * f32 */
+    uint64_t dspark_prompt_bank_bytes;   /* DRAFT_WINDOW * n_embd  * f32 */
+    ds4_gpu_tensor *dspark_raw[3];       /* N * dspark_raw_bank_bytes */
+    ds4_gpu_tensor *dspark_prompt[3];    /* N * dspark_prompt_bank_bytes */
 } ds4_bank_slabs;
 
 typedef struct {
@@ -1130,6 +1140,13 @@ typedef struct {
      * multiseq step; NULL in production single-session serving. */
     uint32_t ms_n_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
     uint32_t ms_n_index_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
+    /* Tier-2 Option F: per-bank DSpark drafter-ring frontier counters (the
+     * device rings themselves are banked slabs, ds4_bank_slabs.dspark_*).
+     * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
+     * window under N=2 spec-time-slice — the whole point of Option F. */
+    uint32_t ms_dspark_n_raw[DS4_MSEQ_MAX][3];
+    uint32_t ms_dspark_prompt_n[DS4_MSEQ_MAX];
+    uint32_t ms_dspark_prompt_lo[DS4_MSEQ_MAX];
     int32_t *ms_positions;
     int32_t *ms_seq_id;
     ds4_gpu_tensor *batch_positions;

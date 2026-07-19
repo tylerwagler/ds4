@@ -401,10 +401,13 @@ uint64_t gpu_graph_session_bytes(
     if (enable_spec) {
         total += 3ull * DS4_N_EMBD * f32;                 /* dspark_target_h[3] */
         total += 3ull * 17 * DS4_N_EMBD * f32;            /* dspark_target_h_batch[3] */
-        total += 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * f32; /* dspark_raw_cache[3] */
+        /* Option F: dspark_raw_cache[3] + dspark_prompt_h[3] are BANKED slabs
+         * (n_banks lanes) so the N=2 spec-time-slice lane keeps a warm ring per
+         * bank; the rest of the drafter state is shared across banks. */
+        total += (uint64_t)n_banks * 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * f32; /* dspark_raw_cache[3] */
         total += (uint64_t)DS4_N_EMBD * f32;              /* dspark_main_x */
         total += 3ull * pc * DS4_N_EMBD * f32;            /* dspark_bulk_h[3] */
-        total += 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * f32; /* dspark_prompt_h[3] */
+        total += (uint64_t)n_banks * 3ull * DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * f32; /* dspark_prompt_h[3] */
         const uint64_t attn_w = 2ull * DS4_N_HEAD_DIM;
         const uint64_t idx_w = 2ull * DS4_N_INDEXER_HEAD_DIM;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -625,6 +628,23 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank) {
                  g->layer_index_state_score[il];
         }
     }
+    /* Option F: swap the per-bank DSpark drafter ring views (present only when
+     * the drafter is loaded and the ring was banked).  Same host-only pointer
+     * surgery as the KV views above, so the spec path transparently reads the
+     * active bank's warm window. */
+    if (ok && b->dspark_raw[0]) {
+        for (int i = 0; i < 3 && ok; i++) {
+            ds4_gpu_tensor_free(g->dspark_raw_cache[i]);
+            ds4_gpu_tensor_free(g->dspark_prompt_h[i]);
+            g->dspark_raw_cache[i] = ds4_gpu_tensor_view(
+                    b->dspark_raw[i], (uint64_t)bank * b->dspark_raw_bank_bytes,
+                    b->dspark_raw_bank_bytes);
+            g->dspark_prompt_h[i] = ds4_gpu_tensor_view(
+                    b->dspark_prompt[i], (uint64_t)bank * b->dspark_prompt_bank_bytes,
+                    b->dspark_prompt_bank_bytes);
+            ok = g->dspark_raw_cache[i] && g->dspark_prompt_h[i];
+        }
+    }
     /* Stale pointer hygiene (mirrors gpu_graph_free). */
     ds4_gpu_batched_copy_free(g->spec_snap_copies);
     ds4_gpu_batched_copy_free(g->spec_restore_copies);
@@ -717,6 +737,11 @@ void gpu_graph_bank_counters_capture(ds4_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = g->layer_n_comp[il];
         g->ms_n_index_comp[bank][il] = g->layer_n_index_comp[il];
     }
+    /* Option F: the drafter-ring frontier is per-bank too (device rings live in
+     * banks.dspark_*), so it rides the same capture/install hand-off. */
+    for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[bank][i] = g->dspark_n_raw[i];
+    g->ms_dspark_prompt_n[bank] = g->dspark_prompt_n;
+    g->ms_dspark_prompt_lo[bank] = g->dspark_prompt_lo;
 }
 
 void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank) {
@@ -725,6 +750,9 @@ void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank) {
         g->layer_n_comp[il] = g->ms_n_comp[bank][il];
         g->layer_n_index_comp[il] = g->ms_n_index_comp[bank][il];
     }
+    for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
+    g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
+    g->dspark_prompt_lo = g->ms_dspark_prompt_lo[bank];
 }
 
 bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
@@ -1337,8 +1365,22 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
          * (17 = the spec block clamp of 16 drafts + first_token). */
         g->dspark_target_h_batch[i] = ds4_gpu_tensor_alloc(
             (uint64_t)17 * DS4_N_EMBD * sizeof(float));
-        g->dspark_raw_cache[i] = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
+        /* Option F: bank the drafter ring when the pool is enabled — one
+         * bank-major slab, dspark_raw_cache[i] becomes bank 0's view (repoint
+         * swaps it). */
+        if (g->banks.n_banks != 0) {
+            g->banks.dspark_raw_bank_bytes =
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float);
+            g->banks.dspark_raw[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)g->banks.n_banks * g->banks.dspark_raw_bank_bytes);
+            g->dspark_raw_cache[i] = g->banks.dspark_raw[i]
+                ? ds4_gpu_tensor_view(g->banks.dspark_raw[i], 0,
+                                      g->banks.dspark_raw_bank_bytes)
+                : NULL;
+        } else {
+            g->dspark_raw_cache[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
+        }
         g->dspark_n_raw[i] = 0;
         ok = ok && g->dspark_target_h[i] && g->dspark_target_h_batch[i] &&
              g->dspark_raw_cache[i];
@@ -1359,8 +1401,19 @@ bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_
     /* Prompt-window ring: last <=128 prompt positions' anchor hiddens. */
     g->dspark_prompt_n = 0;
     for (int i = 0; i < 3; i++) {
-        g->dspark_prompt_h[i] = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float));
+        if (g->banks.n_banks != 0) {
+            g->banks.dspark_prompt_bank_bytes =
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float);
+            g->banks.dspark_prompt[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)g->banks.n_banks * g->banks.dspark_prompt_bank_bytes);
+            g->dspark_prompt_h[i] = g->banks.dspark_prompt[i]
+                ? ds4_gpu_tensor_view(g->banks.dspark_prompt[i], 0,
+                                      g->banks.dspark_prompt_bank_bytes)
+                : NULL;
+        } else {
+            g->dspark_prompt_h[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float));
+        }
         ok = ok && g->dspark_prompt_h[i];
     }
     /* Stage-B no-replay rollback: per-position compressor projection saves for
