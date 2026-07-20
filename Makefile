@@ -41,7 +41,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
 
 all: help
 
@@ -142,6 +142,10 @@ cuda-fork-gate: tests/bank_fork_gate
 # plan-33 inc B: 3-way output-equality harness (server-level; see the script).
 warm-fork-3way: ds4-server
 	bash tests/warm_fork_3way.sh $(FRONTIER_MODEL)
+
+# plan-33 inc D: partial-prefix fork 3-way output-equality harness (server-level).
+warm-partial-fork-3way: ds4-server
+	bash tests/warm_partial_fork_3way.sh $(FRONTIER_MODEL)
 
 # Prefill bit-exactness gate (the D2R acceptance gate; see the header of
 # tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,

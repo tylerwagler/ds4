@@ -983,8 +983,17 @@ int main(int argc, char **argv) {
         const char *wf = getenv("DS4_WARM_FORK");
         s.warm_fork_enabled = s.pool_banks > 0 &&
                               !(wf && (wf[0] == '0' || !strcasecmp(wf, "off")));
-        server_log(DS4_LOG_DEFAULT, "ds4-server: warm-fork routing %s",
-                   s.warm_fork_enabled ? "ENABLED" : "disabled");
+        /* inc D: partial-cut floor. Default 256 tokens (2 ratio-4 groups of
+         * reuse); floor to 128 so a cut always aligns to >= one group of R. */
+        s.warm_partial_min = 256;
+        const char *wpm = getenv("DS4_WARM_PARTIAL_MIN");
+        if (wpm && *wpm) {
+            int v = atoi(wpm);
+            if (v < 128) v = 128;
+            s.warm_partial_min = v;
+        }
+        server_log(DS4_LOG_DEFAULT, "ds4-server: warm-fork routing %s (partial-min %d)",
+                   s.warm_fork_enabled ? "ENABLED" : "disabled", s.warm_partial_min);
     }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;

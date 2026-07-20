@@ -905,6 +905,12 @@ struct server {
      * bank's committed history, the router forks that trunk into a FREE bank and
      * continues there, leaving the trunk intact for siblings. */
     bool         warm_fork_enabled;
+    /* plan-33 inc D: minimum shared-prefix TOKEN count for a PARTIAL fork-cut to
+     * be worth it (below this, reusing so few tokens loses to a plain cold
+     * prefill; a full-prefix match still forks regardless). DS4_WARM_PARTIAL_MIN,
+     * read once at startup; floored to the ratio-4 align (partial cuts below R
+     * reuse nothing). */
+    int          warm_partial_min;
     uint64_t     bank_marginal_bytes; /* Tier-2: per-bank ledger charge in pooled
                                          mode (even split of the admitted pool
                                          cost; conservative, demand-paged reality

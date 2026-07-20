@@ -18,6 +18,10 @@ static bool server_bank_switch(server *s, int bank);
 /* Bank-aware common-prefix of `sl` against `prompt` (scheduling reads). */
 static int server_slot_common_prefix(const server *s, const session_slot *sl,
                                      const ds4_tokens *prompt);
+/* plan-33 inc D: evict ONE non-trunk victim (LRU-superseded preferred, else
+ * plain LRU) so a warm fork has a free bank — trunk always protected. Defined
+ * near worker_evict_one; forward-declared for the routing path above it. */
+static bool server_fork_make_room(server *s, const session_slot *trunk);
 
 
 
@@ -2741,57 +2745,78 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
                                              refusal);
         if (fresh) return fresh;
     }
-    /* plan-33 inc B: warm FULL-PREFIX FORK. best's committed history is a strict
-     * token-prefix of the request (common == frontier < prompt len, non-trivial):
-     * instead of continuing IN PLACE (which consumes the trunk — today's
-     * behavior), fork the trunk into a FREE bank and continue there, so siblings
-     * sharing the prefix keep matching the intact trunk. Token-level match only
-     * (a byte-LCP registry is increment D's ranking machinery); fork refusal or
-     * no free bank degrades to today's path — never an error to the client. The
-     * fork's own memcmp re-validates before any device write. */
-    if (s->pool_banks > 0 && s->warm_fork_enabled && best &&
-        !best_clobbers_warm_state && !best->active_job &&
-        best_common == server_slot_frontier_pos(s, best) &&
-        best_common < j->req.prompt.len) {
+    /* plan-33 inc B/D: warm FORK routing. `best`'s committed history shares a
+     * token prefix `best_common` with the request (validated bit-for-bit inside
+     * the fork before any device write). Instead of continuing IN PLACE (which
+     * consumes the trunk — today's behavior), fork the trunk into another bank
+     * and continue there, leaving the trunk INTACT so a divergent sibling keeps
+     * matching it:
+     *   - inc B FULL fork   : best_common == trunk frontier  -> ds4_session_bank_fork
+     *                         (dst resumes at the exact frontier; re-prefill suffix).
+     *   - inc D PARTIAL cut : warm_partial_min <= best_common < frontier
+     *                         -> ds4_session_bank_fork_partial (engine aligns down
+     *                         to R, byte-stashes the ratio-4 boundary row; dst's
+     *                         committed history becomes tokens[0..R), re-prefill [R..).
+     * A free bank is used first; else one non-trunk victim is evicted (make_room,
+     * LRU-superseded preferred). Any refusal (history moved, evicted src, cut
+     * below R, no evictable bank) degrades to today's path — never a client error. */
+    const int frontier = best ? server_slot_frontier_pos(s, best) : 0;
+    const bool warm_ok = s->pool_banks > 0 && s->warm_fork_enabled && best &&
+                         !best_clobbers_warm_state && !best->active_job &&
+                         best_common > 0 && best_common < j->req.prompt.len;
+    const bool full    = warm_ok && best_common == frontier;                 /* inc B */
+    const bool partial = warm_ok && !full && best_common >= s->warm_partial_min &&
+                         best_common < frontier;                             /* inc D */
+    if (full || partial) {
         provision_refusal fr;
         session_slot *dst = provision_slot(s, provision_ctx_for_job(s, j), &fr);
+        if (!dst && fr == PROVISION_REFUSED_POOL_FULL &&
+            server_fork_make_room(s, best)) {
+            /* Freed one non-trunk victim; the trunk was protected. Retry once. */
+            dst = provision_slot(s, provision_ctx_for_job(s, j), &fr);
+        }
         if (dst && dst != best) {
             ds4_session *pool = s->slots[0].sess;
-            if (ds4_session_bank_fork(pool, best->bank, dst->bank,
-                                      j->req.prompt.v, best_common) == 0) {
-                dst->committed_pos = best_common;
+            const int rc = full
+                ? ds4_session_bank_fork(pool, best->bank, dst->bank,
+                                        j->req.prompt.v, best_common)
+                : ds4_session_bank_fork_partial(pool, best->bank, dst->bank,
+                                                j->req.prompt.v, best_common);
+            if (rc == 0) {
+                /* FULL resumes at best_common; PARTIAL resumes at the engine's
+                 * R-aligned cut (read it back rather than recompute the align). */
+                dst->committed_pos = full ? best_common
+                                          : ds4_session_bank_pos(pool, dst->bank);
                 server_log(DS4_LOG_DEFAULT,
-                           "ds4-server: warm-fork: trunk bank %u (pos %d) -> bank %u; "
-                           "trunk preserved for siblings",
-                           best->bank, best_common, dst->bank);
+                           "ds4-server: warm-fork-%s: trunk bank %u (frontier %d, "
+                           "common %d) -> bank %u (resume %d); trunk preserved",
+                           full ? "full" : "partial", best->bank, frontier,
+                           best_common, dst->bank, dst->committed_pos);
                 *clobbers = false;
                 return dst;
             }
-            /* Refused (history moved / evicted src): dst stays a fresh empty
-             * bank — using it cold is safe and better than clobbering best. */
+            /* Refused (history moved / evicted src / cut below R): dst stays a
+             * fresh empty bank — cold on it is safe and beats clobbering best. */
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: warm-fork refused (bank %u); cold on bank %u",
-                       best->bank, dst->bank);
+                       "ds4-server: warm-fork-%s refused (bank %u); cold on bank %u",
+                       full ? "full" : "partial", best->bank, dst->bank);
             *clobbers = false;
             return dst;
         }
-        /* No free bank (fork wanted but pool full): in-place continuation is the
-         * correct linear-case fallback; the branching loser degrades to cold on
-         * a later request. Trunk-protection under eviction pressure (don't evict
-         * `best` to make the fork's room) is inc D's victim policy. */
+        /* No free/evictable bank: in-place continuation is the correct fallback
+         * (linear case optimal; branching loser degrades to cold later). */
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: warm-fork wanted (bank %u pos %d) but no free bank; "
-                   "in-place continuation", best->bank, best_common);
-    } else if (s->warm_fork_enabled && best && !best_clobbers_warm_state &&
-               !best->active_job && best_common > 0 &&
-               best_common < server_slot_frontier_pos(s, best)) {
-        /* Warm but PARTIAL match (common < trunk frontier): not a full-prefix
-         * fork case (that is inc C's partial cut). Rewind-and-continue in place —
-         * logged so "why no fork" is never silent. */
+                   "ds4-server: warm-fork-%s wanted (bank %u common %d) but no free "
+                   "bank; in-place continuation",
+                   full ? "full" : "partial", best->bank, best_common);
+    } else if (warm_ok && best_common < frontier) {
+        /* Warm but the shared prefix is below warm_partial_min (a partial cut
+         * would reuse too little to beat cold): rewind-and-continue in place.
+         * Logged so "why no fork" is never silent. */
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: warm partial match bank %u (common %d < frontier %d); "
-                   "in-place rewind (no full-prefix fork)",
-                   best->bank, best_common, server_slot_frontier_pos(s, best));
+                   "ds4-server: warm partial match bank %u (common %d < min %d, "
+                   "frontier %d); in-place rewind (no fork)",
+                   best->bank, best_common, s->warm_partial_min, frontier);
     }
     *clobbers = best_clobbers_warm_state;
     return best;
@@ -3083,6 +3108,70 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
                (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0),
                (double)server_mem_available_bytes() / (1024.0 * 1024.0 * 1024.0));
     return true;
+}
+
+
+
+/* plan-33 inc D victim policy: an idle bank is LRU-SUPERSEDED when its whole
+ * committed history is a token-prefix of ANOTHER live bank's history (a sibling
+ * that already extends past it) — its KV is redundant, so evicting it loses the
+ * least. Returns such a slot's index (the least-recently-served among them), or
+ * -1. Pure host reads (ds4_session_bank_tokens / _common_prefix are the same
+ * host-carry reads routing already uses on idle banks; no CUDA, no install). */
+static int server_pick_superseded_idle(server *s, const bool *protect) {
+    ds4_session *pool = s->slots[0].sess;
+    if (!pool) return -1;
+    int victim = -1;
+    for (int i = 1; i < s->n_slots; i++) {
+        session_slot *a = &s->slots[i];
+        if (!a->sess || a->active_job || (protect && protect[i])) continue;
+        if (ds4_session_bank_fork_pinned(pool, a->bank)) continue;
+        const ds4_tokens *at = ds4_session_bank_tokens(pool, a->bank);
+        if (!at || at->len == 0) continue;              /* empty: LRU handles it */
+        bool superseded = false;
+        for (int k = 1; k < s->n_slots && !superseded; k++) {
+            if (k == i) continue;
+            session_slot *b = &s->slots[k];
+            if (!b->sess) continue;
+            /* b supersedes a iff a's whole history is b's prefix AND b is strictly
+             * longer (b can reconstruct everything a holds). */
+            if (server_slot_frontier_pos(s, b) > at->len &&
+                ds4_session_bank_common_prefix(pool, b->bank, at) >= at->len) {
+                superseded = true;
+            }
+        }
+        if (!superseded) continue;
+        if (victim < 0 ||
+            a->last_serviced_us < s->slots[victim].last_serviced_us) {
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+/* Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is
+ * always protected (a sibling still matches it); LRU-superseded victims go
+ * first, else plain LRU (worker_evict_one's picker). Reuses the proven eviction
+ * body (snapshot + ledger release + bank reset). Worker thread only; returns
+ * true when a bank was freed. */
+static bool server_fork_make_room(server *s, const session_slot *trunk) {
+    if (s->pool_banks <= 0 || !trunk) return false;
+    bool protect[DS4_SESSION_POOL_CAP];
+    worker_protect_queued_owner_slots(s, protect);      /* live-tool owners */
+    const int ti = (int)(trunk - s->slots);
+    if (ti >= 0 && ti < DS4_SESSION_POOL_CAP) protect[ti] = true;  /* NEVER the trunk */
+    const int sup = server_pick_superseded_idle(s, protect);
+    if (sup >= 0) {
+        /* Force worker_evict_one onto the superseded pick by protecting all others. */
+        bool only[DS4_SESSION_POOL_CAP];
+        for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) only[i] = (i != sup);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: warm-fork make-room: evicting LRU-superseded bank %u "
+                   "(trunk bank %u preserved)", s->slots[sup].bank, trunk->bank);
+        return worker_evict_one(s, only);
+    }
+    /* No superseded victim: plain LRU among unprotected idle, trunk still safe. */
+    return worker_evict_one(s, protect);
 }
 
 
