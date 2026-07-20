@@ -448,6 +448,70 @@ int main(int argc, char **argv) {
         free(toks5); free(fbuf); free(cbuf);
     }
 
+    /* ============ P6: SERVER-CONFIG work-skipped TEETH (dst == cur) ==========
+     * The value bug: the server provisions dst, INSTALLS it as cur, and
+     * INVALIDATES the live session (s->checkpoint.len -> 0) BEFORE forking.
+     * P2/P3/P5 fork into a NON-cur dst and re-install it, so they never
+     * exercised this path — and it left the frontier at 0, so the server
+     * re-prefilled 100% of the prompt (fork "fired" but skipped ZERO work; the
+     * correctness gates stayed green because re-prefill-from-0 IS byte-identical).
+     * These teeth assert bank_pos(dst) == cut in the dst==cur config, so a
+     * 0-benefit fork can never pass green again — for BOTH full and partial. */
+    {
+        const int FLEN = 8192, SLEN6 = 8192, NC6 = 4102, R6 = 4096, L6 = 8192;
+
+        /* ---- FULL fork, dst==cur: bank_pos(dst) must be n_cached, not 0 ---- */
+        CHECK(prefill_bank_cold(s, 0, toks, FLEN), "P6 full src prefill");
+        ds4_session_bank_state_save(s, 0);
+        CHECK(ds4_session_bank_state_restore(s, 1), "P6 install dst(1) as cur");
+        ds4_session_invalidate(s);                    /* mimic provision: cur len -> 0 */
+        CHECK(ds4_session_pos(s) == 0, "P6 precondition: dst==cur must start at 0");
+        CHECK(ds4_session_bank_fork(s, 0, 1, toks, FLEN) == 0, "P6 full fork (dst==cur) refused");
+        CHECK(ds4_session_bank_pos(s, 1) == FLEN,
+              "P6 FULL dst==cur bank_pos %d != %d (WORK-SKIPPED REGRESSION: "
+              "server would re-prefill from 0)", ds4_session_bank_pos(s, 1), FLEN);
+        CHECK(ds4_session_pos(s) == FLEN, "P6 full live pos %d != %d", ds4_session_pos(s), FLEN);
+        fprintf(stderr, "fork_gate: P6 FULL fork dst==cur bank_pos=%d (==%d: %s)\n",
+                ds4_session_bank_pos(s, 1), FLEN,
+                ds4_session_bank_pos(s, 1) == FLEN ? "YES" : "NO");
+
+        /* ---- PARTIAL fork, dst==cur: bank_pos(dst) must be R, and the tail
+         *      [R,L) re-prefill lands byte-identical to cold (aligned oracle) --- */
+        int *toks6 = malloc((size_t)L6 * sizeof(int));
+        for (int i = 0; i < L6; i++)
+            toks6[i] = i < NC6 ? toks[i] : base.v[(i + 5150) % base.len];
+        CHECK(prefill_bank_cold(s, 0, toks, SLEN6), "P6 partial src prefill");
+        ds4_session_bank_state_save(s, 0);
+        CHECK(ds4_session_bank_state_restore(s, 1), "P6 install dst(1) as cur (partial)");
+        ds4_session_invalidate(s);
+        CHECK(ds4_session_bank_fork_partial(s, 0, 1, toks6, NC6) == 0,
+              "P6 partial fork (dst==cur) refused");
+        CHECK(ds4_session_bank_pos(s, 1) == R6,
+              "P6 PARTIAL dst==cur bank_pos %d != R %d (WORK-SKIPPED REGRESSION)",
+              ds4_session_bank_pos(s, 1), R6);
+        CHECK(ds4_session_pos(s) == R6, "P6 partial live pos %d != %d", ds4_session_pos(s), R6);
+        {   /* replay ONLY the tail [R6,L6) — the (L6-R6) tokens actually skipped */
+            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks6; p.len = p.cap = L6;
+            char e6[256];
+            CHECK(ds4_session_sync(s, &p, e6, sizeof e6) == 0, "P6 tail replay: %s", e6);
+            CHECK(ds4_session_pos(s) == L6, "P6 post-replay pos %d != %d", ds4_session_pos(s), L6);
+            gpu_graph_bank_counters_capture(&s->graph, 1);
+        }
+        ds4_gpu_synchronize();
+        const uint64_t sum_p6 = checksum_bank_kv(s, 1);
+        ds4_session_bank_state_save(s, 1);
+        CHECK(prefill_bank_cold(s, 2, toks6, L6), "P6 cold control");
+        ds4_gpu_synchronize();
+        const uint64_t sum_c6 = checksum_bank_kv(s, 2);
+        CHECK(sum_p6 == sum_c6,
+              "P6 partial(dst==cur)+tail KV != cold (%016" PRIx64 " vs %016" PRIx64 ")",
+              sum_p6, sum_c6);
+        fprintf(stderr, "fork_gate: P6 PARTIAL fork dst==cur bank_pos=%d==R "
+                "(tail-only replay %d tok; KV==cold: %s)\n",
+                R6, L6 - R6, sum_p6 == sum_c6 ? "YES" : "NO");
+        free(toks6);
+    }
+
     free(toks);
     fprintf(stderr, "BANK-FORK GATE: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

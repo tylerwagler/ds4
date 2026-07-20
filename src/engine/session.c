@@ -2152,6 +2152,17 @@ uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q) {
 
 static bool bank_carry_ensure(ds4_session *s);   /* defined below */
 
+/* Set d's token contents to EXACTLY toks[0..n) (reusing d's owned buffer). The
+ * fork paths use this to stamp a dst's committed frontier from the VALIDATED
+ * request prefix, rather than relying on truncating a copied/live checkpoint —
+ * that truncate silently no-ops when the target starts shorter than n (a fresh
+ * dst==cur carry at len 0), which is exactly what made the server re-prefill
+ * from 0 and skip zero work (the fork "fired" but delivered no TTFT gain). */
+static void token_vec_set_prefix(token_vec *d, const int *toks, int n) {
+    d->len = 0;
+    for (int i = 0; i < n; i++) token_vec_push(d, toks[i]);
+}
+
 /* Tier-2 PATH-A (plan-33 inc A) — deep-copy one bank carry into another (src's
  * conversation continues on dst). Reuses d's owned heap buffers; no alias/leak. */
 static void bank_carry_copy(ds4_bank_carry *d, const ds4_bank_carry *sc) {
@@ -2219,6 +2230,28 @@ int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
     if (src < s->bank_carry_n && dst < s->bank_carry_n) {
         bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
     }
+    /* dst owns tokens[0..n_cached) as its committed frontier. SET it explicitly
+     * from the validated request prefix (do not trust the copied carry alone). */
+    if (dst < s->bank_carry_n) {
+        ds4_bank_carry *c = &s->bank_carry[dst];
+        token_vec_set_prefix(&c->checkpoint, tokens, n_cached);
+        c->checkpoint_valid = true;
+        c->valid = true;
+    }
+    /* BUG FIX (server dst==cur): provision_bank installs the fresh dst as cur and
+     * invalidates the live session (s->checkpoint.len -> 0) BEFORE this fork runs.
+     * bank_frontier_tokens(dst) then reads the LIVE s->checkpoint, so unless we
+     * SET it here bank_pos(dst) stays 0 and the server re-prefills the WHOLE
+     * prompt (fork fires, zero work skipped). Install dst's graph frontier and
+     * stamp s->checkpoint to tokens[0..n_cached). */
+    if (dst == cur) {
+        gpu_graph_bank_counters_install(g, dst);
+        token_vec_set_prefix(&s->checkpoint, tokens, n_cached);
+        s->checkpoint_valid = true;
+        s->spec_carry_valid = false;
+        s->dspark_n_pending = 0;
+        s->mseq_dirty = false;
+    }
     /* 7. Full fork has no ratio-4 boundary stash — keep the emit hook inactive.
      * The drafter ring is NOT cloned: zero dst's ring counters so the spec path
      * re-warms instead of reading another conversation's window. */
@@ -2284,13 +2317,17 @@ int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
         g->fork_pin[src] = 0u;
         return 1;
     }
-    /* 5. Host carry: dst owns tokens[0..R) as its committed history. */
+    /* 5. Host carry: dst owns tokens[0..R) as its committed history. Copy src's
+     * carry for the auxiliary state (logits/dspark), then SET the checkpoint
+     * EXPLICITLY to the validated tokens[0..R) — do not rely on truncating a
+     * possibly-stale/short carry (a fresh dst carry starts at len 0, so the old
+     * `checkpoint.len = R` set a length past the buffer's real contents). */
     if (src != dst && src < s->bank_carry_n && dst < s->bank_carry_n) {
         bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
     }
     if (dst < s->bank_carry_n) {
         ds4_bank_carry *c = &s->bank_carry[dst];
-        c->checkpoint.len = (int)R;                 /* truncate committed history */
+        token_vec_set_prefix(&c->checkpoint, tokens, (int)R);
         c->checkpoint_valid = true;
         c->valid = true;
         /* Position-stamped state beyond R is meaningless on dst. */
@@ -2303,11 +2340,15 @@ int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
     for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[dst][i] = 0u;
     g->ms_dspark_prompt_n[dst] = 0u;
     g->ms_dspark_prompt_lo[dst] = 0u;
-    /* 6. If dst is the installed bank (truncate-reuse of cur, or fork onto cur),
-     * refresh the LIVE session state from the truncated carry. */
+    /* 6. If dst is the installed bank (server forks onto a freshly provisioned
+     * cur, or the truncate-reuse of cur), refresh the LIVE session state and SET
+     * (not truncate-if-larger) s->checkpoint to tokens[0..R). BUG FIX: on the
+     * server dst==cur is fresh (len 0), so `if (len > R) len = R` never fired ->
+     * bank_pos(dst) stayed 0 -> the server re-prefilled the WHOLE prompt (fork
+     * fired, zero work skipped, no TTFT gain). Stamp it to R explicitly. */
     if (dst == cur) {
         gpu_graph_bank_counters_install(g, dst);
-        if (s->checkpoint.len > (int)R) s->checkpoint.len = (int)R;
+        token_vec_set_prefix(&s->checkpoint, tokens, (int)R);
         s->checkpoint_valid = true;
         s->spec_carry_valid = false;
         s->dspark_n_pending = 0;
