@@ -380,6 +380,18 @@ typedef struct {
 int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen);
+/* plan-34 phase-2: mixed prefill+decode batched step. SAME contract, kernel path,
+ * and post-step invalidation as ds4_session_decode_multiseq, but the per-row
+ * descriptor scratch is HEAP-allocated (up to the session's prefill_cap rows)
+ * rather than the fixed DS4_MSEQ_MAX stack — the row representation the fused
+ * mixed-batch step grows into. INCREMENT 1 is a byte-identical refactor: for a
+ * decode-only batch (1 row per bank, n_rows == bank count) it produces the SAME
+ * per-row logits as ds4_session_decode_multiseq. n_rows must be <= prefill_cap;
+ * the underlying kernel still bounds the live row count to DS4_MSEQ_MAX this
+ * increment (later increments lift it). Returns 0 / 1 / -1 as decode_multiseq. */
+int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
+                             uint32_t n_rows, float *logits, int logits_cap,
+                             char *err, size_t errlen);
 /* Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
  * hosts up to N co-scheduled conversations as banks; each server slot maps to a
  * bank id.  The pool size is chosen at session create (DS4_MSEQ_BANKS today);

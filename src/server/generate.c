@@ -3584,9 +3584,13 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
         if (m == 0) break;
 
         char err[96];
-        const int rc = ds4_session_decode_multiseq(pool, reqs, (uint32_t)m,
-                                                    logits, (uint32_t)m * vocab,
-                                                    err, sizeof(err));
+        /* plan-34 inc 1: route the decode-only lane through the mixed entry
+         * (n_rows == n_dec, still exactly 1 row per bank — no prefill rows, no
+         * mixing yet). Byte-identical to ds4_session_decode_multiseq; the only
+         * change is the heap descriptor scratch. */
+        const int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m,
+                                                 logits, (uint32_t)m * vocab,
+                                                 err, sizeof(err));
         s->live_bank = -1;   /* pool is multiseq-poisoned: no clean live bank */
         if (rc != 0) {
             for (int q = 0; q < m; q++) {

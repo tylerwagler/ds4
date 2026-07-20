@@ -3039,6 +3039,70 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
 }
 #undef DS4_MULTISEQ_ERR
 
+/* plan-34 phase-2 increment 1 — mixed prefill+decode descriptor entry.
+ *
+ * BYTE-IDENTICAL to ds4_session_decode_multiseq for a decode-only (1-row-per-bank)
+ * batch: the ONLY difference is that the per-row descriptor scratch
+ * (positions / seq_id / tokens) lives on the HEAP, sized to n_rows up to
+ * prefill_cap, instead of the fixed [DS4_MSEQ_MAX] stack arrays. This establishes
+ * the >DS4_MSEQ_MAX-row representation the fused mixed-batch step grows into over
+ * increments 2-5. The kernel path (gpu_graph_decode_multiseq_batch + step_begin)
+ * is UNCHANGED: it still bounds the current ROW count to DS4_MSEQ_MAX and keeps
+ * DS4_MSEQ_MAX as the BANK-count bound. No mixing, no scheduler change, no algo
+ * work this increment — the descriptor container is the only thing that moved. */
+#define DS4_MIXED_ERR(...) do { \
+        if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
+    } while (0)
+int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
+                             uint32_t n_rows, float *logits, int logits_cap,
+                             char *err, size_t errlen) {
+    if (!s || !reqs || !logits || n_rows == 0 ||
+        n_rows > s->graph.prefill_cap) {
+        DS4_MIXED_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
+                      n_rows, s ? s->graph.prefill_cap : 0u);
+        return 1;
+    }
+    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n_rows * DS4_N_VOCAB) {
+        DS4_MIXED_ERR("mixed decode: logits capacity %d < %u rows x %u",
+                      logits_cap, n_rows, (unsigned)DS4_N_VOCAB);
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    /* HEAP descriptor scratch (positions / seq_id / tokens), sized to n_rows —
+     * this is the whole point of the refactor: no [DS4_MSEQ_MAX] stack ceiling. */
+    int32_t *pos    = xmalloc((size_t)n_rows * sizeof(*pos));
+    int32_t *bank   = xmalloc((size_t)n_rows * sizeof(*bank));
+    int     *tokens = xmalloc((size_t)n_rows * sizeof(*tokens));
+    for (uint32_t k = 0; k < n_rows; k++) {
+        pos[k]    = reqs[k].pos;
+        bank[k]   = (int32_t)reqs[k].bank;
+        tokens[k] = reqs[k].token;
+    }
+    const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
+                                                   &e->weights, tokens, pos,
+                                                   bank, n_rows, logits);
+    /* The batch call consumed the descriptor synchronously (tokens copied to a
+     * stack row, pos/seq uploaded to device in step_begin); the host scratch is
+     * dead now regardless of rc. */
+    free(pos); free(bank); free(tokens);
+    if (rc == 0) {
+        /* Recoverable rejection: nothing mutated (see ds4_session_decode_multiseq
+         * for the precise argument — every step_begin reject precedes its first
+         * scalar write). Leave the classic view flags alone. */
+        DS4_MIXED_ERR("mixed decode step rejected (recoverable; reason on stderr)");
+        return 1;
+    }
+    /* Step was armed: scalar counters now hold a cross-bank superset; the classic
+     * single-bank view is stale exactly as after a multiseq step. */
+    s->checkpoint_valid = false;
+    s->mseq_dirty = true;
+    s->spec_carry_valid = false;
+    if (rc == 1) return 0;
+    DS4_MIXED_ERR("mixed decode step failed mid-sweep (session state fatal)");
+    return -1;
+}
+#undef DS4_MIXED_ERR
+
 
 
 /* ===== Tier-2 PATH A: per-bank HOST carry (ds4_bank_carry) ================
