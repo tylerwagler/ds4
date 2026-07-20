@@ -2767,6 +2767,20 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
     const bool full    = warm_ok && best_common == frontier;                 /* inc B */
     const bool partial = warm_ok && !full && best_common >= s->warm_partial_min &&
                          best_common < frontier;                             /* inc D */
+    /* Always-on routing-decision inputs, so a 0-fork count is never silent (the
+     * verbose KVCACHE stream; one line per bind, not per token). Confirmed nuance:
+     * re-tokenized generated tail rarely reproduces the trunk's exact frontier, so
+     * best_common < frontier (the PARTIAL path) is the common case; full is the
+     * rare exact-continuation. */
+    if (s->pool_banks > 0 && s->warm_fork_enabled)
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: route: best bank %d common %d frontier %d prompt %d "
+                   "partial_min %d -> %s%s%s",
+                   best ? (int)best->bank : -1, best_common, frontier,
+                   j->req.prompt.len, s->warm_partial_min,
+                   full ? "FORK-full" : partial ? "FORK-partial" : "in-place/cold",
+                   best_clobbers_warm_state ? " [trivial]" : "",
+                   (best && best->active_job) ? " [busy]" : "");
     if (full || partial) {
         provision_refusal fr;
         session_slot *dst = provision_slot(s, provision_ctx_for_job(s, j), &fr);

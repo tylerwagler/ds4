@@ -77,6 +77,25 @@ static bool prefill_bank_cold(ds4_session *s, uint32_t bank, int *toks, int len)
     return true;
 }
 
+/* P5 output-token oracle: greedy-decode `ngen` tokens from the bank CURRENTLY
+ * installed at position `len`, appending each into toks[len..] and recording it
+ * in out[0..ngen). Mirrors the server's decode loop (sample -> feed the token
+ * back -> sync -> sample again). `toks` must have capacity >= len+ngen. On a sync
+ * failure the stream is truncated with a -1 sentinel. */
+static void decode_stream_greedy(ds4_session *s, uint32_t bank, int *toks,
+                                 int len, int ngen, int *out) {
+    ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks;
+    for (int i = 0; i < ngen; i++) {
+        const int t = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+        out[i] = t;
+        toks[len + i] = t;
+        p.len = p.cap = len + i + 1;
+        char err[256];
+        if (ds4_session_sync(s, &p, err, sizeof err) != 0) { out[i] = -1; break; }
+        gpu_graph_bank_counters_capture(&s->graph, bank);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [N_CACHED L]\n", argv[0]); return 2; }
     /* ORACLE VALIDITY: n_cached must be a multiple of the PREFILL CHUNK (4096
@@ -353,6 +372,80 @@ int main(int argc, char **argv) {
               "P4 wrapped-ring cut NOT refused (window guard broken)");
         fprintf(stderr, "fork_gate: P4 wrapped-ring cut refused : OK\n");
         free(toks2);
+    }
+
+    /* ============ P5: UNALIGNED-SOURCE output-token COHERENCE ============
+     * P2 proves BYTE-identity at a chunk-ALIGNED source/cut. The PRODUCTION case
+     * is different: a trunk prefilled to a NON-chunk-multiple length, cut at R,
+     * then resumed. The resumed [R,L) prefill does not chunk-align to the cold
+     * run's 4096 boundaries, so it runs the per-token compressor-fallback realign
+     * — the engine's accepted warm-continuation numerics, a last-ulp KV delta.
+     * BYTE-identity therefore does NOT hold (and asserting it would be wrong).
+     * The honest oracle is OUTPUT-TOKEN COHERENCE: the fork+suffix must greedy-
+     * decode the SAME token stream as a cold full-prefill of the identical text.
+     * This closes the gap between P2's aligned proof and how forks actually run. */
+    {
+        const int SLEN5 = 5000;     /* trunk length: NOT a multiple of 4096 */
+        const int NC5   = 4700;     /* shared-prefix tokens (R aligns down from here) */
+        const int L5    = 6000;     /* full request length (SLEN5..L5 diverges from trunk) */
+        const int NGEN  = 24;       /* decoded token-stream length to compare */
+        CHECK(SLEN5 % 4096 != 0, "P5 source must be chunk-UNALIGNED (got %d)", SLEN5);
+        CHECK(NC5 < SLEN5 && L5 > SLEN5, "P5 length ordering");
+        const int R5 = ((NC5 - 4) / 128) * 128;   /* engine's ratio-4 align-down */
+
+        int *toks5 = malloc((size_t)(L5 + NGEN) * sizeof(int));
+        for (int i = 0; i < L5; i++)
+            toks5[i] = i < NC5 ? toks[i] : base.v[(i + 31337) % base.len];
+
+        /* trunk on bank 0, prefilled to the UNALIGNED SLEN5. */
+        CHECK(prefill_bank_cold(s, 0, toks, SLEN5), "P5 trunk prefill @%d", SLEN5);
+        ds4_session_bank_state_save(s, 0);
+
+        /* partial fork 0->1 at NC5 (cut R5), replay the divergent suffix to L5. */
+        const int prc5 = ds4_session_bank_fork_partial(s, 0, 1, toks5, NC5);
+        CHECK(prc5 == 0, "P5 partial fork refused rc=%d", prc5);
+        CHECK(!ds4_session_bank_fork_pinned(s, 0), "P5 src left pinned");
+        CHECK(ds4_session_bank_state_restore(s, 1), "P5 install fork dst");
+        CHECK(ds4_session_pos(s) == R5, "P5 dst pos %d != R %d", ds4_session_pos(s), R5);
+        {
+            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks5; p.len = p.cap = L5;
+            char e5[256];
+            CHECK(ds4_session_sync(s, &p, e5, sizeof e5) == 0, "P5 replay sync: %s", e5);
+            CHECK(ds4_session_pos(s) == L5, "P5 live pos %d != %d", ds4_session_pos(s), L5);
+            gpu_graph_bank_counters_capture(&s->graph, 1);
+        }
+        const uint64_t sum_pf5 = checksum_bank_kv(s, 1);
+        /* decode the fork's stream (bank 1 installed at L5). */
+        int *fbuf = malloc((size_t)(L5 + NGEN) * sizeof(int));
+        memcpy(fbuf, toks5, (size_t)L5 * sizeof(int));
+        int fork_stream[64];
+        decode_stream_greedy(s, 1, fbuf, L5, NGEN, fork_stream);
+        ds4_session_bank_state_save(s, 1);
+
+        /* COLD control: bank 2 full prefill of the identical text, same decode. */
+        CHECK(prefill_bank_cold(s, 2, toks5, L5), "P5 cold prefill @%d", L5);
+        const uint64_t sum_pc5 = checksum_bank_kv(s, 2);
+        int *cbuf = malloc((size_t)(L5 + NGEN) * sizeof(int));
+        memcpy(cbuf, toks5, (size_t)L5 * sizeof(int));
+        int cold_stream[64];
+        decode_stream_greedy(s, 2, cbuf, L5, NGEN, cold_stream);
+
+        /* THE ORACLE: identical output-token STREAM (NOT KV bytes). */
+        int firstdiff = -1;
+        for (int i = 0; i < NGEN; i++)
+            if (fork_stream[i] != cold_stream[i]) { firstdiff = i; break; }
+        CHECK(firstdiff < 0,
+              "P5 output-token stream diverges at %d (fork %d != cold %d)",
+              firstdiff, firstdiff < 0 ? 0 : fork_stream[firstdiff],
+              firstdiff < 0 ? 0 : cold_stream[firstdiff]);
+        /* Informational: the KV IS expected to differ (unaligned last-ulp delta);
+         * a byte-identical result here would mean the source happened to align. */
+        fprintf(stderr,
+                "fork_gate: P5 unaligned-source(SLEN=%d R=%d) coherence: %d/%d tokens "
+                "match cold (KV byte-identical: %s — delta expected on unaligned)\n",
+                SLEN5, R5, firstdiff < 0 ? NGEN : firstdiff, NGEN,
+                sum_pf5 == sum_pc5 ? "YES" : "no");
+        free(toks5); free(fbuf); free(cbuf);
     }
 
     free(toks);

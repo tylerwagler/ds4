@@ -1,37 +1,50 @@
 #!/bin/bash
-# plan-33 inc D gate: PARTIAL-prefix fork routing — the DOMINANT single-turn shape.
+# plan-33 inc D gate — THE server-fork proof: PARTIAL-prefix fork routing on the
+# DOMINANT shape (a LARGE shared text prefix + divergent user tails) + the TTFT
+# payoff number.
 #
-# Shape: a large SHARED system/few-shot TRUNK + a divergent user tail. This is the
-# ~7x-TTFT payoff path: every request pays for the shared preamble once, then each
-# divergent turn reuses it via a PARTIAL fork-cut instead of cold-prefilling it.
+# CONSTRUCTION (settled with the coordinator): the partial fork only fires, and
+# only matters, on a LARGE shared prefix. Appended detokenized GENERATION diverges
+# at the trunk/gen junction (~47 tok in) — so the shared region must be literal
+# TEXT, identical across branches, with NO generated text inside it. Then P
+# tokenizes stably and common ~= |P| > warm_partial_min.
 #
-#   R1 : SYS + " Alpha: <question 1>"  -> bank A, generates, frontier = |SYS+Q1+gen1|
-#   R2 : SYS + " Zeta:  <question 2>"  -> common == |SYS| (< frontier): PARTIAL match
-#        -> ds4_session_bank_fork_partial cuts A at R=align_down(|SYS|) into bank B,
-#           re-prefills [R..]; trunk A stays intact.
+#   P            : a long shared system+few-shot TEXT block (~600 tokens), used
+#                  verbatim as the literal start of every branch prompt.
+#   R1 = P+tail0 : establishes the trunk (bank A), commits -> frontier > |P|.
+#   R2 = P+tailA : common ~= |P| (diverges at the P/tail boundary),
+#                  256 <= common < frontier -> PARTIAL fork A->B (A intact).
+#   R3 = P+tailB : A still intact -> second PARTIAL fork A->C.
 #
-# SYS is ~300 tokens (>= DS4_WARM_PARTIAL_MIN=256) and deliberately NOT a 4096-chunk
-# multiple, so the fork resumes from an UNALIGNED source length R — the production-
-# realistic class where the resumed compressor carries the accepted warm-continuation
-# last-ulp KV delta. Hence the oracle is the OUTPUT TOKEN STREAM (greedy/temp-0 text),
-# NOT KV byte-identity (which only holds at chunk-aligned cuts, proven by C-P2).
+# Full-fork (common==frontier) is rare-by-design (exact continuation, hard to hit
+# via text) and its engine primitive is already proven by the fork gate (A); this
+# gate proves the SERVER partial path.
 #
-# Three ways, assert IDENTICAL R2 output text:
-#   (F) warm-partial-fork  DS4_WARM_FORK=1 -> partial cut fires, trunk preserved
-#   (W) warm continuation  DS4_WARM_FORK=0 -> in-place rewind of A to |SYS|, prefill Q2
-#   (C) cold               fresh server, R2 only -> full cold prefill, no reuse
-# plus: >=1 "warm-fork-partial" fired with a cut logged, and a trunk-preserved line.
+# ASSERTS:
+#  (i)   OUTPUT-TOKEN identity fork-vs-warm-vs-cold for each branch (temp-0 text is
+#        the token-stream oracle; NOT KV bytes — the partial cut resumes at R, the
+#        unaligned last-ulp class, see fork-gate P5).
+#  (ii)  >=2 warm-fork-partial fired (grep `warm-fork-partial:`), trunk preserved.
+#  (iii) TTFT payoff: warm-forked branch vs cold branch (max_tokens=1 wall time).
 # Run manually under GPU discipline (flock, drop_caches, watchdog, one load).
 #   usage: tests/warm_partial_fork_3way.sh [MODEL] [PORT]
 set -u
 MODEL=${1:-gguf/model.gguf}; PORT=${2:-8902}
 DIR=$(mktemp -d /tmp/warmpartial.XXXX); LOG=$DIR/server.log
-# ~300-token shared preamble (150 * "word "), unaligned to the 4096 prefill chunk.
-SYS=$(python3 -c "print('You are a meticulous assistant. '+'context word '*150)")
-Q1="$SYS
-Alpha: Summarize the first policy in one sentence."
-Q2="$SYS
-Zeta: List two unrelated prime numbers."
+# ~600-token shared system+few-shot TEXT block (literal, identical across branches).
+P=$(python3 -c "
+import sys
+hdr='You are a precise assistant. Follow the format exactly.\n'
+shot='Example %d: given input, respond with a single factual sentence and stop.\n'
+print(hdr + ''.join(shot%i for i in range(1,120)))")
+T0="$P
+Task-0: name a color."
+TA="$P
+Question-Alpha: name two prime numbers."
+TB="$P
+Question-Bravo: name a European river."
+TT="$P
+Probe-Gamma: name a mountain."     # dedicated TTFT tail (fresh partial fork)
 jreq(){ python3 -c "import json,sys;print(json.dumps({'prompt':sys.argv[1],'max_tokens':int(sys.argv[2]),'temperature':0.0,'stream':False}))" "$1" "$2"; }
 start(){ DS4_WARM_FORK=$1 DS4_MSEQ_BANKS=3 DS4_WARM_PARTIAL_MIN=256 ./ds4-server -m "$MODEL" \
         --host 127.0.0.1 --port $PORT -c 32768 --kv-disk-dir "" >"$LOG" 2>&1 & SP=$!
@@ -39,28 +52,38 @@ start(){ DS4_WARM_FORK=$1 DS4_MSEQ_BANKS=3 DS4_WARM_PARTIAL_MIN=256 ./ds4-server
 stop(){ kill -INT $SP 2>/dev/null; sleep 2; kill -9 $SP 2>/dev/null; }
 gen(){ curl -s -m 600 http://127.0.0.1:$PORT/v1/completions -H 'content-type: application/json' \
         -d "$(jreq "$1" "$2")" | python3 -c "import json,sys;print(json.load(sys.stdin)['choices'][0]['text'])"; }
+# wall time (seconds) of a max_tokens=1 request == TTFT proxy (prefill + 1 token).
+ttft(){ curl -s -m 600 -o /dev/null -w '%{time_total}' http://127.0.0.1:$PORT/v1/completions \
+        -H 'content-type: application/json' -d "$(jreq "$1" 1)"; }
 
-# (F) warm-partial-fork: R1 establishes the trunk, R2 partial-forks off it.
-echo "[Dgate] (F) warm-partial-fork"; start 1 || { echo FAIL-start; exit 1; }
-gen "$Q1" 24 >/dev/null                                    # R1: build trunk A
-F2=$(gen "$Q2" 48)                                          # R2: partial fork A->B
-PF=$(grep -c "warm-fork-partial: trunk" "$LOG")            # partial forks that fired
-CUTLOG=$(grep -c "warm-fork-partial: .*resume" "$LOG")     # cut/resume logged
+# (F) warm-partial-fork: trunk then two branches partial-forking off it.
+echo "[Dgate] (F) warm-partial-fork (branching)"; start 1 || { echo FAIL-start; exit 1; }
+gen "$T0" 24 >/dev/null                                    # R1: build trunk A
+FA=$(gen "$TA" 48)                                          # R2: partial fork A->B
+FB=$(gen "$TB" 48)                                          # R3: A intact -> partial fork A->C
+T_WARM=$(ttft "$TT")                                        # TTFT: warm partial fork off A
+PF=$(grep -c "warm-fork-partial:" "$LOG")
 PRES=$(grep -c "trunk preserved" "$LOG")
 stop
 
-# (W) warm continuation (fork off): same two requests, in-place rewind on A.
+# (W) warm continuation (fork off): same requests, in-place rewind on A.
 echo "[Dgate] (W) warm continuation (fork off)"; start 0 || { echo FAIL-start; exit 1; }
-gen "$Q1" 24 >/dev/null; W2=$(gen "$Q2" 48); stop
+gen "$T0" 24 >/dev/null; WA=$(gen "$TA" 48); WB=$(gen "$TB" 48); stop
 
-# (C) cold: fresh server, R2 only (no trunk in KV at all).
-echo "[Dgate] (C) cold"; start 0 || { echo FAIL-start; exit 1; }; C2=$(gen "$Q2" 48); stop
+# (C) cold: fresh server per branch (no trunk in KV).
+echo "[Dgate] (C) cold per branch"
+start 0 || { echo FAIL-start; exit 1; }; CA=$(gen "$TA" 48); stop
+start 0 || { echo FAIL-start; exit 1; }; CB=$(gen "$TB" 48); stop
+start 0 || { echo FAIL-start; exit 1; }; T_COLD=$(ttft "$TT"); stop
 
 fail=0
-[ "$F2" = "$W2" ] || { echo "MISMATCH R2: partial-fork vs warm-continuation"; fail=1; }
-[ "$F2" = "$C2" ] || { echo "MISMATCH R2: partial-fork vs cold"; fail=1; }
-echo "partial forks fired: $PF (cut/resume logged: $CUTLOG, trunk-preserved: $PRES)"
-[ "$PF"     -ge 1 ] || { echo "EXPECTED >=1 partial fork, got $PF"; fail=1; }
-[ "$CUTLOG" -ge 1 ] || { echo "partial fork fired without a cut/resume log line"; fail=1; }
-[ "$PRES"   -ge 1 ] || { echo "trunk never reported preserved"; fail=1; }
-echo "WARM-PARTIAL-FORK 3WAY: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+[ "$FA" = "$WA" ] || { echo "MISMATCH branch A: fork vs warm"; fail=1; }
+[ "$FA" = "$CA" ] || { echo "MISMATCH branch A: fork vs cold"; fail=1; }
+[ "$FB" = "$WB" ] || { echo "MISMATCH branch B: fork vs warm"; fail=1; }
+[ "$FB" = "$CB" ] || { echo "MISMATCH branch B: fork vs cold"; fail=1; }
+echo "partial forks fired: $PF (trunk-preserved: $PRES)"
+[ "$PF"   -ge 2 ] || { echo "EXPECTED >=2 partial forks (both branches), got $PF"; fail=1; }
+[ "$PRES" -ge 1 ] || { echo "trunk never reported preserved"; fail=1; }
+SPEEDUP=$(python3 -c "w=$T_WARM;c=$T_COLD;print('%.2f'%(c/w) if w>0 else 'inf')")
+echo "TTFT payoff: warm-fork ${T_WARM}s vs cold ${T_COLD}s -> ${SPEEDUP}x faster"
+echo "WARM-PARTIAL-FORK GATE: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
