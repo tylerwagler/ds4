@@ -1138,6 +1138,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas_ready = 0;
         g_cublas = NULL;
     }
+    /* Invalidate the fp8 weight-pointer cache BEFORE freeing the model arenas
+     * it points into -- a later engine open in this process would otherwise be
+     * served dangling MXFP8_LT pointers (the second engine's mmap typically
+     * reuses the same base address, so the cache guard cannot catch it). */
+    cuda_fp8_weight_cache_clear();
     cuda_model_range_release_all();
     cuda_model_load_progress_reset();
     if (g_cuda_tmp) {

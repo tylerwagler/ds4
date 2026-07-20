@@ -580,6 +580,12 @@ static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
  * set. */
 static std::unordered_set<uint64_t> g_mxfp8_lt_offsets;
 
+/* Direct-mapped front cache for cuda_fp8_mx_weight (file-scope so backend
+ * cleanup can invalidate it together with g_fp8_mx_by_offset). */
+constexpr uint32_t FP8_FC = 2048u;
+static uint64_t g_fp8_fc_off[FP8_FC];        /* zero-init; real offsets are never 0 */
+static const fp8_mx_weight *g_fp8_fc_ptr[FP8_FC];
+
 
 /* lazily de-interleave + swizzle an MXFP8 weight into device buffers, cached by offset. */
 static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t offset, uint64_t weight_bytes,
@@ -589,9 +595,9 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
      * of the unordered_map skips the probe on the hot repeat; a miss or hash
      * collision just falls through (benign), and the cached pointer is
      * re-validated (map references are stable across inserts). */
-    constexpr uint32_t FC = 2048u;
-    static uint64_t fc_off[FC];              /* zero-init; real offsets are never 0 */
-    static const fp8_mx_weight *fc_ptr[FC];
+    constexpr uint32_t FC = FP8_FC;
+    uint64_t *fc_off = g_fp8_fc_off;
+    const fp8_mx_weight **fc_ptr = g_fp8_fc_ptr;
     const uint32_t slot = (uint32_t)(((offset >> 5) ^ (offset >> 17)) & (FC - 1u));
     if (offset != 0 && fc_off[slot] == offset) {
         const fp8_mx_weight *p = fc_ptr[slot];
@@ -1038,6 +1044,30 @@ extern "C" void ds4_gpu_register_fp8_weight(uint64_t weight_offset) { g_fp8_offs
 
 
 extern "C" void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offsets.insert(weight_offset); }
+
+
+/* Drop every process-global fp8 weight-cache entry. MUST run at backend
+ * cleanup (ds4_gpu_cleanup): pre-stored MXFP8_LT entries point straight into
+ * the per-engine model arena that cleanup frees, and a subsequent engine open
+ * in the same process typically mmaps the model at the SAME base address --
+ * the cache's (host_base, offset, dims) guard then false-positives and serves
+ * dangling pointers into freed memory (garbage/NaN activations, and an
+ * illegal TMA access inside the cuBLASLt MXFP8 GEMM once a page is gone).
+ * Converted (non-LT) entries own their device buffers; free them here so a
+ * multi-engine process does not leak one conversion set per engine cycle. */
+void cuda_fp8_weight_cache_clear(void) {
+    for (auto &kv : g_fp8_mx_by_offset) {
+        if (g_mxfp8_lt_offsets.count(kv.first)) continue;   /* arena-owned, freed with the arena */
+        if (kv.second.data) (void)cudaFree((void *)kv.second.data);
+        if (kv.second.scale) (void)cudaFree((void *)kv.second.scale);
+    }
+    g_fp8_mx_by_offset.clear();
+    memset(g_fp8_fc_off, 0, sizeof(g_fp8_fc_off));
+    memset(g_fp8_fc_ptr, 0, sizeof(g_fp8_fc_ptr));
+    /* per-load registrations; the next engine open re-registers its own set */
+    g_fp8_offsets.clear();
+    g_mxfp8_lt_offsets.clear();
+}
 
 
 

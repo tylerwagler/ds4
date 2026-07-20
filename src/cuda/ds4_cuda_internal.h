@@ -153,6 +153,7 @@ extern std::unordered_set<uint64_t> g_fp8_offsets;
 /* ---- shared host functions ---- */
 
 void *cuda_tmp_alloc(uint64_t bytes, const char *what);
+void cuda_fp8_weight_cache_clear(void);
 int cuda_attention_score_buffer_fits(uint32_t n_comp);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);

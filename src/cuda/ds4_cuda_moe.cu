@@ -2229,14 +2229,9 @@ static int routed_moe_launch_cutlass(
     }
 
     for (uint32_t e = 0; e < n_total_expert; e++) {
-        const uint32_t pair_offset = h_offsets[e];
-        const uint32_t count = h_offsets[e + 1] - pair_offset;
-        if (count == 0) continue;
-
-        moe_cutlass_gather_kernel<<<count, 256>>>(x_gathered, w_gathered,
-                (const float *)x->ptr, (const float *)weights->ptr,
-                sorted_pairs, pair_offset, count, n_expert, expert_in_dim);
-        if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass gather launch")) return 0;
+        const uint32_t e_offset = h_offsets[e];
+        const uint32_t e_count = h_offsets[e + 1] - e_offset;
+        if (e_count == 0) continue;
 
         const uint8_t *Wg_d = (const uint8_t *)gate_w + (uint64_t)e * gate_stride;
         const uint8_t *Wg_sf = Wg_d + gate_data_bytes;
@@ -2245,16 +2240,34 @@ static int routed_moe_launch_cutlass(
         const uint8_t *Wd_d = (const uint8_t *)down_w + (uint64_t)e * down_stride;
         const uint8_t *Wd_sf = Wd_d + down_data_bytes;
 
-        const int rc = ds4_cutlass_expert_ffn_scratch(ffn_out, x_gathered,
-                Wg_d, Wg_sf, Wu_d, Wu_sf, Wd_d, Wd_sf,
-                w_gathered, clamp,
-                (int)count, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                ffn_scratch, ffn_scratch_bytes);
-        if (rc != 0) return 0;
+        /* One expert can receive MORE than n_tokens pairs when routing carries
+         * duplicates (e.g. tid2eid -1 "dropped" entries all clamp to expert 0),
+         * but the gather/ffn scratch is sized for T_max = n_tokens rows -- so
+         * run the expert in <=T_max-row slices. Every row is computed
+         * independently (per-row GEMM dot products, per-row swiglu), so slicing
+         * is bit-identical to a single full-count pass; with well-formed
+         * routing (count <= n_tokens) this loop body runs exactly once with
+         * the same arguments as before. */
+        for (uint32_t done = 0; done < e_count; done += T_max) {
+            const uint32_t pair_offset = e_offset + done;
+            const uint32_t count = (e_count - done < T_max) ? (e_count - done) : T_max;
 
-        moe_cutlass_scatter_kernel<<<count, 256>>>((float *)down->ptr, ffn_out,
-                sorted_pairs, pair_offset, count, out_dim);
-        if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass scatter launch")) return 0;
+            moe_cutlass_gather_kernel<<<count, 256>>>(x_gathered, w_gathered,
+                    (const float *)x->ptr, (const float *)weights->ptr,
+                    sorted_pairs, pair_offset, count, n_expert, expert_in_dim);
+            if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass gather launch")) return 0;
+
+            const int rc = ds4_cutlass_expert_ffn_scratch(ffn_out, x_gathered,
+                    Wg_d, Wg_sf, Wu_d, Wu_sf, Wd_d, Wd_sf,
+                    w_gathered, clamp,
+                    (int)count, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
+                    ffn_scratch, ffn_scratch_bytes);
+            if (rc != 0) return 0;
+
+            moe_cutlass_scatter_kernel<<<count, 256>>>((float *)down->ptr, ffn_out,
+                    sorted_pairs, pair_offset, count, out_dim);
+            if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass scatter launch")) return 0;
+        }
     }
 
     const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
