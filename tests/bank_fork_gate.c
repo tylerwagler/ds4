@@ -79,8 +79,23 @@ static bool prefill_bank_cold(ds4_session *s, uint32_t bank, int *toks, int len)
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [N_CACHED L]\n", argv[0]); return 2; }
-    const int n_cached = argc > 2 ? atoi(argv[2]) : 12000;
-    const int L = argc > 3 ? atoi(argv[3]) : 20000;
+    /* ORACLE VALIDITY: n_cached must be a multiple of the PREFILL CHUNK (4096
+     * default; also of 128 = LCM of compress ratios). A resumed prefill aligns
+     * its chunks to absolute prefill_cap boundaries (imatrix.c chunked_range),
+     * so with an aligned cut every resumed chunk has the SAME batch shape as the
+     * cold run's — bit-identical kernels — and byte-identity is a fair oracle.
+     * An UNALIGNED cut runs a short realign chunk through the per-token
+     * compressor fallback (a different code path than cold's batched one):
+     * last-ulp GEMM differences then propagate to every later row — that is the
+     * engine's existing warm-continuation numerics, NOT a fork bug, and it
+     * breaks the byte oracle spuriously. */
+    const int n_cached = argc > 2 ? atoi(argv[2]) : 12288;
+    const int L = argc > 3 ? atoi(argv[3]) : 20480;
+    if ((n_cached % 4096) != 0) {
+        fprintf(stderr, "n_cached %d must be a multiple of the prefill chunk (4096) "
+                        "for the byte-identity oracle (see header comment)\n", n_cached);
+        return 2;
+    }
     const int ctx = L + 4096;
     if (n_cached >= L) { fprintf(stderr, "need N_CACHED < L\n"); return 2; }
 
@@ -148,11 +163,20 @@ int main(int argc, char **argv) {
         ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks; p.len = p.cap = L;
         char err[256];
         CHECK(ds4_session_sync(s, &p, err, sizeof err) == 0, "fork-dst suffix sync: %s", err);
+        /* LIVE frontier assert (catches a silently short-circuited sync HERE,
+         * while bank 1 is still installed — ds4_session_pos reads the live
+         * checkpoint, not a possibly-stale carry). */
+        CHECK(ds4_session_pos(s) == L, "fork-dst live pos %d != %d after suffix sync",
+              ds4_session_pos(s), L);
         gpu_graph_bank_counters_capture(&s->graph, 1);
     }
     const int tok_fork = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
     ds4_gpu_synchronize();
     const uint64_t sum_fork_full = checksum_bank_kv(s, 1);
+    /* SAVE bank 1's live state before switching away — the final bank_pos(1)
+     * read below reads the CARRY once bank 2 is installed; without this save it
+     * reads the stale fork-time carry (the original gate-A false "pos" failure). */
+    ds4_session_bank_state_save(s, 1);
 
     /* cold: bank 2 full prefill of [0, L). */
     CHECK(prefill_bank_cold(s, 2, toks, L), "cold full prefill bank 2");
