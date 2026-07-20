@@ -1071,6 +1071,24 @@ void cuda_fp8_weight_cache_clear(void) {
 
 
 
+/* plan-34 phase-2 inc 2 — cuBLASLt ALGO-STABILITY. When armed (a batched
+ * multiseq/mixed step), force the M-INDEPENDENT custom per-token GEMV kernels for
+ * the whole batched row range [2..DS4_MSEQ_MAX=8] instead of switching to a
+ * cuBLAS(Lt) tensor-core GEMM at n_tok>=5. cuBLAS(Lt) resolves an M-dependent
+ * (ntok-keyed heuristic) algo, so a co-scheduled decode bank's logits would shift
+ * with the batch width (measured: M=5/8 differ from M=2). The custom deint_nt /
+ * f16_nt kernels compute each output row purely from THAT row's activations, so
+ * they are byte-identical across M by construction. Armed once per step
+ * (multiseq_step_begin) / cleared (step_end) — NEVER per token. Classic prefill
+ * never arms it, so its large-M cuBLAS tensor-core path is unchanged, and the
+ * decode-only lane (n_tok<=4, already custom) is bit-for-bit unchanged. */
+static bool g_batch_mneutral = false;
+extern "C" void ds4_gpu_matmul_set_batch_mneutral(int on) { g_batch_mneutral = (on != 0); }
+/* Queried cross-TU by the MoE dispatch (ds4_cuda_moe.cu) to keep the M-independent
+ * per-token expert path (not the batch-composition-dependent grouped GEMM) armed
+ * for the whole batched-step row range. */
+extern "C" int ds4_gpu_matmul_batch_mneutral(void) { return g_batch_mneutral ? 1 : 0; }
+
 static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     if (g_fp8_offsets.count(weight_offset)) {
@@ -1089,7 +1107,12 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
         static const int gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
                 return e ? atoi(e) : 4; }();
         static const int nt_fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
-        if (n_tok >= 2 && n_tok <= 4 && n_tok <= (uint64_t)gemv_max_n &&
+        /* inc 2: raise the custom-nt cap to DS4_MSEQ_MAX (8) for a batched step so
+         * n_tok 5..8 keep the M-independent kernel instead of cuBLASLt. Default cap
+         * (gemv_max_n=4) is unchanged for classic prefill (never armed) and for the
+         * decode-only lane (n_tok<=4), which take the identical cases 2/3/4 below. */
+        const uint64_t nt_cap = g_batch_mneutral ? 8u : (uint64_t)gemv_max_n;
+        if (n_tok >= 2 && n_tok <= nt_cap && n_tok <= 8 &&
             in_dim % 128 == 0 && !nt_fp8_raw) {
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
@@ -1097,14 +1120,19 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
                 const int KBp = mx_rup((int)(in_dim / 32), 4);
                 const unsigned wpb = 8;
                 dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
+                #define DS4_FP8_NT(N) mxfp8_mmvq_deint_nt_kernel<N><<<grid, wpb * 32>>>( \
+                        (float *)out->ptr, bw->data, bw->scale, (const float *)x->ptr, \
+                        (int)in_dim, (int)out_dim, KBp)
                 switch (n_tok) {
-                case 2: mxfp8_mmvq_deint_nt_kernel<2><<<grid, wpb * 32>>>((float *)out->ptr,
-                        bw->data, bw->scale, (const float *)x->ptr, (int)in_dim, (int)out_dim, KBp); break;
-                case 3: mxfp8_mmvq_deint_nt_kernel<3><<<grid, wpb * 32>>>((float *)out->ptr,
-                        bw->data, bw->scale, (const float *)x->ptr, (int)in_dim, (int)out_dim, KBp); break;
-                default: mxfp8_mmvq_deint_nt_kernel<4><<<grid, wpb * 32>>>((float *)out->ptr,
-                        bw->data, bw->scale, (const float *)x->ptr, (int)in_dim, (int)out_dim, KBp); break;
+                case 2: DS4_FP8_NT(2); break;
+                case 3: DS4_FP8_NT(3); break;
+                case 4: DS4_FP8_NT(4); break;
+                case 5: DS4_FP8_NT(5); break;
+                case 6: DS4_FP8_NT(6); break;
+                case 7: DS4_FP8_NT(7); break;
+                default: DS4_FP8_NT(8); break;   /* n_tok == 8 */
                 }
+                #undef DS4_FP8_NT
                 return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt");
             }
         }
@@ -1311,13 +1339,23 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
      * matmul_f16_kernel. DS4_F16_GEMV_MAX_N=1 restores the cuBLAS dispatch. */
     static const int f16_gemv_max_n = []{ const char *e = getenv("DS4_F16_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
-    if (n_tok >= 2 && n_tok <= 4 && n_tok <= (uint64_t)f16_gemv_max_n) {
+    /* inc 2: batched step forces the M-independent nt kernel across [2..8] (see the
+     * mxfp8 twin). Default cap 4 for prefill / decode-only (identical cases 2/3/4). */
+    const uint64_t f16_nt_cap = g_batch_mneutral ? 8u : (uint64_t)f16_gemv_max_n;
+    if (n_tok >= 2 && n_tok <= f16_nt_cap && n_tok <= 8) {
         dim3 g((unsigned)out_dim);
+        #define DS4_F16_NT(N) matmul_f16_nt_kernel<N><<<g, 256>>>( \
+                (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim)
         switch (n_tok) {
-        case 2: matmul_f16_nt_kernel<2><<<g, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim); break;
-        case 3: matmul_f16_nt_kernel<3><<<g, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim); break;
-        default: matmul_f16_nt_kernel<4><<<g, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim); break;
+        case 2: DS4_F16_NT(2); break;
+        case 3: DS4_F16_NT(3); break;
+        case 4: DS4_F16_NT(4); break;
+        case 5: DS4_F16_NT(5); break;
+        case 6: DS4_F16_NT(6); break;
+        case 7: DS4_F16_NT(7); break;
+        default: DS4_F16_NT(8); break;   /* n_tok == 8 */
         }
+        #undef DS4_F16_NT
         return cuda_ok(cudaGetLastError(), "matmul_f16 nt launch");
     }
     if (g_cublas_ready && n_tok > 1) {
@@ -1532,7 +1570,13 @@ extern "C" int ds4_gpu_attention_output_batch_tensor(
     static const int a_gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
     int a_done = 0;
-    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && getenv("DS4_FP8_NO_MXCORE") == NULL) {
+    /* plan-34 inc 2: a batched multiseq/mixed step must NOT take the M-dependent
+     * tensor-core (cuBLASLt) 'a' GEMM -- fall to launch_grouped_fp8mx_a, whose
+     * warp8/nt kernels are per-token M-independent (bit-identical to the n=1
+     * DEINT kernel), so a co-scheduled decode bank's attn-output row is invariant
+     * to the batch width. Classic prefill (not armed) keeps the tensor-core path. */
+    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && !g_batch_mneutral &&
+        getenv("DS4_FP8_NO_MXCORE") == NULL) {
         a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
                                                  group_dim, rank, n_groups, heads, n_tokens);
     }

@@ -1392,11 +1392,16 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
     }
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;
+    /* plan-34 inc 2: force M-independent custom GEMMs for every GEMM in this step
+     * (byte-identical decode-bank logits regardless of batch width). Armed here,
+     * cleared in step_end — the output head rides the armed window too. */
+    ds4_gpu_matmul_set_batch_mneutral(1);
     return true;
 }
 
 bool gpu_graph_multiseq_step_end(ds4_gpu_graph *g) {
     if (!g || !g->batch_multiseq) return false;
+    ds4_gpu_matmul_set_batch_mneutral(0);
     g->batch_multiseq = false;
     const uint32_t n_rows = g->batch_multiseq_rows;
     g->batch_multiseq_rows = 0;

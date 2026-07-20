@@ -251,6 +251,14 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* plan-34 phase-2 inc 2: arm (on!=0) / disarm the M-neutral batched-matmul mode.
+ * Armed for the duration of a batched multiseq/mixed step so the MXFP8/F16 GEMMs
+ * force their M-independent custom per-token kernels across the whole row range
+ * [2..DS4_MSEQ_MAX] instead of a batch-width-dependent cuBLAS(Lt) heuristic algo.
+ * Set once at multiseq_step_begin, cleared at step_end — never on a per-token path. */
+void ds4_gpu_matmul_set_batch_mneutral(int on);
+int  ds4_gpu_matmul_batch_mneutral(void);   /* query (MoE dispatch reads it) */
+
 int ds4_gpu_matmul_bf16_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

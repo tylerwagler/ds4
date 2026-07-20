@@ -41,7 +41,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
 
 all: help
 
@@ -138,6 +138,13 @@ cuda-evict-restore-gate: tests/bank_evict_restore_gate tests/bank_fork_gate
 # tests/bank_fork_gate.c. MODEL-DEPENDENT, needs DS4_MSEQ_BANKS>=3.
 cuda-fork-gate: tests/bank_fork_gate
 	DS4_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
+
+# plan-34 phase-2 inc 2: cuBLASLt algo-stability. A decode bank's step logits must
+# be byte-identical across batched-step widths M (incl. the M=4->5 custom->cuBLASLt
+# boundary) so a co-scheduled big prefill (inc 4) cannot perturb it. MODEL-DEPENDENT,
+# needs DS4_MSEQ_BANKS>=8. Run pack on/off + idx-fp4 on/off under GPU discipline.
+cuda-algo-stability-gate: tests/algo_stability_gate
+	DS4_MSEQ_BANKS=8 ./tests/algo_stability_gate $(FRONTIER_MODEL)
 
 # plan-33 inc B: 3-way output-equality harness (server-level; see the script).
 warm-fork-3way: ds4-server
@@ -268,6 +275,9 @@ tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.c src/engine/ds4_
 tests/bank_fork_gate.o: tests/bank_fork_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_fork_gate.c
 
+tests/algo_stability_gate.o: tests/algo_stability_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.c
+
 # Public-API only (ds4.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
 # DS4_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
@@ -308,6 +318,9 @@ tests/bank_evict_restore_gate: tests/bank_evict_restore_gate.o src/lib/ds4_help.
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/bank_fork_gate: tests/bank_fork_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/algo_stability_gate: tests/algo_stability_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)

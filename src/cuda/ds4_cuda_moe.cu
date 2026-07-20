@@ -2610,7 +2610,15 @@ static int routed_moe_launch_mixed40(
      * 128-padded grouped buffer would be almost all padding (few tokens spread over many experts),
      * so its memset/pack/grouped-launch overhead dominates. Big batches (prefill) use the grouped,
      * no-host-sync path. `rows` sizes the gather/proj buffers for whichever path is active. */
-    const int use_grouped = (n_tokens > 4u);
+    /* plan-34 inc 2: a batched multiseq/mixed step forces the M-INDEPENDENT
+     * per-token (non-grouped) path across the whole row range (<=DS4_MSEQ_MAX=8):
+     * the grouped path's per-expert group sizes depend on the batch composition,
+     * so a co-scheduled decode bank's expert output would shift with the batch
+     * width. The non-grouped CUTLASS proj uses fixed compile-time tiles (per-row
+     * output independent of M); buffers are sized by n_tokens, so 5..8 are safe.
+     * Classic prefill (never armed) keeps the grouped, no-host-sync path at >4. */
+    const int use_grouped = ds4_gpu_matmul_batch_mneutral()
+            ? (n_tokens > 8u) : (n_tokens > 4u);
     const uint64_t rows = use_grouped ? padded_upper : (uint64_t)n_tokens;
     /* The dp4a side (iq2/q2k) must use the production SORTED-TILED kernels at prefill, not the slow
      * generic qwarp32 -- that (not the CUTLASS GEMM) is where the mixed-layer time went. Big-batch
@@ -3517,7 +3525,10 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
                     (unsigned long long)(mid ? mid->bytes : 0),
                     (unsigned long long)((uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)));
         }
-        if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u &&
+        /* inc 2: raise the M-independent GEMV cap to DS4_MSEQ_MAX (8) for a batched
+         * step so 5..8 keep the per-token path instead of the grouped GEMM. */
+        const uint32_t moe_gemv_cap = ds4_gpu_matmul_batch_mneutral() ? 8u : 4u;
+        if (fp4_gemv && n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
             mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
