@@ -1081,16 +1081,54 @@ void cuda_fp8_weight_cache_clear(void) {
  * they are byte-identical across M by construction. Armed once per step
  * (multiseq_step_begin) / cleared (step_end) — NEVER per token. Classic prefill
  * never arms it, so its large-M cuBLAS tensor-core path is unchanged, and the
- * decode-only lane (n_tok<=4, already custom) is bit-for-bit unchanged. */
-static bool g_batch_mneutral = false;
-extern "C" void ds4_gpu_matmul_set_batch_mneutral(int on) { g_batch_mneutral = (on != 0); }
-/* Queried cross-TU by the MoE dispatch (ds4_cuda_moe.cu) to keep the M-independent
- * per-token expert path (not the batch-composition-dependent grouped GEMM) armed
- * for the whole batched-step row range. */
-extern "C" int ds4_gpu_matmul_batch_mneutral(void) { return g_batch_mneutral ? 1 : 0; }
+ * decode-only lane (n_tok<=4, already custom) is bit-for-bit unchanged.
+ *
+ * plan-34 phase-2 inc 4 — GENERALIZED to a PREFIX ROW COUNT. In a fused mixed
+ * step the row layout is [decode rows 0..n_dec) then one K-row prefill run
+ * [n_dec..M). The decode prefix must stay M-independent (byte-identical to a
+ * decode-only step of width n_dec — gate-4 neutrality); the prefill suffix takes
+ * the fast tensor-core path (correctness, not byte-identity). g_mneutral_rows now
+ * holds n_dec (0 = pure prefill / not armed; == n_tok = decode-only). Each dense
+ * GEMM splits by recursing with the flag set to each range's PURE regime, so the
+ * exact inc-2 (custom) and inc-3 (tensor-core) code paths are reused verbatim —
+ * the decode prefix launch is LITERALLY the same nt<n_dec> a decode-only step
+ * emits, and the prefill suffix is the same tensor-core GEMM a pure-prefill step
+ * emits at that width. No kernel logic is duplicated. */
+static int g_mneutral_rows = 0;
+extern "C" void ds4_gpu_matmul_set_batch_mneutral(int n) { g_mneutral_rows = (n > 0) ? n : 0; }
+/* Queried cross-TU by the MoE dispatch (ds4_cuda_moe.cu): the number of leading
+ * decode rows that must take the M-independent per-token expert path (the trailing
+ * prefill rows take the grouped GEMM). 0 = not armed. Nonzero = armed (inc-2/3
+ * read it as a boolean; inc-4 MoE two-pass reads the count to place the split). */
+extern "C" int ds4_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
 
 static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
+    /* inc 4 prefix-split: 0<n_dec<n_tok => mixed decode+prefill batch. Run the
+     * decode prefix [0,n_dec) in the M-independent (decode) regime and the prefill
+     * suffix [n_dec,n_tok) in the tensor-core (prefill) regime, by recursing with
+     * the flag set to each range's pure value. Offsets are row-major (float rows). */
+    {
+        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        if (n_dec > 0 && n_dec < n_tok) {
+            const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
+            ds4_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            ds4_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
+            ds4_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
+                                       out->bytes - n_dec * outb, 0 };
+            ds4_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
+                                       x->bytes - n_dec * inb, 0 };
+            const int saved = g_mneutral_rows;
+            g_mneutral_rows = (int)n_dec;   /* decode prefix: n_dec == n_tok' => all custom */
+            int r1 = cuda_matmul_mxfp8_tensor_labeled(&out_pre, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_pre, n_dec, label);
+            g_mneutral_rows = 0;            /* prefill suffix: tensor-core */
+            int r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec, label);
+            g_mneutral_rows = saved;
+            return r1 && r2;
+        }
+    }
     if (g_fp8_offsets.count(weight_offset)) {
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes = out_dim * fblocks * 33;
@@ -1111,7 +1149,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
          * n_tok 5..8 keep the M-independent kernel instead of cuBLASLt. Default cap
          * (gemv_max_n=4) is unchanged for classic prefill (never armed) and for the
          * decode-only lane (n_tok<=4), which take the identical cases 2/3/4 below. */
-        const uint64_t nt_cap = g_batch_mneutral ? 8u : (uint64_t)gemv_max_n;
+        const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)gemv_max_n;
         if (n_tok >= 2 && n_tok <= nt_cap && n_tok <= 8 &&
             in_dim % 128 == 0 && !nt_fp8_raw) {
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
@@ -1325,6 +1363,29 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
+    /* inc 4 prefix-split (see the mxfp8 twin): decode prefix [0,n_dec) custom-nt,
+     * prefill suffix [n_dec,n_tok) cuBLAS tensor-core, via pure-regime recursion. */
+    {
+        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        if (n_dec > 0 && n_dec < n_tok) {
+            const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
+            ds4_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            ds4_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
+            ds4_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
+                                       out->bytes - n_dec * outb, 0 };
+            ds4_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
+                                       x->bytes - n_dec * inb, 0 };
+            const int saved = g_mneutral_rows;
+            g_mneutral_rows = (int)n_dec;
+            int r1 = ds4_gpu_matmul_f16_tensor(&out_pre, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_pre, n_dec);
+            g_mneutral_rows = 0;
+            int r2 = ds4_gpu_matmul_f16_tensor(&out_suf, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec);
+            g_mneutral_rows = saved;
+            return r1 && r2;
+        }
+    }
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
     if (weight_bytes > model_size - weight_offset) return 0;
@@ -1341,7 +1402,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
             return e ? atoi(e) : 4; }();
     /* inc 2: batched step forces the M-independent nt kernel across [2..8] (see the
      * mxfp8 twin). Default cap 4 for prefill / decode-only (identical cases 2/3/4). */
-    const uint64_t f16_nt_cap = g_batch_mneutral ? 8u : (uint64_t)f16_gemv_max_n;
+    const uint64_t f16_nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)f16_gemv_max_n;
     if (n_tok >= 2 && n_tok <= f16_nt_cap && n_tok <= 8) {
         dim3 g((unsigned)out_dim);
         #define DS4_F16_NT(N) matmul_f16_nt_kernel<N><<<g, 256>>>( \
@@ -1546,6 +1607,37 @@ extern "C" int ds4_gpu_attention_output_batch_tensor(
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
         return 0;
     }
+    /* inc 4 prefix-split: recurse the whole attn-output stage (a-proj + b-proj)
+     * over the decode prefix [0,n_dec) in the M-independent regime and the prefill
+     * suffix [n_dec,n_tokens) in the tensor-core regime. Both the warp8/nt 'a' path
+     * and the mxfp8 'b' path then run their PURE code for each range (the 'b' proj
+     * recurses no further: its sub-range already has n_dec in {n_tok',0}). */
+    {
+        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        if (n_dec > 0 && n_dec < (uint64_t)n_tokens) {
+            const uint64_t low_dim = (uint64_t)n_groups * rank;
+            const uint64_t headb = (uint64_t)n_groups * group_dim * sizeof(float);
+            const uint64_t lowb  = low_dim * sizeof(float);
+            const uint64_t outb  = out_dim * sizeof(float);
+            ds4_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            ds4_gpu_tensor low_pre = { low->ptr, low->bytes, 0 };
+            ds4_gpu_tensor hd_pre  = { heads->ptr, heads->bytes, 0 };
+            ds4_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb, out->bytes - n_dec * outb, 0 };
+            ds4_gpu_tensor low_suf = { (char *)low->ptr + n_dec * lowb, low->bytes - n_dec * lowb, 0 };
+            ds4_gpu_tensor hd_suf  = { (char *)heads->ptr + n_dec * headb, heads->bytes - n_dec * headb, 0 };
+            const int saved = g_mneutral_rows;
+            g_mneutral_rows = (int)n_dec;
+            int r1 = ds4_gpu_attention_output_batch_tensor(&out_pre, &low_pre, model_map,
+                    model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
+                    out_dim, &hd_pre, (uint32_t)n_dec);
+            g_mneutral_rows = 0;
+            int r2 = ds4_gpu_attention_output_batch_tensor(&out_suf, &low_suf, model_map,
+                    model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
+                    out_dim, &hd_suf, n_tokens - (uint32_t)n_dec);
+            g_mneutral_rows = saved;
+            return r1 && r2;
+        }
+    }
     if (!g_fp8_offsets.count(out_a_offset) || !g_fp8_offsets.count(out_b_offset)) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks_a = (group_dim + 31) / 32;
@@ -1575,7 +1667,7 @@ extern "C" int ds4_gpu_attention_output_batch_tensor(
      * warp8/nt kernels are per-token M-independent (bit-identical to the n=1
      * DEINT kernel), so a co-scheduled decode bank's attn-output row is invariant
      * to the batch width. Classic prefill (not armed) keeps the tensor-core path. */
-    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && !g_batch_mneutral &&
+    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && g_mneutral_rows == 0 &&
         getenv("DS4_FP8_NO_MXCORE") == NULL) {
         a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
                                                  group_dim, rank, n_groups, heads, n_tokens);

@@ -1392,18 +1392,25 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
     }
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;
-    /* plan-34 inc 2/3: arm the M-independent custom GEMMs ONLY for a DECODE-ONLY
-     * step (every run length 1 => n_runs == n_rows) — the small-M lane whose
-     * decode-bank logits must stay byte-identical across batch width (inc-2).
-     * A step containing a K-row PREFILL run (n_runs < n_rows) does NOT arm it:
-     * with no co-scheduled decode to protect (inc 3 is prefill-only), the GEMMs
-     * take their fast TENSOR-CORE paths at large M. The inc-4 split (decode rows
-     * custom + prefill rows tensor-core in one step) will generalize this to a
-     * per-row prefix count. */
-    uint32_t n_runs = 0;
-    for (uint32_t t = 0; t < n_rows; t++)
-        if (t + 1 == n_rows || seq[t + 1] != seq[t]) n_runs++;
-    ds4_gpu_matmul_set_batch_mneutral(n_runs == n_rows ? 1 : 0);
+    /* plan-34 inc 2/3/4: arm the M-independent custom GEMMs for the DECODE PREFIX
+     * of this step. Row layout (inc 4): decode rows first — one 1-row run per
+     * decode bank — then the K-row PREFILL run(s). n_dec = the count of leading
+     * rows that live in length-1 runs; every dense GEMM runs those rows through the
+     * M-independent custom kernel (byte-identical to a decode-only step of that
+     * width — gate-4 neutrality) and the trailing prefill rows through the fast
+     * tensor-core path. Decode-only (every run length 1) => n_dec == n_rows (arm
+     * all, == inc-2). Pure prefill (first run length>1) => n_dec == 0 (arm none,
+     * == inc-3). The scan stops at the first multi-row run: the inc-4 scheduler
+     * lays decode rows strictly before the prefill run (a length-1 run appearing
+     * AFTER a prefill run is not an inc-4 layout and would be treated as prefill —
+     * documented, enforced by the row builder / gate). */
+    uint32_t n_dec = 0;
+    for (uint32_t t = 0; t < n_rows; ) {
+        uint32_t rl = 1;
+        while (t + rl < n_rows && seq[t + rl] == seq[t]) rl++;
+        if (rl == 1) { n_dec++; t++; } else break;
+    }
+    ds4_gpu_matmul_set_batch_mneutral((int)n_dec);
     return true;
 }
 

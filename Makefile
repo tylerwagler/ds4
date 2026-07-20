@@ -41,7 +41,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
 
 all: help
 
@@ -150,6 +150,12 @@ cuda-algo-stability-gate: tests/algo_stability_gate
 # coherence vs classic, K>ratio boundary, tensor-core speed. MODEL-DEPENDENT.
 cuda-mixed-prefill-gate: tests/mixed_prefill_gate
 	DS4_MSEQ_BANKS=2 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
+
+# plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
+# fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
+# a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
+cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
+	DS4_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
 
 # plan-33 inc B: 3-way output-equality harness (server-level; see the script).
 warm-fork-3way: ds4-server
@@ -286,6 +292,9 @@ tests/algo_stability_gate.o: tests/algo_stability_gate.c src/engine/ds4_engine_i
 tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_prefill_gate.c
 
+tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_neutrality_gate.c
+
 # Public-API only (ds4.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
 # DS4_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
@@ -332,6 +341,9 @@ tests/algo_stability_gate: tests/algo_stability_gate.o src/lib/ds4_help.o $(CORE
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/mixed_prefill_gate: tests/mixed_prefill_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/mixed_neutrality_gate: tests/mixed_neutrality_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)

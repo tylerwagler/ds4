@@ -3487,8 +3487,61 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 }
 
 
+/* plan-34 inc 4: row-offset sub-view of a per-token MoE tensor for the two-pass
+ * split (byte offset into a row-major [n_tokens x stride] buffer). Reads ptr/bytes
+ * only; owner=0 (never freed). NULL/empty tensors pass through as empty. */
+static inline ds4_gpu_tensor moe_subrow(const ds4_gpu_tensor *t, uint64_t off_bytes) {
+    ds4_gpu_tensor s; s.ptr = NULL; s.bytes = 0; s.owner = 0;
+    if (t && t->ptr) {
+        s.ptr = (char *)t->ptr + off_bytes;
+        s.bytes = t->bytes > off_bytes ? t->bytes - off_bytes : 0;
+    }
+    return s;
+}
+
 static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
+    /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
+     * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
+     * is strictly per-row (selected/weights/x/out addressed by token), so a decode
+     * row's expert output is invariant to co-scheduled rows ONLY if it takes the
+     * M-independent per-token path — but the grouped GEMM's per-expert group sizes
+     * depend on the whole batch. So: run the PER-TOKEN path over the decode prefix
+     * (n_tokens=n_dec<=8 keeps the GEMV/non-grouped dispatch) and the GROUPED path
+     * over the prefill suffix (K>8), offsetting every per-token buffer by n_dec rows.
+     *   - Pass 1 keeps the flag = n_dec (nonzero) so the cap-8 dispatch picks the
+     *     per-token path for n_dec<=8; n_tokens==n_dec => it does NOT re-split.
+     *   - Pass 2 clears the flag so it (a) does not re-split and (b) is BYTE-
+     *     IDENTICAL to an inc-3 pure-prefill MoE of the same K rows (grouped path,
+     *     which reads no flag). The flag is restored before returning so the rest of
+     *     the layer/step still splits its dense GEMMs. */
+    {
+        const uint32_t n_dec = (uint32_t)ds4_gpu_matmul_batch_mneutral();
+        if (n_dec > 0 && n_dec < n_tokens && x && selected && weights && out) {
+            const uint64_t f = sizeof(float), i4 = sizeof(int32_t);
+            ds4_gpu_tensor x_s    = moe_subrow(x,        (uint64_t)n_dec * expert_in_dim * f);
+            ds4_gpu_tensor sel_s  = moe_subrow(selected, (uint64_t)n_dec * n_expert * i4);
+            ds4_gpu_tensor w_s    = moe_subrow(weights,  (uint64_t)n_dec * n_expert * f);
+            ds4_gpu_tensor out_s  = moe_subrow(out,      (uint64_t)n_dec * out_dim * f);
+            ds4_gpu_tensor gate_s = moe_subrow(gate,     (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            ds4_gpu_tensor up_s   = moe_subrow(up,       (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            ds4_gpu_tensor mid_s  = moe_subrow(mid,      (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            ds4_gpu_tensor down_s = moe_subrow(down,     (uint64_t)n_dec * n_expert * out_dim * f);
+            const int r1 = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+                    gate_offset, up_offset, down_offset, gate_type, down_type,
+                    gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                    expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+                    n_total_expert, n_expert, clamp, x, layer_index, n_dec, mid_is_f16);
+            ds4_gpu_matmul_set_batch_mneutral(0);
+            const int r2 = routed_moe_batch_impl(&out_s, &gate_s, &up_s, &mid_s, &down_s,
+                    model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type,
+                    gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                    expert_in_dim, expert_mid_dim, out_dim, &sel_s, &w_s,
+                    n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec, mid_is_f16);
+            ds4_gpu_matmul_set_batch_mneutral((int)n_dec);
+            return (r1 && r2) ? 1 : 0;
+        }
+    }
     {
         static int entry_log = -1;
         if (entry_log < 0) entry_log = getenv("DS4_MOE_PATH_LOG") != NULL ? 200 : 0;

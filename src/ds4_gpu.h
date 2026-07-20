@@ -251,13 +251,17 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* plan-34 phase-2 inc 2: arm (on!=0) / disarm the M-neutral batched-matmul mode.
- * Armed for the duration of a batched multiseq/mixed step so the MXFP8/F16 GEMMs
- * force their M-independent custom per-token kernels across the whole row range
- * [2..DS4_MSEQ_MAX] instead of a batch-width-dependent cuBLAS(Lt) heuristic algo.
- * Set once at multiseq_step_begin, cleared at step_end — never on a per-token path. */
-void ds4_gpu_matmul_set_batch_mneutral(int on);
-int  ds4_gpu_matmul_batch_mneutral(void);   /* query (MoE dispatch reads it) */
+/* plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
+ * ROW COUNT. `n` = the number of leading DECODE rows in the batched step; those
+ * rows run through the M-independent custom per-token kernels (byte-identical
+ * across batch width), while the trailing prefill rows [n..M) take the fast
+ * cuBLAS(Lt)/grouped tensor-core path. n==0 disarms (pure prefill / classic).
+ * n==M arms the whole batch (decode-only, == inc-2). Set once at
+ * multiseq_step_begin, cleared at step_end — never on a per-token path.
+ * The query returns the count (MoE two-pass reads it to place the split;
+ * inc-2/3 dense-GEMM callers treat nonzero as "armed"). */
+void ds4_gpu_matmul_set_batch_mneutral(int n);
+int  ds4_gpu_matmul_batch_mneutral(void);   /* query: decode-prefix row count (0 = disarmed) */
 
 int ds4_gpu_matmul_bf16_tensor(
         ds4_gpu_tensor       *out,
