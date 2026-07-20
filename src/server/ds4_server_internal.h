@@ -900,6 +900,11 @@ struct server {
     int          pool_banks;
     int          live_bank;
     int          spec_max_live;
+    /* plan-33 inc B: warm full-prefix FORK routing (DS4_WARM_FORK, default on;
+     * read once at startup). When a request's prompt token-extends an idle warm
+     * bank's committed history, the router forks that trunk into a FREE bank and
+     * continues there, leaving the trunk intact for siblings. */
+    bool         warm_fork_enabled;
     uint64_t     bank_marginal_bytes; /* Tier-2: per-bank ledger charge in pooled
                                          mode (even split of the admitted pool
                                          cost; conservative, demand-paged reality

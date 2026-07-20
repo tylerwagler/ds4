@@ -2741,6 +2741,42 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
                                              refusal);
         if (fresh) return fresh;
     }
+    /* plan-33 inc B: warm FULL-PREFIX FORK. best's committed history is a strict
+     * token-prefix of the request (common == frontier < prompt len, non-trivial):
+     * instead of continuing IN PLACE (which consumes the trunk — today's
+     * behavior), fork the trunk into a FREE bank and continue there, so siblings
+     * sharing the prefix keep matching the intact trunk. Token-level match only
+     * (a byte-LCP registry is increment D's ranking machinery); fork refusal or
+     * no free bank degrades to today's path — never an error to the client. The
+     * fork's own memcmp re-validates before any device write. */
+    if (s->pool_banks > 0 && s->warm_fork_enabled && best &&
+        !best_clobbers_warm_state && !best->active_job &&
+        best_common == server_slot_frontier_pos(s, best) &&
+        best_common < j->req.prompt.len) {
+        provision_refusal fr;
+        session_slot *dst = provision_slot(s, provision_ctx_for_job(s, j), &fr);
+        if (dst && dst != best) {
+            ds4_session *pool = s->slots[0].sess;
+            if (ds4_session_bank_fork(pool, best->bank, dst->bank,
+                                      j->req.prompt.v, best_common) == 0) {
+                dst->committed_pos = best_common;
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: warm-fork: trunk bank %u (pos %d) -> bank %u; "
+                           "trunk preserved for siblings",
+                           best->bank, best_common, dst->bank);
+                *clobbers = false;
+                return dst;
+            }
+            /* Refused (history moved / evicted src): dst stays a fresh empty
+             * bank — using it cold is safe and better than clobbering best. */
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: warm-fork refused (bank %u); cold on bank %u",
+                       best->bank, dst->bank);
+            *clobbers = false;
+            return dst;
+        }
+        /* No free bank: fall through to today's in-place continuation. */
+    }
     *clobbers = best_clobbers_warm_state;
     return best;
 }

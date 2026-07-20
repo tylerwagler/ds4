@@ -139,6 +139,10 @@ cuda-evict-restore-gate: tests/bank_evict_restore_gate tests/bank_fork_gate
 cuda-fork-gate: tests/bank_fork_gate
 	DS4_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
 
+# plan-33 inc B: 3-way output-equality harness (server-level; see the script).
+warm-fork-3way: ds4-server
+	bash tests/warm_fork_3way.sh $(FRONTIER_MODEL)
+
 # Prefill bit-exactness gate (the D2R acceptance gate; see the header of
 # tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,
 # not part of `make test`.  Discipline before running: no ds4-server/ds4_test

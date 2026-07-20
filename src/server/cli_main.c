@@ -976,6 +976,16 @@ int main(int argc, char **argv) {
         if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
         s.spec_max_live = v;
     }
+    /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
+     * pool mode; DS4_WARM_FORK=0 restores today's in-place-continuation routing
+     * exactly. One startup read — never on a hot path. */
+    {
+        const char *wf = getenv("DS4_WARM_FORK");
+        s.warm_fork_enabled = s.pool_banks > 0 &&
+                              !(wf && (wf[0] == '0' || !strcasecmp(wf, "off")));
+        server_log(DS4_LOG_DEFAULT, "ds4-server: warm-fork routing %s",
+                   s.warm_fork_enabled ? "ENABLED" : "disabled");
+    }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;
     for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) s.slots[i].bank = (uint32_t)i;
