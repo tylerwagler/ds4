@@ -967,12 +967,27 @@ bool gpu_graph_encode_layer_attention_batch(
             }
             gpu_graph_attn_comp_prefill_target_free(attn_comp_target);
         } else {
-            /* Multiseq steps always take the per-row loop: the bulk
-             * aligned-chunk path assumes one bank and one contiguous position
-             * run (single-bank aligned batches could reuse it later via the
-             * bank views; verify batches never align, so nothing regresses). */
+            /* Classic aligned-chunk fast path: one contiguous ratio-aligned run
+             * on the single-session cache. */
             const bool aligned_chunk = !mseq &&
                                        (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+            /* LEVER 2 (plan-34): a BANKED step whose whole batch is a single
+             * same-bank contiguous run (step_begin guarantees contiguity, so
+             * seq_id[0]==seq_id[last] => one run => one bank) that is ratio-
+             * aligned reuses the SAME batched replay/pool kernels the classic
+             * aligned path trusts, keyed at the bank's frontier — one launch
+             * per stage instead of the per-row loop's N launches.  Byte-
+             * identical by construction: the batched pool recomputes the same
+             * candidate window the recurrent per-row state carries (proven
+             * equivalent by the classic aligned-vs-per-row equivalence), and it
+             * leaves the bank state in the exact configuration classic leaves
+             * (compressor_prefill*_tensor's tail re-seed == the per-row shift).
+             * A mixed step's decode rows are length-1 runs (seq_id[0]!=
+             * seq_id[last]) and fall through to the per-row loop unchanged. */
+            const uint32_t run_bank = mseq ? (uint32_t)g->ms_seq_id[0] : 0u;
+            const bool mseq_aligned_run = mseq &&
+                (uint32_t)g->ms_seq_id[n_tokens - 1u] == run_bank &&
+                (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
             if (aligned_chunk) {
                 const uint32_t comp_before = g->layer_n_comp[il];
                 const uint32_t comp_chunk = n_tokens / ratio;
@@ -1084,6 +1099,96 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
                 gpu_graph_attn_comp_prefill_target_free(attn_comp_target);
+            } else if (mseq_aligned_run) {
+                /* LEVER 2: batched banked attn-compressor emit for the single
+                 * same-bank aligned run.  Mirrors the classic aligned branch
+                 * above, keyed at the bank's frontier / bank state lanes /
+                 * bank comp cache.  quantize_fp8 = !pack (the pack commit is the
+                 * single fp8 quantizer, as in the classic path). */
+                const uint32_t bank = run_bank;
+                const uint32_t comp_before = g->ms_n_comp[bank][il];
+                const uint32_t comp_chunk = n_tokens / ratio;
+                const bool pack = gpu_graph_attn_pack_enabled();
+                ds4_gpu_tensor *bank_comp = NULL;
+                ds4_gpu_tensor *bank_st_kv = NULL, *bank_st_sc = NULL, *comp_target = NULL;
+                if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
+                    fprintf(stderr, "ds4: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
+                    ok = false;
+                }
+                if (ok && pack && comp_chunk > g->attn_comp_stage_cap) {
+                    fprintf(stderr, "ds4: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
+                    ok = false;
+                }
+                if (ok) {
+                    bank_st_kv = gpu_graph_bank_attn_state_kv_view(g, il, bank);
+                    bank_st_sc = gpu_graph_bank_attn_state_score_view(g, il, bank);
+                    ok = bank_st_kv && bank_st_sc;
+                }
+                if (ok) {
+                    if (pack) {
+                        comp_target = ds4_gpu_tensor_view(g->attn_comp_stage, 0,
+                                (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float));
+                    } else {
+                        bank_comp = gpu_graph_bank_attn_comp_view(g, il, bank);
+                        if (bank_comp) {
+                            comp_target = ds4_gpu_tensor_view(bank_comp,
+                                    (uint64_t)comp_before * DS4_N_HEAD_DIM * sizeof(float),
+                                    (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float));
+                        }
+                    }
+                    ok = comp_target != NULL;
+                }
+                if (ok && ratio == 4) {
+                    ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+                            comp_target, bank_st_kv, bank_st_sc,
+                            g->batch_comp_kv, g->batch_comp_sc,
+                            model->map, model->size,
+                            layer->attn_compressor_ape->abs_offset,
+                            layer->attn_compressor_ape->type,
+                            layer->attn_compressor_norm->abs_offset,
+                            layer->attn_compressor_norm->type,
+                            DS4_N_HEAD_DIM, pos0, n_tokens, DS4_N_ROT,
+                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                            !pack, freq_base, freq_scale, ext_factor, attn_factor,
+                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                            DS4_RMS_EPS) != 0;
+                } else if (ok) {
+                    ok = ds4_gpu_compressor_prefill_tensor(
+                            comp_target, bank_st_kv, bank_st_sc,
+                            g->batch_comp_kv, g->batch_comp_sc,
+                            model->map, model->size,
+                            layer->attn_compressor_ape->abs_offset,
+                            layer->attn_compressor_ape->type,
+                            layer->attn_compressor_norm->abs_offset,
+                            layer->attn_compressor_norm->type,
+                            DS4_N_HEAD_DIM, ratio, pos0, n_tokens, DS4_N_ROT,
+                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                            !pack, freq_base, freq_scale, ext_factor, attn_factor,
+                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                            DS4_RMS_EPS) != 0;
+                }
+                if (ok && comp_chunk != 0) {
+                    ok = gpu_graph_commit_attn_comp_stage_bank(g, il, bank, comp_before, comp_chunk);
+                }
+                if (ok && ratio == 4) {
+                    ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
+                            bank_st_kv, bank_st_sc,
+                            layer->attn_compressor_kv, layer->attn_compressor_gate,
+                            layer->attn_compressor_ape, DS4_N_HEAD_DIM, comp_width,
+                            pos0, n_tokens);
+                }
+                if (ok) {
+                    g->ms_n_comp[bank][il] = comp_before + comp_chunk;
+                    if (comp_counts) {
+                        for (uint32_t t = 0; t < n_tokens; t++) {
+                            comp_counts[t] = (pos0 + t + 1u) / ratio;
+                        }
+                    }
+                }
+                ds4_gpu_tensor_free(comp_target);
+                ds4_gpu_tensor_free(bank_comp);
+                ds4_gpu_tensor_free(bank_st_sc);
+                ds4_gpu_tensor_free(bank_st_kv);
             } else {
                 /* Per-row compressor loop.  Multiseq: row t belongs to bank
                  * ms_seq_id[t] at absolute position ms_positions[t] — the
@@ -1361,9 +1466,14 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
             } else {
-                /* Multiseq: per-row loop only (see the attn emit section). */
+                /* Classic aligned fast path; LEVER 2 adds the banked single-
+                 * same-bank-aligned-run variant (see the attn emit section). */
                 const bool aligned_chunk = !mseq &&
                                            (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+                const uint32_t run_bank = mseq ? (uint32_t)g->ms_seq_id[0] : 0u;
+                const bool mseq_aligned_run = mseq &&
+                    (uint32_t)g->ms_seq_id[n_tokens - 1u] == run_bank &&
+                    (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
                 if (aligned_chunk) {
                     const uint32_t index_before = g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
@@ -1460,6 +1570,87 @@ bool gpu_graph_encode_layer_attention_batch(
                                                       pos0);
                     }
                     ds4_gpu_tensor_free(index_view);
+                } else if (mseq_aligned_run) {
+                    /* LEVER 2: batched banked indexer-compressor emit for the
+                     * single same-bank aligned run — mirrors the classic aligned
+                     * indexer path, keyed at the bank frontier / bank index
+                     * state lanes / bank index comp cache.  fp4 stages in the
+                     * shared idx_comp_stage (one bank per step, no aliasing) and
+                     * packs into the bank cache; f32 quantizes the bank cache in
+                     * place. */
+                    const uint32_t bank = run_bank;
+                    const uint32_t index_before = g->ms_n_index_comp[bank][il];
+                    const uint32_t index_chunk = n_tokens / ratio;
+                    const int idx_fp4 = gpu_graph_idx_fp4_enabled();
+                    ds4_gpu_tensor *bank_idx = NULL, *bank_ist_kv = NULL, *bank_ist_sc = NULL;
+                    ds4_gpu_tensor *index_view = NULL;
+                    if (index_before + index_chunk > g->layer_comp_cap[il]) {
+                        fprintf(stderr, "ds4: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+                        ok = false;
+                    }
+                    if (ok) {
+                        bank_idx = gpu_graph_bank_index_comp_view(g, il, bank);
+                        bank_ist_kv = gpu_graph_bank_index_state_kv_view(g, il, bank);
+                        bank_ist_sc = gpu_graph_bank_index_state_score_view(g, il, bank);
+                        ok = bank_idx && bank_ist_kv && bank_ist_sc;
+                    }
+                    if (ok) {
+                        index_view = idx_fp4
+                            ? ds4_gpu_tensor_view(g->idx_comp_stage,
+                                    (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                    (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float))
+                            : ds4_gpu_tensor_view(bank_idx,
+                                    (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                    (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                        ok = index_view != NULL;
+                    }
+                    if (ok) {
+                        ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+                                index_view, bank_ist_kv, bank_ist_sc,
+                                g->batch_comp_kv, g->batch_comp_sc,
+                                model->map, model->size,
+                                layer->indexer_compressor_ape->abs_offset,
+                                layer->indexer_compressor_ape->type,
+                                layer->indexer_compressor_norm->abs_offset,
+                                layer->indexer_compressor_norm->type,
+                                DS4_N_INDEXER_HEAD_DIM, pos0, n_tokens, DS4_N_ROT,
+                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                false, freq_base, freq_scale, ext_factor, attn_factor,
+                                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                DS4_RMS_EPS) != 0;
+                    }
+                    if (ok && index_chunk != 0) {
+                        ok = idx_fp4
+                            ? ds4_gpu_dsv4_indexer_qat_pack_tensor(index_view,
+                                                                    bank_idx,
+                                                                    index_before,
+                                                                    index_chunk,
+                                                                    DS4_N_INDEXER_HEAD_DIM) != 0
+                            : ds4_gpu_dsv4_indexer_qat_tensor(index_view,
+                                                              index_chunk,
+                                                              DS4_N_INDEXER_HEAD_DIM) != 0;
+                        if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank,
+                                index_before, index_chunk, true);
+                    }
+                    if (ok) {
+                        ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
+                                bank_ist_kv, bank_ist_sc,
+                                layer->indexer_compressor_kv, layer->indexer_compressor_gate,
+                                layer->indexer_compressor_ape, DS4_N_INDEXER_HEAD_DIM,
+                                index_width, pos0, n_tokens);
+                    }
+                    if (ok) {
+                        g->ms_n_index_comp[bank][il] = index_before + index_chunk;
+                        if (index_counts) {
+                            for (uint32_t t = 0; t < n_tokens; t++) {
+                                index_counts[t] = (pos0 + t + 1u) / ratio;
+                            }
+                        }
+                    }
+                    ds4_gpu_tensor_free(index_view);
+                    ds4_gpu_tensor_free(bank_ist_sc);
+                    ds4_gpu_tensor_free(bank_ist_kv);
+                    ds4_gpu_tensor_free(bank_idx);
                 } else {
                     /* Per-row indexer compressor loop; multiseq semantics as
                      * in the attn emit loop above (bank state lanes, bank
