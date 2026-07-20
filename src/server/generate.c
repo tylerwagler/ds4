@@ -3590,7 +3590,7 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
          * change is the heap descriptor scratch. */
         const int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m,
                                                  logits, (uint32_t)m * vocab,
-                                                 err, sizeof(err));
+                                                 NULL, err, sizeof(err));
         s->live_bank = -1;   /* pool is multiseq-poisoned: no clean live bank */
         if (rc != 0) {
             for (int q = 0; q < m; q++) {

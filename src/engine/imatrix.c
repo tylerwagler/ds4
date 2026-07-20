@@ -1073,10 +1073,16 @@ int gpu_graph_decode_multiseq_batch(
         const int32_t         *pos,
         const int32_t         *bank,
         uint32_t               n_active,
-        float                 *logits) {
+        float                 *logits,
+        uint32_t              *out_n_rows) {
+    /* plan-34 inc 3: the ROW count (n_active) is bounded by prefill_cap (a K-row
+     * prefill chunk rides this entry); DS4_MSEQ_MAX bounds only the BANK count,
+     * enforced per-row in step_begin (seq[t] >= DS4_MSEQ_MAX). The pool-count
+     * clause below is the bank ceiling; do NOT reinstate an n_active>DS4_MSEQ_MAX
+     * row ceiling. */
     if (!g || !model || !weights || !tokens || !pos || !bank || !logits ||
-        n_active == 0 || n_active > DS4_MSEQ_MAX ||
-        n_active > gpu_graph_bank_pool_count(g) ||
+        n_active == 0 ||
+        n_active > gpu_graph_bank_pool_count(g) * g->prefill_cap ||
         n_active > g->prefill_cap || !g->spec_logits) {
         fprintf(stderr, "ds4: multiseq decode rejected: bad args (n_active=%u"
                         " pool=%u prefill_cap=%u logits_slab=%s)\n", n_active,
@@ -1093,7 +1099,9 @@ int gpu_graph_decode_multiseq_batch(
      * (<= DS4_MSEQ_MAX ints) keeps the caller's `const int *` honest — the
      * token_vec ABI is non-const and casting it away here would license a
      * write we do not make. */
-    int cur_tokens[DS4_MSEQ_MAX];
+    /* inc 3: heap the row-indexed token copy (was [DS4_MSEQ_MAX]) so a K-row
+     * prefill chunk fits. n_active <= prefill_cap. */
+    int *cur_tokens = (int *)xmalloc((size_t)n_active * sizeof(int));
     memcpy(cur_tokens, tokens, (size_t)n_active * sizeof(cur_tokens[0]));
     token_vec cur;
     memset(&cur, 0, sizeof(cur));
@@ -1104,49 +1112,72 @@ int gpu_graph_decode_multiseq_batch(
                                                g->prefill_tokens,
                                                model, weights, &cur,
                                                0, n_active)) {
+        free(cur_tokens);
         return 0;   /* scratch-only writes so far — recoverable */
     }
+    free(cur_tokens);   /* uploaded to device; host copy is dead */
 
     /* Arm the banked step (validates the driver contract; a rejection here
      * leaves the graph untouched — recoverable). */
     if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, false)) return 0;
 
-    /* Layer sweep + output head ride ONE command block: ds4_gpu_end_commands
-     * is a full device synchronize, and a second block would pay that twice
-     * per decoded token on the hot path this increment exists to speed up.
-     * The head is row-parallel and bank-agnostic (it reads no descriptor or
-     * frontier state), so it is safe to encode while the step is armed; the
-     * step_end self-check below is host-int only and needs no drained
-     * device.  Encoding stops at the first failure, so a failed sweep never
-     * enqueues the head. */
+    /* plan-34 inc 3: emit logits only for the LAST ROW OF EACH per-bank RUN.
+     * A K-row prefill run advances the KV by K but only its last row's logits
+     * are consumed (the continuation); computing all K vocab GEMMs would be the
+     * single biggest GEMM in the model AND overflow the 16-row spec_logits slab.
+     * n_runs == n_banks <= DS4_MSEQ_MAX <= 16, so the head always fits.
+     * DECODE-ONLY (every run length 1 => n_runs == n_active) keeps the identity
+     * layout and the SINGLE-BLOCK layers+head path => byte-identical to before
+     * (the inc-1/inc-2 gates must stay green). */
+    int last_idx[DS4_MSEQ_MAX];
+    uint32_t n_runs = 0;
+    for (uint32_t t = 0; t < n_active; t++) {
+        if (t + 1 == n_active || bank[t + 1] != bank[t]) {
+            if (n_runs < DS4_MSEQ_MAX) last_idx[n_runs] = (int)t;
+            n_runs++;
+        }
+    }
+    const bool decode_only = (n_runs == n_active);
+
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        ok = gpu_graph_encode_layer_batch(g,
-                                            model,
-                                            &weights->layer[il],
-                                            il,
-                                            (uint32_t)pos[0],
-                                            n_active);
+        ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
+                                          (uint32_t)pos[0], n_active);
     }
-    if (ok) ok = gpu_graph_encode_output_head_batch(g,
-                                                      model,
-                                                      weights,
-                                                      n_active,
-                                                      weights->output->dim[1]);
-    if (ok) {
-        ok = ds4_gpu_end_commands() != 0;
+    if (decode_only) {
+        /* Hot path: head in the SAME block on all rows (no extra synchronize),
+         * exactly as before. */
+        if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
+                                                        n_active, weights->output->dim[1]);
+        if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
     } else {
-        (void)ds4_gpu_synchronize();
+        /* Prefill/mixed: close the layer block so batch_cur_hc is final, GATHER
+         * each run's LAST row to the front of batch_cur_hc, then run the head on
+         * the compact n_runs rows in a second block. last_idx is ascending with
+         * last_idx[r] >= r, so front-compaction never clobbers an un-copied
+         * source. The extra synchronize is amortized over a large K prefill. */
+        if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
+        const uint64_t hc_row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        for (uint32_t r = 0; ok && r < n_runs; r++) {
+            if ((uint32_t)last_idx[r] != r)
+                ok = ds4_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
+                                         g->batch_cur_hc, (uint64_t)last_idx[r] * hc_row_bytes,
+                                         hc_row_bytes) != 0;
+        }
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
+                                                        n_runs, weights->output->dim[1]);
+        if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
     }
     /* Disarm + per-bank frontier self-check even when the sweep failed. */
     const bool end_ok = gpu_graph_multiseq_step_end(g);
     if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
 
-    /* Per-row logits readback: spec_logits row k = bank[k]. */
-    ok = ds4_gpu_tensor_read(g->spec_logits,
-                               0,
-                               logits,
-                               (uint64_t)n_active * DS4_N_VOCAB * sizeof(float)) != 0;
+    /* Logits readback: n_runs rows (one per bank, in run order = ascending
+     * first-appearance). Decode-only => n_runs == n_active, row k == bank[k]. */
+    if (out_n_rows) *out_n_rows = n_runs;
+    ok = ds4_gpu_tensor_read(g->spec_logits, 0, logits,
+                             (uint64_t)n_runs * DS4_N_VOCAB * sizeof(float)) != 0;
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,
      * which desynchronizes its sampling from the committed KV — treat as

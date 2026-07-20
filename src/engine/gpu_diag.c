@@ -1392,10 +1392,18 @@ bool gpu_graph_multiseq_step_begin(ds4_gpu_graph *g, const int32_t *pos,
     }
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;
-    /* plan-34 inc 2: force M-independent custom GEMMs for every GEMM in this step
-     * (byte-identical decode-bank logits regardless of batch width). Armed here,
-     * cleared in step_end — the output head rides the armed window too. */
-    ds4_gpu_matmul_set_batch_mneutral(1);
+    /* plan-34 inc 2/3: arm the M-independent custom GEMMs ONLY for a DECODE-ONLY
+     * step (every run length 1 => n_runs == n_rows) — the small-M lane whose
+     * decode-bank logits must stay byte-identical across batch width (inc-2).
+     * A step containing a K-row PREFILL run (n_runs < n_rows) does NOT arm it:
+     * with no co-scheduled decode to protect (inc 3 is prefill-only), the GEMMs
+     * take their fast TENSOR-CORE paths at large M. The inc-4 split (decode rows
+     * custom + prefill rows tensor-core in one step) will generalize this to a
+     * per-row prefix count. */
+    uint32_t n_runs = 0;
+    for (uint32_t t = 0; t < n_rows; t++)
+        if (t + 1 == n_rows || seq[t + 1] != seq[t]) n_runs++;
+    ds4_gpu_matmul_set_batch_mneutral(n_runs == n_rows ? 1 : 0);
     return true;
 }
 

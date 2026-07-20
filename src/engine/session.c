@@ -3012,9 +3012,11 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
         bank[k] = (int32_t)reqs[k].bank;
         tokens[k] = reqs[k].token;
     }
+    /* decode_multiseq is decode-only (1 row per bank), so n_runs == n; no
+     * out-param needed (the caller reads n logit rows). */
     const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
                                                    &e->weights, tokens, pos,
-                                                   bank, n, logits);
+                                                   bank, n, logits, NULL);
     if (rc == 0) {
         /* Recoverable: the driver rejected before arming the step, so nothing
          * was mutated — the upload writes ahead of it touch scratch only, and
@@ -3055,16 +3057,24 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
     } while (0)
 int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
-                             char *err, size_t errlen) {
+                             uint32_t *out_n_rows, char *err, size_t errlen) {
+    if (out_n_rows) *out_n_rows = 0;
     if (!s || !reqs || !logits || n_rows == 0 ||
         n_rows > s->graph.prefill_cap) {
         DS4_MIXED_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
                       n_rows, s ? s->graph.prefill_cap : 0u);
         return 1;
     }
-    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n_rows * DS4_N_VOCAB) {
-        DS4_MIXED_ERR("mixed decode: logits capacity %d < %u rows x %u",
-                      logits_cap, n_rows, (unsigned)DS4_N_VOCAB);
+    /* plan-34 inc 3: the engine emits ONE logit row per BANK RUN (last-of-run),
+     * not one per token-row, so the caller need only size `logits` for n_runs =
+     * the number of contiguous per-bank runs (<= DS4_MSEQ_MAX). Compute it here
+     * for the capacity check; the engine returns it via out_n_rows. */
+    uint32_t n_runs = 0;
+    for (uint32_t k = 0; k < n_rows; k++)
+        if (k + 1 == n_rows || reqs[k + 1].bank != reqs[k].bank) n_runs++;
+    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n_runs * DS4_N_VOCAB) {
+        DS4_MIXED_ERR("mixed decode: logits capacity %d < %u runs x %u",
+                      logits_cap, n_runs, (unsigned)DS4_N_VOCAB);
         return 1;
     }
     ds4_engine *e = s->engine;
@@ -3080,7 +3090,7 @@ int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
     }
     const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
                                                    &e->weights, tokens, pos,
-                                                   bank, n_rows, logits);
+                                                   bank, n_rows, logits, out_n_rows);
     /* The batch call consumed the descriptor synchronously (tokens copied to a
      * stack row, pos/seq uploaded to device in step_begin); the host scratch is
      * dead now regardless of rc. */

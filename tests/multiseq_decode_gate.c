@@ -218,7 +218,7 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
             }
             const int rc = use_mixed
                 ? ds4_session_decode_mixed(s, reqs, (uint32_t)n,
-                                           logits, n * vocab, err, sizeof(err))
+                                           logits, n * vocab, NULL, err, sizeof(err))
                 : ds4_session_decode_multiseq(s, reqs, (uint32_t)n,
                                               logits, n * vocab, err, sizeof(err));
             if (rc != 0) {

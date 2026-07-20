@@ -389,9 +389,15 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
  * per-row logits as ds4_session_decode_multiseq. n_rows must be <= prefill_cap;
  * the underlying kernel still bounds the live row count to DS4_MSEQ_MAX this
  * increment (later increments lift it). Returns 0 / 1 / -1 as decode_multiseq. */
+/* On success `logits` receives ONE row per per-bank RUN (the LAST row of each
+ * run — plan-34 inc 3), in run order (ascending first-appearance of the bank);
+ * *out_n_rows (may be NULL) is set to that count (== the number of distinct
+ * banks). For a decode-only batch (1 row per bank) that is n_rows rows in bank
+ * order — unchanged. For a K-row prefill run it is a single row (the K-th token's
+ * logits). Size `logits` for the run count, not n_rows. */
 int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
-                             char *err, size_t errlen);
+                             uint32_t *out_n_rows, char *err, size_t errlen);
 /* Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
  * hosts up to N co-scheduled conversations as banks; each server slot maps to a
  * bank id.  The pool size is chosen at session create (DS4_MSEQ_BANKS today);
