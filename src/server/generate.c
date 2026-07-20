@@ -2775,7 +2775,23 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
             *clobbers = false;
             return dst;
         }
-        /* No free bank: fall through to today's in-place continuation. */
+        /* No free bank (fork wanted but pool full): in-place continuation is the
+         * correct linear-case fallback; the branching loser degrades to cold on
+         * a later request. Trunk-protection under eviction pressure (don't evict
+         * `best` to make the fork's room) is inc D's victim policy. */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: warm-fork wanted (bank %u pos %d) but no free bank; "
+                   "in-place continuation", best->bank, best_common);
+    } else if (s->warm_fork_enabled && best && !best_clobbers_warm_state &&
+               !best->active_job && best_common > 0 &&
+               best_common < server_slot_frontier_pos(s, best)) {
+        /* Warm but PARTIAL match (common < trunk frontier): not a full-prefix
+         * fork case (that is inc C's partial cut). Rewind-and-continue in place —
+         * logged so "why no fork" is never silent. */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: warm partial match bank %u (common %d < frontier %d); "
+                   "in-place rewind (no full-prefix fork)",
+                   best->bank, best_common, server_slot_frontier_pos(s, best));
     }
     *clobbers = best_clobbers_warm_state;
     return best;
