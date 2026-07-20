@@ -900,6 +900,19 @@ struct server {
     int          pool_banks;
     int          live_bank;
     int          spec_max_live;
+    /* plan-34 phase-2 inc 5: fused mixed-batch lane (DS4_MIXED_BATCH, default OFF,
+     * read once at startup). When ON, the worker folds ONE prefilling slot's next
+     * chunk (a K-row prefill run) into the decode quantum's first mixed step
+     * (ds4_session_decode_mixed) instead of advancing it as a separate classic
+     * sweep — true continuous batching (P=1). OFF => today's exact decode-quantum +
+     * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
+     * pool mode (pool_banks>0). */
+    bool         mixed_batch_enabled;
+    /* Prefill rows folded into EACH decode step of a fused quantum (DS4_MIXED_CHUNK,
+     * read once; default 32). Spreading the prefill uniformly across the quantum's
+     * steps (vs one big chunk on one step) is what trades the time-slice's per-
+     * interval decode STALL for a small uniform per-token cost — the p99 lever. */
+    int          mixed_chunk_tokens;
     /* plan-33 inc B: warm full-prefix FORK routing (DS4_WARM_FORK, default on;
      * read once at startup). When a request's prompt token-extends an idle warm
      * bank's committed history, the router forks that trunk into a FREE bank and

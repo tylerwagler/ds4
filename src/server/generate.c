@@ -821,6 +821,10 @@ struct gen_state {
     int  batch_feed_token;
     int  batch_feed_pos;
     ds4_tokens batch_pending;
+    /* plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
+     * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
+     * once by the fused quantum on giveup; the classic path handles it correctly. */
+    bool no_fuse;
 
     /* deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;
@@ -3634,6 +3638,228 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
     }
 }
 
+/* plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
+ * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
+ * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
+ * classic), and with more than one fold-chunk of prompt still left (the FINAL tail
+ * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
+ * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
+ * when the flag is off, not in pool mode, or nothing qualifies. */
+static session_slot *worker_find_fuse_prefill(server *s) {
+    if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
+    ds4_session *pool = s->slots[0].sess;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *sl = &s->slots[i];
+        gen_state *g = sl->gen;
+        if (!sl->active_job || !g || g->phase != GEN_PREFILL_MAIN || !g->prompt_for_sync ||
+            g->no_fuse)
+            continue;
+        const int P = ds4_session_bank_pos(pool, sl->bank);
+        const int len = g->prompt_for_sync->len;
+        if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
+        return sl;                                              /* P=1: first qualifier */
+    }
+    return NULL;
+}
+
+/* plan-34 phase-2 inc 5 — FUSED mixed-batch quantum. One decode quantum whose EVERY
+ * step folds a small (s->mixed_chunk_tokens) prefill run for `pf` into the SAME
+ * ds4_session_decode_mixed sweep as the decode banks (true continuous batching,
+ * P=1). Decode banks advance exactly as worker_batched_decode_quantum — the inc-4
+ * neutrality gate proves a co-scheduled prefill does not perturb them — so their
+ * per-request output is unchanged in shape. The prefill advances up to
+ * QUANTUM*chunk tokens, SPREAD uniformly across the steps so no single decode step
+ * eats a whole chunk (the p99 lever vs the time-slice's per-interval decode stall).
+ * pf's FIRST chunk (pos 0) and FINAL tail (<= chunk) stay CLASSIC: the tail's
+ * ds4_session_sync carries the prefill->decode completion (kv-cache store,
+ * gen_stream_begin), so this never reimplements that handoff. Reconciliation of
+ * pf's bank is the exact recipe the decode lane uses (bank_state_restore +
+ * note_committed_tokens). */
+static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, session_slot *pf) {
+    if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
+    ds4_session *pool = s->slots[0].sess;
+    const int vocab = ds4_engine_logits_width(s->engine);
+    gen_state *pg = pf->gen;
+    const ds4_tokens *pp = pg->prompt_for_sync;
+
+    server_guard_maybe_evict(s, dec, n);
+
+    /* Decode-bank ENTRY — identical to worker_batched_decode_quantum. */
+    for (int i = 0; i < n; i++) {
+        session_slot *sl = dec[i];
+        gen_state *g = sl->gen;
+        if (g->batch_feed_valid) continue;
+        if (!server_bank_switch(s, sl->bank)) {
+            snprintf(g->err, sizeof g->err,
+                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+            g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
+            continue;
+        }
+        float temp, top_p, min_p; int top_k;
+        gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+        g->batch_feed_token = ds4_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_pos = ds4_session_pos(pool);
+        ds4_session_bank_state_save(pool, (uint32_t)sl->bank);
+        g->batch_feed_valid = true; g->batch_active = true;
+    }
+
+    /* Prefill-bank ENTRY: make pf live at its committed frontier P0 and capture its
+     * per-bank counters so the mixed driver reads pf's TRUE starting frontier. */
+    if (!server_bank_switch(s, pf->bank)) {
+        snprintf(pg->err, sizeof pg->err, "prefill bank %u restore failed", (unsigned)pf->bank);
+        pg->finish = "error"; pg->phase = GEN_FINISH; return;
+    }
+    const int P0 = ds4_session_pos(pool);
+    ds4_session_bank_state_save(pool, (uint32_t)pf->bank);
+    {   /* one-shot observability: confirm the fused lane actually engaged. */
+        static int logged = 0;
+        if (logged < 3) { logged++;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: FUSED mixed quantum engaged (prefill bank %u at pos %d/%d, "
+                       "%d decode banks, chunk %d/step)",
+                       (unsigned)pf->bank, P0, pp->len, n, s->mixed_chunk_tokens);
+        }
+    }
+
+    int kstep = s->mixed_chunk_tokens;
+    const int cap = ds4_session_prefill_cap(pool);   /* mixed-step row ceiling */
+    if (kstep > cap - DS4_SESSION_POOL_CAP) kstep = cap - DS4_SESSION_POOL_CAP;
+    if (kstep < 1) kstep = 1;
+    const int len = pp->len;
+    int pf_done = 0;
+    bool reached_end = false;                     /* prefill reached len this quantum */
+    bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
+
+    const size_t reqcap = (size_t)DS4_SESSION_POOL_CAP + (size_t)kstep;
+    ds4_multiseq_req *reqs = server_xmalloc(reqcap * sizeof(*reqs));
+    float *logits = server_xmalloc((size_t)(DS4_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    /* last-position (len-1) logits captured from the final fused prefill run — the
+     * decode seed for the prefill->decode handoff (byte-identical to classic per
+     * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
+    float *pf_last_logits = server_xmalloc((size_t)vocab * sizeof(float));
+    int live_idx[DS4_SESSION_POOL_CAP];
+
+    for (int step = 0; step < DS4_SERVER_DECODE_QUANTUM_TOKENS; step++) {
+        int m = 0;
+        for (int i = 0; i < n && m < DS4_SESSION_POOL_CAP; i++) {
+            session_slot *sl = dec[i];
+            gen_state *g = sl->gen;
+            if (!g->batch_feed_valid) continue;
+            if (g_stop_requested || g->completion >= g->max_tokens) {
+                g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
+            }
+            if (g->batch_feed_pos >= ds4_session_ctx(pool)) {
+                g->batch_feed_valid = false; g->finish = "length"; g->phase = GEN_FINISH; continue;
+            }
+            reqs[m].bank = sl->bank; reqs[m].pos = g->batch_feed_pos;
+            reqs[m].token = g->batch_feed_token; live_idx[m] = i; m++;
+        }
+        /* Fold this step's ascending prefill sub-chunk from P0+pf_done, all the way
+         * to len (the FINAL sub-chunk carries the last-position logits used for the
+         * prefill->decode handoff — no non-aligned classic tail resume, so the
+         * prefill output stays byte-identical to a cold prefill). */
+        const int pos_now = P0 + pf_done;
+        int kthis = 0;
+        if (!pf_giveup && pos_now < len) {
+            kthis = kstep;
+            if (pos_now + kthis > len) kthis = len - pos_now;
+        }
+        for (int j = 0; j < kthis; j++) {
+            reqs[m + j].bank = pf->bank;
+            reqs[m + j].pos = pos_now + j;
+            reqs[m + j].token = pp->v[pos_now + j];
+        }
+        const int nrows = m + kthis;
+        if (nrows == 0) break;
+
+        char err[96];
+        uint32_t n_runs = 0;
+        int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
+                (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, err, sizeof err);
+        if (rc == 1 && kthis > 0) {
+            /* RECOVERABLE reject (nothing committed) caused by the PREFILL run — e.g.
+             * its bank's frontier is not position-true (a cache-warm resume). Do NOT
+             * harm the co-scheduled decode banks: stop folding this prefill (route it
+             * classic via no_fuse) and retry this step DECODE-ONLY. */
+            pf_giveup = true; pg->no_fuse = true;
+            if (m > 0) {
+                rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
+                        (int)((size_t)m * (size_t)vocab), &n_runs, err, sizeof err);
+            } else { s->live_bank = -1; break; }   /* only prefill this step: just stop */
+            kthis = 0;                              /* prefill did not advance */
+        }
+        s->live_bank = -1;
+        if (rc != 0) {
+            for (int q = 0; q < m; q++) {
+                gen_state *g = dec[live_idx[q]]->gen;
+                g->finish = "error";
+                snprintf(g->err, sizeof g->err, "fused mixed decode failed: %s", err);
+                g->batch_feed_valid = false; g->phase = GEN_FINISH;
+            }
+            break;   /* real decode failure -> stop */
+        }
+        pf_done += kthis;
+        if (kthis > 0 && pos_now + kthis == len) {
+            /* final prefill sub-chunk: capture the len-1 logits (prefill run row =
+             * index m, last-of-run) as the decode seed for the handoff. */
+            memcpy(pf_last_logits, logits + (size_t)m * (size_t)vocab, (size_t)vocab * sizeof(float));
+            reached_end = true;
+        }
+
+        for (int q = 0; q < m; q++) {
+            session_slot *sl = dec[live_idx[q]];
+            gen_state *g = sl->gen;
+            const int committed = g->batch_feed_token;
+            g->batch_feed_pos++; sl->committed_pos = g->batch_feed_pos;
+            ds4_tokens_push(&g->batch_pending, committed);
+            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+            slot_writer_install(&g->writer);
+            if (gen_emit_token(s, sl, committed)) {
+                g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
+            }
+            const float *row = logits + (size_t)q * (size_t)vocab;
+            float temp, top_p, min_p; int top_k;
+            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            g->batch_feed_token = ds4_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+        }
+    }
+    free(reqs); free(logits);
+
+    /* Reconcile the prefill bank (same recipe as a decode bank leaving the lane):
+     * install its driver-maintained frontier (P0+pf_done) and advance the host
+     * checkpoint by exactly the committed prefill tokens, so its next chunk resumes
+     * correctly and any store sees the true frontier. */
+    if (pf_done > 0 && pg->phase == GEN_PREFILL_MAIN) {
+        if (ds4_session_bank_state_restore(pool, pf->bank)) {
+            ds4_session_note_committed_tokens(pool, &pp->v[P0], pf_done);
+            pf->committed_pos = P0 + pf_done;
+            s->live_bank = (int)pf->bank;
+            if (reached_end) {
+                /* Prefill complete: seed the decode with the fused last-position
+                 * logits (byte-identical to classic) and run the SAME prefill->
+                 * decode handoff the classic path uses (kv-cache store, SSE start,
+                 * GEN_DECODE_INIT). No non-aligned classic tail resume => the
+                 * request's decode is byte-identical to a cold classic prefill. */
+                ds4_session_set_logits(pool, pf_last_logits, vocab);
+                slot_writer_install(&pg->writer);
+                gen_stream_begin(s, pf);
+                slot_writer_flush(&pg->writer);
+            }
+        } else {
+            snprintf(pg->err, sizeof pg->err, "prefill bank %u reconcile failed", (unsigned)pf->bank);
+            pg->finish = "error"; pg->phase = GEN_FINISH;
+        }
+    }
+    free(pf_last_logits);
+
+    const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+    for (int i = 0; i < n; i++) {
+        dec[i]->last_serviced_us = now_us;
+        if (dec[i]->gen) slot_writer_flush(&dec[i]->gen->writer);
+    }
+    pf->last_serviced_us = now_us;
+}
+
 void *worker_main(void *arg) {
     server *s = arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */
@@ -3682,7 +3908,14 @@ void *worker_main(void *arg) {
             (n_dec > s->spec_max_live || n_batched > 0);
 
         if (use_batched) {
-            worker_batched_decode_quantum(s, dec, n_dec);
+            /* plan-34 inc 5: when the fused lane is armed and a prefilling slot is
+             * admissible (P=1), FOLD its next chunk into the decode sweep instead of
+             * the separate classic prefill advance below. Flag OFF (or nothing
+             * admissible) => pf_fuse==NULL => today's exact decode-quantum +
+             * separate-prefill time-slice, byte-identical. */
+            session_slot *pf_fuse = worker_find_fuse_prefill(s);
+            if (pf_fuse) worker_mixed_batch_quantum(s, dec, n_dec, pf_fuse);
+            else         worker_batched_decode_quantum(s, dec, n_dec);
             /* Finish any slot the batched quantum stopped (per-slot path
              * reconciles its checkpoint). Then also advance ONE non-decode
              * active slot (prefill/init/finish) so prompt ingest never starves
@@ -3700,7 +3933,9 @@ void *worker_main(void *arg) {
             session_slot *other = NULL;
             for (int k = 0; k < s->n_slots; k++) {
                 session_slot *c = &s->slots[(rr + k) % s->n_slots];
-                if (c->active_job && !slot_is_batchable_decode(c) &&
+                /* inc 5: skip the slot already advanced in-band by the fused
+                 * quantum (pf_fuse) so it does not also run a classic chunk. */
+                if (c->active_job && c != pf_fuse && !slot_is_batchable_decode(c) &&
                     !(c->gen && c->gen->batch_active)) {
                     other = c;
                     rr = (int)(c - s->slots) + 1;

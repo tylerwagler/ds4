@@ -976,6 +976,21 @@ int main(int argc, char **argv) {
         if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
         s.spec_max_live = v;
     }
+    /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF — v0.3.0 ships it
+     * dark; enable only if the measurement justifies it. One startup read, no
+     * hot-path getenv. Only engages in pool mode. */
+    {
+        const char *mb = getenv("DS4_MIXED_BATCH");
+        s.mixed_batch_enabled = s.pool_banks > 0 &&
+                                mb && (mb[0] == '1' || !strcasecmp(mb, "on"));
+        const char *mc = getenv("DS4_MIXED_CHUNK");
+        int kc = mc ? atoi(mc) : 32;
+        if (kc < 1) kc = 1;
+        s.mixed_chunk_tokens = kc;
+        server_log(DS4_LOG_DEFAULT, "ds4-server: fused mixed-batch lane %s (chunk=%d/step)",
+                   s.mixed_batch_enabled ? "ENABLED (DS4_MIXED_BATCH)" : "disabled (default)",
+                   s.mixed_chunk_tokens);
+    }
     /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
      * pool mode; DS4_WARM_FORK=0 restores today's in-place-continuation routing
      * exactly. One startup read — never on a hot path. */
