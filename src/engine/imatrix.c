@@ -1074,7 +1074,8 @@ int gpu_graph_decode_multiseq_batch(
         const int32_t         *bank,
         uint32_t               n_active,
         float                 *logits,
-        uint32_t              *out_n_rows) {
+        uint32_t              *out_n_rows,
+        uint32_t               max_head_runs) {
     /* plan-34 inc 3: the ROW count (n_active) is bounded by prefill_cap (a K-row
      * prefill chunk rides this entry); DS4_MSEQ_MAX bounds only the BANK count,
      * enforced per-row in step_begin (seq[t] >= DS4_MSEQ_MAX). The pool-count
@@ -1137,28 +1138,45 @@ int gpu_graph_decode_multiseq_batch(
             n_runs++;
         }
     }
-    const bool decode_only = (n_runs == n_active);
+    /* plan-34 inc 5 (LEVER 1): the caller may emit logits for only the FIRST
+     * `max_head_runs` runs (0 == all). A fused mixed step whose trailing PREFILL
+     * run is not on its final chunk passes max_head_runs = n_dec (the decode banks
+     * only): the prefill run's intermediate logits are NEVER consumed, so not
+     * computing them changes nothing observable — and, crucially, when the emitted
+     * runs are exactly the leading length-1 decode runs (last_idx[r] == r), the head
+     * takes the SINGLE-BLOCK identity path (no extra end/gather/begin/end resync,
+     * no wasted K-row prefill head GEMM). Decode-bank logits are byte-identical to a
+     * decode-only step either way. max_head_runs == 0 (all runs) preserves inc-3/4
+     * behavior exactly. */
+    uint32_t head_runs = (max_head_runs == 0u || max_head_runs > n_runs)
+                       ? n_runs : max_head_runs;
+    bool head_single_block = true;
+    for (uint32_t r = 0; r < head_runs; r++)
+        if ((uint32_t)last_idx[r] != r) { head_single_block = false; break; }
 
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
                                           (uint32_t)pos[0], n_active);
     }
-    if (decode_only) {
-        /* Hot path: head in the SAME block on all rows (no extra synchronize),
-         * exactly as before. */
+    if (head_single_block) {
+        /* Hot path: the emitted runs are the leading identity rows [0,head_runs)
+         * (all length-1) — head in the SAME block, no gather, no extra synchronize.
+         * Decode-only (head_runs == n_active) is byte-identical to before; an
+         * intermediate fused step (head_runs == n_dec < n_active) heads only the
+         * decode banks and skips the whole prefill-head two-block. */
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                        n_active, weights->output->dim[1]);
+                                                        head_runs, weights->output->dim[1]);
         if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
     } else {
-        /* Prefill/mixed: close the layer block so batch_cur_hc is final, GATHER
-         * each run's LAST row to the front of batch_cur_hc, then run the head on
-         * the compact n_runs rows in a second block. last_idx is ascending with
-         * last_idx[r] >= r, so front-compaction never clobbers an un-copied
-         * source. The extra synchronize is amortized over a large K prefill. */
+        /* Prefill/mixed final: close the layer block so batch_cur_hc is final,
+         * GATHER each emitted run's LAST row to the front of batch_cur_hc, then run
+         * the head on the compact head_runs rows in a second block. last_idx is
+         * ascending with last_idx[r] >= r, so front-compaction never clobbers an
+         * un-copied source. The extra synchronize is amortized over the prefill. */
         if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
         const uint64_t hc_row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
-        for (uint32_t r = 0; ok && r < n_runs; r++) {
+        for (uint32_t r = 0; ok && r < head_runs; r++) {
             if ((uint32_t)last_idx[r] != r)
                 ok = ds4_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
                                          g->batch_cur_hc, (uint64_t)last_idx[r] * hc_row_bytes,
@@ -1166,18 +1184,21 @@ int gpu_graph_decode_multiseq_batch(
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                        n_runs, weights->output->dim[1]);
+                                                        head_runs, weights->output->dim[1]);
         if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
     }
-    /* Disarm + per-bank frontier self-check even when the sweep failed. */
+    /* Disarm + per-bank frontier self-check even when the sweep failed. The
+     * step_end check covers EVERY bank (incl. a prefill run whose head we skipped),
+     * so a skipped-head run's KV frontier is still validated. */
     const bool end_ok = gpu_graph_multiseq_step_end(g);
     if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
 
-    /* Logits readback: n_runs rows (one per bank, in run order = ascending
-     * first-appearance). Decode-only => n_runs == n_active, row k == bank[k]. */
-    if (out_n_rows) *out_n_rows = n_runs;
+    /* Logits readback: head_runs rows (one per emitted run, in run order = ascending
+     * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
+     * bank[k]. */
+    if (out_n_rows) *out_n_rows = head_runs;
     ok = ds4_gpu_tensor_read(g->spec_logits, 0, logits,
-                             (uint64_t)n_runs * DS4_N_VOCAB * sizeof(float)) != 0;
+                             (uint64_t)head_runs * DS4_N_VOCAB * sizeof(float)) != 0;
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,
      * which desynchronizes its sampling from the committed KV — treat as

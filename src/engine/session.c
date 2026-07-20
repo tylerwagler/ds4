@@ -3013,10 +3013,10 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
         tokens[k] = reqs[k].token;
     }
     /* decode_multiseq is decode-only (1 row per bank), so n_runs == n; no
-     * out-param needed (the caller reads n logit rows). */
+     * out-param needed (the caller reads n logit rows). max_head_runs = 0 (all). */
     const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
                                                    &e->weights, tokens, pos,
-                                                   bank, n, logits, NULL);
+                                                   bank, n, logits, NULL, 0u);
     if (rc == 0) {
         /* Recoverable: the driver rejected before arming the step, so nothing
          * was mutated — the upload writes ahead of it touch scratch only, and
@@ -3057,7 +3057,8 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
     } while (0)
 int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
-                             uint32_t *out_n_rows, char *err, size_t errlen) {
+                             uint32_t *out_n_rows, uint32_t max_head_runs,
+                             char *err, size_t errlen) {
     if (out_n_rows) *out_n_rows = 0;
     if (!s || !reqs || !logits || n_rows == 0 ||
         n_rows > s->graph.prefill_cap) {
@@ -3090,7 +3091,8 @@ int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
     }
     const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
                                                    &e->weights, tokens, pos,
-                                                   bank, n_rows, logits, out_n_rows);
+                                                   bank, n_rows, logits, out_n_rows,
+                                                   max_head_runs);
     /* The batch call consumed the descriptor synchronously (tokens copied to a
      * stack row, pos/seq uploaded to device in step_begin); the host scratch is
      * dead now regardless of rc. */

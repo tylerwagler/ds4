@@ -46,7 +46,7 @@ static bool decode_cont(ds4_session *s, int F, int t0, int *out){
     for(int i=1; i<NGEN && ok; i++){
         ds4_multiseq_req r={.bank=0,.pos=F+i-1,.token=out[i-1]};
         uint32_t nr=0;
-        if(ds4_session_decode_mixed(s,&r,1,lg,vocab,&nr,e,sizeof e)!=0){ fprintf(stderr,"cont step %d: %s\n",i,e); ok=false; break; }
+        if(ds4_session_decode_mixed(s,&r,1,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"cont step %d: %s\n",i,e); ok=false; break; }
         out[i]=(int)argmax_f32(lg,(uint64_t)vocab);
     }
     free(lg); return ok;
@@ -86,7 +86,7 @@ static bool mixed_stream(int c0, int K, int *out, double *secs, float *out_lg){
     for(int j=0;j<K;j++){ rq[j].bank=0; rq[j].pos=c0+j; rq[j].token=g_toks.v[c0+j]; }
     uint32_t nr=0;
     double t0=secs?now_s():0.0;
-    if(ok && ds4_session_decode_mixed(s,rq,(uint32_t)K,lg,vocab,&nr,e,sizeof e)!=0){ fprintf(stderr,"mixed K-run: %s\n",e); ok=false; }
+    if(ok && ds4_session_decode_mixed(s,rq,(uint32_t)K,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"mixed K-run: %s\n",e); ok=false; }
     if(secs) *secs=now_s()-t0;
     if(ok && nr!=1){ fprintf(stderr,"mixed run n_rows=%u expected 1\n",nr); ok=false; }
     if(ok && out_lg) memcpy(out_lg,lg,(size_t)vocab*sizeof(float));   /* last-position logits */

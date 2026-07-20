@@ -3594,7 +3594,7 @@ static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) 
          * change is the heap descriptor scratch. */
         const int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m,
                                                  logits, (uint32_t)m * vocab,
-                                                 NULL, err, sizeof(err));
+                                                 NULL, 0u, err, sizeof(err));
         s->live_bank = -1;   /* pool is multiseq-poisoned: no clean live bank */
         if (rc != 0) {
             for (int q = 0; q < m; q++) {
@@ -3774,8 +3774,16 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
 
         char err[96];
         uint32_t n_runs = 0;
+        /* LEVER 1: on an INTERMEDIATE prefill sub-chunk (prefill does not reach len
+         * this step, and there are decode banks to head), emit ONLY the decode banks'
+         * logits (max_head_runs = m) — the prefill run's intermediate logits are
+         * unused, and the head takes the single-block identity path (no two-block
+         * resync, no wasted prefill head). On the FINAL sub-chunk (pos_now+kthis==len)
+         * OR a pure-decode step, pass 0 = all runs (the prefill head IS consumed). */
+        const uint32_t head_cap =
+            (kthis > 0 && m > 0 && pos_now + kthis < len) ? (uint32_t)m : 0u;
         int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
-                (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, err, sizeof err);
+                (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, head_cap, err, sizeof err);
         if (rc == 1 && kthis > 0) {
             /* RECOVERABLE reject (nothing committed) caused by the PREFILL run — e.g.
              * its bank's frontier is not position-true (a cache-warm resume). Do NOT
@@ -3784,7 +3792,7 @@ static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, ses
             pf_giveup = true; pg->no_fuse = true;
             if (m > 0) {
                 rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
-                        (int)((size_t)m * (size_t)vocab), &n_runs, err, sizeof err);
+                        (int)((size_t)m * (size_t)vocab), &n_runs, 0u, err, sizeof err);
             } else { s->live_bank = -1; break; }   /* only prefill this step: just stop */
             kthis = 0;                              /* prefill did not advance */
         }

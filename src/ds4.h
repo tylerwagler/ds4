@@ -395,9 +395,17 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
  * banks). For a decode-only batch (1 row per bank) that is n_rows rows in bank
  * order — unchanged. For a K-row prefill run it is a single row (the K-th token's
  * logits). Size `logits` for the run count, not n_rows. */
+/* max_head_runs (plan-34 inc 5, LEVER 1): emit head logits for only the FIRST
+ * max_head_runs runs (0 = ALL runs = inc-3/4 behavior). A fused mixed step whose
+ * trailing prefill run is on an INTERMEDIATE chunk passes n_dec (the decode banks
+ * only): the prefill run's intermediate logits are never consumed, so skipping them
+ * is unobservable AND lets the head take the single-block identity path (no
+ * two-block gather/resync, no wasted K-row prefill head GEMM). *out_n_rows is then
+ * the emitted count (== min(n_runs, max_head_runs), with 0 meaning n_runs). */
 int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
-                             uint32_t *out_n_rows, char *err, size_t errlen);
+                             uint32_t *out_n_rows, uint32_t max_head_runs,
+                             char *err, size_t errlen);
 /* Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
  * hosts up to N co-scheduled conversations as banks; each server slot maps to a
  * bank id.  The pool size is chosen at session create (DS4_MSEQ_BANKS today);

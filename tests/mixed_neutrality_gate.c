@@ -55,8 +55,11 @@ static char *read_file(const char *p, size_t *n) {
 /* Populate decode banks + (if K>0) the prefill bank on a FRESH session, run ONE
  * fused decode_mixed step, and copy back: each decode bank's logit row into
  * dec_rows[k] (N_DEC * vocab), and (K>0) the prefill run's last-position logits
- * into pre_row (vocab). Returns false on any engine failure. */
-static bool fused_step_logits(int K, float *dec_rows, float *pre_row) {
+ * into pre_row (vocab). head_cap is forwarded to ds4_session_decode_mixed's
+ * max_head_runs (0 = all runs; N_DEC = LEVER-1 intermediate path: decode banks
+ * only, prefill head skipped — pre_row is then unavailable). Returns false on any
+ * engine failure. */
+static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *pre_row) {
     ds4_session *s = NULL;
     if (ds4_session_create(&s, g_e, 4096) != 0) return false;
     ds4_gpu_graph *g = &s->graph;
@@ -110,12 +113,14 @@ static bool fused_step_logits(int K, float *dec_rows, float *pre_row) {
         }
         uint32_t n_runs = 0;
         const int rc = ds4_session_decode_mixed(s, reqs, n_rows, logits, (int)(n_rows * vocab),
-                                                &n_runs, err, sizeof err);
+                                                &n_runs, head_cap, err, sizeof err);
         if (rc != 0) { fprintf(stderr, "decode_mixed(K=%d) failed rc=%d: %s\n", K, rc, err); ok = false; }
         else {
-            const uint32_t exp_runs = (uint32_t)N_DEC + (K > 0 ? 1u : 0u);
+            const uint32_t full_runs = (uint32_t)N_DEC + (K > 0 ? 1u : 0u);
+            const uint32_t exp_runs = (head_cap == 0u || head_cap > full_runs) ? full_runs : head_cap;
             if (n_runs != exp_runs) {
-                fprintf(stderr, "n_runs=%u expected %u (split boundary wrong)\n", n_runs, exp_runs);
+                fprintf(stderr, "n_runs=%u expected %u (head_cap=%u split boundary wrong)\n",
+                        n_runs, exp_runs, head_cap);
                 ok = false;
             }
         }
@@ -178,16 +183,18 @@ int main(int argc, char **argv) {
 
     const int vocab = (int)DS4_N_VOCAB;
     float *ref_dec = malloc((size_t)N_DEC * vocab * sizeof(float));   /* decode-only M=N_DEC */
-    float *mix_dec = malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused    M=N_DEC+K */
+    float *mix_dec = malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, full head */
+    float *lv1_dec = malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, LEVER-1 head */
     float *mix_pre = malloc((size_t)vocab * sizeof(float));           /* fused prefill last */
     float *cls_pre = malloc((size_t)vocab * sizeof(float));           /* classic-resume last */
     int cls_next = -1;
 
-    if (!fused_step_logits(0,     ref_dec, NULL))    { fprintf(stderr, "GATE FAIL: decode-only reference run failed\n"); g_fail = 1; goto done; }
-    if (!fused_step_logits(K_PRE, mix_dec, mix_pre)) { fprintf(stderr, "GATE FAIL: fused mixed run failed\n"); g_fail = 1; goto done; }
+    if (!fused_step_logits(0,     0u,             ref_dec, NULL))    { fprintf(stderr, "GATE FAIL: decode-only reference run failed\n"); g_fail = 1; goto done; }
+    if (!fused_step_logits(K_PRE, 0u,             mix_dec, mix_pre)) { fprintf(stderr, "GATE FAIL: fused mixed run (full head) failed\n"); g_fail = 1; goto done; }
+    if (!fused_step_logits(K_PRE, (uint32_t)N_DEC, lv1_dec, NULL))   { fprintf(stderr, "GATE FAIL: fused mixed run (LEVER-1 head) failed\n"); g_fail = 1; goto done; }
     if (!classic_resume(K_PRE, cls_pre, &cls_next))  { fprintf(stderr, "GATE FAIL: classic-resume reference failed\n"); g_fail = 1; goto done; }
 
-    /* GATE 4: each decode bank byte-identical decode-only vs fused. */
+    /* GATE 4: each decode bank byte-identical decode-only vs fused (full head). */
     for (int k = 0; k < N_DEC; k++) {
         const long d = first_diff(mix_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
         if (d < 0) {
@@ -197,6 +204,23 @@ int main(int argc, char **argv) {
             fprintf(stderr, "GATE 4 FAIL: decode bank %d logits DIFFER at float %ld (%.9g vs %.9g) — "
                     "co-scheduling a %d-row prefill perturbed a decode bank\n",
                     k, d, (mix_dec + (size_t)k * vocab)[d], (ref_dec + (size_t)k * vocab)[d], K_PRE);
+            g_fail = 1;
+        }
+    }
+
+    /* GATE 4b (LEVER 1): an INTERMEDIATE fused step (max_head_runs = n_dec, prefill
+     * head SKIPPED, single-block identity head path) must yield decode-bank logits
+     * BYTE-IDENTICAL to decode-only — the prefill's intermediate logits are never
+     * consumed, and skipping them must not perturb the decode banks. */
+    for (int k = 0; k < N_DEC; k++) {
+        const long d = first_diff(lv1_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
+        if (d < 0) {
+            printf("GATE 4b LEVER-1: decode bank %d logits (intermediate fused, head-skip) == decode-only "
+                   "BYTE-IDENTICAL\n", k);
+        } else {
+            fprintf(stderr, "GATE 4b FAIL: decode bank %d LEVER-1 logits DIFFER at float %ld (%.9g vs %.9g) "
+                    "— skipping the prefill head perturbed a decode bank\n",
+                    k, d, (lv1_dec + (size_t)k * vocab)[d], (ref_dec + (size_t)k * vocab)[d]);
             g_fail = 1;
         }
     }
@@ -222,7 +246,7 @@ int main(int argc, char **argv) {
     if (!(N_DEC >= 2 && K_PRE > 8)) { fprintf(stderr, "GATE 3 FAIL: gate misconfigured (need n_dec>=2 and K>8)\n"); g_fail = 1; }
 
 done:
-    free(ref_dec); free(mix_dec); free(mix_pre); free(cls_pre);
+    free(ref_dec); free(mix_dec); free(lv1_dec); free(mix_pre); free(cls_pre);
     ds4_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "MIXED-NEUTRALITY GATE: FAIL\n"); return 1; }
     printf("MIXED-NEUTRALITY GATE: PASS\n");

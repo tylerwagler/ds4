@@ -96,7 +96,7 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
             reqs[k].token = argtok[k];
         }
         const int rc = ds4_session_decode_mixed(s, reqs, (uint32_t)M, logits,
-                                                M * vocab, NULL, err, sizeof err);
+                                                M * vocab, NULL, 0u, err, sizeof err);
         if (rc != 0) { fprintf(stderr, "decode_mixed(M=%d) failed rc=%d: %s\n", M, rc, err); ok = false; }
         else memcpy(row0_out, logits, (size_t)vocab * sizeof(float));  /* row 0 == bank 0 */
     }

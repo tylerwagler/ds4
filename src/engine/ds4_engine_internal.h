@@ -2222,7 +2222,8 @@ int gpu_graph_decode_multiseq_batch(
         const int32_t         *bank,
         uint32_t               n_active,
         float                 *logits,
-        uint32_t              *out_n_rows);
+        uint32_t              *out_n_rows,
+        uint32_t               max_head_runs);
 /* DS4_DECODE_DESCR=1 (env, read once): Tier-2 descriptor-vs-classic byte
  * diagnostic — see gpu_decode.c. */
 int gpu_graph_decode_descr_enabled(void);
