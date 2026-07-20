@@ -1094,7 +1094,13 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        int raw_f16) {
+        int raw_f16,
+        uint32_t comp_kv_pack,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        const void * const * __restrict__ comp_bank_ptrs,
+        uint32_t comp_cap,
+        uint32_t n_banks) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1102,14 +1108,44 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * HEADS_PER_GROUP + warp;
     const bool valid_head = head < n_head;
+    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
+        /* Dead/evicted row: zero the head, then all threads return together
+         * (no __syncthreads has run yet).  See
+         * attention_decode_mixed_heads8_online_kernel. */
+        if (valid_head) {
+            float *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
+            for (uint32_t d = lane; d < head_dim; d += 32u) oh[d] = 0.0f;
+        }
+        return;
+    }
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
     __shared__ float4 kv_shared[ROWS_PER_STAGE * 128];
 
-    uint32_t qpos = pos0 + t;
-    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    /* Descriptor (banked) preamble: per-row qpos, raw ring span, per-bank base
+     * derived from positions[t]/seq_id[t], byte-for-byte as
+     * attention_decode_mixed_heads8_online_kernel derives them.  NULL
+     * descriptors reproduce the classic scalar pos0+t / raw_start / contiguous
+     * comp path exactly (raw_base = comp_base = 0, comp_src = comp_kv). */
+    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t eff_n_raw = n_raw;
+    uint32_t eff_raw_start = raw_start;
+    uint32_t first_raw_pos;
+    if (positions) {
+        eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
+        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+        first_raw_pos = qpos + 1u - eff_n_raw;
+    } else {
+        first_raw_pos = pos0 + n_tokens - n_raw;
+    }
+    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
+    const float *comp_src = comp_bank_ptrs ? (const float *)comp_bank_ptrs[sid_b] : comp_kv;
+    const uint64_t comp_base = comp_bank_ptrs ? 0u
+                             : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
@@ -1119,8 +1155,8 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
-        if (n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (eff_n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
             if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0 && qpos + 1u > window) {
@@ -1138,7 +1174,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
     }
     __syncthreads();
 
@@ -1177,9 +1213,35 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                 int32_t c = topk[(uint64_t)t * top_k + (sr - raw_count)];
                 comp_idx = (c >= 0 && (uint32_t)c < visible_comp) ? (uint32_t)c : 0u;
             }
-            kv_shared[off] = sr < raw_count
-                ? raw_kv_ld4(raw_kv, raw_f16, (uint64_t)raw_rows[sr] * head_dim, c4)
-                : ((const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim))[c4];
+            if (sr < raw_count) {
+                kv_shared[off] = raw_kv_ld4(raw_kv, raw_f16, (uint64_t)raw_rows[sr] * head_dim, c4);
+            } else if (comp_kv_pack) {
+                /* ATTN_PACK comp row -> f32 float4 in smem, byte-identical to the
+                 * pack dequant in attention_decode_mixed_heads8_online_kernel; the
+                 * indexed row id is the top-k comp_idx, not sr-raw_count. */
+                const uint32_t n_nope = head_dim - DS4_ATTN_PACK_NROT;
+                const uint8_t *pr = (const uint8_t *)comp_src +
+                    (comp_base + (uint64_t)comp_idx) * DS4_ATTN_PACK_ROWBYTES(head_dim);
+                const uint32_t base = c4 << 2;
+                float4 v;
+                if (base < n_nope) {
+                    const float scale = __uint_as_float((uint32_t)pr[n_nope + (base / DS4_FP8_KV_BLOCK)] << 23);
+                    const uint32_t w = *(const uint32_t *)(pr + base);
+                    v.x = attn_pack_e4m3(w & 0xffu, scale);
+                    v.y = attn_pack_e4m3((w >> 8) & 0xffu, scale);
+                    v.z = attn_pack_e4m3((w >> 16) & 0xffu, scale);
+                    v.w = attn_pack_e4m3(w >> 24, scale);
+                } else {
+                    const float *rope = (const float *)(pr + n_nope + DS4_ATTN_PACK_SCALES_PAD(head_dim));
+                    v.x = rope[base - n_nope + 0u];
+                    v.y = rope[base - n_nope + 1u];
+                    v.z = rope[base - n_nope + 2u];
+                    v.w = rope[base - n_nope + 3u];
+                }
+                kv_shared[off] = v;
+            } else {
+                kv_shared[off] = ((const float4 *)(comp_src + (comp_base + (uint64_t)comp_idx) * head_dim))[c4];
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -2184,9 +2246,21 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (!descr && n_tokens > 1 && head_dim == 512 && top_k <= 512u && !comp_kv_pack &&
+    /* The heads8-online kernel is banked-aware (it takes the descriptor
+     * arrays), so banked rows route here too — recovering the ~5x it holds over
+     * the generic per-(row,head) kernel that banked mode was previously forced
+     * onto.  The rb4 twopass variant stays single-bank-only, so a banked launch
+     * always takes the online branch (never rb4).
+     *
+     * Scope guard: packed comp routes to the online kernel ONLY in banked mode
+     * (descr).  Classic (non-descr) paths keep their exact prior kernel choice —
+     * f32 -> online, pack -> generic — so no classic path changes behaviour. */
+    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
+        (descr || !comp_kv_pack) &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
-        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        /* rb4 twopass has no pack support, so pack (and banked) always take the
+         * online branch. */
+        if (descr || comp_kv_pack || getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
                                                                                sinks,
@@ -2205,7 +2279,13 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                ratio,
                                                                                n_head,
                                                                                head_dim,
-                                                                               raw_f16);
+                                                                               raw_f16,
+                                                                               comp_kv_pack,
+                                                                               positions_ptr,
+                                                                               seq_id_ptr,
+                                                                               comp_bank_ptrs_ptr,
+                                                                               comp_cap,
+                                                                               descr ? n_banks : 1u);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
