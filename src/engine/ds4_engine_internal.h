@@ -1169,6 +1169,14 @@ typedef struct {
      * guarantee). Both zero-initialised with the graph. */
     uint32_t ms_emit_keep[DS4_MSEQ_MAX];
     uint8_t  fork_pin[DS4_MSEQ_MAX];
+    /* Boundary-row stash (inc C): one PACKED row per (bank, layer) — the ratio-4
+     * comp row R/4 and index row R/4 copied byte-for-byte at fork_copy_cut, and
+     * byte-REPLACED over the replay's recomputed row by gpu_graph_emit_keep_restore
+     * (never re-encoded: bit-exact for MXFP8-pack AND the non-idempotent MXFP4 QAT
+     * alike). Sized n_banks * DS4_N_LAYER * row_bytes at slab alloc; NULL when the
+     * pool is disabled. */
+    ds4_gpu_tensor *emit_stash_comp;
+    ds4_gpu_tensor *emit_stash_index;
     int32_t *ms_positions;
     int32_t *ms_seq_id;
     ds4_gpu_tensor *batch_positions;
@@ -2133,6 +2141,12 @@ bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank);
 /* Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
  * KV into dst + mirror frontier counters. Caller validates + pins src first. */
 bool gpu_graph_bank_fork_copy(ds4_gpu_graph *g, uint32_t src, uint32_t dst);
+/* plan-33 inc C: partial-cut fork + boundary machinery (gpu_diag.c). */
+uint32_t ds4_partial_fork_base_align(void);
+bool gpu_graph_bank_fork_copy_cut(ds4_gpu_graph *g, uint32_t src, uint32_t dst,
+                                  uint32_t R, uint32_t src_len);
+bool gpu_graph_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t bank,
+                                 uint32_t row0, uint32_t rows, bool indexer);
 /* Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */

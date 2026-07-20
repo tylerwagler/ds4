@@ -631,6 +631,16 @@ static bool gpu_graph_bank_slabs_alloc(
                                      (uint64_t)n_banks * index_width * index_rows);
         }
     }
+    /* plan-33 inc C: the partial-fork boundary-row stash (one packed comp row +
+     * one packed index row per (bank, layer); a few hundred KB total). */
+    if (ok) {
+        const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+        const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+            ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        g->emit_stash_comp = ds4_gpu_tensor_alloc((uint64_t)n_banks * DS4_N_LAYER * attn_row);
+        g->emit_stash_index = ds4_gpu_tensor_alloc((uint64_t)n_banks * DS4_N_LAYER * idx_row);
+        ok = g->emit_stash_comp && g->emit_stash_index;
+    }
     return ok;
 }
 
@@ -692,6 +702,9 @@ bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = 0;
         g->ms_n_index_comp[bank][il] = 0;
     }
+    /* plan-33: an evicted bank's boundary stash is meaningless — disarm the
+     * emit-restore hook so a later cold refill cannot restore stale bytes. */
+    g->ms_emit_keep[bank] = 0u;
     if (!table_ok) {
         fprintf(stderr,
                 "ds4: WARNING free_physical bank %u: base-table NULL device-write "
@@ -735,6 +748,145 @@ bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank) {
         return g->banks.comp[il][bank] == NULL;   /* freed in lockstep across layers */
     }
     return false;
+}
+
+/* plan-33 inc C: base alignment for a partial cut = LCM of the layer compress
+ * ratios (128 on Flash): a multiple-of-LCM cut leaves every ratio-128 layer with
+ * an EMPTY in-progress group; only ratio-4 layers straddle (boundary row). */
+uint32_t ds4_partial_fork_base_align(void) {
+    static uint32_t a = 0;
+    if (a == 0u) {
+        uint32_t m = 4u;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t r = ds4_layer_compress_ratio(il);
+            if (r > m) m = r;
+        }
+        a = m;
+    }
+    return a;
+}
+
+/* plan-33 inc C: byte-REPLACE the recomputed ratio-4 boundary row with the stash.
+ * Fires after any ratio-4 emit that wrote rows starting below the bank's keep
+ * threshold (R/4+1); self-deactivates once emits move past. Byte-copy — NEVER
+ * re-encode (MXFP4 QAT is non-idempotent; MXFP8 pack byte-copy is trivially
+ * bit-exact too). Same-stream D2D: ordered after the emit's store and before any
+ * later attention read. No-op when the pool/stash is absent or keep==0. */
+bool gpu_graph_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t bank,
+                                 uint32_t row0, uint32_t rows, bool indexer) {
+    if (!g || rows == 0u || bank >= DS4_MSEQ_MAX) return true;
+    const uint32_t keep = g->ms_emit_keep[bank];
+    if (keep == 0u || row0 >= keep) return true;
+    if (ds4_layer_compress_ratio(il) != 4u) return true;
+    ds4_gpu_tensor *stash = indexer ? g->emit_stash_index : g->emit_stash_comp;
+    if (!stash) return true;
+    const uint64_t row_bytes = indexer
+        ? (gpu_graph_idx_fp4_enabled() ? DS4_ENGINE_IDXFP4_ROWBYTES
+                                       : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float))
+        : gpu_graph_attn_comp_cache_row_bytes();
+    const uint32_t keep4 = keep - 1u;              /* the boundary row index R/4 */
+    ds4_gpu_tensor *cache = indexer ? gpu_graph_bank_index_comp_view(g, il, bank)
+                                    : gpu_graph_bank_attn_comp_view(g, il, bank);
+    if (!cache) return false;
+    const bool ok = ds4_gpu_tensor_copy(cache, (uint64_t)keep4 * row_bytes,
+                                        stash,
+                                        ((uint64_t)bank * DS4_N_LAYER + il) * row_bytes,
+                                        row_bytes) != 0;
+    ds4_gpu_tensor_free(cache);
+    return ok;
+}
+
+/* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C, the risky core). Clone
+ * bank src's KV TRUNCATED at position R into dst (src==dst = in-place truncate:
+ * no copies, counters/stash only). Preconds: pool on, R >= align, R % align == 0,
+ * R+4 <= src_len (the boundary row R/4 pools [R-4, R+4) — all inside the
+ * validated prefix). Wrapped-ring guard: if src's ring has scrolled past
+ * R - raw_window, the replay's attention would read scrolled-out raw rows —
+ * REFUSE (caller cold-prefills). Per layer: raw [0,R) (or the whole wrapped
+ * ring); ratio-4 comp/index rows [0, R/4+1) — ONE row past the counter (the
+ * byte-valid boundary row), counters set to R/4 so it is present-but-invisible;
+ * ratio-128 rows [0, R/128) (group closed exactly at a 128-multiple cut); state
+ * lanes copied for hygiene (the replay re-seeds ratio-4 state from raw). The
+ * boundary rows are stashed (packed bytes, from src) and ms_emit_keep[dst] =
+ * R/4+1 arms the emit-restore hook. Caller validates tokens + pins src FIRST. */
+bool gpu_graph_bank_fork_copy_cut(ds4_gpu_graph *g, uint32_t src, uint32_t dst,
+                                  uint32_t R, uint32_t src_len) {
+    if (!g || g->banks.n_banks == 0) return false;
+    if (src >= g->banks.n_banks || dst >= g->banks.n_banks) return false;
+    const uint32_t align = ds4_partial_fork_base_align();
+    if (R < align || (R % align) != 0u || (uint64_t)R + 4u > src_len) return false;
+    if (gpu_graph_bank_is_evicted(g, src)) return false;
+    if (src != dst && gpu_graph_bank_is_evicted(g, dst) &&
+        !gpu_graph_bank_alloc_physical(g, dst)) return false;
+    ds4_bank_slabs *b = &g->banks;
+    /* Wrapped-ring window guard: ring holds positions [oldest, src_len); the
+     * replay from R reads raw rows [R - raw_window, R). */
+    const uint32_t rcap = g->raw_cap;
+    const uint64_t oldest = src_len > rcap ? (uint64_t)src_len - rcap : 0u;
+    if ((uint64_t)R < oldest + g->raw_window) return false;   /* scrolled out */
+    if (!g->emit_stash_comp || !g->emit_stash_index) return false;
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+        ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint32_t keep4 = R / 4u;
+    const uint64_t raw_row_bytes = b->raw_bank_bytes / rcap;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (src != dst) {
+            const uint64_t raw_bytes = (uint64_t)(src_len <= rcap ? R : rcap) * raw_row_bytes;
+            if (raw_bytes)
+                ok = ds4_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
+                                         b->raw[il], (uint64_t)src * b->raw_bank_bytes,
+                                         raw_bytes) != 0;
+            if (ok && ratio != 0) {
+                const uint64_t crows = ratio == 4u ? (uint64_t)keep4 + 1u
+                                                   : (uint64_t)R / ratio;
+                if (crows)
+                    ok = ds4_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0,
+                                             crows * attn_row) != 0;
+                if (ok) ok = ds4_gpu_tensor_copy(b->askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                                 b->askv[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                                 b->astate_bank_bytes[il]) != 0;
+                if (ok) ok = ds4_gpu_tensor_copy(b->assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                                 b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                                 b->astate_bank_bytes[il]) != 0;
+                if (ok && ratio == 4u) {
+                    ok = ds4_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0,
+                                             ((uint64_t)keep4 + 1u) * idx_row) != 0;
+                    if (ok) ok = ds4_gpu_tensor_copy(b->iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                                     b->iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                                     b->istate_bank_bytes[il]) != 0;
+                    if (ok) ok = ds4_gpu_tensor_copy(b->issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                                     b->issc[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                                     b->istate_bank_bytes[il]) != 0;
+                }
+            }
+        }
+        if (!ok) break;
+        /* Boundary-row stash (from SRC's rows — identical to dst's copy, and the
+         * only source for the src==dst truncate) + counters at frontier R. */
+        if (ratio == 4u) {
+            ok = ds4_gpu_tensor_copy(g->emit_stash_comp,
+                                     ((uint64_t)dst * DS4_N_LAYER + il) * attn_row,
+                                     b->comp[il][src], (uint64_t)keep4 * attn_row,
+                                     attn_row) != 0;
+            if (ok) ok = ds4_gpu_tensor_copy(g->emit_stash_index,
+                                     ((uint64_t)dst * DS4_N_LAYER + il) * idx_row,
+                                     b->index[il][src], (uint64_t)keep4 * idx_row,
+                                     idx_row) != 0;
+            g->ms_n_comp[dst][il] = keep4;
+            g->ms_n_index_comp[dst][il] = keep4;
+        } else if (ratio != 0) {
+            g->ms_n_comp[dst][il] = R / ratio;
+            g->ms_n_index_comp[dst][il] = 0u;
+        } else {
+            g->ms_n_comp[dst][il] = 0u;
+            g->ms_n_index_comp[dst][il] = 0u;
+        }
+    }
+    if (ok) g->ms_emit_keep[dst] = keep4 + 1u;
+    return ok;
 }
 
 /* Tier-2 PATH-A FULL-PREFIX FORK (plan-33 increment A). Device-side D2D clone of

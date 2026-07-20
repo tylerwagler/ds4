@@ -449,14 +449,22 @@ bool gpu_graph_commit_attn_comp_stage(
         if (first_row > g->layer_comp_cap[il] || rows > g->layer_comp_cap[il] - first_row) {
             return false;
         }
-        return ds4_gpu_attn_pack_quantize_store_tensor(g->attn_comp_stage,
-                                                       g->layer_attn_comp_cache[il],
-                                                       first_row, rows,
-                                                       DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+        if (ds4_gpu_attn_pack_quantize_store_tensor(g->attn_comp_stage,
+                                                    g->layer_attn_comp_cache[il],
+                                                    first_row, rows,
+                                                    DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
+            return false;
+        }
+        /* plan-33 inc C: byte-replace the ratio-4 boundary row after any commit
+         * below the fork keep threshold (no-op when ms_emit_keep is 0). */
+        return gpu_graph_emit_keep_restore(g, il,
+                g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
     }
     /* Classic f32 storage: the compressor wrote the persistent cache directly
-     * (gpu_graph_attn_comp_update_target returned it), nothing to commit. */
-    return true;
+     * (gpu_graph_attn_comp_update_target returned it), nothing to commit — but
+     * the fork boundary restore still applies to the rows it just wrote. */
+    return gpu_graph_emit_keep_restore(g, il,
+            g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
 }
 
 
@@ -484,7 +492,8 @@ bool gpu_graph_commit_attn_comp_stage_bank(
             g->attn_comp_stage, cache, first_row, rows,
             DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
     ds4_gpu_tensor_free(cache);
-    return ok;
+    /* plan-33 inc C: boundary-row restore for the explicit-bank commit path. */
+    return ok && gpu_graph_emit_keep_restore(g, il, bank, first_row, rows, false);
 }
 
 
@@ -1015,6 +1024,9 @@ bool gpu_graph_encode_decode_layer(
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
                     ds4_gpu_tensor_free(index_row_view);
                 }
+                /* plan-33 inc C: boundary-row restore (decode-fallback site). */
+                if (ok) ok = gpu_graph_emit_keep_restore(g, il,
+                        g->banks.n_banks ? g->banks.cur_bank : 0u, index_row, 1, true);
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_sparse_threshold =

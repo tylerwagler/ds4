@@ -226,6 +226,14 @@ uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q);
 int  ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
                            const int *tokens, int n_cached);
 bool ds4_session_bank_fork_pinned(const ds4_session *s, uint32_t bank);
+/* plan-33 increment C — PARTIAL-prefix fork: the request shares only
+ * tokens[0..n_cached) with src's history. Cuts at R = ((n_cached-4)/128)*128,
+ * validates tokens[0..R+4) vs src BEFORE any device write, clones [0,R) (+ the
+ * byte-stashed ratio-4 boundary row, emit-restored during the replay), and makes
+ * dst's committed history tokens[0..R) — the caller then re-prefills [R, ...).
+ * src==dst = in-place truncate-reuse. 0 on success; non-zero -> cold prefill. */
+int  ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
+                                   const int *tokens, int n_cached);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any

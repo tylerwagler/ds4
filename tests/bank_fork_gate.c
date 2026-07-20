@@ -193,6 +193,126 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fork_gate: fork+suffix checksum=%016" PRIx64 " cold=%016" PRIx64 " (byte-identical: %s); next-token fork=%d cold=%d\n",
             sum_fork_full, sum_cold, sum_fork_full == sum_cold ? "YES" : "NO", tok_fork, tok_cold);
 
+    /* ================= increment C: PARTIAL-cut fork oracle ================
+     * Mid-ratio-4-group cut on an UNWRAPPED source, chunk-aligned R (oracle
+     * validity, see header): src bank0 @4300 (toks), request toks2 shares
+     * [0,4102) then diverges; n_cached=4102 -> R=4096 (%4096==0, %128==0),
+     * boundary row R/4=1024. fork_partial + replay vs COLD toks2 prefill:
+     * byte-identical frontier + SPECIFIC row-1024 byte-diff per ratio-4 layer
+     * (comp AND the MXFP4 indexer row separately — plan-33 risks 1+2). */
+    {
+        const int SLEN = 4300, NC = 4102, RCUT = 4096, L2 = 8192;
+        int *toks2 = malloc((size_t)L2 * sizeof(int));
+        for (int i = 0; i < L2; i++)
+            toks2[i] = i < NC ? toks[i] : base.v[(i + 7777) % base.len];
+
+        /* fresh short src on bank 0 */
+        CHECK(prefill_bank_cold(s, 0, toks, SLEN), "P2 src prefill bank0@%d", SLEN);
+        ds4_session_bank_state_save(s, 0);
+
+        /* shallow-cut refusal (R would be 0) */
+        CHECK(ds4_session_bank_fork_partial(s, 0, 1, toks2, 100) != 0,
+              "P2 shallow cut not refused");
+
+        /* partial fork 0->1 and replay toks2 to L2 */
+        const int prc = ds4_session_bank_fork_partial(s, 0, 1, toks2, NC);
+        CHECK(prc == 0, "P2 partial fork refused rc=%d", prc);
+        CHECK(!ds4_session_bank_fork_pinned(s, 0), "P2 src left pinned");
+        CHECK(ds4_session_bank_state_restore(s, 1), "P2 install fork dst");
+        CHECK(ds4_session_pos(s) == RCUT, "P2 dst pos %d != R %d", ds4_session_pos(s), RCUT);
+        {
+            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks2; p.len = p.cap = L2;
+            char e2[256];
+            CHECK(ds4_session_sync(s, &p, e2, sizeof e2) == 0, "P2 replay sync: %s", e2);
+            CHECK(ds4_session_pos(s) == L2, "P2 live pos %d != %d", ds4_session_pos(s), L2);
+            gpu_graph_bank_counters_capture(&s->graph, 1);
+        }
+        const int tok_pf = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+        ds4_gpu_synchronize();
+        const uint64_t sum_pf = checksum_bank_kv(s, 1);
+        ds4_session_bank_state_save(s, 1);
+
+        /* cold control on bank 2 */
+        CHECK(prefill_bank_cold(s, 2, toks2, L2), "P2 cold control bank2");
+        ds4_session_bank_state_save(s, 2);
+        const int tok_pc = ds4_session_sample(s, 0.0f, 0, 1.0f, 0.0f, &(uint64_t){7});
+        ds4_gpu_synchronize();
+        const uint64_t sum_pc = checksum_bank_kv(s, 2);
+
+        CHECK(sum_pf == sum_pc, "P2 partial-fork KV != cold (%016" PRIx64 " vs %016" PRIx64 ")",
+              sum_pf, sum_pc);
+        CHECK(tok_pf == tok_pc, "P2 next-token %d != cold %d", tok_pf, tok_pc);
+        fprintf(stderr, "fork_gate: P2 partial(mid-group R=%d) checksum=%016" PRIx64
+                " cold=%016" PRIx64 " (byte-identical: %s) tok %d/%d\n",
+                RCUT, sum_pf, sum_pc, sum_pf == sum_pc ? "YES" : "NO", tok_pf, tok_pc);
+
+        /* SPECIFIC boundary-row byte-diff: comp + MXFP4 index row R/4 per
+         * ratio-4 layer, fork vs cold (risks 1+2 — a checksum can hide a
+         * single half-restored row only if another row compensates; this
+         * cannot). */
+        {
+            ds4_gpu_graph *g = &s->graph;
+            const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+            const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
+                ? DS4_ENGINE_IDXFP4_ROWBYTES : (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            uint8_t *ra = malloc((size_t)attn_row), *rb = malloc((size_t)attn_row);
+            int diffc = 0, diffi = 0, checked = 0;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (ds4_layer_compress_ratio(il) != 4u) continue;
+                ds4_gpu_tensor *va = gpu_graph_bank_attn_comp_view(g, il, 1);
+                ds4_gpu_tensor *vb = gpu_graph_bank_attn_comp_view(g, il, 2);
+                if (va && vb &&
+                    ds4_gpu_tensor_read(va, (uint64_t)(RCUT/4) * attn_row, ra, attn_row) &&
+                    ds4_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * attn_row, rb, attn_row)) {
+                    if (memcmp(ra, rb, (size_t)attn_row) != 0) diffc++;
+                } else diffc += 1000;   /* read failure = loud */
+                ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vb);
+                va = gpu_graph_bank_index_comp_view(g, il, 1);
+                vb = gpu_graph_bank_index_comp_view(g, il, 2);
+                if (va && vb &&
+                    ds4_gpu_tensor_read(va, (uint64_t)(RCUT/4) * idx_row, ra, idx_row) &&
+                    ds4_gpu_tensor_read(vb, (uint64_t)(RCUT/4) * idx_row, rb, idx_row)) {
+                    if (memcmp(ra, rb, (size_t)idx_row) != 0) diffi++;
+                } else diffi += 1000;
+                ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vb);
+                checked++;
+            }
+            free(ra); free(rb);
+            CHECK(diffc == 0, "P2 boundary COMP row %d differs on %d ratio-4 layer(s)", RCUT/4, diffc);
+            CHECK(diffi == 0, "P2 boundary MXFP4 INDEX row %d differs on %d layer(s)", RCUT/4, diffi);
+            fprintf(stderr, "fork_gate: P2 boundary row %d byte-diff: comp %d, index %d "
+                    "(over %d ratio-4 layers) : %s\n", RCUT/4, diffc, diffi, checked,
+                    (diffc == 0 && diffi == 0) ? "OK" : "FAIL");
+        }
+
+        /* P3: src==dst TRUNCATE-reuse — rewind bank 1 (@L2) to R and replay the
+         * SAME tokens; must again be byte-identical to the cold control. */
+        CHECK(ds4_session_bank_state_restore(s, 1), "P3 install bank1");
+        const int trc = ds4_session_bank_fork_partial(s, 1, 1, toks2, NC);
+        CHECK(trc == 0, "P3 truncate refused rc=%d", trc);
+        CHECK(ds4_session_pos(s) == RCUT, "P3 truncated pos %d != %d", ds4_session_pos(s), RCUT);
+        {
+            ds4_tokens p; memset(&p, 0, sizeof p); p.v = toks2; p.len = p.cap = L2;
+            char e2[256];
+            CHECK(ds4_session_sync(s, &p, e2, sizeof e2) == 0, "P3 replay sync: %s", e2);
+            gpu_graph_bank_counters_capture(&s->graph, 1);
+        }
+        ds4_gpu_synchronize();
+        const uint64_t sum_tr = checksum_bank_kv(s, 1);
+        CHECK(sum_tr == sum_pc, "P3 truncate-replay KV != cold (%016" PRIx64 " vs %016" PRIx64 ")",
+              sum_tr, sum_pc);
+        fprintf(stderr, "fork_gate: P3 truncate(src==dst) checksum=%016" PRIx64
+                " (==cold: %s)\n", sum_tr, sum_tr == sum_pc ? "YES" : "NO");
+
+        /* P4: wrapped-ring window guard — bank 2 is @8192 (> raw_cap), a cut at
+         * R=3840 has raw rows [3840-128, 3840) scrolled out (oldest 3840+) ->
+         * the engine primitive must REFUSE. */
+        CHECK(!gpu_graph_bank_fork_copy_cut(&s->graph, 2, 1, 3840, 8192),
+              "P4 wrapped-ring cut NOT refused (window guard broken)");
+        fprintf(stderr, "fork_gate: P4 wrapped-ring cut refused : OK\n");
+        free(toks2);
+    }
+
     free(toks);
     fprintf(stderr, "BANK-FORK GATE: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

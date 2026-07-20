@@ -1319,6 +1319,9 @@ bool gpu_graph_encode_layer_attention_batch(
                         : ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
                                                           n_comp,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
+                    /* plan-33 inc C: boundary-row restore (whole-prefill site). */
+                    if (ok) ok = gpu_graph_emit_keep_restore(g, il,
+                            g->banks.n_banks ? g->banks.cur_bank : 0u, 0, n_comp, true);
                 }
                 if (ok) {
                     ok = gpu_graph_refresh_ratio4_compressor_state(g,
@@ -1414,6 +1417,11 @@ bool gpu_graph_encode_layer_attention_batch(
                             : ds4_gpu_dsv4_indexer_qat_tensor(index_view,
                                                               index_chunk,
                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
+                        /* plan-33 inc C: boundary-row restore (chunked emit site —
+                         * the replay-from-R path that recomputes row R/4). */
+                        if (ok) ok = gpu_graph_emit_keep_restore(g, il,
+                                g->banks.n_banks ? g->banks.cur_bank : 0u,
+                                index_before, index_chunk, true);
                     }
                     if (ok) {
                         ok = gpu_graph_refresh_ratio4_compressor_state(g,
@@ -1533,6 +1541,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                       DS4_N_INDEXER_HEAD_DIM) != 0;
                                 ds4_gpu_tensor_free(index_row_view);
                             }
+                            /* plan-33 inc C: boundary-row restore (banked emit). */
+                            if (ok) ok = gpu_graph_emit_keep_restore(g, il,
+                                    mseq ? (uint32_t)bank
+                                         : (g->banks.n_banks ? g->banks.cur_bank : 0u),
+                                    index_row, 1, true);
                         }
                         if (ok && emit) (*n_index_slot)++;
                         if (index_counts) index_counts[t] = *n_index_slot;

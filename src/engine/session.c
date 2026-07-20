@@ -2219,8 +2219,13 @@ int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
     if (src < s->bank_carry_n && dst < s->bank_carry_n) {
         bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
     }
-    /* 7. Full fork has no ratio-4 boundary stash — keep the emit hook inactive. */
+    /* 7. Full fork has no ratio-4 boundary stash — keep the emit hook inactive.
+     * The drafter ring is NOT cloned: zero dst's ring counters so the spec path
+     * re-warms instead of reading another conversation's window. */
     g->ms_emit_keep[dst] = 0u;
+    for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[dst][i] = 0u;
+    g->ms_dspark_prompt_n[dst] = 0u;
+    g->ms_dspark_prompt_lo[dst] = 0u;
     /* 8. (dst suffix KV-growth admission charge is the server's job in a later
      *    increment; the engine clone copies existing KV, touching nothing new.) */
     g->fork_pin[src] = 0u;
@@ -2230,6 +2235,86 @@ int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
 bool ds4_session_bank_fork_pinned(const ds4_session *s, uint32_t bank) {
     if (!s || bank >= gpu_graph_bank_pool_count(&s->graph)) return false;
     return s->graph.fork_pin[bank] != 0u;
+}
+
+/* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C). Like ds4_session_bank_fork
+ * but for a request that shares only tokens[0..n_cached) with src's committed
+ * history: the cut is ALIGNED DOWN to R = ((n_cached-4)/align)*align (align = 128,
+ * the ratio LCM) so every ratio-128 layer cuts on a closed group and only ratio-4
+ * layers straddle (boundary row R/4, byte-stashed + emit-restored). VALIDATES
+ * tokens[0..R+4) against src's history BEFORE any device write (the boundary row
+ * pools [R-4, R+4), so the prefix must match through R+4). dst's committed
+ * history becomes tokens[0..R): the caller re-prefills [R, ...) — the replay's
+ * first ratio-4 emit recomputes row R/4 and the emit hook byte-replaces it with
+ * the stash. src==dst is the in-place truncate-reuse degenerate (no copies).
+ * Returns 0 on success; non-zero refusal (mismatch, unaligned/short cut, evicted
+ * src, wrapped-out ring) -> caller cold-prefills. */
+int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
+                                  const int *tokens, int n_cached) {
+    if (!s || !tokens || n_cached < 4) return 1;
+    ds4_gpu_graph *g = &s->graph;
+    if (g->banks.n_banks == 0 || src >= g->banks.n_banks || dst >= g->banks.n_banks)
+        return 1;
+    const uint32_t align = ds4_partial_fork_base_align();
+    const uint32_t R = (uint32_t)((n_cached - 4) / (int)align) * align;
+    if (R < align) return 1;                        /* cut too shallow */
+    /* 1. VALIDATE tokens[0..R+4) vs src's committed history BEFORE any write. */
+    const uint32_t cur = g->banks.cur_bank;
+    const token_vec *hist = NULL;
+    if (src == cur) {
+        hist = s->checkpoint_valid ? &s->checkpoint : NULL;
+    } else if (s->bank_carry && src < s->bank_carry_n &&
+               s->bank_carry[src].valid && s->bank_carry[src].checkpoint_valid) {
+        hist = &s->bank_carry[src].checkpoint;
+    }
+    if (!hist || hist->len < (int)(R + 4u)) return 1;
+    for (uint32_t i = 0; i < R + 4u; i++) {
+        if (hist->v[i] != tokens[i]) return 1;      /* mismatch -> cold */
+    }
+    /* 2. Pin src; refuse evicted. Snapshot src's host carry FIRST: state_save
+     * re-captures the live frontier counters, which MUST happen before copy_cut
+     * writes the CUT counters into ms[dst] (src==dst truncate would otherwise
+     * be clobbered back to the live frontier). */
+    g->fork_pin[src] = 1u;
+    if (gpu_graph_bank_is_evicted(g, src)) { g->fork_pin[src] = 0u; return 1; }
+    if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
+    if (src == cur) ds4_session_bank_state_save(s, src);
+    /* 3-4. Clone-with-cut (cut counters + boundary stash + keep threshold). */
+    if (!gpu_graph_bank_fork_copy_cut(g, src, dst, R, (uint32_t)hist->len)) {
+        g->fork_pin[src] = 0u;
+        return 1;
+    }
+    /* 5. Host carry: dst owns tokens[0..R) as its committed history. */
+    if (src != dst && src < s->bank_carry_n && dst < s->bank_carry_n) {
+        bank_carry_copy(&s->bank_carry[dst], &s->bank_carry[src]);
+    }
+    if (dst < s->bank_carry_n) {
+        ds4_bank_carry *c = &s->bank_carry[dst];
+        c->checkpoint.len = (int)R;                 /* truncate committed history */
+        c->checkpoint_valid = true;
+        c->valid = true;
+        /* Position-stamped state beyond R is meaningless on dst. */
+        c->spec_carry_valid = false;
+        c->dspark_n_pending = 0;
+        c->dspark_pending_sampled = false;
+        c->mseq_dirty = false;
+    }
+    /* Drafter ring not cloned (and cut anyway): re-warm from empty. */
+    for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[dst][i] = 0u;
+    g->ms_dspark_prompt_n[dst] = 0u;
+    g->ms_dspark_prompt_lo[dst] = 0u;
+    /* 6. If dst is the installed bank (truncate-reuse of cur, or fork onto cur),
+     * refresh the LIVE session state from the truncated carry. */
+    if (dst == cur) {
+        gpu_graph_bank_counters_install(g, dst);
+        if (s->checkpoint.len > (int)R) s->checkpoint.len = (int)R;
+        s->checkpoint_valid = true;
+        s->spec_carry_valid = false;
+        s->dspark_n_pending = 0;
+        s->mseq_dirty = false;
+    }
+    g->fork_pin[src] = 0u;
+    return 0;
 }
 
 /* Tier-2 task #55 increment 2b — RAW per-bank comp/index KV disk snapshot. The
@@ -2366,6 +2451,9 @@ int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp,
         g->ms_n_index_comp[bank][il] = idx_cnt[il];
     }
     gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
+    /* plan-33 inc C: a disk-restored bank carries full committed state — any
+     * stale fork boundary threshold must not fire on it. */
+    g->ms_emit_keep[bank] = 0u;
     return 0;
 }
 
@@ -4306,6 +4394,12 @@ void ds4_session_invalidate(ds4_session *s) {
     s->dspark_n_pending = 0;
     s->spec_carry_valid = false;
     spec_quench_reset(s);
+    /* plan-33 inc C: an invalidated bank restarts from zero — a live keep
+     * threshold would make the fresh prefill's early emits restore a STALE
+     * boundary row over the new conversation's KV. Disarm it. */
+    if (s->graph.banks.n_banks) {
+        s->graph.ms_emit_keep[s->graph.banks.cur_bank] = 0u;
+    }
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first
      * attended over the PREVIOUS request's window rows for its first ~128

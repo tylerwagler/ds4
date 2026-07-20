@@ -158,6 +158,11 @@ void gpu_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->banks.dspark_raw[i]);
         ds4_gpu_tensor_free(g->banks.dspark_prompt[i]);
     }
+    /* plan-33 inc C: partial-fork boundary-row stash. */
+    ds4_gpu_tensor_free(g->emit_stash_comp);
+    ds4_gpu_tensor_free(g->emit_stash_index);
+    g->emit_stash_comp = NULL;
+    g->emit_stash_index = NULL;
     /* The batched-copy tables cache raw device pointers into the state tensors
      * freed above; drop them so a rebuilt graph re-prepares fresh tables. */
     ds4_gpu_batched_copy_free(g->spec_snap_copies);
