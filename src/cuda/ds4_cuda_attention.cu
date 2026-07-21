@@ -1502,9 +1502,14 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const float *comp_src = comp_bank_ptrs ? (const float *)comp_bank_ptrs[sid_b] : comp_kv;
     const uint64_t comp_base = comp_bank_ptrs ? 0u
                              : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
+    /* Scalar decode-entry convention: n_tokens==1, pos0==0, ratio==0,
+     * positions==NULL — the caller means "attend to ALL cached rows" and does
+     * NOT supply a real absolute position, so qpos is 0 and the windowing
+     * arithmetic below does not apply.  Mirrors attention_decode_mixed_kernel. */
+    const bool single_all = (n_tokens == 1u && ratio == 0u && positions == NULL);
     uint32_t comp_count = 0;
     if (n_comp != 0u) {
-        if (n_tokens == 1u && ratio == 0u && positions == NULL) {
+        if (single_all) {
             comp_count = n_comp;
         } else if (ratio != 0u) {
             comp_count = (qpos + 1u) / ratio;
@@ -1516,7 +1521,17 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         uint32_t raw_first_idx = 0;
         if (eff_n_raw != 0u) {
             const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
-            if (qpos >= first_raw_pos) {
+            /* single_all MUST be handled before the qpos comparison below.  In
+             * that convention first_raw_pos = pos0 + n_tokens - n_raw = 1 - 128,
+             * which UNDERFLOWS to 4294967169, so `qpos(0) >= first_raw_pos` is
+             * false and raw_count would stay 0 — silently dropping the ENTIRE
+             * SWA raw window while comp_count above stayed correct.  That is not
+             * a visible failure: it just answers from compressed rows only, and
+             * measures as a large FAKE speedup (skipping 128 rows/layer/token)
+             * with heavy logit damage underneath. */
+            if (single_all) {
+                raw_count = eff_n_raw > 256u ? 256u : eff_n_raw;
+            } else if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0u && qpos + 1u > window) {
                     const uint32_t wlo = qpos + 1u - window;
