@@ -405,6 +405,19 @@ static void server_close_resources(server *s) {
         s->slots[i].sess = NULL;
     }
     if (pool) ds4_session_free(pool);
+    /* Tier-2 guard spill files are per-bank snapshots (server_spill_bank in
+     * generate.c writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
+     * still spilled when the server exits would otherwise leave a stale
+     * multi-GiB file behind forever, so sweep every provisioned slot's bank
+     * on the way out.  Best-effort: a missing file is the normal case. */
+    if (s->spill_dir[0]) {
+        for (int i = 0; i < s->n_slots && i < DS4_SESSION_POOL_CAP; i++) {
+            char spath[600];
+            snprintf(spath, sizeof spath, "%s/spill-bank-%u.kv",
+                     s->spill_dir, (unsigned)s->slots[i].bank);
+            (void)remove(spath);
+        }
+    }
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -976,9 +989,17 @@ int main(int argc, char **argv) {
         if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
         s.spec_max_live = v;
     }
-    /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF — v0.3.0 ships it
-     * dark; enable only if the measurement justifies it. One startup read, no
-     * hot-path getenv. Only engages in pool mode. */
+    /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF — MEASURED, not
+     * dark-pending. Clean chunk sweep 2026-07-20 (build 0e643eb, K=8000, ndec=3):
+     * prefill GPU-work is conserved, so fusion only REDISTRIBUTES the decode stall
+     * — small chunk trades median up for tail down (c8: median 435 ms vs 93 ms OFF,
+     * p99 824 ms vs 9341 ms), large chunk keeps median but worsens the tail. NO
+     * chunk is net-positive on all axes; stream-overlap can't help (the step is
+     * bandwidth-saturated on GB10's unified bus — 8 prefill tokens 4.7x the decode
+     * median). So it's a genuine multi-user tail/throughput TRADE, not a free win:
+     * opt-in via DS4_MIXED_BATCH=1 (+DS4_MIXED_CHUNK, c8 for the tail/throughput
+     * point). Phase-1 warm-fork TTFT is v0.3.0's headline continuous-batching win.
+     * One startup read, no hot-path getenv. Only engages in pool mode. */
     {
         const char *mb = getenv("DS4_MIXED_BATCH");
         s.mixed_batch_enabled = s.pool_banks > 0 &&
@@ -1233,8 +1254,22 @@ int main(int argc, char **argv) {
         session_slot *sl = &s.slots[i];
         if (!sl->sess) continue;
         /* Tier-2: install this slot's bank so tokens/store read ITS frontier,
-         * not the pool's last-live cursor (worker has joined; single-threaded). */
-        if (s.pool_banks > 0) ds4_session_bank_state_restore(sl->sess, sl->bank);
+         * not the pool's last-live cursor (worker has joined; single-threaded).
+         * Must go through server_bank_switch, NOT a bare state_restore: a bank
+         * parked by the guard spill has had its comp/index slabs cudaFree'd, and
+         * only server_bank_switch reloads them from spill-bank-N.kv first.  The
+         * bare restore left gpu_graph_bank_repoint to fail partway through the
+         * layer loop, which both lost THIS slot's snapshot and left the graph
+         * half-repointed with cur_bank stale — so the next slot whose bank
+         * matched that stale cur_bank early-returned "success" over mixed views
+         * and silently lost its snapshot too.  Skip the slot if it can't be
+         * installed rather than persisting another conversation's frontier. */
+        if (s.pool_banks > 0 && !server_bank_switch(&s, sl->bank)) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: slot %d bank %d could not be installed at shutdown; "
+                       "skipping its KV persist", i, sl->bank);
+            continue;
+        }
         const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
         if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
             server_log(DS4_LOG_KVCACHE,

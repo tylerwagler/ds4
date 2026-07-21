@@ -1503,6 +1503,11 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  * Worker-thread scheduling reads AND the client/worker tool-id lookups use this
  * instead of ds4_session_pos so a non-live bank's frontier is never misread as
  * the pool's live cursor (defined in generate.c). */
+/* Install `bank` on the shared pool session: lazily saves the outgoing bank's
+ * carry, reloads a guard-spilled target from disk, and repoints the graph's
+ * views.  Returns false WITHOUT installing on any failure — callers must fail
+ * the request rather than run against a half-repointed view set. */
+bool server_bank_switch(server *s, int bank);
 int server_slot_frontier_pos(const server *s, const session_slot *sl);
 /* LRU eviction victim: least-recently-serviced idle provisioned slot,
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be

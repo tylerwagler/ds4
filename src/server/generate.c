@@ -14,7 +14,7 @@
  * (KV unrecoverable): the bank is NOT installed and cur_bank is unchanged, so the
  * caller MUST fail the request rather than sample/commit on the wrong bank's KV
  * (review finding 1). True on success (or classic mode / no-op). */
-static bool server_bank_switch(server *s, int bank);
+bool server_bank_switch(server *s, int bank);
 /* Bank-aware common-prefix of `sl` against `prompt` (scheduling reads). */
 static int server_slot_common_prefix(const server *s, const session_slot *sl,
                                      const ds4_tokens *prompt);
@@ -855,6 +855,41 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
  * bit-exact resumption AND enough suffix remains that the resumed sync takes
  * the batched chunk path rather than the single-token tail path (see
  * ds4_session_prefill_quantum_min_suffix). */
+/* Has the client gone away?  A request whose peer has disconnected is pure
+ * waste: on this box a single stream is ~16 t/s, so an abandoned long generation
+ * burns minutes of EXCLUSIVE GPU that a live request could have used.  Streaming
+ * requests already notice via a failed write (send_all), but a NON-streaming
+ * request writes nothing until the very end, so nothing detected the disconnect
+ * at all — it ran to max_tokens for a socket no one was reading.
+ *
+ * Polled non-blocking, and only at coarse boundaries (once per decode quantum,
+ * ~1/s, and once before a queued job starts) — never per token.
+ *
+ * POLLRDHUP is the signal that matters: a client that times out or is Ctrl-C'd
+ * sends FIN, which shows up as POLLRDHUP and NOT as POLLHUP (POLLHUP needs a
+ * full teardown/RST).  The deliberate trade: a client that half-closes its write
+ * side while still reading the response would be treated as gone.  HTTP clients
+ * do not do that while awaiting a response, and the same assumption is standard
+ * in production servers — but DS4_ABORT_ON_DISCONNECT=0 restores the old
+ * run-to-completion behavior without a rebuild if some client ever misbehaves.
+ * The env is read ONCE (project rule: no per-token getenv). */
+static bool gen_client_disconnected(int fd) {
+    if (fd < 0) return false;
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_ABORT_ON_DISCONNECT");
+        enabled = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (!enabled) return false;
+    struct pollfd p;
+    p.fd = fd;
+    p.events = POLLRDHUP;
+    p.revents = 0;
+    if (poll(&p, 1, 0) <= 0) return false;   /* 0 = quiet = still connected */
+    return (p.revents & (POLLERR | POLLHUP | POLLNVAL | POLLRDHUP)) != 0;
+}
+
+
 static bool gen_prefill_cancel_cb(void *ud) {
     const gen_state *g = ud;
     if (g->prefill_min_suffix == 0) return false;
@@ -1618,6 +1653,18 @@ static void gen_step_decode(server *s, session_slot *sl) {
     job *j = g->j;
     const int quantum_start = g->completion;
     bool stop_decode = false;
+
+    /* Once per quantum (~1/s): stop generating for a client that has gone away.
+     * Falls through the normal GEN_FINISH epilogue so the slot, KV checkpoint and
+     * metrics are released exactly as on a natural stop; the final write simply
+     * fails harmlessly on the dead fd. */
+    if (gen_client_disconnected(j->fd)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: client disconnected, abandoning generation after %d tokens",
+                   g->completion);
+        g->phase = GEN_FINISH;
+        return;
+    }
 
     while (!g_stop_requested && g->completion < g->max_tokens &&
            ds4_session_pos(sl->sess) < ds4_session_ctx(sl->sess)) {
@@ -2388,7 +2435,7 @@ typedef enum {
  * is installed. Defined below (near the guard); forward-declared for the switch. */
 static bool server_bank_restore_spilled(server *s, int bank);
 
-static bool server_bank_switch(server *s, int bank) {
+bool server_bank_switch(server *s, int bank) {
     if (s->pool_banks <= 0) return true;          /* classic mode */
     if (bank < 0 || bank >= s->pool_banks) return true;
     if (bank == s->live_bank && !s->slots[bank].spilled) return true; /* already installed */
@@ -2409,7 +2456,13 @@ static bool server_bank_switch(server *s, int bank) {
     if (s->slots[bank].spilled) {
         if (!server_bank_restore_spilled(s, bank)) return false;
     }
-    ds4_session_bank_state_restore(pool, (uint32_t)bank);
+    /* The state restore can ALSO fail (gpu_graph_bank_repoint rejects a bank
+     * whose slabs are missing, e.g. after a partially-failed realloc).  Ignoring
+     * it published live_bank over a half-repointed view set with cur_bank
+     * unchanged, so the caller ran engine work against mixed banks instead of
+     * failing the request.  Fail loud here — this is the one check that catches
+     * a bad repoint before any token is generated. */
+    if (!ds4_session_bank_state_restore(pool, (uint32_t)bank)) return false;
     s->live_bank = bank;
     s->slots[bank].committed_pos = ds4_session_pos(pool);
     return true;

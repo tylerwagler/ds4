@@ -1304,6 +1304,24 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
      * computed, index-order sum); the other paths sort `cand` in place and
      * compute probs + sum post-sort, in sorted order, exactly as before. */
     sample_candidate *sc = cand;
+    /* LAZY-MATERIALIZATION view for the full-vocab (top_k<=0, min_p small)
+     * path. That path used to materialize a 12-byte sample_candidate for
+     * EVERY finite vocab entry (129,280 x 12 B = 1.55 MB of strided stores,
+     * each pulling logits[id] through a random gather) and then walk the same
+     * array AGAIN to fill in .prob — while the cutoff loop below almost always
+     * breaks within a few dozen entries and only `filtered` entries are ever
+     * read out. Instead it now makes ONE fused pass that writes only the
+     * probabilities, PACKED (4 B/entry, into cand's storage — cand itself is
+     * unused on that path), and leaves the ids where the radix sort already
+     * put them: the low 32 bits of keys[i]. `pv`/`idk` are the resulting
+     * lazy view; SC_PROB/SC_ID below read whichever representation is live.
+     * Arithmetic is UNCHANGED: same max_logit (logits[keys[0]] IS cand[0].logit),
+     * same expf inputs in the same sorted order, same `sum` accumulation
+     * order, hence the same cutoff, `filtered` set and output probabilities. */
+    const float *pv = NULL;         /* packed probs, sorted order (or NULL) */
+    const uint64_t *idk = NULL;     /* sorted keys; id = low 32 bits (or NULL) */
+#define SC_PROB(i) (pv ? pv[(i)] : sc[(i)].prob)
+#define SC_ID(i)   (idk ? (int)(uint32_t)idk[(i)] : sc[(i)].id)
     uint32_t n = 0;
     int have_probs = 0;
     float sum = 0.0f;
@@ -1373,11 +1391,20 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
         }
         if (n) {
             sample_radix_sort_desc(keys, scratch->tmp, n);
+            /* Fused prob pass over the packed view (see the note at `pv`).
+             * Byte-identical to the old materialize-then-!have_probs-loop:
+             * max_logit, the expf inputs and the `sum` order all match. */
+            float *probs = (float *)cand;   /* n*4 <= cap*sizeof(sample_candidate) */
+            const float max_logit = logits[(uint32_t)keys[0]];
             for (uint32_t i = 0; i < n; i++) {
-                const uint32_t id = (uint32_t)keys[i];
-                cand[i] = (sample_candidate){
-                    .id = (int)id, .logit = logits[id], .prob = 0.0f};
+                const float p =
+                    expf((logits[(uint32_t)keys[i]] - max_logit) / temperature);
+                probs[i] = p;
+                sum += p;
             }
+            pv = probs;
+            idk = keys;
+            have_probs = 1;
         }
     }
     if (n == 0) {
@@ -1399,18 +1426,19 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
     if (sum <= 0.0f || !isfinite(sum)) {
         out->ids = xmalloc(sizeof(int));
         out->probs = xmalloc(sizeof(float));
-        out->ids[0] = sc[0].id;
+        out->ids[0] = SC_ID(0);
         out->probs[0] = 1.0f;
         out->n = 1;
         return 1;
     }
-    const float min_prob = (sc[0].prob / sum) * min_p;
+    const float min_prob = (SC_PROB(0) / sum) * min_p;
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const float pr = sc[i].prob / sum;
+        const float p = SC_PROB(i);
+        const float pr = p / sum;
         if (i > 0 && pr < min_prob) break;
-        filtered_sum += sc[i].prob;
+        filtered_sum += p;
         filtered++;
         if (filtered_sum / sum >= top_p) break;
     }
@@ -1419,10 +1447,12 @@ int ds4_sample_dist_build(const float *logits, uint32_t n_vocab,
     out->probs = xmalloc((size_t)filtered * sizeof(float));
     out->n = filtered;
     for (uint32_t i = 0; i < filtered; i++) {
-        out->ids[i] = sc[i].id;
-        out->probs[i] = sc[i].prob / filtered_sum;   /* renormalized nucleus */
+        out->ids[i] = SC_ID(i);
+        out->probs[i] = SC_PROB(i) / filtered_sum;   /* renormalized nucleus */
     }
     return 1;
+#undef SC_PROB
+#undef SC_ID
 }
 
 void ds4_sample_dist_free(ds4_sample_dist *d) {
