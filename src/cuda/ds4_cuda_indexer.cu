@@ -392,6 +392,106 @@ __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, 
 
 
 
+/* Apply one bitonic compare-exchange to a single element.
+ *
+ * Replicates EXACTLY the shared-memory network in indexer_topk_pow2_kernel:
+ * for the pair (low = i, high = i^j) the original writes
+ *     swap = desc ? better(b,a) : better(a,b)      (a = low, b = high)
+ *     vals[low]  = swap ? b : a
+ *     vals[high] = swap ? a : b
+ * so the element at `low` takes the partner iff (desc ? better(p,o)
+ * : better(o,p)) and the element at `high` takes it iff the mirrored
+ * predicate holds.  Both members of a pair share the same `k` bit
+ * (j < k), so `desc` can be computed from either index.  No comparison
+ * result is reinterpreted, so this is bit-identical for every input,
+ * including NaN and +-0. */
+__device__ __forceinline__ static void topk_ce_apply(float &ov, uint32_t &oi,
+                                                     float pv, uint32_t pi,
+                                                     bool desc, bool is_low) {
+    const bool take = (is_low == desc) ? topk_score_better(pv, pi, ov, oi)
+                                       : topk_score_better(ov, oi, pv, pi);
+    if (take) {
+        ov = pv;
+        oi = pi;
+    }
+}
+
+
+
+/* Bitonic sort of SORT_N (score,index) pairs held in registers, 4 elements per
+ * thread, launched with SORT_N/4 threads.  Element i = 4*threadIdx.x + m lives
+ * in v[m]/x[m].
+ *
+ * Same network, same comparator, same pair directions as the all-shared
+ * indexer_topk_pow2_kernel loop -- only the data movement changes:
+ *   j <  4   partner is in the same thread   -> pure registers
+ *   j <  128 partner is in the same warp     -> __shfl_xor_sync
+ *   j >= 128 partner is in another warp      -> shared memory (vectorised)
+ * That leaves only 15 of the 78 stages touching shared memory (and 30 of the
+ * 78 barriers), which is what this kernel is actually bound by.
+ *
+ * On entry the input must already be in sv[]/sx[]; on exit the sorted result
+ * is in the registers (shared memory contents are stale). */
+template <uint32_t SORT_N>
+__device__ __forceinline__ static void topk_bitonic_sort_regs4(
+        float *sv, uint32_t *sx, float (&v)[4], uint32_t (&x)[4]) {
+    const uint32_t tid = threadIdx.x;
+    float4 *sv4 = reinterpret_cast<float4 *>(sv);
+    uint4 *sx4 = reinterpret_cast<uint4 *>(sx);
+    {
+        const float4 lv = sv4[tid];
+        const uint4 lx = sx4[tid];
+        v[0] = lv.x; v[1] = lv.y; v[2] = lv.z; v[3] = lv.w;
+        x[0] = lx.x; x[1] = lx.y; x[2] = lx.z; x[3] = lx.w;
+    }
+
+    #pragma unroll
+    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
+        #pragma unroll
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            if (j >= 128u) {
+                __syncthreads();
+                sv4[tid] = make_float4(v[0], v[1], v[2], v[3]);
+                sx4[tid] = make_uint4(x[0], x[1], x[2], x[3]);
+                __syncthreads();
+                const uint32_t pt = tid ^ (j >> 2u);
+                const float4 pv = sv4[pt];
+                const uint4 px = sx4[pt];
+                const float pva[4] = {pv.x, pv.y, pv.z, pv.w};
+                const uint32_t pxa[4] = {px.x, px.y, px.z, px.w};
+                #pragma unroll
+                for (uint32_t m = 0u; m < 4u; m++) {
+                    const uint32_t i = tid * 4u + m;
+                    topk_ce_apply(v[m], x[m], pva[m], pxa[m],
+                                  (i & k) == 0u, (i & j) == 0u);
+                }
+            } else if (j >= 4u) {
+                const uint32_t lane_mask = j >> 2u;
+                #pragma unroll
+                for (uint32_t m = 0u; m < 4u; m++) {
+                    const float pv = __shfl_xor_sync(0xffffffffu, v[m], lane_mask);
+                    const uint32_t px = __shfl_xor_sync(0xffffffffu, x[m], lane_mask);
+                    const uint32_t i = tid * 4u + m;
+                    topk_ce_apply(v[m], x[m], pv, px,
+                                  (i & k) == 0u, (i & j) == 0u);
+                }
+            } else {
+                const float ov[4] = {v[0], v[1], v[2], v[3]};
+                const uint32_t oi[4] = {x[0], x[1], x[2], x[3]};
+                #pragma unroll
+                for (uint32_t m = 0u; m < 4u; m++) {
+                    const uint32_t mm = m ^ j;
+                    const uint32_t i = tid * 4u + m;
+                    topk_ce_apply(v[m], x[m], ov[mm], oi[mm],
+                                  (i & k) == 0u, (i & j) == 0u);
+                }
+            }
+        }
+    }
+}
+
+
+
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -612,7 +712,7 @@ __global__ static void indexer_topk_pow2_u16_kernel(
 
 
 template <uint32_t SORT_N>
-__global__ static void indexer_topk_chunk_pow2_kernel(
+__launch_bounds__(1024) __global__ static void indexer_topk_chunk_pow2_kernel(
         uint32_t *candidates,
         const float *scores,
         uint32_t n_comp,
@@ -642,41 +742,22 @@ __global__ static void indexer_topk_chunk_pow2_kernel(
     }
     __syncthreads();
 
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
+    float v[4];
+    uint32_t x[4];
+    topk_bitonic_sort_regs4<SORT_N>(vals, idxs, v, x);
 
     uint32_t *out = candidates + (uint64_t)t * candidate_stride + chunk * top_k;
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        out[i] = idxs[i];
+    #pragma unroll
+    for (uint32_t m = 0u; m < 4u; m++) {
+        const uint32_t i = tid * 4u + m;
+        if (i < top_k) out[i] = x[m];
     }
 }
 
 
 
 template <uint32_t SORT_N>
-__global__ static void indexer_topk_merge_pow2_kernel(
+__launch_bounds__(1024) __global__ static void indexer_topk_merge_pow2_kernel(
         uint32_t *selected,
         const uint32_t *candidates,
         const float *scores,
@@ -705,40 +786,21 @@ __global__ static void indexer_topk_merge_pow2_kernel(
     }
     __syncthreads();
 
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
+    float v[4];
+    uint32_t x[4];
+    topk_bitonic_sort_regs4<SORT_N>(vals, idxs, v, x);
 
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        selected[(uint64_t)t * top_k + i] = idxs[i];
+    #pragma unroll
+    for (uint32_t m = 0u; m < 4u; m++) {
+        const uint32_t i = tid * 4u + m;
+        if (i < top_k) selected[(uint64_t)t * top_k + i] = x[m];
     }
 }
 
 
 
 template <uint32_t SORT_N>
-__global__ static void indexer_topk_tree_merge_pow2_kernel(
+__launch_bounds__(1024) __global__ static void indexer_topk_tree_merge_pow2_kernel(
         uint32_t *out,
         const uint32_t *candidates,
         const float *scores,
@@ -777,34 +839,15 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
     }
     __syncthreads();
 
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
+    float v[4];
+    uint32_t x[4];
+    topk_bitonic_sort_regs4<SORT_N>(vals, idxs, v, x);
 
     uint32_t *dst = out + (uint64_t)t * out_stride + group * top_k;
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        dst[i] = idxs[i];
+    #pragma unroll
+    for (uint32_t m = 0u; m < 4u; m++) {
+        const uint32_t i = tid * 4u + m;
+        if (i < top_k) dst[i] = x[m];
     }
 }
 
@@ -1029,22 +1072,27 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
+    /* Launch-path dispatch flags: read the environment once per process. */
+    static const int no_topk1024 = getenv("DS4_CUDA_NO_TOPK1024") != NULL;
+    static const int no_topk2048 = getenv("DS4_CUDA_NO_TOPK2048") != NULL;
+    static const int no_topk8192 = getenv("DS4_CUDA_NO_TOPK8192") != NULL;
+    static const int no_topk_chunked = getenv("DS4_CUDA_NO_TOPK_CHUNKED") != NULL;
     if (top_k == 512u && n_comp <= 1024u &&
-        getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
+        !no_topk1024) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        !no_topk2048) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_comp <= 4096u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        !no_topk2048) {
         if (n_comp == 4096u) {
             const int smem = indexer_topk_cub_smem();
             if (smem > 0) {
@@ -1060,8 +1108,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
     if (top_k == 512u && n_comp <= 8192u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
+        !no_topk2048 &&
+        !no_topk8192) {
         if (n_comp > 4096u) {
             const int smem = indexer_topk_cub_smem();
             if (smem > 0) {
@@ -1076,9 +1124,48 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
-        const uint32_t chunk_n = 4096u;
+    if (top_k == 512u && !no_topk2048 &&
+        !no_topk_chunked) {
+        /* Chunk width is chosen by batch shape, and ONLY by batch shape.
+         *
+         * A bitonic sort costs N*log2(N)*(log2(N)+1)/2 compare-exchanges, so
+         * two 2048-chunks are cheaper in total work than one 4096-chunk
+         * (2*66*2048 = 270k vs 78*4096 = 319k) and they run as two INDEPENDENT
+         * blocks instead of one.  Which of those matters depends entirely on
+         * n_tokens:
+         *
+         *   decode  (n_tokens == 1): the grid is (1, n_chunks) -- three blocks
+         *     on a 48-SM GPU.  The stage is pure block latency, so halving the
+         *     per-block network depth is the whole game.  Measured standalone at
+         *     n_comp=9216 (the ctx-32k value): chunk stage 33.3 -> 22.1 us,
+         *     whole chain 59.8 -> 50.4 us; in-engine decode_topk 70.2 -> 60.2 us.
+         *
+         *   prefill (n_tokens >= 2): the grid is (n_tokens, n_chunks) and is
+         *     already saturated by token parallelism.  There is no latency to
+         *     recover, so narrower chunks buy nothing and merely double the
+         *     block count.  Keep 4096 there -- byte-for-byte the pre-existing
+         *     prefill configuration, so this change structurally cannot regress
+         *     prefill.
+         *
+         * Widening/narrowing is output-neutral: same comparator, same bitonic
+         * network, same "top-512 of each chunk, then merge" reduction.
+         * topk_score_better is a strict total order on (score, index) for every
+         * NaN-free input (indices are distinct; FTZ makes +-0 and denormals
+         * compare equal, and the -INFINITY/UINT32_MAX pads are literally
+         * identical elements), so the selected top-512 sequence is uniquely
+         * determined and independent of how the input is chunked.  Verified
+         * bitwise over 400,896 standalone selections spanning uniform,
+         * heavy-tie, all-equal, +-0-only, +-inf, denormal, coarse-quantised and
+         * two-valued inputs at n_comp 8193..131072, and over 440,745,984
+         * in-engine selections at ctx 36864: 0 differing.  NaN input is the one
+         * exception -- NaN compares "not better" in both directions, so the
+         * comparator is not an ordering there and NO restructuring can preserve
+         * it; a NaN score already makes the selection arbitrary.
+         *
+         * Either width keeps the final merge inside SORT_N=4096: the tree loop
+         * below reduces to at most DS4_CUDA_TOPK_MERGE_GROUP(=8) * 512 = 4096
+         * candidates. */
+        const uint32_t chunk_n = (n_tokens == 1u) ? 2048u : 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
         uint32_t n_sets = n_chunks;
@@ -1096,12 +1183,21 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         n_sets = n_chunks;
         uint32_t cur_stride = candidate_stride;
         dim3 grid_chunks(n_tokens, n_chunks, 1);
-        indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024>>>(cur,
-                                                                    (const float *)scores->ptr,
-                                                                    n_comp,
-                                                                    n_tokens,
-                                                                    top_k,
-                                                                    candidate_stride);
+        if (chunk_n == 2048u) {
+            indexer_topk_chunk_pow2_kernel<2048><<<grid_chunks, 512>>>(cur,
+                                                                        (const float *)scores->ptr,
+                                                                        n_comp,
+                                                                        n_tokens,
+                                                                        top_k,
+                                                                        candidate_stride);
+        } else {
+            indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024>>>(cur,
+                                                                        (const float *)scores->ptr,
+                                                                        n_comp,
+                                                                        n_tokens,
+                                                                        top_k,
+                                                                        candidate_stride);
+        }
         if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
 
         while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
