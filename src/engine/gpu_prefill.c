@@ -74,6 +74,19 @@ ds4_gpu_tensor *gpu_graph_tensor_row_view(
 }
 
 
+/* Row view into an HC residual CARRIER buffer (BF16 storage; task #62). Same as
+ * gpu_graph_tensor_row_view but strides by DS4_HC_ELT_SIZE, not sizeof(float) —
+ * use this (not the generic helper) for cur_hc/next_hc/after_*_hc bases. */
+ds4_gpu_tensor *gpu_graph_hc_row_view(
+        ds4_gpu_tensor *base,
+        uint32_t          row,
+        uint64_t          row_values) {
+    return ds4_gpu_tensor_view(base,
+                                 (uint64_t)row * row_values * DS4_HC_ELT_SIZE,
+                                 row_values * DS4_HC_ELT_SIZE);
+}
+
+
 
 /* Upload prompt token ids for kernels that need token-aware hash routing. */
 bool gpu_graph_upload_prompt_tokens(
@@ -181,20 +194,22 @@ static bool gpu_graph_upload_prompt_embeddings_hc_cpu(
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t total = (uint64_t)n_tokens * hc_dim;
-    float *hc = xmalloc((size_t)total * sizeof(hc[0]));
+    /* out_hc is an HC residual CARRIER (BF16 storage; task #62) — stage in the
+     * carrier's element size, NOT f32, or this write overflows the device buffer
+     * by 2x. Rounding matches the GPU store path (__float2bfloat16 = RNE). */
+    unsigned char *hc = xmalloc((size_t)total * DS4_HC_ELT_SIZE);
     float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
 
     for (uint32_t t = 0; t < n_tokens; t++) {
         embed_token_f16(model, weights, prompt->v[pos0 + t], plain);
-        float *dst = hc + (uint64_t)t * hc_dim;
+        unsigned char *dst = hc + (uint64_t)t * hc_dim * DS4_HC_ELT_SIZE;
         for (uint32_t h = 0; h < DS4_N_HC; h++) {
-            memcpy(dst + (uint64_t)h * DS4_N_EMBD,
-                   plain,
-                   (size_t)DS4_N_EMBD * sizeof(plain[0]));
+            unsigned char *row = dst + (uint64_t)h * DS4_N_EMBD * DS4_HC_ELT_SIZE;
+            ds4_store_hc_carrier_f32(row, plain, DS4_N_EMBD);
         }
     }
 
-    const bool ok = ds4_gpu_tensor_write(out_hc, 0, hc, total * sizeof(hc[0])) != 0;
+    const bool ok = ds4_gpu_tensor_write(out_hc, 0, hc, total * DS4_HC_ELT_SIZE) != 0;
     free(plain);
     free(hc);
     return ok;
@@ -462,7 +477,7 @@ bool gpu_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *attn_cur_view = ds4_gpu_tensor_view(
             g->batch_attn_cur, 0, (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
-            g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
+            g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * DS4_HC_ELT_SIZE);   /* carrier */
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
     const bool fuse_hc_norm = DS4_N_HC == 4 &&
                               !gpu_graph_use_reference_hc_decode() &&
@@ -543,6 +558,14 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("attn_norm", g->batch_attn_norm,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
+    /* batch_attn_norm is now final for this layer and feeds up to seven MXFP8
+     * projections below (q_a, kv, attn compressor kv+gate, indexer compressor
+     * kv+gate, indexer_proj), each of which would otherwise re-quantize the
+     * identical [n_tokens x n_embd] f32 tensor.  Arm the quantize-once cache
+     * here -- immediately after the ONLY writes to this buffer (the fused-norm
+     * and standalone-norm branches above), which is what keeps a later cache
+     * hit coherent -- and disarm at the single exit below. */
+    if (ok) ds4_gpu_mxfp8_act_cache_arm(g->batch_attn_norm, n_tokens, DS4_N_EMBD);
     DS4_CUDA_PROFILE_ATTN_STAGE("norm");
     DS4_CUDA_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
@@ -2308,10 +2331,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                             DS4_N_HC) != 0;
     }
     if (ok) {
-        gpu_graph_debug_dump_tensor("hc_attn_post", g->batch_after_attn_hc,
+        gpu_graph_debug_dump_hc_tensor("hc_attn_post", g->batch_after_attn_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
     DS4_CUDA_PROFILE_ATTN_STAGE("hc_post");
+    ds4_gpu_mxfp8_act_cache_disarm();
     ds4_gpu_tensor_free(after_attn_hc_view);
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
@@ -2364,7 +2388,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor *ffn_cur_view = ds4_gpu_tensor_view(
             g->batch_ffn_cur, 0, (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
     ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
-            g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
+            g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * DS4_HC_ELT_SIZE);   /* carrier */
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
     const bool fuse_hc_norm = DS4_N_HC == 4 &&
                               !gpu_graph_use_reference_hc_decode() &&
@@ -2621,7 +2645,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                   DS4_N_HC) != 0;
     }
     if (ok) {
-        gpu_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
+        gpu_graph_debug_dump_hc_tensor("hc_ffn_post", g->batch_next_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
     DS4_CUDA_PROFILE_FFN_STAGE("hc_post");

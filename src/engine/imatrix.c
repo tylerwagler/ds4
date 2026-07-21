@@ -441,7 +441,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         ds4_gpu_tensor *saved_cur = g->cur_hc;
         ds4_gpu_tensor *last_hc = NULL;
         if (ok && logits) {
-            last_hc = gpu_graph_tensor_row_view(g->batch_cur_hc, output_row, hc_dim);
+            last_hc = gpu_graph_hc_row_view(g->batch_cur_hc, output_row, hc_dim);
             ok = last_hc != NULL;
         }
         if (ok && logits) {
@@ -619,9 +619,9 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     const double t_head0 = profile ? now_sec() : 0.0;
     if (logits) {
-        last_hc = gpu_graph_tensor_row_view(g->batch_cur_hc,
-                                              output_row,
-                                              hc_dim);
+        last_hc = gpu_graph_hc_row_view(g->batch_cur_hc,
+                                          output_row,
+                                          hc_dim);
         ok = last_hc != NULL;
     }
     if (ok && logits) {
@@ -896,7 +896,11 @@ bool gpu_graph_verify_suffix_tops(
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
 
-    const bool timing = getenv("DS4_SPEC_VERIFY_TIMING") != NULL;
+    /* Diagnostic flag: read the environment once per process (C has no
+     * static-initializer form for this, so use the repo's -1 sentinel idiom). */
+    static int timing_env = -1;
+    if (timing_env < 0) timing_env = getenv("DS4_SPEC_VERIFY_TIMING") != NULL;
+    const bool timing = timing_env != 0;
     const double t0 = timing ? now_sec() : 0.0;
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
@@ -1175,7 +1179,7 @@ int gpu_graph_decode_multiseq_batch(
          * ascending with last_idx[r] >= r, so front-compaction never clobbers an
          * un-copied source. The extra synchronize is amortized over the prefill. */
         if (ok) ok = ds4_gpu_end_commands() != 0; else (void)ds4_gpu_synchronize();
-        const uint64_t hc_row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        const uint64_t hc_row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * DS4_HC_ELT_SIZE;   /* carrier */
         for (uint32_t r = 0; ok && r < head_runs; r++) {
             if ((uint32_t)last_idx[r] != r)
                 ok = ds4_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,

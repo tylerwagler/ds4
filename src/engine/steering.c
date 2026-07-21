@@ -121,18 +121,27 @@ ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
  * the command batch, so it is intentionally isolated here.
  */
 
+/* Is graph dumping enabled AT ALL this process?  Read once and cached.  Exposed
+ * so graph allocation can skip buffers that exist ONLY to be dumped: the routed
+ * MoE gate/up staging slabs are written by the qwarp32 kernels and read by
+ * nothing except gpu_graph_debug_dump_tensor, yet cost ~400 MB per session at
+ * the default prefill_cap and ~2-4 MB/token of pointless device writes. */
+bool gpu_graph_debug_dump_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *p = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+        enabled = (p && p[0]) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
     /* Called ~60x/layer x 43 layers/token on the release decode path, where it
      * is a no-op unless dumping is enabled.  Cache the enabled flag so the
      * common (disabled) case costs one branch, not a linear environ scan per
      * call.  The dump env vars are read once at process start like every other
      * flag; caching does not change runtime behavior. */
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *p = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
-        enabled = (p && p[0]) ? 1 : 0;
-    }
-    if (!enabled) return false;
+    if (!gpu_graph_debug_dump_enabled()) return false;
 
     const char *name_env = getenv("DS4_CUDA_GRAPH_DUMP_NAME");
     if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;

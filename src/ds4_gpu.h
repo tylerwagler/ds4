@@ -5,6 +5,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Hyper-connection (HC) residual-stream storage precision (task #62).
+ * The source model runs a BF16 residual (config torch_dtype: bfloat16 — see
+ * ds4-source-numerics); our HC carriers were f32, i.e. 2x the precision AND
+ * bandwidth of the source with no fidelity gain. We narrow the STORAGE of the
+ * six swap-coupled HC residual carriers (cur_hc/after_attn_hc/after_ffn_hc and
+ * their batched twins) to BF16, while every kernel keeps accumulating in f32 —
+ * exactly what torch does (bf16 storage, f32 math). This macro is the element
+ * size of a stored HC residual sample, shared by the CUDA kernels (typed via
+ * ds4_hc_t in ds4_cuda_internal.h) and the C host stride/offset math.
+ *
+ * Define DS4_HC_F32 (compile flag) to restore f32 carriers — the fallback, and
+ * the intermediate used to prove the storage-narrowing plumbing is a pure
+ * no-op (f32 build must be byte-identical to the pre-change build) before the
+ * BF16 flip. One compile-time switch; NO per-token/per-layer runtime branch. */
+#ifdef DS4_HC_F32
+#define DS4_HC_ELT_SIZE 4u
+#else
+#define DS4_HC_ELT_SIZE 2u
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -208,6 +228,20 @@ void ds4_gpu_register_fp8_weight(uint64_t weight_offset);
  * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
  * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
 void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset);
+
+/* Batched-prefill activation quantization cache.
+ *
+ * One normalized activation feeds several block-scaled MXFP8 projections per
+ * layer; the per-GEMM activation quantization is a pure function of the buffer
+ * and its shape, so it only has to run once.  Arm the cache immediately after
+ * the activation is written (arming invalidates any earlier contents, which is
+ * what makes a later hit safe even though the buffer pointer is reused every
+ * layer); disarm when the activation is dead.  A backend without the
+ * optimization may implement both as no-ops.  Purely a traffic optimization:
+ * results are bit-identical either way.
+ */
+void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
+void ds4_gpu_mxfp8_act_cache_disarm(void);
 
 /* Optional fused GPU operations.
  *
@@ -1178,6 +1212,20 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps);
+
+/* Fused plain-RMSNorm + f16 HC-mix GEMV (decode, n_tok == 1).  Byte-identical
+ * to rms_norm_plain_tensor() followed by matmul_f16_tensor(); see the kernel
+ * comment in ds4_cuda_hc_router.cu for the order argument.  `x` is an HC
+ * residual CARRIER (ds4_hc_t storage, DS4_HC_ELT_SIZE bytes/sample), not f32. */
+int ds4_gpu_hc_norm_mix_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   eps);
 
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,

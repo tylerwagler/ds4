@@ -19,6 +19,19 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 
+# HC residual-carrier storage precision (task #62). HC_F32=1 restores f32
+# carriers (the fallback, and the control build for the byte-exact gate).
+# CRITICAL: this MUST reach BOTH the host (CFLAGS) and device (NVCCFLAGS) TUs.
+# Defining it on only one half compiles and links cleanly, the in-TU
+# static_assert does NOT fire, and every residual read/write silently strides
+# the wrong element size -> total activation corruption. Never pass
+# -DDS4_HC_F32 by hand; use HC_F32=1.
+HC_F32 ?= 0
+ifeq ($(HC_F32),1)
+CFLAGS += -DDS4_HC_F32
+NVCCFLAGS += -DDS4_HC_F32
+endif
+
 CUTLASS_DIR ?= $(CURDIR)/cutlass
 CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt

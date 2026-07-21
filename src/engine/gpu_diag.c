@@ -72,6 +72,39 @@ void gpu_graph_debug_dump_tensor(
 }
 
 
+/* Same dump for an HC residual CARRIER (BF16 storage; task #62). The plain f32
+ * dump above would read n*sizeof(float) from a buffer holding n*DS4_HC_ELT_SIZE
+ * bytes — a 2x out-of-bounds read — so carriers MUST come through here. */
+void gpu_graph_debug_dump_hc_tensor(
+        const char       *name,
+        ds4_gpu_tensor *t,
+        uint64_t          n_elems,
+        uint32_t          il,
+        uint32_t          pos) {
+    if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
+        return;
+    }
+
+    float *buf = xmalloc((size_t)n_elems * sizeof(buf[0]));
+    if (ds4_read_hc_carrier_f32(t, 0, buf, n_elems) != 0) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        if (write_f32_binary_file(path, buf, n_elems)) {
+            fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+        }
+    }
+    free(buf);
+
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
+    }
+}
+
+
 
 void gpu_graph_debug_dump_f16_tensor(
         const char       *name,
@@ -309,6 +342,7 @@ uint64_t gpu_graph_session_bytes_banked(
     gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
     const uint64_t pc = dz.prefill_cap;
     const uint64_t f32 = sizeof(float);
+    const uint64_t hc = DS4_HC_ELT_SIZE;   /* HC residual carrier element (BF16); task #62 */
 
     /* Persistent KV caches (raw ring, packed attn comp, indexer comp) plus the
      * indexer_scores/comp_mask working pair — shared with the managed-vs-device
@@ -340,7 +374,8 @@ uint64_t gpu_graph_session_bytes_banked(
     }
 
     /* Single-token graph buffers. */
-    total += 2ull * dz.hc_dim * f32;                      /* cur_hc, flat_hc */
+    total += dz.hc_dim * hc;                              /* cur_hc (carrier) */
+    total += dz.hc_dim * f32;                             /* flat_hc (RMSNorm out, f32) */
     total += 2ull * dz.mix_hc * f32;                      /* hc_mix, hc_split (views free) */
     total += 2ull * DS4_N_EMBD * f32;                     /* attn_cur, attn_norm */
     total += 2ull * dz.q_rank * f32;                      /* qr, qr_norm */
@@ -361,7 +396,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += dz.q_dim * f32;                              /* heads */
     total += dz.low_dim * f32;                            /* attn_low */
     total += (uint64_t)DS4_N_EMBD * f32;                  /* attn_out */
-    total += dz.hc_dim * f32;                             /* after_attn_hc */
+    total += dz.hc_dim * hc;                              /* after_attn_hc (carrier) */
     total += 2ull * DS4_N_EMBD * f32;                     /* ffn_cur, ffn_norm */
     total += 3ull * dz.shared_dim * f32;                  /* shared_gate/up/mid */
     total += (uint64_t)DS4_N_EMBD * f32;                  /* shared_out */
@@ -370,7 +405,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += 3ull * DS4_N_EXPERT_USED * dz.routed_mid_dim * f32; /* routed_gate/up/mid */
     total += (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * f32;     /* routed_down */
     total += (uint64_t)DS4_N_EMBD * f32;                  /* routed_out */
-    total += dz.hc_dim * f32;                             /* after_ffn_hc */
+    total += dz.hc_dim * hc;                              /* after_ffn_hc (carrier) */
     total += 2ull * DS4_N_HC * f32;                       /* output_pre, output_weights */
     total += 2ull * DS4_N_EMBD * f32;                     /* output_embd, output_norm */
     total += dz.vocab_dim * f32;                          /* logits */
@@ -386,7 +421,8 @@ uint64_t gpu_graph_session_bytes_banked(
 
     /* Batch (prefill working set) buffers — the pc-scaled bulk that dominates
      * the non-KV cost (~4 GiB at pc=4096 on Flash). */
-    total += 3ull * pc * dz.hc_dim * f32;                 /* batch_cur/next/flat_hc */
+    total += 2ull * pc * dz.hc_dim * hc;                  /* batch_cur/next_hc (carriers) */
+    total += pc * dz.hc_dim * f32;                        /* batch_flat_hc (RMSNorm out, f32) */
     total += 2ull * pc * dz.mix_hc * f32;                 /* batch_hc_mix/split */
     total += 2ull * pc * DS4_N_EMBD * f32;                /* batch_attn_cur/norm */
     total += 2ull * pc * dz.q_rank * f32;                 /* batch_qr/qr_norm */
@@ -398,7 +434,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += pc * dz.q_dim * f32;                         /* batch_heads */
     total += pc * dz.low_dim * f32;                       /* batch_attn_low */
     total += pc * DS4_N_EMBD * f32;                       /* batch_attn_out */
-    total += pc * dz.hc_dim * f32;                        /* batch_after_attn_hc */
+    total += pc * dz.hc_dim * hc;                         /* batch_after_attn_hc (carrier) */
     total += 2ull * pc * DS4_N_EMBD * f32;                /* batch_ffn_cur/norm */
     total += 3ull * pc * dz.shared_dim * f32;             /* batch_shared_gate/up/mid */
     total += pc * DS4_N_EMBD * f32;                       /* batch_shared_out */
@@ -736,6 +772,20 @@ bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank) {
         if (ok) ok = bank_bases_set(g, il, bank, b->comp[il][bank],
                                     ratio == 4 ? b->index[il][bank] : NULL);
     }
+    if (!ok) {
+        /* TRANSACTIONAL: roll the bank back to fully-evicted rather than leaving
+         * layers 0..k allocated.  A half-allocated bank is the dangerous state —
+         * callers (server_bank_restore_spilled) return false, so the slot stays
+         * marked spilled, but the bank now LOOKS partly live.  Returning it to a
+         * clean evicted state keeps gpu_graph_bank_is_evicted's answer truthful
+         * and lets a later retry start from scratch. */
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (ds4_layer_compress_ratio(il) == 0) continue;
+            if (b->comp[il][bank])  { ds4_gpu_tensor_free(b->comp[il][bank]);  b->comp[il][bank] = NULL; }
+            if (b->index[il][bank]) { ds4_gpu_tensor_free(b->index[il][bank]); b->index[il][bank] = NULL; }
+            (void)bank_bases_set(g, il, bank, NULL, NULL);
+        }
+    }
     return ok;
 }
 
@@ -743,9 +793,17 @@ bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank) {
  * server checks this before restoring on a returning request. */
 bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank) {
     if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
+    /* Scan EVERY compressed layer, not just the first.  The old version sampled
+     * layer 0 and returned, on the assumption that slabs are freed in lockstep.
+     * That holds for eviction, but NOT for a FAILED (re)allocation:
+     * gpu_graph_bank_alloc_physical can fail partway and leave layers 0..k
+     * allocated, at which point a layer-0 sample reports the bank LIVE while it
+     * is really half-built — and bank_fork_copy would then read NULL/garbage
+     * slabs from it (silent cross-conversation KV corruption).  A bank is only
+     * "live" when every compressed layer has physical. */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (ds4_layer_compress_ratio(il) == 0) continue;
-        return g->banks.comp[il][bank] == NULL;   /* freed in lockstep across layers */
+        if (g->banks.comp[il][bank] == NULL) return true;
     }
     return false;
 }
@@ -1570,7 +1628,7 @@ bool gpu_graph_alloc_raw_cap(
     }
     const bool banked = g->banks.n_banks != 0;
 
-    g->cur_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    g->cur_hc = ds4_gpu_tensor_alloc(hc_dim * DS4_HC_ELT_SIZE);   /* HC residual carrier (BF16); task #62 */
     g->flat_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->hc_mix = ds4_gpu_tensor_alloc(mix_hc * sizeof(float));
     g->hc_split = ds4_gpu_tensor_alloc(mix_hc * sizeof(float));
@@ -1710,7 +1768,7 @@ bool gpu_graph_alloc_raw_cap(
     g->heads = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
     g->attn_low = ds4_gpu_tensor_alloc(low_dim * sizeof(float));
     g->attn_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->after_attn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    g->after_attn_hc = ds4_gpu_tensor_alloc(hc_dim * DS4_HC_ELT_SIZE);   /* HC residual carrier */
     g->ffn_cur = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->ffn_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->shared_gate = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
@@ -1721,12 +1779,17 @@ bool gpu_graph_alloc_raw_cap(
     g->router_probs = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
     g->router_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
     g->router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    /* NOTE (task #64): these look debug-only — the qwarp32 kernels' stores are
+     * read only by gpu_graph_debug_dump_tensor — but they are NOT safe to skip:
+     * routed_moe_*_impl rejects NULL gate/up (moe.cu ~2597/2908) and the batch
+     * path REUSES gate->ptr as cuda_block_q8_K staging for quantized mid
+     * (moe.cu ~2957). Keep them allocated unconditionally. */
     g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->routed_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->after_ffn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    g->after_ffn_hc = ds4_gpu_tensor_alloc(hc_dim * DS4_HC_ELT_SIZE);   /* HC residual carrier */
     g->output_pre = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->output_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
@@ -1741,8 +1804,8 @@ bool gpu_graph_alloc_raw_cap(
      * only), which left the multiseq driver rejecting every step whenever
      * speculation was off. */
     g->spec_logits = ds4_gpu_tensor_alloc(16ull * DS4_N_VOCAB * sizeof(float));
-    g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+    g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * DS4_HC_ELT_SIZE);   /* HC residual carrier */
+    g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * DS4_HC_ELT_SIZE);   /* HC residual carrier */
     g->batch_flat_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_hc_mix = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
@@ -1760,7 +1823,7 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
     g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_after_attn_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+    g->batch_after_attn_hc = ds4_gpu_tensor_alloc(pc * hc_dim * DS4_HC_ELT_SIZE);   /* HC residual carrier */
     g->batch_ffn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_ffn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_shared_gate = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
