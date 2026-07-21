@@ -179,8 +179,20 @@ int main(int argc, char **argv) {
 
         /* Tolerance: host-page rounding + UVM slack. Managed pages fault in at
          * (up to) 2 MiB granularity per bank/layer lane, and MemAvailable can
-         * wobble; allow the LARGER of 256 MiB or 12% of the increment. */
-        const int64_t tol = (int64_t)(256ull * 1024 * 1024);
+         * wobble; allow the LARGER of this floor or 12% of the increment.
+         *
+         * 2026-07-21: raised 256 -> 768 MiB after a measured A/B showed this
+         * check flaking ~25% of runs IDENTICALLY on clean HEAD and on a modified
+         * tree (3 PASS / 1 FAIL per arm, 4 runs each) — i.e. a gate defect, not a
+         * product defect.  `phys_delta` comes from a machine-GLOBAL
+         * `cudaMemGetInfo` free delta, which drifts by up to ~470 MiB between the
+         * warm baseline and the first fill (the engine transiently releases a few
+         * hundred MiB), while the signal being measured is only 64-160 MiB.  The
+         * noise floor was simply larger than the tolerance.  The bounded
+         * never-overcount invariant below is the check with real teeth and is
+         * unaffected; `dtouched` was bit-stable (0.064/0.160 GiB) across all 8
+         * runs, so the engine's own accounting was never in question. */
+        const int64_t tol = (int64_t)(768ull * 1024 * 1024);
         const int64_t tol_rel = (int64_t)(0.12 * (double)touched_delta);
         const int64_t tol_eff = tol > tol_rel ? tol : tol_rel;
 
@@ -191,7 +203,13 @@ int main(int argc, char **argv) {
                 "| dphys=%.3f GiB dtouched=%.3f GiB diff=%.1f MiB (%.1f%%) tol=%.0f MiB -> %s\n",
                 len,
                 (double)touched / GIB, (double)touched_delta / GIB,
-                (double)(free0 - free_now) / GIB, (double)phys_delta / GIB,
+                /* free0 - free_now UNDERFLOWS when cudaMemGetInfo's free has RISEN
+                 * since the warm baseline (the engine transiently releases a few
+                 * hundred MiB), printing 2^64 bytes = 17179869184 GiB and making a
+                 * benign flake look like catastrophic corruption.  Guard it the
+                 * same way the absolute check below already does. */
+                (double)(free0 > free_now ? free0 - free_now : 0) / GIB,
+                (double)phys_delta / GIB,
                 (double)phys_delta / GIB, (double)touched_delta / GIB,
                 (double)diff / (1024.0 * 1024.0), rel * 100.0,
                 (double)tol_eff / (1024.0 * 1024.0),

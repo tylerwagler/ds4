@@ -85,7 +85,7 @@ static bool spec_stream(ds4_session *s, int steps, int *stream,
     int acc[32];
     uint64_t rng = 0x2545F4914F6CDD1Dull;
     const int eos = ds4_token_eos(g_e);
-    const uint64_t acc0 = s->spec_accepted_tokens, drf0 = s->spec_draft_tokens;
+    const uint64_t acc0 = s->spec.spec_accepted_tokens, drf0 = s->spec.spec_draft_tokens;
     int emitted = 0;
     while (emitted < steps) {
         const int base = s->checkpoint.len;
@@ -97,8 +97,8 @@ static bool spec_stream(ds4_session *s, int steps, int *stream,
         for (int i = 0; i < ntok && emitted < steps; i++)
             stream[emitted++] = s->checkpoint.v[base + i];
     }
-    if (accepted) *accepted = s->spec_accepted_tokens - acc0;
-    if (drafted)  *drafted  = s->spec_draft_tokens - drf0;
+    if (accepted) *accepted = s->spec.spec_accepted_tokens - acc0;
+    if (drafted)  *drafted  = s->spec.spec_draft_tokens - drf0;
     /* pad a short (eos) stream so comparisons stay in-bounds */
     for (int j = emitted; j < steps; j++) stream[j] = -1;
     return true;
@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
             for (int k = 0; k < 2 && ok; k++) {
                 if (emitted[k] >= steps) continue;
                 if (!ds4_session_bank_state_restore(s, (uint32_t)k)) { ok = false; break; }
-                const uint64_t a0 = s->spec_accepted_tokens, d0 = s->spec_draft_tokens;
+                const uint64_t a0 = s->spec.spec_accepted_tokens, d0 = s->spec.spec_draft_tokens;
                 const int base = s->checkpoint.len;
                 const int ntok = ds4_session_generate_speculative(
                         s, 0.0f, 0, 1.0f, 0.0f, &rng[k], steps - emitted[k], eos,
@@ -234,8 +234,8 @@ int main(int argc, char **argv) {
                 if (ntok < 0) { fprintf(stderr, "T2 spec bank %d: %s\n", k, err); ok = false; break; }
                 for (int i = 0; i < ntok && emitted[k] < steps; i++)
                     ts[k][emitted[k]++] = s->checkpoint.v[base + i];
-                acc[k] += s->spec_accepted_tokens - a0;
-                drf[k] += s->spec_draft_tokens - d0;
+                acc[k] += s->spec.spec_accepted_tokens - a0;
+                drf[k] += s->spec.spec_draft_tokens - d0;
                 if (ntok == 0) emitted[k] = steps; /* eos/stall: retire */
                 ds4_session_bank_state_save(s, (uint32_t)k);
             }
