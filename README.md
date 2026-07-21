@@ -414,6 +414,10 @@ immediate 503 instead of piling up threads), and a whole-request read deadline
 
 Supported endpoints:
 
+- `GET /health` — readiness + live status: `{status, version, model, uptime_s, slots{total,running,waiting}, kv_cache_usage}`; **200** when serving, **503 `{"status":"draining"}`** once shutdown is requested (so a load balancer stops routing)
+- `GET /healthz`, `GET /ping` — liveness (always **200** while the process runs, independent of drain state)
+- `GET /version` — `{version, engine, cuda_arch, model, model_name, context}`
+- `GET /` — banner with version + endpoint list
 - `GET /v1/models`
 - `GET /v1/models/{id}`
 - `POST /v1/chat/completions` — OpenAI-compatible
@@ -426,7 +430,8 @@ Supported endpoints:
 as a compatibility alias: it reports the model actually loaded from the GGUF
 passed with `-m`; the id does not select a different model.
 
-There is no `/health` endpoint; use `GET /v1/models` as the health probe.
+Use `GET /health` for readiness/status (or `GET /v1/models`, which also
+returns 200 when the model is loaded and serving).
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
