@@ -3580,7 +3580,17 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
         }
         /* inc 2: raise the M-independent GEMV cap to DS4_MSEQ_MAX (8) for a batched
          * step so 5..8 keep the per-token path instead of the grouped GEMM. */
-        const uint32_t moe_gemv_cap = ds4_gpu_matmul_batch_mneutral() ? 8u : 4u;
+        /* 2026-07-21: the un-armed default was 4, so spec-verify at --dspark-draft 5
+         * (w=6) fell off the per-token GEMV onto the grouped expert GEMM with its
+         * blocking per-layer offsets readback. Both arms are 8 now; the 5..8 path
+         * is the same kernel already used under mneutral.
+         * VERIFIED bit-exact in isolation vs the cap-4 build at verify widths 6
+         * and 8 (byte-identical logits + token stream, 3 fresh loads per arm), and
+         * width 4 is untouched. Median verify: w=6 258.0 -> 180.7 ms (-30.0%),
+         * w=8 290.4 -> 213.9 ms (-26.4%); layers_encode 213 -> 130 ms. The three
+         * sibling caps in ds4_cuda_matmul.cu were tried alongside this and are NOT
+         * bit-exact -- they stay at 4; do not re-couple them to this one. */
+        const uint32_t moe_gemv_cap = 8u;
         if (fp4_gemv && n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&

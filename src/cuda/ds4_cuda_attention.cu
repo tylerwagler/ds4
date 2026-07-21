@@ -1792,6 +1792,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
 }
 
 
+
+
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
@@ -1802,9 +1804,13 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* Launch-path dispatch flags: read the environment once per process. */
+    static const int no_window_attn = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
+    static const int force_window_attn = getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL;
+    static const int no_cublas_attn = getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") != NULL;
     if (n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        !no_window_attn &&
+        (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -1821,7 +1827,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        !no_cublas_attn) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
@@ -2040,9 +2046,12 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
+    /* Launch-path dispatch flags: read the environment once per process. */
+    static const int no_window_attn = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
+    static const int force_window_attn = getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        !no_window_attn &&
+        (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -2186,9 +2195,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_banks) {
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
      * (scalar n_raw/raw_start ignored and unvalidated, raw_cap must be the true
-     * per-bank ring capacity, rejections fail-loud); additionally the heads8
-     * fast variants stay single-bank-only, so banked rows are forced onto the
-     * generic per-(row,head) kernel below. */
+     * per-bank ring capacity, rejections fail-loud).  NOTE: banked rows are NO
+     * LONGER forced onto the generic per-(row,head) kernel — 0e643eb taught the
+     * heads8-online fast variant the banked descriptors, and the dispatch below
+     * routes banked rows to it (see the rationale at the dispatch site).  That
+     * recovered ~5x on ratio-4 banked prefill; do not "restore" the old
+     * single-bank-only restriction. */
     const int descr = positions != NULL || seq_id != NULL;
     if (descr &&
         (!positions || !seq_id || n_banks == 0 || raw_cap == 0 || ratio == 0 ||
@@ -2237,8 +2249,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const void * const *comp_bank_ptrs_ptr =
         (descr && comp_bank_ptrs) ? (const void * const *)comp_bank_ptrs->ptr : NULL;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    /* Launch-path dispatch flags: read the environment once per process. */
+    static const int no_indexed_topk_sort = getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") != NULL;
+    static const int no_indexed_heads8 = getenv("DS4_CUDA_NO_INDEXED_HEADS8") != NULL;
+    static const int twopass_requested = getenv("DS4_CUDA_INDEXED_TWOPASS") != NULL;
     if (n_tokens > 1u && top_k == 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+        !no_indexed_topk_sort) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
@@ -2257,10 +2273,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      * f32 -> online, pack -> generic — so no classic path changes behaviour. */
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         (descr || !comp_kv_pack) &&
-        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+        !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
          * online branch. */
-        if (descr || comp_kv_pack || getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        if (descr || comp_kv_pack || !twopass_requested) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
                                                                                sinks,
@@ -2370,9 +2386,13 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* Launch-path dispatch flags: read the environment once per process. */
+    static const int no_window_attn = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
+    static const int force_window_attn = getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL;
+    static const int no_cublas_attn = getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") != NULL;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        !no_window_attn &&
+        (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -2389,7 +2409,7 @@ static int attention_prefill_mixed_launch(
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        !no_cublas_attn) {
         const uint32_t n_keys = n_tokens + n_comp;
         const uint64_t kv_count = (uint64_t)n_keys * head_dim;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;

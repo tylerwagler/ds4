@@ -2,19 +2,19 @@
 
 
 
-__global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
+__global__ static void embed_token_hc_kernel(ds4_hc_t *out, const unsigned short *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
     if (i >= n) return;
     uint32_t e = i % n_embd;
     uint32_t tok = token < n_vocab ? token : n_vocab - 1; /* clamp: an OOB token id is a wild global read */
-    out[i] = __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)tok * n_embd + e]);
+    ds4_hc_store(out, i, __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)tok * n_embd + e]));
 }
 
 
 
 __global__ static void embed_tokens_hc_kernel(
-        float *out,
+        ds4_hc_t *out,
         const int32_t *tokens,
         const __half *w,
         uint32_t n_vocab,
@@ -30,7 +30,7 @@ __global__ static void embed_tokens_hc_kernel(
     int32_t tok_i = tokens[t];
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
-    out[gid] = __half2float(w[(uint64_t)tok * n_embd + d]);
+    ds4_hc_store(out, gid, __half2float(w[(uint64_t)tok * n_embd + d]));
 }
 
 
@@ -254,10 +254,10 @@ enum { DS4_FP8MX_ROWS = 4 };
 
 template<bool DEINT>
 __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
-        float *out_hc,
+        ds4_hc_t *out_hc,
         float *block_out,
         const float *block_add,
-        const float *residual_hc,
+        const ds4_hc_t *residual_hc,
         const float *split,
         const unsigned char *w,
         const __nv_fp8_e4m3 *wdata,
@@ -316,10 +316,10 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
             float hc_acc = block_v * post[dst_hc];
             for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
                 const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
-                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                const float res_v = ds4_hc_load(residual_hc, (uint64_t)src_hc * n_embd + d);
                 hc_acc += comb_v * res_v;
             }
-            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+            ds4_hc_store(out_hc, (uint64_t)dst_hc * n_embd + d, hc_acc);
         }
     }
 }
@@ -460,12 +460,16 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
 
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !model_map || weight_offset >= model_size || n_vocab == 0) return 0;
+    /* The kernel writes n_embd*n_hc carrier samples; validate like the batched
+     * sibling does. Before the BF16 narrowing an undersized out_hc still had 2x
+     * slack — it does not any more, so this check is load-bearing (task #62). */
+    if (out_hc->bytes < (uint64_t)n_embd * n_hc * DS4_HC_ELT_SIZE) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_vocab, n_embd, n_hc);
+    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr, (const unsigned short *)wptr, token, n_vocab, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
@@ -485,7 +489,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
         weight_offset > model_size ||
         (uint64_t)n_vocab * n_embd * sizeof(uint16_t) > model_size - weight_offset ||
         tokens_t->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-        out_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * sizeof(float)) {
+        out_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE) {
         return 0;
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
@@ -494,7 +498,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
     if (!wptr) return 0;
     uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
     embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
-        (float *)out_hc->ptr,
+        (ds4_hc_t *)out_hc->ptr,
         (const int32_t *)tokens_t->ptr,
         (const __half *)wptr,
         n_vocab, n_tokens, n_embd, n_hc);
@@ -658,6 +662,96 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
 }
 
 
+/* ---- "quantize once, N GEMMs" activation cache --------------------------
+ *
+ * In the batched prefill path a single normalized activation (batch_attn_norm,
+ * [n_tok x n_embd] f32) feeds up to SEVEN block-scaled MXFP8 projections per
+ * ratio-4 layer (q_a, kv, attn compressor kv+gate, indexer compressor kv+gate,
+ * indexer_proj).  mxfp8_quant_act_kernel is a PURE function of
+ * (x, n_tok, in_dim) -- see the kernel: per-warp, no atomics, no state -- so
+ * running it once per consumer re-derives byte-identical E4M3 data and E8M0
+ * scales while re-reading the whole f32 activation each time.  Cache the first
+ * result and hand it to the remaining GEMMs: bit-identical by construction,
+ * and it drops ~6/7 of the activation quant traffic on those layers.
+ *
+ * ALIASING: the cached buffers must NOT come from cuda_tmp_alloc.  That is one
+ * process-global scratch region (ds4_cuda_runtime.cu) that later callers --
+ * attention, MoE, the indexer top-k -- freely overwrite or realloc, and such
+ * calls DO run between the consumers above.  Dedicated cudaMalloc'd storage is
+ * the only safe home for a value that must survive across unrelated kernels.
+ *
+ * COHERENCE: the cache is keyed on (x->ptr, n_tok, in_dim), which is NOT enough
+ * on its own -- batch_attn_norm keeps its pointer and shape while its CONTENTS
+ * change every layer.  So a hit additionally requires that the engine has armed
+ * the cache for that exact buffer since the last write to it
+ * (ds4_gpu_mxfp8_act_cache_arm, called immediately after the norm that produces
+ * it).  Arming invalidates, so a stale hit would require a write with no arm.
+ *
+ * THREADING: per-thread state, matching the per-thread CUDA streams -- two
+ * sessions prefilling concurrently must not share a quantized activation.
+ *
+ * TWO ENCODINGS, ONE ARMING.  The same activation also feeds F16 cuBLAS GEMMs
+ * (this model stores the compressor/indexer projections as F16 while q_a/kv are
+ * MXFP8), and ds4_gpu_matmul_f16_tensor re-runs f32_to_f16_kernel over the whole
+ * activation on every call for exactly the same reason.  That conversion is
+ * likewise pure, so the cache carries an f16 copy alongside the MXFP8 one and
+ * both are filled lazily -- a layer pays for only the encodings it actually
+ * uses.  On a ratio-4 layer that is 1 quantization + 1 conversion instead of
+ * 2 + 5. */
+struct mxfp8_act_cache_t {
+    const void    *key_ptr;      /* armed activation buffer (NULL = disarmed) */
+    uint64_t       key_ntok;
+    uint64_t       key_in_dim;
+    int            valid;        /* xq/sx hold the MXFP8 quant of that (ptr,shape) */
+    int            valid_h;      /* xh holds the f16 conversion of that (ptr,shape) */
+    __nv_fp8_e4m3 *xq;
+    size_t         xq_cap;
+    unsigned char *sx;
+    size_t         sx_cap;
+    __half        *xh;
+    size_t         xh_cap;
+};
+static thread_local mxfp8_act_cache_t g_act_cache;
+
+extern "C" void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
+    /* Operational kill switch / A-B measurement handle. Read ONCE (this runs
+     * per layer, not per token), and disarming restores the exact pre-cache
+     * code path in the GEMMs below. */
+    static const int off = getenv("DS4_NO_MXFP8_ACT_CACHE") != NULL;
+    g_act_cache.valid = 0;
+    g_act_cache.valid_h = 0;
+    if (off || !x || !x->ptr || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0) {
+        g_act_cache.key_ptr = NULL;
+        return;
+    }
+    g_act_cache.key_ptr    = x->ptr;
+    g_act_cache.key_ntok   = n_tok;
+    g_act_cache.key_in_dim = in_dim;
+}
+
+extern "C" void ds4_gpu_mxfp8_act_cache_disarm(void) {
+    g_act_cache.key_ptr = NULL;
+    g_act_cache.valid   = 0;
+    g_act_cache.valid_h = 0;
+}
+
+/* Grow-only device buffer for the cache. cudaFree implicitly synchronizes, so
+ * a growth cannot pull the old pointer out from under an in-flight kernel. */
+static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const char *what) {
+    if (*cap >= need) return 1;
+    void *p = NULL;
+    if (*buf) { (void)cudaFree(*buf); *buf = NULL; *cap = 0; }
+    if (cudaMalloc(&p, need) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: MXFP8 activation cache alloc failed for %s (%.2f MiB)\n",
+                what ? what : "act", (double)need / 1048576.0);
+        return 0;
+    }
+    *buf = p; *cap = need;
+    return 1;
+}
+
+
 static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
         uint64_t n_tok, const char *label) {
@@ -674,18 +768,46 @@ static int cuda_matmul_fp8_mx_tensor_labeled(ds4_gpu_tensor *out, const void *mo
      * cuda_tmp_alloc hands out one shared scratch region (later calls alias or
      * realloc/free earlier ones). Carve three non-overlapping, 256-aligned
      * regions from a single allocation instead. */
-    size_t off_xq = 0;
-    size_t off_sx = (in_dim * (size_t)ntok + 255) & ~(size_t)255;
-    size_t off_ws = (off_sx + sx_bytes + 255) & ~(size_t)255;
-    char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "fp8_mx scratch");
-    if (!scratch) return 0;
-    __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)(scratch + off_xq);
-    unsigned char *sx = (unsigned char *)(scratch + off_sx);
-    void *ws = scratch + off_ws;
-    cudaMemsetAsync(sx, 0, sx_bytes, 0);
-    int warps = ntok * (int)KB;
-    mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, ntok, (int)in_dim, KBp, xq, sx);
-    if (!cuda_ok(cudaGetLastError(), "fp8_mx act quant")) return 0;
+    /* Armed activation cache (see mxfp8_act_cache_t above): reuse the E4M3 data
+     * and E8M0 scales this activation was already quantized into, and take only
+     * the cuBLASLt workspace from the shared tmp region. */
+    mxfp8_act_cache_t *ac = NULL;
+    if (g_act_cache.key_ptr == x->ptr && g_act_cache.key_ntok == n_tok &&
+        g_act_cache.key_in_dim == in_dim) {
+        if (mxfp8_act_cache_reserve((void **)&g_act_cache.xq, &g_act_cache.xq_cap,
+                                    in_dim * (size_t)ntok, "act data") &&
+            mxfp8_act_cache_reserve((void **)&g_act_cache.sx, &g_act_cache.sx_cap,
+                                    sx_bytes, "act scale")) {
+            ac = &g_act_cache;
+        } else {
+            g_act_cache.valid = 0;   /* fall back to the per-GEMM quantization */
+        }
+    }
+    __nv_fp8_e4m3 *xq;
+    unsigned char *sx;
+    void *ws;
+    if (ac) {
+        xq = ac->xq;
+        sx = ac->sx;
+        ws = cuda_tmp_alloc(wz, "fp8_mx scratch");
+        if (!ws) return 0;
+    } else {
+        size_t off_xq = 0;
+        size_t off_sx = (in_dim * (size_t)ntok + 255) & ~(size_t)255;
+        size_t off_ws = (off_sx + sx_bytes + 255) & ~(size_t)255;
+        char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "fp8_mx scratch");
+        if (!scratch) return 0;
+        xq = (__nv_fp8_e4m3 *)(scratch + off_xq);
+        sx = (unsigned char *)(scratch + off_sx);
+        ws = scratch + off_ws;
+    }
+    if (!ac || !ac->valid) {
+        cudaMemsetAsync(sx, 0, sx_bytes, 0);
+        int warps = ntok * (int)KB;
+        mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, ntok, (int)in_dim, KBp, xq, sx);
+        if (!cuda_ok(cudaGetLastError(), "fp8_mx act quant")) return 0;
+        if (ac) ac->valid = 1;
+    }
     /* Shape-keyed handle cache: the desc/layout/preference build plus the
      * heuristic query cost ~100us of host time PER GEMM and only the two
      * scale pointers change between calls of the same (in,out,ntok) shape.
@@ -1142,6 +1264,18 @@ static int cuda_matmul_mxfp8_tensor_labeled(ds4_gpu_tensor *out, const void *mod
          * token). Bit-identical per token to the n=1 deint mmvq, so verify logits
          * match the decode path's numerics. DS4_FP8_GEMV_MAX_N=1 restores the
          * tensor-core dispatch for all n_tok>1. */
+        /* 2026-07-21: raising this default 4 -> 8 was TRIED and REVERTED. The
+         * "bit-identical" claim above is GEMV-n vs GEMV-1 -- it does NOT extend to
+         * the cuBLASLt dispatch this cap hands off to, which is what widening the
+         * window actually swaps out. Measured at verify width 6: all 129280 logits
+         * differ, max |d| 1.674, RMS 0.312 vs sigma 6.02, and 115/128 generated
+         * tokens change. It also reaches real prefill -- the final chunk keeps the
+         * exact remainder, so a 4102-token prompt at chunk 4096 ends on n_tok=6 and
+         * its logits move (4100 -> n_tok=4 is byte-identical, control). The
+         * prefill byte-exact gate pins chunk 4096 with depths 512/2048/4096/6144
+         * and never lands a 5..8 remainder, so it does NOT cover this. Keep 4.
+         * The width-6 verify win is real but belongs entirely to moe_gemv_cap
+         * (see ds4_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
         static const int gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
                 return e ? atoi(e) : 4; }();
         static const int nt_fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
@@ -1319,7 +1453,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
     const uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * wstride)) return 0;
     const uint64_t weight_bytes = out_dim * blocks * wstride;
-    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE;   /* residual_hc + out_hc are carriers */
     const uint64_t split_bytes = (uint64_t)(2u * n_hc + n_hc * n_hc) * sizeof(float);
     if (weight_bytes > model_size - weight_offset ||
         x->bytes < in_dim * sizeof(float) ||
@@ -1345,14 +1479,14 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
     const float *ba = block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr;
     if (dw) {
         matmul_fp8mx_hc_expand_warp8_kernel<true><<<hg, 256>>>(
-                (float *)out_hc->ptr, (float *)block_out->ptr, ba,
-                (const float *)residual_hc->ptr, (const float *)split->ptr,
+                (ds4_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
+                (const ds4_hc_t *)residual_hc->ptr, (const float *)split->ptr,
                 (const unsigned char *)wptr, dw->data, dw->scale, KBp, (const float *)x->ptr,
                 in_dim, out_dim, n_embd, n_hc, blocks, block_add ? 1 : 0);
     } else {
         matmul_fp8mx_hc_expand_warp8_kernel<false><<<hg, 256>>>(
-                (float *)out_hc->ptr, (float *)block_out->ptr, ba,
-                (const float *)residual_hc->ptr, (const float *)split->ptr,
+                (ds4_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
+                (const ds4_hc_t *)residual_hc->ptr, (const float *)split->ptr,
                 (const unsigned char *)wptr, (const __nv_fp8_e4m3 *)NULL, (const unsigned char *)NULL, 0,
                 (const float *)x->ptr, in_dim, out_dim, n_embd, n_hc, blocks, block_add ? 1 : 0);
     }
@@ -1398,6 +1532,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
      * weight-row read serves all tokens and there is no f32->f16 activation
      * convert or tmp alloc; per-token output is bit-identical to the n=1
      * matmul_f16_kernel. DS4_F16_GEMV_MAX_N=1 restores the cuBLAS dispatch. */
+    /* 2026-07-21: raising to 8 was TRIED and REVERTED, same as the mxfp8 twin
+     * above. This one is the clearest case: the cuBLAS side converts activations
+     * to __half for cublasGemmEx while the GEMV stays f32, so the two dispatches
+     * were never going to agree. Measured non-bit-exact at widths 6 and 8. */
     static const int f16_gemv_max_n = []{ const char *e = getenv("DS4_F16_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
     /* inc 2: batched step forces the M-independent nt kernel across [2..8] (see the
@@ -1421,10 +1559,26 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
-        __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
+        /* Armed activation cache: this f32 tensor feeds several F16 projections
+         * per layer and the conversion is pure, so run it once (see
+         * mxfp8_act_cache_t -- and note the cached copy must live outside the
+         * shared cuda_tmp scratch, which unrelated kernels overwrite between
+         * those calls). */
+        mxfp8_act_cache_t *hc = NULL;
+        if (g_act_cache.key_ptr == x->ptr && g_act_cache.key_ntok == n_tok &&
+            g_act_cache.key_in_dim == in_dim &&
+            mxfp8_act_cache_reserve((void **)&g_act_cache.xh, &g_act_cache.xh_cap,
+                                    xh_count * sizeof(__half), "act f16")) {
+            hc = &g_act_cache;
+        }
+        __half *xh = hc ? hc->xh
+                        : (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
-        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
-        if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+        if (!hc || !hc->valid_h) {
+            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+            if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+            if (hc) hc->valid_h = 1;
+        }
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -1659,6 +1813,9 @@ extern "C" int ds4_gpu_attention_output_batch_tensor(
      * variant at 2..4 -- one launch vs 8 per-group GEMMs, bit-identical per
      * token to decode's kernel). DS4_FP8_GEMV_MAX_N=1 restores the tensor-core
      * dispatch for all n_tokens>1, same as the dense-matmul gate. */
+    /* 2026-07-21: raising to 8 was TRIED and REVERTED (see the dense-matmul gate
+     * for the measurement). Shares DS4_FP8_GEMV_MAX_N with that gate, so the two
+     * defaults must move together. */
     static const int a_gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
     int a_done = 0;
