@@ -100,7 +100,42 @@ static float dspark_conf_sched_tau(void) {
  * The controller reads only (commit, n_batch) — counts, never wall-clock —
  * so for a fixed token stream the quench point is deterministic. Constants
  * are compile-time (no hot-path env reads; project rule). */
-#define DS4_QUENCH_FLAT_MS    95.7f
+/* REFIT 2026-07-21 (FLAT 95.7 -> 57.0; ROW unchanged). The 2026-07-17 fit went
+ * stale: the fused step got ~30-40 ms cheaper (41 commits + the mxfp8head ->
+ * type-40/MXFP8_LT model swap) while plain decode did not, so the shipped line
+ * OVER-priced the step at EVERY width -- +57% at n_batch=1, +29% at 3, +14-15%
+ * at 6..8. Guard = step/plain, so over-pricing raises the break-even, which
+ * biases TOWARD quenching: the exact false-quench the design comment says it
+ * deliberately biased against. Measured live at 2.7k/n_batch=6, yield 2.964 sat
+ * below the shipped guard 3.057 (quench) but above the true 2.732 (spec was
+ * ~8% faster than plain).
+ *
+ * Basis: 7591 steady-state steps over six cells (greedy/T1.0 x prose/structured
+ * x 2.7k/9.4k/38k), pooled resid rms 5.88 ms (original fit: 7.2). Per-cell fits
+ * are excellent (rms 0.08-2.4 ms), so ONE line is still the right model.
+ *
+ * Why 57.0 and why ROW stays 18.37:
+ *  - Residual structure is by ENGINE DRAFT DEPTH, not temperature or context.
+ *    FLAT rises ~3.3 ms per configured draft position (drafting work, which is
+ *    NOT in the verify batch) while ROW falls to compensate: draft-2 fits
+ *    FLAT 53.3/ROW 20.95, draft-7 fits FLAT 81.0/ROW 16.97. Since
+ *    dspark_draft_tokens is fixed per engine and only conf-sched trim moves
+ *    n_batch, the WITHIN-engine line is the one the controller actually rides.
+ *    57.0 targets the shipped --dspark-draft 3 engine (~56.6); deeper drafts are
+ *    then UNDER-priced, which biases against quenching = the safe direction.
+ *  - Pooled ROW (20.3) is inflated by smearing cross-engine drafting cost into
+ *    the slope. Keeping the lower shipped 18.37 lands the line 3-6% BELOW
+ *    measured at every width 2..8, restoring the intended underprice margin.
+ *  - Greedy remains the MINIMUM cell (T1.0 costs +3.5..12.4 ms at equal width),
+ *    so a greedy-derived FLAT stays the conservative choice, as originally
+ *    intended.
+ * Depth enters as a small additive FLAT term only (~0.17 ms/1k, +6 ms over 35k)
+ * and ROW is depth-invariant, so nothing depth-aware belongs in the step term.
+ * NOTE the old comment's premise "spec step cost is ~flat in depth while plain
+ * slows" is NOT what was measured: the step's depth slope (0.17 ms/1k) is close
+ * to plain's (0.20). The guard ratio still improves with depth, but because the
+ * step is 2-3x larger, not because it is flat. */
+#define DS4_QUENCH_FLAT_MS    57.0f
 #define DS4_QUENCH_ROW_MS     18.37f
 #define DS4_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
 #define DS4_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
@@ -108,32 +143,69 @@ static float dspark_conf_sched_tau(void) {
 #define DS4_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
 
 /* Served plain-decode ms/token vs request depth: piecewise-linear through the
- * measured 2026-07-15 depth table. The bottom clamp over-estimates plain and
- * biases AGAINST quenching (conservative for the no-spurious-quench gates).
- * The top is EXTRAPOLATED along the last measured segment (was a flat clamp):
- * beyond 38k the flat value under-estimated plain (last-segment slope
- * ~0.20 ms/1k gives ~87 ms at 100k vs the clamped 74.5), which inflated the
- * guard ~17% and biased TOWARD quenching exactly where spec advantage is
- * already marginal. Plain ms/token keeps rising ~linearly with KV depth, so
- * projecting the last segment tracks the physics far better than flat-lining.
- * The projection is held flat past ~256k (DS4_QUENCH_PLAIN_CAP_POS): that is
- * well beyond the measured range, so rather than extrapolate ms/token without
- * limit we bound it at the 256k value (~118 ms). Deterministic (constants
- * only) so the quench point stays reproducible for a fixed token stream. */
+ * measured depth table (re-measured 2026-07-21 — see the block below for the
+ * data and for why the 2026-07-15 values were retired). The bottom clamp
+ * over-estimates plain and biases AGAINST quenching (conservative for the
+ * no-spurious-quench gates). Plain ms/token keeps rising ~linearly with KV
+ * depth, so beyond the last anchor we project that segment's slope rather than
+ * flat-lining — a flat clamp under-estimates plain, which inflates the guard
+ * and biases TOWARD quenching exactly where spec advantage is already marginal.
+ * The projection is bounded at ~256k (DS4_QUENCH_PLAIN_CAP_POS), well past the
+ * measured range, rather than extrapolating without limit. Deterministic
+ * (constants only) so the quench point stays reproducible for a fixed stream. */
+/* RE-MEASURED 2026-07-21 (medians of 3, run-to-run spread 0.01-0.11%), matching
+ * the ORIGINAL instrument: the server's own `decoding ... avg=` line over a
+ * 256-token greedy generation, `--no-dspark`, prose. Confirmed the shipped py
+ * was exactly 1000/{16.74,14.85,14.55,13.43} from the 2026-07-15 prose table.
+ *
+ *   depth    old table   measured   ratio
+ *     426      60.18       56.18    0.933
+ *    2348      67.31       63.05    0.937
+ *    9141      68.67       65.78    0.958
+ *   38147      74.53       69.98    0.939
+ *  100362      87.10*      80.24    0.921      (*extrapolated, now MEASURED)
+ *
+ * The table was uniformly ~6% HIGH — plain decode got ~6% faster since
+ * 2026-07-15, alongside the fused spec step. The 100k anchor is new and real;
+ * `-c` confound controlled (38k reads 70.12 at -c 131072 vs 70.00 at -c 40960,
+ * +0.17%).
+ *
+ * A 2026-07-21 spot check that reported 85.89 ms at 38k (and an alarming
+ * 0.675 ms/1k slope) was a MEASUREMENT ARTIFACT, reconstructed to 0.03 ms:
+ * it used 128-vs-384 marginal differencing WITHOUT `--no-kv-disk`, so the two
+ * legs took different disk-KV hits and prefilled 30011 vs 31163 tokens —
+ * 70.20 true marginal + 12.55 unequal prefill + 3.17 client overhead = 85.92.
+ * The real 9.1k->38k slope is 0.145 ms/1k, so the beyond-38k extrapolation was
+ * if anything slightly too STEEP, never "3x too shallow". LESSON: when
+ * differencing two runs to cancel prefill, DISABLE the disk KV cache or the
+ * cancellation silently fails.
+ *
+ * DIRECTION (correcting the earlier note): the FLAT staleness and this table's
+ * staleness did NOT compound — they partially CANCELLED. FLAT was over-priced
+ * (guard too high) while plain was over-estimated (guard too low). Fixing FLAT
+ * alone left the guard ~6-9% too LOW; this correction restores it (+7.0% @2.3k,
+ * +6.4% @38k, +8.6% @100k, +11.9% @256k at n_batch=6).
+ *
+ * The measured curve is mildly convex (0.145 -> 0.165 ms/1k), so the linear
+ * projection past 100k slightly UNDER-estimates plain, which inflates the guard
+ * — the conservative direction this design already prefers, and now anchored on
+ * a real 100k point instead of a 38k one. Past 100k is UNMEASURED: the 256k cap
+ * (~105.9 ms) is a bounded guess. Also unmeasured: whether structured/tool
+ * output shifts plain ms/token at depth (all five anchors are prose). */
 #define DS4_QUENCH_PLAIN_CAP_POS 256000.0f
 static float spec_quench_plain_ms(int pos) {
-    static const float px[4] = { 300.0f, 2300.0f, 9300.0f, 38000.0f };
-    static const float py[4] = { 59.7f, 67.3f, 68.7f, 74.5f };
+    static const float px[5] = { 300.0f, 2300.0f, 9300.0f, 38000.0f, 100000.0f };
+    static const float py[5] = { 55.7f, 62.9f, 65.8f, 70.0f, 80.2f };
     const float p = (float)pos;
     if (p <= px[0]) return py[0];
-    for (int i = 1; i < 4; i++)
+    for (int i = 1; i < 5; i++)
         if (p <= px[i])
             return py[i - 1] + (py[i] - py[i - 1]) * (p - px[i - 1]) /
                                    (px[i] - px[i - 1]);
-    /* pos > 38000: extend the last segment's slope, capped at the 256k value. */
-    const float slope = (py[3] - py[2]) / (px[3] - px[2]);
+    /* pos > 100000: extend the last segment's slope, capped at the 256k value. */
+    const float slope = (py[4] - py[3]) / (px[4] - px[3]);
     const float q = p < DS4_QUENCH_PLAIN_CAP_POS ? p : DS4_QUENCH_PLAIN_CAP_POS;
-    return py[3] + slope * (q - px[3]);
+    return py[4] + slope * (q - px[4]);
 }
 
 static float spec_quench_guard(uint32_t n_batch, int pos) {
@@ -144,10 +216,10 @@ static float spec_quench_guard(uint32_t n_batch, int pos) {
 /* Re-arm at request boundaries (the same sites that drop the carry and
  * pendings). All-zero == armed, matching the xcalloc'd session. */
 static void spec_quench_reset(ds4_session *s) {
-    s->spec_quench_debt = 0.0f;
-    s->spec_quench_ewma = 0.0f;
-    s->spec_quench_steps = 0;
-    s->spec_quenched = false;
+    s->spec.spec_quench_debt = 0.0f;
+    s->spec.spec_quench_ewma = 0.0f;
+    s->spec.spec_quench_steps = 0;
+    s->spec.spec_quenched = false;
 }
 
 /* Test-only (identity gates): DS4_QUENCH_FORCE_STEP=<N> latches the quench
@@ -1020,8 +1092,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     /* drop speculative lookahead up front, not just on success: a restore
      * that fails midway may already have overwritten GPU state the carry
      * and pendings were conditioned on */
-    s->spec_carry_valid = false;
-    s->dspark_n_pending = 0;
+    s->spec.spec_carry_valid = false;
+    s->spec.dspark_n_pending = 0;
     spec_quench_reset(s);
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
@@ -1227,8 +1299,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
      * were all conditioned on the replaced state. Leaving the ring makes the
      * next drafts (and therefore the verify batch shapes) depend on whatever
      * ran before the restore — the source of run-to-run tie flips. */
-    s->spec_carry_valid = false;
-    s->dspark_n_pending = 0;
+    s->spec.spec_carry_valid = false;
+    s->spec.dspark_n_pending = 0;
     spec_quench_reset(s);
     for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = 0;
     g->dspark_prompt_n = 0;
@@ -1868,20 +1940,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * Reuses the bound-layer expert tensors and the CUDA tile-width
          * accessor; log-only, runs once at open on every GPU serve. */
         {
-            const ds4_layer_weights *ml = weights_first_bound_layer(&e->weights);
-            if (ml && ml->ffn_gate_exps && ml->ffn_down_exps) {
-                const uint32_t gt = ml->ffn_gate_exps->type;
-                const uint32_t dt = ml->ffn_down_exps->type;
+            /* Count the tier PER LAYER.  Reporting the first bound layer's type
+             * as "the" tier is actively misleading on a heterogeneous model:
+             * v5mx has only 5 uniform-MXFP4 layers, so the old line printed
+             * "per-expert-tiled" while a dozen layers were in fact running the
+             * grouped CUTLASS path (2026-07-21 profile).  This observability
+             * exists to catch a SILENT fall to a slow tier, so it has to be
+             * truthful about the mix or it defeats its own purpose. */
+            uint32_t n_grouped = 0, n_tiled = 0, n_routed = 0;
+            const ds4_layer_weights *ml = NULL;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const ds4_layer_weights *l = &e->weights.layer[il];
+                if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
+                if (!ml) ml = l;                    /* first routed layer, for the type sample */
+                n_routed++;
                 /* The grouped/GEMV CUTLASS dispatch is entered only when BOTH
                  * gate and down experts are type-40 (see the moe.cu batch
                  * predicate); any other mix takes the per-expert tiled path. */
-                const char *tier = (gt == DS4_TENSOR_CUTLASS_MXFP4 &&
-                                    dt == DS4_TENSOR_CUTLASS_MXFP4)
-                                       ? "grouped-CUTLASS"
-                                       : "per-expert-tiled";
+                if (l->ffn_gate_exps->type == DS4_TENSOR_CUTLASS_MXFP4 &&
+                    l->ffn_down_exps->type == DS4_TENSOR_CUTLASS_MXFP4) n_grouped++;
+                else n_tiled++;
+            }
+            if (ml) {
+                const uint32_t gt = ml->ffn_gate_exps->type;
+                const uint32_t dt = ml->ffn_down_exps->type;
                 fprintf(stderr,
-                        "ds4: MoE expert tier: %s  gate=%s(%u) down=%s(%u) mxfp4 tile=NT%u\n",
-                        tier, tensor_type_name(gt), gt, tensor_type_name(dt), dt,
+                        "ds4: MoE expert tier: %u/%u layers grouped-CUTLASS, %u/%u per-expert-tiled "
+                        "(first routed layer gate=%s(%u) down=%s(%u)) mxfp4 tile=NT%u\n",
+                        n_grouped, n_routed, n_tiled, n_routed,
+                        tensor_type_name(gt), gt, tensor_type_name(dt), dt,
                         ds4_gpu_moe_mxfp4_tile_width());
             }
         }
@@ -1945,10 +2032,10 @@ void ds4_session_spec_metrics(const ds4_session *s, ds4_spec_metrics *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
     if (!s) return;
-    out->accepted_tokens = s->spec_accepted_tokens;
-    out->draft_tokens = s->spec_draft_tokens;
-    out->num_drafts = s->spec_num_drafts;
-    out->gen_tokens = s->spec_gen_tokens;
+    out->accepted_tokens = s->spec.spec_accepted_tokens;
+    out->draft_tokens = s->spec.spec_draft_tokens;
+    out->num_drafts = s->spec.spec_num_drafts;
+    out->gen_tokens = s->spec.spec_gen_tokens;
     out->max_draft = s->engine ? s->engine->dspark_draft_tokens : 0;
     out->has_dspark = s->engine ? s->engine->dspark_ready : false;
 }
@@ -2248,8 +2335,8 @@ int ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
         gpu_graph_bank_counters_install(g, dst);
         token_vec_set_prefix(&s->checkpoint, tokens, n_cached);
         s->checkpoint_valid = true;
-        s->spec_carry_valid = false;
-        s->dspark_n_pending = 0;
+        s->spec.spec_carry_valid = false;
+        s->spec.dspark_n_pending = 0;
         s->mseq_dirty = false;
     }
     /* 7. Full fork has no ratio-4 boundary stash — keep the emit hook inactive.
@@ -2331,10 +2418,11 @@ int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
         c->checkpoint_valid = true;
         c->valid = true;
         /* Position-stamped state beyond R is meaningless on dst. */
-        c->spec_carry_valid = false;
-        c->dspark_n_pending = 0;
-        c->dspark_pending_sampled = false;
-        c->mseq_dirty = false;
+        c->spec.spec_carry_valid = false;
+        c->spec.dspark_n_pending = 0;
+        c->spec.dspark_pending_sampled = false;
+        /* (no carried mseq_dirty: bank_state_restore clears the live flag
+         * unconditionally once this bank's frontier counters are installed) */
     }
     /* Drafter ring not cloned (and cut anyway): re-warm from empty. */
     for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[dst][i] = 0u;
@@ -2350,8 +2438,8 @@ int ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
         gpu_graph_bank_counters_install(g, dst);
         token_vec_set_prefix(&s->checkpoint, tokens, (int)R);
         s->checkpoint_valid = true;
-        s->spec_carry_valid = false;
-        s->dspark_n_pending = 0;
+        s->spec.spec_carry_valid = false;
+        s->spec.dspark_n_pending = 0;
         s->mseq_dirty = false;
     }
     g->fork_pin[src] = 0u;
@@ -2507,6 +2595,7 @@ void ds4_session_free(ds4_session *s) {
     ds4_sample_scratch_free(&s->sample_scratch);
     ds4_session_bank_carry_free(s);
     free(s->dspark_pending_qrows);
+    free(s->spec_row_scratch);
     free(s->logits);
     free(s);
 }
@@ -2598,12 +2687,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     /* a sync begins a new request: any carry left by a max-tokens/stop-string
      * truncated generation belongs to the previous request's distribution.
      * (position stamping alone misses a same-length full rebuild.) */
-    s->spec_carry_valid = false;
+    s->spec.spec_carry_valid = false;
     /* Same argument, same blind spot: the pendings' position stamp cannot see a
      * rebuild that lands on the same length, and a sampled draft's q belongs to
      * the previous request's distribution. Dropping them here costs one draft
      * round at the start of a request and is the only guard that covers it. */
-    s->dspark_n_pending = 0;
+    s->spec.dspark_n_pending = 0;
     /* A sync begins a new request: re-arm the terminal yield quench. */
     spec_quench_reset(s);
 
@@ -2950,7 +3039,7 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     token_vec_push(&s->checkpoint, token);
     /* a token evaluated outside the speculative path (tool injection, plain
      * fallback loops) advances the state past any in-flight carry */
-    s->spec_carry_valid = false;
+    s->spec.spec_carry_valid = false;
     return 0;
 }
 
@@ -3033,7 +3122,7 @@ int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
      * classic single-bank view stale (see above); only the diagnosis differs. */
     s->checkpoint_valid = false;
     s->mseq_dirty = true;
-    s->spec_carry_valid = false;
+    s->spec.spec_carry_valid = false;
     if (rc == 1) return 0;
     DS4_MULTISEQ_ERR("multiseq decode step failed mid-sweep "
                      "(session state fatal)");
@@ -3108,7 +3197,7 @@ int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
      * single-bank view is stale exactly as after a multiseq step. */
     s->checkpoint_valid = false;
     s->mseq_dirty = true;
-    s->spec_carry_valid = false;
+    s->spec.spec_carry_valid = false;
     if (rc == 1) return 0;
     DS4_MIXED_ERR("mixed decode step failed mid-sweep (session state fatal)");
     return -1;
@@ -3186,34 +3275,14 @@ void ds4_session_bank_state_save(ds4_session *s, uint32_t bank) {
     }
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
-    c->mseq_dirty             = s->mseq_dirty;
-    memcpy(c->dspark_pending, s->dspark_pending, sizeof(c->dspark_pending));
-    c->dspark_n_pending       = s->dspark_n_pending;
-    c->dspark_pending_base    = s->dspark_pending_base;
-    c->dspark_pending_pos     = s->dspark_pending_pos;
-    c->spec_carry_token       = s->spec_carry_token;
-    c->spec_carry_valid       = s->spec_carry_valid;
-    c->spec_carry_pos         = s->spec_carry_pos;
-    c->spec_carry_temp        = s->spec_carry_temp;
-    c->spec_carry_top_p       = s->spec_carry_top_p;
-    c->spec_carry_min_p       = s->spec_carry_min_p;
-    c->spec_carry_top_k       = s->spec_carry_top_k;
-    memcpy(c->dspark_pending_alt, s->dspark_pending_alt, sizeof(c->dspark_pending_alt));
-    memcpy(c->dspark_pending_conf, s->dspark_pending_conf, sizeof(c->dspark_pending_conf));
-    c->dspark_pending_sampled = s->dspark_pending_sampled;
-    memcpy(c->dspark_pending_q, s->dspark_pending_q, sizeof(c->dspark_pending_q));
-    c->dspark_pending_temp    = s->dspark_pending_temp;
-    c->dspark_pending_top_p   = s->dspark_pending_top_p;
-    c->dspark_pending_min_p   = s->dspark_pending_min_p;
-    c->dspark_pending_top_k   = s->dspark_pending_top_k;
-    c->spec_quench_debt       = s->spec_quench_debt;
-    c->spec_quench_ewma       = s->spec_quench_ewma;
-    c->spec_quench_steps      = s->spec_quench_steps;
-    c->spec_quenched          = s->spec_quenched;
-    c->spec_accepted_tokens   = s->spec_accepted_tokens;
-    c->spec_draft_tokens      = s->spec_draft_tokens;
-    c->spec_num_drafts        = s->spec_num_drafts;
-    c->spec_gen_tokens        = s->spec_gen_tokens;
+    /* Whole speculative/DSpark shadow in one assignment — a new field added to
+     * ds4_spec_carry_state is carried here for free (the old field-by-field
+     * mirror was a silent-corruption footgun: miss one and the entering bank
+     * inherits another conversation's speculative state).
+     * s->mseq_dirty is NOT saved: it describes the graph's scalar frontier
+     * counters, not this bank's conversation, and _restore re-establishes
+     * per-bank frontier truth and clears it unconditionally. */
+    c->spec = s->spec;
     c->valid = true;
 }
 
@@ -3247,33 +3316,8 @@ bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank) {
                (size_t)c->dspark_pending_qrows_cap * sizeof(float));
     }
     s->checkpoint_valid       = c->checkpoint_valid;
-    memcpy(s->dspark_pending, c->dspark_pending, sizeof(s->dspark_pending));
-    s->dspark_n_pending       = c->dspark_n_pending;
-    s->dspark_pending_base    = c->dspark_pending_base;
-    s->dspark_pending_pos     = c->dspark_pending_pos;
-    s->spec_carry_token       = c->spec_carry_token;
-    s->spec_carry_valid       = c->spec_carry_valid;
-    s->spec_carry_pos         = c->spec_carry_pos;
-    s->spec_carry_temp        = c->spec_carry_temp;
-    s->spec_carry_top_p       = c->spec_carry_top_p;
-    s->spec_carry_min_p       = c->spec_carry_min_p;
-    s->spec_carry_top_k       = c->spec_carry_top_k;
-    memcpy(s->dspark_pending_alt, c->dspark_pending_alt, sizeof(s->dspark_pending_alt));
-    memcpy(s->dspark_pending_conf, c->dspark_pending_conf, sizeof(s->dspark_pending_conf));
-    s->dspark_pending_sampled = c->dspark_pending_sampled;
-    memcpy(s->dspark_pending_q, c->dspark_pending_q, sizeof(s->dspark_pending_q));
-    s->dspark_pending_temp    = c->dspark_pending_temp;
-    s->dspark_pending_top_p   = c->dspark_pending_top_p;
-    s->dspark_pending_min_p   = c->dspark_pending_min_p;
-    s->dspark_pending_top_k   = c->dspark_pending_top_k;
-    s->spec_quench_debt       = c->spec_quench_debt;
-    s->spec_quench_ewma       = c->spec_quench_ewma;
-    s->spec_quench_steps      = c->spec_quench_steps;
-    s->spec_quenched          = c->spec_quenched;
-    s->spec_accepted_tokens   = c->spec_accepted_tokens;
-    s->spec_draft_tokens      = c->spec_draft_tokens;
-    s->spec_num_drafts        = c->spec_num_drafts;
-    s->spec_gen_tokens        = c->spec_gen_tokens;
+    /* Mirror of the save above: one assignment restores the whole shadow. */
+    s->spec = c->spec;
     /* Cheap resume: per-bank frontier truth is now installed, so the multiseq
      * superset poison no longer applies to this bank. */
     s->mseq_dirty = false;
@@ -3402,7 +3446,7 @@ static void dspark_dump_step(ds4_gpu_graph *g, int pos, int first_token,
     /* block-2 output hidden (pre-hc_head) for each draft position [HC, EMBD]. */
     for (int p = 0; p < n_draft; p++) {
         memset(hc, 0, (size_t)hcw * sizeof(float));
-        (void)ds4_gpu_tensor_read(g->batch_cur_hc, (uint64_t)p * hcw * 4, hc, hcw * 4);
+        (void)ds4_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p * hcw, hc, hcw);
         fwrite(hc, sizeof(float), (size_t)hcw, f);
     }
     fclose(f);
@@ -3469,9 +3513,9 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * the caller committed something else (tool injection, sampling change),
      * they are stale. */
     int32_t pend[16];
-    uint32_t K = s->dspark_n_pending;
+    uint32_t K = s->spec.dspark_n_pending;
     if (K > 16u) K = 16u;
-    if (K && s->dspark_pending_base != (int32_t)first_token) K = 0;
+    if (K && s->spec.dspark_pending_base != (int32_t)first_token) K = 0;
     /* Position guard — ACCEPTANCE, not exactness. The drafts were conditioned on
      * the old position; dspark_pending_base is a token VALUE, so a plain eval
      * that advances the session (tool injection, </think> recovery) followed by
@@ -3483,7 +3527,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * draft was drawn from and the rule still yields p at the new position.
      * Mirrors carry_pos_match. (checkpoint.len is still the drafting-step value
      * here: this runs before the first_token push below.) */
-    if (K && s->dspark_pending_pos != (int32_t)s->checkpoint.len) K = 0;
+    if (K && s->spec.dspark_pending_pos != (int32_t)s->checkpoint.len) K = 0;
     /* Params guard — also acceptance, not exactness. Drafts drawn under params X
      * and verified under params Y are still verified EXACTLY: the residual
      * rebuilds q under the stored params X (see the walk below), so the accept
@@ -3499,25 +3543,25 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * proposal. The guard just keeps a badly-matched proposal from wasting a
      * row. */
     const bool pending_params_match =
-        s->dspark_pending_temp == temperature && s->dspark_pending_top_k == top_k &&
-        s->dspark_pending_top_p == top_p && s->dspark_pending_min_p == min_p;
+        s->spec.dspark_pending_temp == temperature && s->spec.dspark_pending_top_k == top_k &&
+        s->spec.dspark_pending_top_p == top_p && s->spec.dspark_pending_min_p == min_p;
     if (K && !pending_params_match) K = 0;
     /* Proposal rule the pendings were drafted under; the verify walk must apply
      * the matching rule (see dspark_pending_sampled). */
-    const bool pend_sampled = K ? s->dspark_pending_sampled : false;
+    const bool pend_sampled = K ? s->spec.dspark_pending_sampled : false;
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
-    for (uint32_t i = 0; i < K; i++) pend[i] = s->dspark_pending[i];
+    for (uint32_t i = 0; i < K; i++) pend[i] = s->spec.dspark_pending[i];
     /* DTree Phase 0: carry last step's drafter #2 + conf for these pendings. */
     int32_t pend_alt[16];
     float pend_conf[16];
     if (dtree_stats)
         for (uint32_t i = 0; i < K; i++) {
-            pend_alt[i] = s->dspark_pending_alt[i];
-            pend_conf[i] = s->dspark_pending_conf[i];
+            pend_alt[i] = s->spec.dspark_pending_alt[i];
+            pend_conf[i] = s->spec.dspark_pending_conf[i];
         }
-    s->dspark_n_pending = 0;
-    s->spec_carry_valid = false;
+    s->spec.dspark_n_pending = 0;
+    s->spec.spec_carry_valid = false;
     const uint32_t n_batch = 1u + K;
 
     /* Prompt-window seeding (one-time per prompt): fresh drafter state + a
@@ -3598,7 +3642,9 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
     if (temperature <= 0.0f || K == 0) {
         while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
     } else {
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (!s->spec_row_scratch)
+            s->spec_row_scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        float *row_logits = s->spec_row_scratch;
         bool walk_ok = true;
         while (commit < (int)K) {
             if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, row_logits)) {
@@ -3610,7 +3656,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                                   top_p, min_p, &s->sample_scratch, &dist);
             const bool accepted_row = pend_sampled
                 ? ds4_sample_dist_accept_pq(&dist, (int)pend[commit],
-                                            s->dspark_pending_q[commit], rng)
+                                            s->spec.dspark_pending_q[commit], rng)
                 : ds4_sample_dist_accept(&dist, (int)pend[commit], rng);
             if (accepted_row) {
                 ds4_sample_dist_free(&dist);
@@ -3632,9 +3678,9 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                 ds4_sample_dist qd;
                 ds4_sample_dist_build(s->dspark_pending_qrows +
                                           (size_t)commit * DS4_N_VOCAB,
-                                      DS4_N_VOCAB, s->dspark_pending_temp,
-                                      s->dspark_pending_top_k, s->dspark_pending_top_p,
-                                      s->dspark_pending_min_p,
+                                      DS4_N_VOCAB, s->spec.dspark_pending_temp,
+                                      s->spec.dspark_pending_top_k, s->spec.dspark_pending_top_p,
+                                      s->spec.dspark_pending_min_p,
                                       &s->sample_scratch, &qd);
                 /* Holding two dists over one scratch is safe by dist_build's
                  * aliasing contract: out->ids/probs never point into scratch. */
@@ -3647,7 +3693,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
             ds4_sample_dist_free(&dist);
             break;
         }
-        free(row_logits);
+        /* row_logits is the session-owned reusable row — not freed here. */
         if (!walk_ok) {
             s->checkpoint.len = saved_len;
             (void)spec_frontier_restore(&frontier, s);
@@ -3662,15 +3708,15 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * base token is always emitted; K drafts were verified this step and the
      * accepted prefix is [0,commit). num_drafts counts draft rounds only. */
     e->spec_gen_tokens += 1u + (uint64_t)commit;
-    s->spec_gen_tokens += 1u + (uint64_t)commit;
+    s->spec.spec_gen_tokens += 1u + (uint64_t)commit;
     if (K > 0) {
         e->spec_draft_tokens += K;
         e->spec_accepted_tokens += (uint64_t)commit;
         e->spec_num_drafts += 1u;
         for (int i = 0; i < commit && i < 16; i++) e->spec_accepted_per_pos[i]++;
-        s->spec_draft_tokens += K;
-        s->spec_accepted_tokens += (uint64_t)commit;
-        s->spec_num_drafts += 1u;
+        s->spec.spec_draft_tokens += K;
+        s->spec.spec_accepted_tokens += (uint64_t)commit;
+        s->spec.spec_num_drafts += 1u;
     }
 
     /* Yield-quench controller update (see the constants block up top). Uses
@@ -3680,29 +3726,29 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * routes this request's remaining tokens down the plain-decode path and
      * the drafting block below is skipped; both paths sample the exact target
      * distribution, so quenching changes speed, never marginals. */
-    if (!s->spec_quenched) {
-        s->spec_quench_steps++;
+    if (!s->spec.spec_quenched) {
+        s->spec.spec_quench_steps++;
         const int force = spec_quench_force_step();
         bool fire = false;
         if (force >= 0) {
-            fire = s->spec_quench_steps >= (uint32_t)force;
-        } else if (s->spec_quench_steps > DS4_QUENCH_WARMUP) {
+            fire = s->spec.spec_quench_steps >= (uint32_t)force;
+        } else if (s->spec.spec_quench_steps > DS4_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
                                  spec_quench_guard(n_batch, saved_len);
-            s->spec_quench_ewma = (1.0f - DS4_QUENCH_ALPHA) * s->spec_quench_ewma +
+            s->spec.spec_quench_ewma = (1.0f - DS4_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
                                   DS4_QUENCH_ALPHA * margin;
-            s->spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
-            fire = s->spec_quench_steps >= DS4_QUENCH_MINEV &&
-                   s->spec_quench_ewma < 0.0f &&
-                   s->spec_quench_debt > DS4_QUENCH_BUDGET;
+            s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
+            fire = s->spec.spec_quench_steps >= DS4_QUENCH_MINEV &&
+                   s->spec.spec_quench_ewma < 0.0f &&
+                   s->spec.spec_quench_debt > DS4_QUENCH_BUDGET;
         }
         if (fire) {
-            s->spec_quenched = true;
+            s->spec.spec_quenched = true;
             fprintf(stderr,
                     "ds4: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
                     "-> plain decode for request remainder%s\n",
-                    saved_len + 1 + commit, s->spec_quench_steps,
-                    (double)s->spec_quench_debt, (double)s->spec_quench_ewma,
+                    saved_len + 1 + commit, s->spec.spec_quench_steps,
+                    (double)s->spec.spec_quench_debt, (double)s->spec.spec_quench_ewma,
                     force >= 0 ? " (forced)" : "");
         }
     }
@@ -3821,16 +3867,16 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * so the next generate_speculative call forwards it as batch position 0;
      * pre-draft the NEXT block conditioned on it. */
     const int next_base = carry_tok;
-    s->spec_carry_token = (int32_t)carry_tok;
-    s->spec_carry_valid = !hit_eos;
-    s->spec_carry_pos = (int32_t)s->checkpoint.len;
-    s->spec_carry_temp = temperature;
-    s->spec_carry_top_k = top_k;
-    s->spec_carry_top_p = top_p;
-    s->spec_carry_min_p = min_p;
+    s->spec.spec_carry_token = (int32_t)carry_tok;
+    s->spec.spec_carry_valid = !hit_eos;
+    s->spec.spec_carry_pos = (int32_t)s->checkpoint.len;
+    s->spec.spec_carry_temp = temperature;
+    s->spec.spec_carry_top_k = top_k;
+    s->spec.spec_carry_top_p = top_p;
+    s->spec.spec_carry_min_p = min_p;
     uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     if (n_draft > 16u) n_draft = 16u;
-    if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec_quenched) {
+    if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain. */
@@ -3923,7 +3969,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                               &s->sample_scratch, &q);
         const int drawn = ds4_sample_dist_draw(&q, rng);
         refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
-        s->dspark_pending_q[pos] = ds4_sample_dist_prob(&q, drawn);
+        s->spec.dspark_pending_q[pos] = ds4_sample_dist_prob(&q, drawn);
         /* Diagnostic: how much proposal entropy is there actually? The whole
          * premise of temperature-matched drafting is that q is a DISTRIBUTION.
          * If q.n == 1 (or q(top) ~ 1) the draw is the argmax, min(1,p/q)
@@ -3932,7 +3978,7 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
             fprintf(stderr, "DSPARK_Q pos=%u q_n=%u q_top=%.4f q_drawn=%.4f "
                             "drawn_is_argmax=%d\n",
                     pos, q.n, (double)q.probs[0],
-                    (double)s->dspark_pending_q[pos], drawn == q.ids[0]);
+                    (double)s->spec.dspark_pending_q[pos], drawn == q.ids[0]);
         ds4_sample_dist_free(&q);
     }
     if (!draft_ok) return n_accept;
@@ -4003,8 +4049,8 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
                     float *hcrow = xmalloc(hcw2 * sizeof(float));
                     for (uint32_t p2 = 0; p2 < n_draft; p2++) {
                         memset(hcrow, 0, hcw2 * sizeof(float));
-                        (void)ds4_gpu_tensor_read(g->batch_cur_hc, (uint64_t)p2 * hcw2 * 4,
-                                                  hcrow, hcw2 * 4);
+                        (void)ds4_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
+                                                      hcrow, hcw2);
                         fwrite(hcrow, sizeof(float), hcw2, f2);
                     }
                     free(hcrow);
@@ -4046,9 +4092,9 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
             ds4_gpu_tensor_free(tok_dev);
         }
     }
-    s->dspark_pending_base = (int32_t)next_base;
-    s->dspark_n_pending = keep;
-    for (uint32_t i = 0; i < keep; i++) s->dspark_pending[i] = refined[i + 1];
+    s->spec.dspark_pending_base = (int32_t)next_base;
+    s->spec.dspark_n_pending = keep;
+    for (uint32_t i = 0; i < keep; i++) s->spec.dspark_pending[i] = refined[i + 1];
     /* The proposal rule and the exact params these drafts were sampled under.
      * Stamped unconditionally, in the same straight-line block as
      * dspark_n_pending above — this is the only site that makes pendings
@@ -4058,16 +4104,16 @@ static int ds4_session_eval_speculative_fused(ds4_session *s, int first_token,
      * next step's params guard compares against the params, and — load-bearing —
      * the residual rebuilds q from the qrows under THESE params, so the stored
      * accept denominator and the residual describe one proposal. */
-    s->dspark_pending_sampled = sample_drafts;
-    s->dspark_pending_pos = (int32_t)s->checkpoint.len;
-    s->dspark_pending_temp = temperature;
-    s->dspark_pending_top_k = top_k;
-    s->dspark_pending_top_p = top_p;
-    s->dspark_pending_min_p = min_p;
+    s->spec.dspark_pending_sampled = sample_drafts;
+    s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
+    s->spec.dspark_pending_temp = temperature;
+    s->spec.dspark_pending_top_k = top_k;
+    s->spec.dspark_pending_top_p = top_p;
+    s->spec.dspark_pending_min_p = min_p;
     if (dtree_stats)
         for (uint32_t i = 0; i < keep; i++) {
-            s->dspark_pending_alt[i] = refined2[i + 1];
-            s->dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
+            s->spec.dspark_pending_alt[i] = refined2[i + 1];
+            s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
         }
 
     /* DTree Phase 0: mid-band frequency — how often the drafted chain carries a
@@ -4117,19 +4163,19 @@ int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_
     }
     int first;
     const bool carry_params_match =
-        s->spec_carry_temp == temperature && s->spec_carry_top_k == top_k &&
-        s->spec_carry_top_p == top_p && s->spec_carry_min_p == min_p;
+        s->spec.spec_carry_temp == temperature && s->spec.spec_carry_top_k == top_k &&
+        s->spec.spec_carry_top_p == top_p && s->spec.spec_carry_min_p == min_p;
     /* the carry is only valid at the exact position it was drawn at; any
      * session advance outside this path (sync, plain eval, tool injection)
      * means s->logits no longer matches the carry's source distribution */
-    const bool carry_pos_match = s->spec_carry_pos == (int32_t)s->checkpoint.len;
-    if (s->spec_carry_valid && carry_params_match && carry_pos_match) {
-        first = (int)s->spec_carry_token;
-        s->spec_carry_valid = false;
+    const bool carry_pos_match = s->spec.spec_carry_pos == (int32_t)s->checkpoint.len;
+    if (s->spec.spec_carry_valid && carry_params_match && carry_pos_match) {
+        first = (int)s->spec.spec_carry_token;
+        s->spec.spec_carry_valid = false;
     } else {
         /* no carry, or params changed mid-stream (e.g. tool-call payloads
          * force greedy): redraw from the current distribution */
-        s->spec_carry_valid = false;
+        s->spec.spec_carry_valid = false;
         first = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                                    top_p, min_p, rng);
     }
@@ -4142,7 +4188,7 @@ int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_
     /* Yield-quenched requests run plain for their remainder — the same route
      * as a drafterless engine, chosen per request. The carry consumed above is
      * already correctly distributed, so this is a pure speed decision. */
-    if (!ds4_engine_has_dspark(s->engine) || s->spec_quenched) {
+    if (!ds4_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
         if (ds4_session_eval(s, first, err, errlen) != 0) return -1;
         accepted[0] = first;
         return 1;
@@ -4167,7 +4213,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
                  "per-bank state is stale; re-sync the session first");
         return -1;
     }
-    if (!ds4_engine_has_dspark(s->engine) || s->spec_quenched) {
+    if (!ds4_engine_has_dspark(s->engine) || s->spec.spec_quenched) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -4179,7 +4225,7 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
     static int fused_cache = -1;
     if (fused_cache < 0) fused_cache = getenv("DS4_DSPARK_LEGACY_LOOP") == NULL;
     /* an externally chosen first_token invalidates any pending carry */
-    s->spec_carry_valid = false;
+    s->spec.spec_carry_valid = false;
     if (fused_cache)
         return ds4_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
                                                   0.0f, 0, 1.0f, 0.0f, NULL,
@@ -4437,11 +4483,12 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
          * target distribution after the last committed draft (spec_logits row
          * draft_n-1).
          */
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        if (!s->spec_row_scratch)
+            s->spec_row_scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_scratch[0]));
+        float *row_logits = s->spec_row_scratch;
         ok_state = gpu_graph_read_spec_logits_row(g, (uint32_t)(draft_n - 1), row_logits);
         if (ok_state)
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        free(row_logits);
     } else {
         /*
          * Partial accept or full reject: the verifier ran the target over all
@@ -4508,8 +4555,8 @@ int ds4_session_eval_speculative_block(ds4_session *s, int first_token,
 void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    s->dspark_n_pending = 0;
-    s->spec_carry_valid = false;
+    s->spec.dspark_n_pending = 0;
+    s->spec.spec_carry_valid = false;
     spec_quench_reset(s);
     /* plan-33 inc C: an invalidated bank restarts from zero — a live keep
      * threshold would make the fresh prefill's early emits restore a STALE
@@ -4533,8 +4580,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
-    s->dspark_n_pending = 0;
-    s->spec_carry_valid = false;
+    s->spec.dspark_n_pending = 0;
+    s->spec.spec_carry_valid = false;
     spec_quench_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */

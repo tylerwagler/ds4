@@ -791,30 +791,6 @@ typedef struct {
  * hot loop.
  */
 
-typedef struct {
-    float *raw_kv;
-    uint32_t n_raw;
-    uint32_t cap_raw;
-
-    uint32_t compress_ratio;
-    uint32_t comp_cap;
-    uint32_t n_comp;
-    float *attn_comp_kv;
-    float *attn_state_kv;
-    float *attn_state_score;
-
-    uint32_t n_index_comp;
-    float *index_comp_kv;
-    float *index_state_kv;
-    float *index_state_score;
-} ds4_layer_cache;
-
-typedef struct {
-    ds4_layer_cache layer[DS4_MAX_LAYER];
-    uint32_t head_dim;
-} ds4_kv_cache;
-
-
 /* =========================================================================
  * GPU Release Graph State.
  * =========================================================================
@@ -1331,80 +1307,20 @@ typedef struct {
 void ds4_sample_scratch_free(ds4_sample_scratch *s);
 
 
-/* Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
- * pool-session's HOST per-conversation state (checkpoint token history, host
- * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
- * instance on ds4_session, so time-slicing classic/spec work across banks in
- * one graph must save the leaving bank's carry and restore the entering bank's.
- * gpu_graph_bank_repoint swaps the DEVICE views; this covers the HOST half the
- * engine header (gpu_graph_bank_repoint contract) delegates to the caller.
- * The three heap members are owned deep copies; every other field is a scalar
- * mirror of the identically-named ds4_session field. */
-typedef struct ds4_bank_carry {
-    bool      valid;                 /* has this bank's state ever been saved */
-    /* heap-backed (owned): */
-    token_vec checkpoint;            /* deep copy of s->checkpoint */
-    float    *logits;                /* DS4_N_VOCAB floats, owned */
-    float    *dspark_pending_qrows;  /* dspark_pending_qrows_cap floats, owned */
-    uint32_t  dspark_pending_qrows_cap;
-    /* scalar mirrors: */
-    bool      checkpoint_valid;
-    bool      mseq_dirty;
-    int32_t   dspark_pending[16];
-    uint32_t  dspark_n_pending;
-    int32_t   dspark_pending_base;
-    int32_t   dspark_pending_pos;
-    int32_t   spec_carry_token;
-    bool      spec_carry_valid;
-    int32_t   spec_carry_pos;
-    float     spec_carry_temp, spec_carry_top_p, spec_carry_min_p;
-    int       spec_carry_top_k;
-    int32_t   dspark_pending_alt[16];
-    float     dspark_pending_conf[16];
-    bool      dspark_pending_sampled;
-    float     dspark_pending_q[16];
-    float     dspark_pending_temp, dspark_pending_top_p, dspark_pending_min_p;
-    int       dspark_pending_top_k;
-    float     spec_quench_debt, spec_quench_ewma;
-    uint32_t  spec_quench_steps;
-    bool      spec_quenched;
-    uint64_t  spec_accepted_tokens, spec_draft_tokens, spec_num_drafts, spec_gen_tokens;
-} ds4_bank_carry;
-
-
-struct ds4_session {
-    ds4_engine *engine;
-    ds4_gpu_graph graph;
-    token_vec checkpoint;
-    float *logits;
-    /* Reused working set for the sampled speculative acceptance walk's
-     * full-vocab distribution builds (one per accepted position). Per-session,
-     * never shared: concurrent sessions each run their own walk. */
-    ds4_sample_scratch sample_scratch;
-    ds4_session_progress_fn progress;
-    void *progress_ud;
-    ds4_session_progress_fn display_progress;
-    void *display_progress_ud;
-    ds4_session_cancel_fn cancel;
-    void *cancel_ud;
-    uint32_t prefill_cap;
-    int ctx_size;
-    bool checkpoint_valid;
-    /* A multiseq step has run and the graph's CLASSIC per-bank state is no
-     * longer re-establishable by bookkeeping alone: the scalar frontier
-     * counters (layer_n_comp / layer_n_index_comp) hold a cross-bank
-     * SUPERSET, not any single bank's truth.  Any classic entry that decodes
-     * against those scalars (ds4_session_eval) would emit its compressor row
-     * at the superset index and attend over the rows below it — a previous
-     * tenant's bytes — producing wrong logits SILENTLY.  checkpoint_valid
-     * does NOT cover this: ds4_session_eval never reads it.  Set on every
-     * decode_multiseq path that armed a step; cleared only where per-bank
-     * device state is legitimately re-established (ds4_session_sync's rebuild
-     * path, via gpu_graph_reset_prefill_state zeroing the counters). */
-    bool mseq_dirty;
-    /* GPU bytes this session's create actually allocated (tensor-allocator
-     * delta across ds4_session_create); the server ledger commits this. */
-    uint64_t resident_bytes;
+/* The per-conversation SPECULATIVE / DSpark host shadow, factored into one
+ * named aggregate so it can be saved and restored WHOLESALE.  It is embedded
+ * BY VALUE in both ds4_session (the live state) and ds4_bank_carry (the
+ * per-bank Tier-2 shadow), and ds4_session_bank_state_save/_restore copy it
+ * with a single struct assignment.  That is the whole point: the old
+ * field-by-field mirror meant every new field had to be added at three sites
+ * (struct, save, restore) and forgetting one silently handed a bank ANOTHER
+ * conversation's speculative state.  Add new spec/DSpark scalars HERE and
+ * both paths pick them up for free.
+ *
+ * Deliberately EXCLUDED: heap-backed state (checkpoint, logits,
+ * dspark_pending_qrows) — those need deep copies with per-side ownership, so
+ * they stay as explicit members of each struct. */
+typedef struct ds4_spec_carry_state {
     /* Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
      * position's hidden, pending verification in THIS step's single batched
      * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
@@ -1471,27 +1387,6 @@ struct ds4_session {
     bool dspark_pending_sampled;
     /* q(pend[i]) at draft time — the accept denominator. */
     float dspark_pending_q[16];
-    /* The refined-logits row each pending draft was sampled from, 16 rows of
-     * DS4_N_VOCAB floats, allocated lazily on first sampled draft. The residual
-     * needs the FULL q, but only for the single rejected position — unknown
-     * until verify — so every position's row is persisted and the one that
-     * rejects rebuilds its q via ds4_sample_dist_build.
-     *
-     * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
-     * q: dist_build is a pure function of (logits, params), and the rebuild is
-     * handed BOTH persisted halves — this row and dspark_pending_temp/top_k/
-     * top_p/min_p below. Feeding it either half from live state is the trap: the
-     * live drafter state has advanced, and the live REQUEST params may differ
-     * from the draft-time ones, which would leave the stored accept denominator
-     * dspark_pending_q[i] (computed under the draft-time params) and the
-     * residual's q describing two different proposals inside one rule.
-     *
-     * Device-first note (Item 2): storing the logits ROW + params rather than a
-     * materialized nucleus is deliberate — the GPU accept kernel wants exactly
-     * this, so it swaps this host pool for a resident device buffer instead of
-     * reshaping the format. */
-    float *dspark_pending_qrows;
-    uint32_t dspark_pending_qrows_cap;   /* floats reserved */
     /* The sampling params the pendings were sampled under. TWO consumers, and
      * they are different in kind:
      *   1) EXACTNESS (load-bearing): the verify walk rebuilds the rejecting
@@ -1539,6 +1434,102 @@ struct ds4_session {
     uint64_t spec_draft_tokens;
     uint64_t spec_num_drafts;
     uint64_t spec_gen_tokens;
+} ds4_spec_carry_state;
+
+/* Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
+ * pool-session's HOST per-conversation state (checkpoint token history, host
+ * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
+ * instance on ds4_session, so time-slicing classic/spec work across banks in
+ * one graph must save the leaving bank's carry and restore the entering bank's.
+ * gpu_graph_bank_repoint swaps the DEVICE views; this covers the HOST half the
+ * engine header (gpu_graph_bank_repoint contract) delegates to the caller.
+ * The three heap members are owned deep copies; every other field is a scalar
+ * mirror of the identically-named ds4_session field; the speculative/DSpark
+ * scalars are carried wholesale as one embedded ds4_spec_carry_state. */
+typedef struct ds4_bank_carry {
+    bool      valid;                 /* has this bank's state ever been saved */
+    /* heap-backed (owned): */
+    token_vec checkpoint;            /* deep copy of s->checkpoint */
+    float    *logits;                /* DS4_N_VOCAB floats, owned */
+    float    *dspark_pending_qrows;  /* dspark_pending_qrows_cap floats, owned */
+    uint32_t  dspark_pending_qrows_cap;
+    /* scalar mirrors: */
+    bool      checkpoint_valid;
+    /* Whole speculative/DSpark shadow, mirrored by value (single assignment in
+     * save/restore).  NOTE: ds4_session.mseq_dirty is deliberately NOT carried:
+     * it is a property of the GRAPH's scalar frontier counters, not of a bank's
+     * conversation, and _restore re-establishes per-bank frontier truth via
+     * gpu_graph_bank_counters_install and then clears it unconditionally.  The
+     * old mirror field was write-only (saved, never read) and has been dropped. */
+    ds4_spec_carry_state spec;
+} ds4_bank_carry;
+
+
+struct ds4_session {
+    ds4_engine *engine;
+    ds4_gpu_graph graph;
+    token_vec checkpoint;
+    float *logits;
+    /* Reused working set for the sampled speculative acceptance walk's
+     * full-vocab distribution builds (one per accepted position). Per-session,
+     * never shared: concurrent sessions each run their own walk. */
+    ds4_sample_scratch sample_scratch;
+    /* Reusable DS4_N_VOCAB-float staging row for the speculative paths'
+     * spec_logits readbacks.  ~517 KB, i.e. above glibc's mmap threshold, so a
+     * per-step malloc/free would mmap/munmap and re-fault it every accepted
+     * position — allocate once per session instead.  Deliberately NOT drawn
+     * from sample_scratch: sample_scratch_reserve frees the whole struct when
+     * it grows, which would dangle a row held across a ds4_sample_dist_build.
+     * Only ever live inside one speculative eval call (the fused and block
+     * paths never overlap: block tail-calls fused). */
+    float *spec_row_scratch;
+    ds4_session_progress_fn progress;
+    void *progress_ud;
+    ds4_session_progress_fn display_progress;
+    void *display_progress_ud;
+    ds4_session_cancel_fn cancel;
+    void *cancel_ud;
+    uint32_t prefill_cap;
+    int ctx_size;
+    bool checkpoint_valid;
+    /* A multiseq step has run and the graph's CLASSIC per-bank state is no
+     * longer re-establishable by bookkeeping alone: the scalar frontier
+     * counters (layer_n_comp / layer_n_index_comp) hold a cross-bank
+     * SUPERSET, not any single bank's truth.  Any classic entry that decodes
+     * against those scalars (ds4_session_eval) would emit its compressor row
+     * at the superset index and attend over the rows below it — a previous
+     * tenant's bytes — producing wrong logits SILENTLY.  checkpoint_valid
+     * does NOT cover this: ds4_session_eval never reads it.  Set on every
+     * decode_multiseq path that armed a step; cleared only where per-bank
+     * device state is legitimately re-established (ds4_session_sync's rebuild
+     * path, via gpu_graph_reset_prefill_state zeroing the counters). */
+    bool mseq_dirty;
+    /* GPU bytes this session's create actually allocated (tensor-allocator
+     * delta across ds4_session_create); the server ledger commits this. */
+    uint64_t resident_bytes;
+    /* Live speculative/DSpark shadow; see ds4_spec_carry_state. */
+    ds4_spec_carry_state spec;
+    /* The refined-logits row each pending draft was sampled from, 16 rows of
+     * DS4_N_VOCAB floats, allocated lazily on first sampled draft. The residual
+     * needs the FULL q, but only for the single rejected position — unknown
+     * until verify — so every position's row is persisted and the one that
+     * rejects rebuilds its q via ds4_sample_dist_build.
+     *
+     * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
+     * q: dist_build is a pure function of (logits, params), and the rebuild is
+     * handed BOTH persisted halves — this row and dspark_pending_temp/top_k/
+     * top_p/min_p below. Feeding it either half from live state is the trap: the
+     * live drafter state has advanced, and the live REQUEST params may differ
+     * from the draft-time ones, which would leave the stored accept denominator
+     * dspark_pending_q[i] (computed under the draft-time params) and the
+     * residual's q describing two different proposals inside one rule.
+     *
+     * Device-first note (Item 2): storing the logits ROW + params rather than a
+     * materialized nucleus is deliberate — the GPU accept kernel wants exactly
+     * this, so it swaps this host pool for a resident device buffer instead of
+     * reshaping the format. */
+    float *dspark_pending_qrows;
+    uint32_t dspark_pending_qrows_cap;   /* floats reserved */
     /* Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
      * allocated on the first ds4_session_bank_state_save; NULL / bank_carry_n==0
      * when the pool is disabled (single-session use never touches it). */
@@ -2035,8 +2026,6 @@ void layer_ffn_tokens_parallel(
 uint32_t ds4_default_raw_cap(uint32_t ctx_size);
 uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
-void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap);
-void kv_cache_free(ds4_kv_cache *cache);
 void layer_forward_self_one(
         float                   * out_hc,
         const ds4_model         * model,
@@ -2079,7 +2068,16 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
         uint32_t  prefill_cap,
         uint64_t *kv_cache_bytes_out);
 ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes);
+/* True when DS4_CUDA_GRAPH_DUMP_PREFIX is set (cached). Graph allocation
+ * uses this to skip buffers that exist only to be dumped. */
+bool gpu_graph_debug_dump_enabled(void);
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos);
+void gpu_graph_debug_dump_hc_tensor(
+        const char       *name,
+        ds4_gpu_tensor *t,
+        uint64_t          n_elems,
+        uint32_t          il,
+        uint32_t          pos);
 void gpu_graph_debug_dump_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -2399,6 +2397,16 @@ ds4_gpu_tensor *gpu_graph_tensor_row_view(
         ds4_gpu_tensor *base,
         uint32_t          row,
         uint64_t          row_values);
+ds4_gpu_tensor *gpu_graph_hc_row_view(
+        ds4_gpu_tensor *base,
+        uint32_t          row,
+        uint64_t          row_values);
+/* Read an HC residual carrier (BF16 storage; task #62) into an f32 host buffer,
+ * expanding each sample. Dev-only (parity self-test + env-gated DSpark dumps). */
+int ds4_read_hc_carrier_f32(const ds4_gpu_tensor *t, uint64_t off_elems,
+                            float *out, uint64_t n);
+/* f32 -> HC carrier bytes (RNE, matches the GPU __float2bfloat16 store). */
+void ds4_store_hc_carrier_f32(void *dst, const float *src, uint64_t n);
 bool gpu_graph_upload_prompt_tokens(
         ds4_gpu_tensor *out_tokens,
         const token_vec  *prompt,
