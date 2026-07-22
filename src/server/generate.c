@@ -477,24 +477,39 @@ static void remember_thinking_checkpoint(server *s, session_slot *sl,
 }
 
 /* Tool-call finish WITH thinking on: the model emitted <think>reasoning</think>
- * before the DSML tool call, so the reasoning tokens sit in the live KV. The
- * client replays this turn with the reasoning stripped (<think></think>), so the
- * exact-DSML-replay shortcut no longer aligns and every follow-up re-prefills the
- * whole conversation. Fix it like the toolless thinking path: remember the
- * thinking-STRIPPED bytes the next request will render as a key, but keep the
- * live tokens (reasoning included) as the sampled frontier. The next request then
- * byte-matches the key and continues from live KV — no rewrite, no rebuild. */
+ * before the DSML tool call, so the reasoning tokens sit in the live KV.  We
+ * remember the exact bytes the NEXT request will render for this turn as a visible
+ * key, keeping the live tokens (reasoning included) as the sampled frontier.  The
+ * next request byte-matches the key and continues from live KV — no rewrite, no
+ * rebuild — and, critically, an evicted-then-reloaded checkpoint is keyed by that
+ * same visible transcript on disk (kv_cache_store_current).
+ *
+ * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
+ * for a tool-context turn (prompt_render.c: `tool_context || i > last_user_idx`),
+ * because agentic clients (opencode et al.) replay reasoning_content verbatim so
+ * the model keeps its chain of thought across tool rounds.  So the key MUST carry
+ * the reasoning too — an earlier version dropped it (<think></think>), which byte-
+ * diverges from every reasoning-preserving replay at the first reasoning byte and
+ * made the live alias AND the disk key miss, forcing a full cold re-prefill of the
+ * whole conversation on eviction (opencode's ~4-minute-per-message symptom).  The
+ * toolless thinking path (remember_thinking_checkpoint) still strips: it only fires
+ * for non-tool-context requests (should_remember_thinking_checkpoint bails when
+ * prompt_preserves_reasoning), i.e. clients that DO drop reasoning on replay. */
 static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
                                               const job *j, const char *ctx,
                                               uint64_t trace_id, const char *content,
+                                              const char *reasoning,
                                               const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
     if (!ds4_think_mode_enabled(j->req.think_mode)) return;
 
-    /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + empty-reasoning
-     * suffix "</think>{content}{DSML}<EOS>" — exactly what render_chat_prompt_text
-     * emits for this tool turn on the next request (reasoning dropped). */
-    char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", calls);
+    /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + reasoning-preserved
+     * suffix "{reasoning}</think>{content}{DSML}<EOS>" — byte-identical to what
+     * render_chat_prompt_text emits for this tool turn on the next request (DSML from
+     * the id-keyed raw sample via tool_memory, reasoning replayed verbatim) and to
+     * the sampled bytes already in the live KV. */
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content,
+                                                reasoning ? reasoning : "", calls);
     buf visible = {0};
     buf_puts(&visible, j->req.prompt_text);
     buf_puts(&visible, suffix);
@@ -2026,14 +2041,16 @@ static void gen_step_finish(server *s, session_slot *sl) {
         ds4_think_mode_enabled(j->req.think_mode) &&
         !j->req.force_tool_call)
     {
-        /* Tool call with thinking on: the reasoning is in the live KV but the
-         * client replays the turn stripped, so exact-DSML replay and
-         * canonicalization both fail (the latter can only re-prefill). Remember
-         * the stripped bytes as a key and keep the live tokens — the next
-         * request continues from live KV with no rebuild. */
+        /* Tool call with thinking on: the reasoning is in the live KV, and the
+         * client replays this turn with the reasoning preserved (agentic clients
+         * echo reasoning_content so the model keeps its chain of thought), so we
+         * remember the reasoning-PRESERVED bytes the next request will render as a
+         * key and keep the live tokens — the next request byte-matches the key and
+         * continues from live KV (or a disk-reloaded checkpoint keyed by the same
+         * visible transcript) with no rebuild. */
         remember_tool_thinking_checkpoint(s, sl, j, g->ctx_span, g->trace_id,
                                           parsed_content ? parsed_content : "",
-                                          &parsed_calls);
+                                          parsed_reasoning, &parsed_calls);
     } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
