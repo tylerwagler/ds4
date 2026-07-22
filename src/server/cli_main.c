@@ -756,7 +756,10 @@ int main(int argc, char **argv) {
      * demand), so eager = (banked(2)-banked(1)) - demand and shared = banked(1) -
      * (banked(2)-banked(1)). Overcommit charges only shared + N*eager (+ optional
      * touched reserve) at admission, so a huge --ctx yields N>1 banks instead of
-     * N=1. OFF by default (opt-in until the increment-2 eviction guard lands). */
+     * N=1. DEFAULT ON as of v0.3.0 — the increment-2 proactive-eviction guard has
+     * landed and was stress-validated (banks growing toward 1M are bounded by
+     * LRU-idle eviction before the physical budget is breached; see
+     * server_overcommit_enabled). DS4_OVERCOMMIT=0 reverts to full-charge N=1. */
     const bool overcommit = server_overcommit_enabled();
     uint64_t oc_shared = 0, oc_eager_pb = 0, oc_expect_pb = 0, oc_demand_pb = 0;
     if (overcommit) {

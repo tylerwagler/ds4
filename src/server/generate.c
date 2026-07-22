@@ -3409,8 +3409,16 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * Each slot samples its OWN logits row with its OWN sampler/RNG and streams
  * through gen_emit_token (the shared emit path), so per-request
  * output/stop/streaming is byte-identical in shape to the classic lane; only the
- * forward numerics differ (batched vs single-token path — a pre-existing,
- * co-scheduling-NEUTRAL property proven by the multiseq gate). Plain decode
+ * forward numerics differ (batched vs single-token path). NOTE: this is NOT
+ * co-scheduling-neutral for greedy (temp-0) output. The M>=2 co-batched forward's
+ * logits differ ~1 ULP from the M=1 single-sequence path (different GEMM tiling /
+ * reduction order); at greedy temp-0 that can flip a near-tie argmax, so a
+ * request's greedy continuation depends on what else is co-scheduled. This is
+ * distribution-preserving and INVISIBLE under sampling (temp>0) — same class as
+ * batched inference elsewhere (vLLM et al.) — but it is a real greedy-determinism
+ * property, characterized 2026-07-22. The multiseq gate proves N=2-vs-N=3
+ * neutrality (bank output invariant to OTHER banks), which is a WEAKER invariant
+ * than batched==solo and does NOT cover this ULP. Plain decode
  * only. Slots that stop are set to GEN_FINISH and dropped; the worker finishes
  * them via the per-slot path, which reconciles their host checkpoint against the
  * tokens committed here. Leaves the pool multiseq-poisoned with live_bank = -1
