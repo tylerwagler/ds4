@@ -822,6 +822,7 @@ bool responses_final_response(int fd, bool enable_cors,
 bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
+                           const char *logprobs_json,
                            int prompt_tokens, int completion_tokens) {
     buf b = {0};
     long now = (long)time(NULL);
@@ -838,7 +839,12 @@ bool final_response(int fd, bool enable_cors,
             buf_puts(&b, ",\"tool_calls\":");
             append_tool_calls_json(&b, calls, id, &r->tool_orders);
         }
-        buf_puts(&b, "},\"finish_reason\":");
+        buf_puts(&b, "}"); /* close message */
+        if (logprobs_json) {
+            buf_puts(&b, ",\"logprobs\":");
+            buf_puts(&b, logprobs_json);
+        }
+        buf_puts(&b, ",\"finish_reason\":");
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     } else {

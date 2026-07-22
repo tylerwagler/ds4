@@ -109,6 +109,25 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 goto bad;
             }
             r->has_top_k = true;
+        } else if (!strcmp(key, "logprobs")) {
+            /* OpenAI chat: boolean switch for per-token content logprobs.
+             * (Legacy /v1/completions uses an integer here instead; that path
+             * is handled in parse_completion_request and left untouched.) */
+            if (!json_bool(&p, &r->logprobs)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "top_logprobs")) {
+            /* OpenAI chat: 0-20 alternatives per token. Out-of-range is
+             * clamped rather than erroring, matching top_p/min_p handling
+             * here. Only takes effect when logprobs is true (checked at emit
+             * time). */
+            if (!json_int(&p, &r->top_logprobs)) {
+                free(key);
+                goto bad;
+            }
+            if (r->top_logprobs < 0) r->top_logprobs = 0;
+            if (r->top_logprobs > 20) r->top_logprobs = 20;
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {

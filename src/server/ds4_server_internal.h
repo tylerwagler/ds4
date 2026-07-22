@@ -320,6 +320,13 @@ typedef struct {
     bool has_top_k;
     bool has_top_p;
     bool has_min_p;
+    /* OpenAI-compatible logprobs (chat completions only). `logprobs` is the
+     * boolean switch; `top_logprobs` (0-20) is how many alternatives to report
+     * per token. Both zeroed by request_init's memset; set only in api_parse.c.
+     * When logprobs is set, generate.c forces the per-token sample path (no
+     * speculative decoding) so every token has its own live logits. */
+    bool logprobs;
+    int top_logprobs;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -1140,6 +1147,8 @@ bool http_error_context_length_exceeded(int fd, bool enable_cors,
 bool sse_headers(int fd, bool enable_cors);
 bool sse_error_event(int fd, const request *r, const char *msg);
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish);
+bool sse_chunk_lp(int fd, const request *r, const char *id, const char *text,
+                  const char *finish, const char *logprobs_json);
 int clamp_usage_tokens(int value, int max);
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens);
@@ -1215,6 +1224,7 @@ bool responses_final_response(int fd, bool enable_cors,
 bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
+                           const char *logprobs_json,
                            int prompt_tokens, int completion_tokens);
 void append_anthropic_content(buf *b, const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *id_prefix,

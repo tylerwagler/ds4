@@ -716,6 +716,21 @@ typedef enum {
     GEN_DONE,
 } gen_phase;
 
+/* One decoded token's OpenAI-style logprob record, captured at the sample site
+ * when a request sets `logprobs`. Owns `piece` (a copy of the token text) and
+ * `top` (the top-k alternatives). `byte_off` locates this token's bytes within
+ * gen_state.text: ds4 streams UTF-8/stop-safe byte slices rather than whole
+ * tokens, so the streaming path can only flush a record once its byte range is
+ * fully covered by an emitted delta. */
+typedef struct {
+    char *piece;
+    size_t piece_len;
+    size_t byte_off;
+    float logprob;          /* natural-log prob of the sampled token */
+    ds4_token_score *top;   /* top-k alternatives (id/logit/logprob), or NULL */
+    int n_top;
+} lp_token;
+
 struct gen_state {
     job *j;
     gen_phase phase;
@@ -788,11 +803,149 @@ struct gen_state {
     bool dspark_spec_enabled;
     dsml_decode_tracker dsml_tracker;
 
+    /* OpenAI logprobs capture, active only when j->req.logprobs. The record
+     * array grows one entry per sampled token; lp_stream_next is the index of
+     * the first record not yet emitted on the streaming path. lp_pending_*
+     * hold the sample-site capture (the token's own logprob plus its top-k
+     * alternatives) until the token's piece and byte offset are known a few
+     * lines later in the decode loop. Reset in gen_decode_init, freed by
+     * gen_lp_free (see gen_state_free). */
+    lp_token *lp;
+    int lp_count;
+    int lp_cap;
+    int lp_stream_next;
+    bool lp_pending;
+    float lp_pending_logprob;
+    ds4_token_score *lp_pending_top;
+    int lp_pending_n_top;
+
     /* deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;
 };
 
 static void gen_stream_begin(server *s, session_slot *sl);
+
+/* Release every captured logprob record (and any half-captured pending top-k),
+ * then zero the accumulator. Safe to call repeatedly: gen_decode_init runs it
+ * before each decode attempt (so a tool-error retry starts clean) and
+ * gen_state_free runs it at teardown. */
+static void gen_lp_free(gen_state *g) {
+    for (int i = 0; i < g->lp_count; i++) {
+        free(g->lp[i].piece);
+        free(g->lp[i].top);
+    }
+    free(g->lp);
+    g->lp = NULL;
+    g->lp_count = 0;
+    g->lp_cap = 0;
+    g->lp_stream_next = 0;
+    free(g->lp_pending_top);
+    g->lp_pending_top = NULL;
+    g->lp_pending = false;
+    g->lp_pending_n_top = 0;
+    g->lp_pending_logprob = 0.0f;
+}
+
+/* Sample-site capture: record the sampled token's own logprob and, when
+ * top_k > 0, its top-k alternatives from the live logits. MUST run after
+ * ds4_session_sample and BEFORE ds4_session_eval, which advances the session
+ * to the next position. Held in lp_pending_* until the decode loop knows the
+ * token's piece text and byte offset (gen_lp_commit). */
+static void gen_lp_capture_pending(gen_state *g, ds4_session *sess, int token, int top_k) {
+    ds4_token_score sel = { .id = token, .logit = 0.0f, .logprob = 0.0f };
+    ds4_session_token_logprob(sess, token, &sel);
+    g->lp_pending_logprob = sel.logprob;
+    free(g->lp_pending_top);
+    g->lp_pending_top = NULL;
+    g->lp_pending_n_top = 0;
+    if (top_k > 0) {
+        ds4_token_score *top = calloc((size_t)top_k, sizeof(*top));
+        if (top) {
+            int n = ds4_session_top_logprobs(sess, top, top_k);
+            if (n < 0) n = 0;
+            g->lp_pending_top = top;
+            g->lp_pending_n_top = n;
+        }
+    }
+    g->lp_pending = true;
+}
+
+/* Commit the pending sample-site capture into a full record now that the
+ * token's decoded text and its byte offset within gen_state.text are known.
+ * Copies the piece; takes ownership of the pending top-k array. No-op if no
+ * capture is pending. */
+static void gen_lp_commit(gen_state *g, const char *piece, size_t piece_len, size_t byte_off) {
+    if (!g->lp_pending) return;
+    if (g->lp_count == g->lp_cap) {
+        int ncap = g->lp_cap ? g->lp_cap * 2 : 32;
+        lp_token *nlp = realloc(g->lp, (size_t)ncap * sizeof(*nlp));
+        if (!nlp) { /* out of memory: drop this token's logprobs, keep decoding */
+            free(g->lp_pending_top);
+            g->lp_pending_top = NULL;
+            g->lp_pending_n_top = 0;
+            g->lp_pending = false;
+            return;
+        }
+        g->lp = nlp;
+        g->lp_cap = ncap;
+    }
+    lp_token *rec = &g->lp[g->lp_count++];
+    rec->piece = xstrndup(piece, piece_len);
+    rec->piece_len = piece_len;
+    rec->byte_off = byte_off;
+    rec->logprob = g->lp_pending_logprob;
+    rec->top = g->lp_pending_top;   /* transfer ownership */
+    rec->n_top = g->lp_pending_n_top;
+    g->lp_pending_top = NULL;
+    g->lp_pending_n_top = 0;
+    g->lp_pending = false;
+}
+
+/* Append an OpenAI `bytes` array [b0,b1,...] (unsigned decimal per byte) for a
+ * raw span. */
+static void gen_lp_append_bytes(buf *out, const char *s, size_t n) {
+    buf_putc(out, '[');
+    for (size_t i = 0; i < n; i++) {
+        if (i) buf_putc(out, ',');
+        buf_printf(out, "%u", (unsigned)(unsigned char)s[i]);
+    }
+    buf_putc(out, ']');
+}
+
+/* Append the OpenAI `logprobs` object value {"content":[...]} for `n` records
+ * starting at `recs`. Each entry carries the sampled token's text, natural-log
+ * probability and raw bytes, plus its top-k alternatives (text/logprob/bytes,
+ * resolved from token ids via ds4_token_text). Shared by the non-streaming
+ * response and the per-chunk streaming path. */
+static void gen_lp_content_json(buf *out, ds4_engine *e, const lp_token *recs, int n) {
+    buf_puts(out, "{\"content\":[");
+    for (int i = 0; i < n; i++) {
+        const lp_token *rec = &recs[i];
+        if (i) buf_putc(out, ',');
+        buf_puts(out, "{\"token\":");
+        json_escape_n(out, rec->piece, rec->piece_len);
+        buf_printf(out, ",\"logprob\":%.9g,\"bytes\":", (double)rec->logprob);
+        gen_lp_append_bytes(out, rec->piece, rec->piece_len);
+        buf_puts(out, ",\"top_logprobs\":[");
+        int emitted = 0;
+        for (int k = 0; k < rec->n_top; k++) {
+            if (rec->top[k].id < 0) break; /* sentinel: fewer than k alternatives */
+            if (emitted++) buf_putc(out, ',');
+            size_t tl = 0;
+            char *tt = ds4_token_text(e, rec->top[k].id, &tl);
+            buf_puts(out, "{\"token\":");
+            json_escape_n(out, tt ? tt : "", tt ? tl : 0);
+            buf_printf(out, ",\"logprob\":%.9g,\"bytes\":", (double)rec->top[k].logprob);
+            gen_lp_append_bytes(out, tt ? tt : "", tt ? tl : 0);
+            buf_putc(out, '}');
+            free(tt);
+        }
+        buf_puts(out, "]}");
+    }
+    /* `refusal` mirrors OpenAI's ChoiceLogprobs shape; ds4 never produces a
+     * structured refusal, so it is always null. */
+    buf_puts(out, "],\"refusal\":null}");
+}
 
 
 
@@ -1284,6 +1437,7 @@ static void gen_decode_init(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
     job *j = g->j;
     buf_free(&g->text);
+    gen_lp_free(g);
     g->plain_stream_pos = 0;
     g->stop_scan_from = 0;
     g->finish = "length";
@@ -1392,9 +1546,13 @@ static void gen_step_decode(server *s, session_slot *sl) {
         int token;
         int toks[17];
         int ntok = 0;
-        if (ds4_engine_has_dspark(s->engine) && g->dspark_spec_enabled) {
+        if (ds4_engine_has_dspark(s->engine) && g->dspark_spec_enabled &&
+            !j->req.logprobs) {
             /* the speculative block owns sampling (exact sampled acceptance at
-             * any temperature; greedy degenerates to the argmax rule) */
+             * any temperature; greedy degenerates to the argmax rule).
+             * Speculative decoding commits multiple tokens per step without
+             * exposing per-token logits, so when the client asked for logprobs
+             * we take the single-token sample path below instead. */
             ntok = ds4_session_generate_speculative(sl->sess,
                                                     temperature, top_k, top_p, min_p,
                                                     &g->rng,
@@ -1413,6 +1571,12 @@ static void gen_step_decode(server *s, session_slot *sl) {
             if (token == ds4_token_eos(s->engine)) {
                 g->finish = "stop";
                 break;
+            }
+            /* Capture this token's logprob (and top-k) from the live logits
+             * before eval advances the session. Finalized in the decode loop
+             * once the piece/byte-offset are known (gen_lp_commit). */
+            if (j->req.logprobs) {
+                gen_lp_capture_pending(g, sl->sess, token, j->req.top_logprobs);
             }
             if (ds4_session_eval(sl->sess, token, g->err, sizeof(g->err)) != 0) {
                 g->finish = "error";
@@ -1440,6 +1604,10 @@ static void gen_step_decode(server *s, session_slot *sl) {
             g->completion++;
 
             trace_piece(s, g->trace_id, piece, piece_len);
+            /* Record this token's byte offset within g->text (== current length,
+             * before the append) so the streaming path can flush its logprob
+             * only once these bytes are covered by a stream-safe delta. */
+            if (g->lp_pending) gen_lp_commit(g, piece, piece_len, g->text.len);
             buf_append(&g->text, piece, piece_len);
             thinking_state_feed(&g->thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -1462,7 +1630,28 @@ static void gen_step_decode(server *s, session_slot *sl) {
 
             if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
                 char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
-                bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
+                /* Flush the logprob records whose token bytes are now fully
+                 * covered by the emitted slice. ds4 streams UTF-8/stop-safe
+                 * byte slices, so a token's record is held until its whole
+                 * [byte_off, byte_off+piece_len) range is <= stream_len,
+                 * keeping each chunk's logprobs.content[] token-aligned. */
+                buf lp_json = {0};
+                const char *lp_arg = NULL;
+                if (j->req.logprobs) {
+                    int first = g->lp_stream_next;
+                    while (g->lp_stream_next < g->lp_count &&
+                           g->lp[g->lp_stream_next].byte_off +
+                               g->lp[g->lp_stream_next].piece_len <= stream_len) {
+                        g->lp_stream_next++;
+                    }
+                    if (g->lp_stream_next > first) {
+                        gen_lp_content_json(&lp_json, s->engine, &g->lp[first],
+                                            g->lp_stream_next - first);
+                        lp_arg = lp_json.ptr;
+                    }
+                }
+                bool ok = sse_chunk_lp(j->fd, &j->req, g->id, delta, NULL, lp_arg);
+                buf_free(&lp_json);
                 free(delta);
                 if (!ok) {
                     g->finish = "error";
@@ -1726,7 +1915,18 @@ static void gen_step_finish(server *s, session_slot *sl) {
 
     if (j->req.stream && !g->structured_stream && g->text.len > g->plain_stream_pos) {
         char *tail = xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
-        if (!sse_chunk(j->fd, &j->req, g->id, tail, NULL)) g->finish = "error";
+        /* Final slice covers the rest of the text, so flush every logprob
+         * record not yet streamed. */
+        buf lp_json = {0};
+        const char *lp_arg = NULL;
+        if (j->req.logprobs && g->lp_stream_next < g->lp_count) {
+            gen_lp_content_json(&lp_json, s->engine, &g->lp[g->lp_stream_next],
+                                g->lp_count - g->lp_stream_next);
+            lp_arg = lp_json.ptr;
+            g->lp_stream_next = g->lp_count;
+        }
+        if (!sse_chunk_lp(j->fd, &j->req, g->id, tail, NULL, lp_arg)) g->finish = "error";
+        buf_free(&lp_json);
         free(tail);
     }
 
@@ -1998,11 +2198,18 @@ static void gen_step_finish(server *s, session_slot *sl) {
                                  &parsed_calls, final_finish,
                                  g->prompt_tokens, g->completion);
     } else {
+        buf lp_json = {0};
+        const char *lp_arg = NULL;
+        if (j->req.kind == REQ_CHAT && j->req.logprobs) {
+            gen_lp_content_json(&lp_json, s->engine, g->lp, g->lp_count);
+            lp_arg = lp_json.ptr;
+        }
         final_response(j->fd, s->enable_cors, &j->req, g->id,
                        parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                        parsed_reasoning,
-                       &parsed_calls, final_finish,
+                       &parsed_calls, final_finish, lp_arg,
                        g->prompt_tokens, g->completion);
+        buf_free(&lp_json);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -2085,6 +2292,7 @@ static void gen_state_free(server *s, session_slot *sl) {
     openai_stream_free(&g->openai_live);
     responses_stream_free(&g->responses_live);
     buf_free(&g->text);
+    gen_lp_free(g);
     ds4_tokens_free(&g->effective_prompt);
     ds4_tokens_free(&g->cold_prefix);
     free(g->disk_cache_path);

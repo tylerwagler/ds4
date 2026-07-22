@@ -141,7 +141,11 @@ bool sse_error_event(int fd, const request *r, const char *msg) {
 
 
 
-bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+/* Like sse_chunk, but splices a pre-rendered OpenAI `logprobs` object value
+ * (built by the decode loop) into the chat choice when logprobs_json != NULL.
+ * logprobs are chat-only; the text_completion branch ignores the argument. */
+bool sse_chunk_lp(int fd, const request *r, const char *id, const char *text,
+                  const char *finish, const char *logprobs_json) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -154,6 +158,10 @@ bool sse_chunk(int fd, const request *r, const char *id, const char *text, const
             buf_putc(&b, '}');
         } else {
             buf_puts(&b, finish ? "{}" : "{\"role\":\"assistant\"}");
+        }
+        if (logprobs_json) {
+            buf_puts(&b, ",\"logprobs\":");
+            buf_puts(&b, logprobs_json);
         }
         buf_puts(&b, ",\"finish_reason\":");
         if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
@@ -170,6 +178,10 @@ bool sse_chunk(int fd, const request *r, const char *id, const char *text, const
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
+}
+
+bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+    return sse_chunk_lp(fd, r, id, text, finish, NULL);
 }
 
 
