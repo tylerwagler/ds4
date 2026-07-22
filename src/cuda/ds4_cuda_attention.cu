@@ -2268,6 +2268,17 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     static const int no_indexed_topk_sort = getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") != NULL;
     static const int no_indexed_heads8 = getenv("DS4_CUDA_NO_INDEXED_HEADS8") != NULL;
     static const int twopass_requested = getenv("DS4_CUDA_INDEXED_TWOPASS") != NULL;
+    /* Kill-switch for the single-token (decode) heads8-online route added below;
+     * set it to restore the pre-change generic per-(row,head) decode kernel. */
+    static const int no_indexed_decode_heads8 =
+        getenv("DS4_CUDA_NO_INDEXED_DECODE_HEADS8") != NULL;
+    /* The sort stays OFF for n_tokens == 1.  It is a pure locality optimization:
+     * attention_indexed_mixed_heads8_online_kernel reads topk[] in whatever order
+     * it is given, clamps each id against visible_comp, and folds rows through an
+     * online softmax that is correct for ANY permutation — there is no dedup, no
+     * monotonicity assumption, and no binary search anywhere in it.  At decode the
+     * whole 512-row compressed scan is L2-resident, so ascending row addresses buy
+     * nothing while the bitonic sort costs ~4.2 us per token. */
     if (n_tokens > 1u && top_k == 512u &&
         !no_indexed_topk_sort) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
@@ -2284,10 +2295,27 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      * always takes the online branch (never rb4).
      *
      * Scope guard: packed comp routes to the online kernel ONLY in banked mode
-     * (descr).  Classic (non-descr) paths keep their exact prior kernel choice —
-     * f32 -> online, pack -> generic — so no classic path changes behaviour. */
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
-        (descr || !comp_kv_pack) &&
+     * (descr) or on a single-token (decode) row.  Multi-token classic (non-descr)
+     * paths keep their exact prior kernel choice — f32 -> online, pack -> generic.
+     *
+     * THE n_tokens == 1 CARVE-OUT CHANGES BEHAVIOUR, DELIBERATELY.  Single-token
+     * decode used to fall through to attention_indexed_mixed_kernel at
+     * grid(1, n_head): 64 blocks, each dequantizing the SAME compressed rows for
+     * one head.  Routing it here instead gives grid(1, n_head/16): each block
+     * stages a row into shared memory once and reuses it for 16 heads, amortizing
+     * the pack dequant instructions and the load latency across the group.  This
+     * is a LATENCY / instruction-amortization win, NOT a bandwidth win — the
+     * indexer caps the compressed scan at top_k=512 rows (~0.46 MB per layer),
+     * which sits entirely in GB10's 24 MiB L2, so the reads the old kernel
+     * repeated were already L2 hits.  Do not expect it to scale with context.
+     *
+     * It is NOT bit-exact against the generic kernel: the online softmax folds
+     * rows in a different order, so decode logits drift (top-1 held everywhere
+     * sampled; top-10 reorders and a greedy stream diverges within a token or
+     * two).  Each build stays perfectly deterministic run to run.  Prefill is
+     * untouched — it already took this kernel. */
+    if ((n_tokens > 1 || !no_indexed_decode_heads8) && head_dim == 512 && top_k <= 512u &&
+        (descr || !comp_kv_pack || n_tokens == 1u) &&
         !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
          * online branch. */
