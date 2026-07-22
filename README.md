@@ -67,8 +67,11 @@ This is **beta quality**, but a first release has shipped: the
 measured-allocation DeepSeek-V4-Flash GGUF (the `v5mx` build) and the
 `ds4-server` engine that serves it. The inference path, the MXFP4/MXFP8/IQ2
 quantization, and speculative decoding are validated against the tests in this
-tree and the `tool-eval-bench` quality suite — a fresh 4-seed run of the
+tree and the `tool-eval-bench` quality suite — a 4-seed run of the
 shipping build averages ~90/100 with hardmode included (range 87–92 across seeds).
+v0.3.0 was re-verified **quality-neutral** versus v0.2.3 on the full 84-scenario
+hardmode suite (every committed change — the f32→BF16 residual carrier included —
+within seed noise, no regression cluster).
 Model serving is
 a large surface, so rough edges remain; we keep the project usable and are
 actively hardening it. If you hit a problem, run `ds4-server --trace
@@ -207,10 +210,11 @@ full flag list, and start serving with:
 ## Speed
 
 Performance is measured on this fork's target hardware — a **DGX Spark GB10**
-running the ~91 GB REAP-pruned Flash build. The **v0.2.3** artifact unifies every
+running the ~91 GB REAP-pruned Flash build. The artifact unifies every
 MXFP4 routed-expert layer onto the CUTLASS tensor-core **type-40 W4A8 path**
 (4-bit weights, E4M3 activations) and stores all MXFP8 workhorse weights in the
-**type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack). Prefill is measured
+**type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack) — both since v0.2.3.
+Numbers below are the **v0.3.0** build. Prefill is measured
 **cold** (`cache_prompt` off, unique-prefix probe — a warm cache reports
 arbitrarily high prompt-processing rates and is not a real prefill number);
 decode is measured with the merged DSpark speculative drafter, single stream, on
@@ -219,21 +223,28 @@ real depth-varying prompts.
 
 | Context (actual) | Prefill (t/s, cold) | TTFT (cold) | Decode structured (t/s) | Decode prose (t/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| ~0.3k | — | ~1.3 s | ~27.0 | ~18.1 |
-| ~2.3k | ~390 | ~5.9 s | ~24.0 | ~20.7 |
-| ~9.3k | ~413 | ~22.6 s | ~25.6 | ~19.6 |
+| ~0.3k | — | ~1.2 s | ~25.7 | ~23.0 |
+| ~2.3k | ~393 | ~6.2 s | ~24.9 | ~23.6 |
+| ~9.3k | ~363 | ~25.9 s | ~21.8 | ~20.6 |
 
 Decode figures are the production speculative path (drafter on, thinking on),
-greedy (`temp:0`), single stream. Measured on the v0.2.3 type-40/MXFP8_LT build,
-decode is **neutral** versus the prior v0.2.2 build (within run-to-run noise:
-prior structured 27.7/26.6/25.0, prose 18.7/20.7/21.6 at the same depths).
-Prefill improved: at the pre-release single-shape gate the type-40 unification
-measured **+17.5%**, and the full cold sweep here reads ~390 t/s at ~2.3k rising
-to ~413 t/s at ~9.3k as the larger prefill amortizes fixed overhead. The change
-is **fidelity-neutral** — the type-40/MXFP8_LT re-encode measured KL 0.007 with
-top-1 agreement 100% against the prior build. (Speculative decode at `temp:1.0`
-is comparable and on several depths faster but is stochastic run-to-run, so the
-greedy rows are the reported baseline.)
+greedy (`temp:0`), single stream. Measured on the v0.3.0 build. Decode improved
+over v0.2.3: an under-occupied-kernel fix recovered ~+4.6% at shallow depth
+(bit-exact), and the recalibrated yield-quench no longer false-quenches, so the
+prose rows in particular sit a few percent higher than the prior build (which
+read prose 18.1/20.7/19.6 at the same depths). Prefill is flat versus v0.2.3
+(~393 t/s at ~2.3k) and **declines** with depth to ~363 t/s at ~9.3k — cold
+prefill slows as attention-at-depth grows, and speculative-decode acceptance
+falls, which is the physically expected shape. (The v0.2.3 table's "413 rising at
+9.3k" and a 9.3k structured cell above its 2.3k value were non-monotonic
+measurement artifacts; these v0.3.0 numbers are internally consistent across the
+log estimator, the server `timings{}` block, and a unique-nonce cold probe.) The
+build is **fidelity-neutral to source** — the f32→BF16 residual carrier and all
+quant paths were re-verified quality-neutral on the full 84-scenario hardmode
+suite (see Status). (Speculative decode at `temp:1.0` is comparable and on
+several depths faster but is stochastic run-to-run, so the greedy rows are the
+reported baseline; the one genuinely noisy cell above is 9.3k structured, where
+acceptance forks run-to-run — the median is defensible, a single run is not.)
 
 The MXFP4 rich-expert layers (~4.25 bpw versus the ~2 bpw floor) read ~2x the
 weight bytes and set the prefill rate; the type-40 grouped W4A8 GEMM runs those
@@ -262,47 +273,69 @@ is stochastic run-to-run under sampling; the numbers above are `--temp 0`.)
 
 ## Model residency
 
-DwarfStar is a fully resident engine: the CUDA path makes the whole model
-resident in GPU-addressable memory at load time, plus KV cache, graph scratch,
-and activations. On a 128 GB GB10, the production REAP-pruned Flash GGUF
-(~91 GB weights + merged DSpark drafter), a 64k KV cache, and generation
-scratch all fit together with a comfortable margin.
-A model that does not fit is rejected at startup with a clear error instead of
-silently degrading — there is no partial-residency or streaming fallback, so a
-successful load is also a residency guarantee for the whole run.
+DwarfStar is a fully resident engine for **weights**: the CUDA path makes the
+whole model (~85 GiB of tensor spans + merged DSpark drafter) resident in
+GPU-addressable memory at load time. A model that does not fit is rejected at
+startup with a clear error instead of silently degrading — there is no
+partial-residency or streaming fallback for weights, so a successful load is a
+residency guarantee for the whole run. Since v0.2.3, MXFP8 workhorse weights are
+stored in the type-41 **MXFP8_LT** swizzle and loaded zero-copy (no runtime
+repack cache), and the type-40 W4A8 expert path runs the rich layers on the
+tensor cores.
 
-As of **v0.2.3**, the MXFP8 workhorse weights are stored in the type-41
-**MXFP8_LT** swizzle and loaded zero-copy, which frees the ~6.4 GiB runtime
-repack cache the prior build allocated on every load. The type-40 W4A8 expert
-path adds ~3.59 GiB of CUTLASS grouped-GEMM scratch, so the net change is
-**+2.8 GiB of runtime headroom** — enough to lift the live-session cap from two
-to three (see below).
+**KV state, in v0.3.0, is overcommitted rather than fully charged.** The default
+context is **1M tokens** with **overcommit ON**: a small pool of banks (auto-sized,
+up to 4) comes up "grow-to-1M-capable," but only the *eager floor* (raw sliding
+window + state lanes + drafter) is charged at admission — the ctx-scaled
+compressed-KV/indexer term is virtual-address-only, made physical on touch. A
+short session pays only for the KV it actually uses. Banks that genuinely grow
+toward 1M are bounded by a **proactive LRU-idle eviction guard** (task #55): at
+each batched decode-quantum, if the live banks' projected touched-KV would breach
+the physical budget, the guard spills the least-recently-used idle bank's KV to
+disk and `cudaFree`s its physical slabs, reloading it (bit-identically) on its
+next turn. This was stress-validated — under sustained concurrent multi-bank
+growth the guard fired repeatedly, bounded memory itself (an independent
+out-of-memory watchdog never engaged), and every restore was byte-identical.
+
+Two boundaries are worth knowing: the proactive guard runs **only in the batched
+decode lane** (≥2 concurrent decoding banks — the overcommit default's target
+regime); a purely sequential single-stream workload leans on admission plus a
+live-`MemAvailable` floor backstop instead. And the guard is **decode-quantum
+granular**, so a bank's *prefill* growth between checks is not proactively
+bounded — the layered defenses (admission floor + MemAvailable backstop) catch
+that case. An operator who wants a hard per-session cap passes a smaller `--ctx`;
+`DS4_OVERCOMMIT=0` reverts to classic full-charge admission (1M ⇒ a single
+session).
 
 ### Startup warmup and session admission
 
-At startup, before the listener accepts requests, the server runs a short
-(~11 s) warmup generation that materializes the first-generation CUDA working
-set (~3.8 GiB on v0.2.3, down from ~8.7 GiB before the MXFP8_LT change). This has
-two consequences. First, **prefill numbers are
-effectively post-warmup**: the first real request already has its working set
-resident, which is why cold and process-warm prefill agree within run-to-run
-noise. Second, warmup lets session admission measure the *actual* memory cost of
-a live slot rather than estimate it; the measured budget is logged at startup,
-for example:
+At startup, before the listener accepts requests, the server logs the overcommit
+fit table and runs a short warmup generation that materializes the
+first-generation CUDA working set (~7.2 GiB). Warmup lets admission measure the
+*actual* memory cost of a slot rather than estimate it. At the 1M default the
+boot log reads, for example:
 
 ```text
-warmup generation: 4160 prompt + 12 decode tokens in 11.0 s;
-  MemAvailable 18.47 -> 14.71 GiB (first-generation working set 3.76 GiB materialized)
-session admission: measured budget 13.95 GiB
-  (MemAvailable 14.71 GiB post-warmup - floor 4.00 GiB + slot 0 committed 4.45 GiB; static bound 13.95 GiB)
+Tier-2 pool fit table (budget 14.0 GiB, cap 4 banks):
+  ctx  131072: fits 4 bank(s) (1-bank 4.57 GiB, 4-bank 6.70 GiB)
+  ctx 1048576: fits 2 bank(s) (1-bank 9.59 GiB, 2-bank 13.89 GiB)
+Tier-2 OVERCOMMIT auto-sized to 4 bank(s) for --ctx 1048576: eager floor
+  0.20 GiB/bank charged; demand-paged VA 4.11 GiB/bank reserved (physical on
+  touch, NOT charged); shared 5.28 GiB; admission est 6.07 GiB (batching ON)
+warmup generation: 4160 prompt + 12 decode tokens in 12.3 s;
+  MemAvailable 16.84 -> 9.66 GiB (first-generation working set 7.18 GiB materialized)
+Tier-2 shared pool ACTIVE: 4 banks, spec_max_live=1, pool resident 22.50 GiB
+Tier-2 2b guard ENABLED: touched budget 7.88 GiB (kv budget 13.95 - eager 6.07),
+  spill dir ./ds4-spill
 ```
 
-Each admitted session slot costs ~4.45 GiB of (graph-dominated) working set, so
-on a warmed box the measured ~13.95 GiB budget admits **three live sessions**
-(3 × ~4.45 = ~13.4 GiB); a fourth exceeds the budget and is refused. The v0.2.3
-MXFP8_LT change lifted this cap from two to three by freeing the runtime repack
-cache (the prior build's post-warmup budget was ~9.8 GiB). Admission is driven by
-this measured ledger, not a fixed slot count.
+Without overcommit the 1M context would admit a single session (the full-charge
+fit table shows only 2 banks fit even at the 1M ceiling); with overcommit the
+same box brings up all 4 banks at the eager floor and lets each grow into its
+touched budget under the eviction guard. Admission is driven by this measured
+ledger, not a fixed slot count. (Prefill numbers are effectively post-warmup —
+the first real request already has its working set resident, which is why cold
+and process-warm prefill agree within run-to-run noise.)
 
 Long-context KV state is kept compact by default: the compressed-attention
 cache uses a bit-exact packed value layout (`DS4_ATTN_PACK`, on by default),
@@ -392,21 +425,28 @@ so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads; inference runs on one graph
-worker. The server serves **multiple concurrent sessions**, time-sliced on that
-single engine lane: a small pool of live sessions is admitted against a measured
-KV/VRAM budget, scheduled round-robin at a decode-quantum granularity, and
-evicted least-recently-used — snapshotting to a disk KV cache so a returning
-client resumes instead of re-prefilling. Sessions do **not** yet share a batched
-decode step (that is a planned throughput feature), so aggregate decode is
-roughly the single-stream rate divided across active sessions, while concurrent
-prefills overlap and scale. On the ~128 GB GB10 with ~85 GB of resident weights,
-the practical cap is **three live sessions on a warmed box** at a large context
-(as of v0.2.3, up from two): each provisioned slot costs ~4.45 GiB of
-(graph-dominated) working set, admitted against a measured ~13.95 GiB budget, so
-a fourth session exceeds the budget and is refused (see Startup warmup and
-session admission). Each session's context
-can be sized up to the model's 1M-token limit, and requests beyond the admission
-budget queue or are refused rather than driving the box out of memory.
+worker. The server serves **multiple concurrent sessions** from a small pool of
+banks admitted against a measured KV/VRAM budget. As of **v0.3.0**, concurrently
+decoding banks share **one batched decode step** (Tier-2 batched multi-session
+decode), so aggregate decode throughput now *scales* with concurrency rather than
+being the single-stream rate divided across sessions; concurrent prefills overlap
+as well. The default context is the model's **1M-token** limit with overcommit
+on, so a bank is admitted at its eager floor and grows into its touched budget
+under the eviction guard rather than being charged the full 1M up front (see
+Model residency). A returning client whose bank was evicted resumes from a disk
+KV snapshot instead of re-prefilling, and requests beyond the admission budget
+queue or are refused rather than driving the box out of memory.
+
+One property of batched decode is worth noting for reproducibility: an M≥2
+co-batched forward differs by ~1 ULP from the single-sequence path (different
+GEMM tiling / reduction order). This is invisible under sampling (`temp` > 0) and
+distribution-preserving, but at **greedy `temp:0`** it can flip a near-tie argmax,
+so a request's greedy continuation can depend on what else is co-scheduled at the
+moment — the same class of numerical nondeterminism as batched inference in other
+engines. Likewise, v0.3.0's head-grouped decode-attention kernel is not
+bit-identical to v0.2.3 at depth, so a given greedy prompt's continuation may
+differ from the prior release (quality-verified neutral; set
+`DS4_CUDA_NO_INDEXED_DECODE_HEADS8=1` to restore the prior kernel).
 Two further guardrails keep a misbehaving client from wedging the server:
 concurrent client connections are capped (64; connections over the cap get an
 immediate 503 instead of piling up threads), and a whole-request read deadline
