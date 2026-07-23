@@ -907,6 +907,11 @@ static bool gen_client_disconnected(int fd) {
 
 static bool gen_prefill_cancel_cb(void *ud) {
     const gen_state *g = ud;
+    /* A client that cancelled or hung up during a long prefill must stop the
+     * engine — otherwise opencode's deep-context prefills run to completion after
+     * a cancel, burning the GPU and a bank. Polled between chunks (not per token);
+     * gen_step_prefill abandons on the resulting interrupt. */
+    if (gen_client_disconnected(g->j->fd)) return true;
     if (g->prefill_min_suffix == 0) return false;
     if (g->prefill_chunks_done < 1) return false;
     if (g->prefill_last_current < 0 || g->prefill_total <= g->prefill_last_current) return false;
@@ -1211,9 +1216,11 @@ static void gen_begin(server *s, session_slot *sl) {
     g->thinking_live_continuation = thinking_live_continuation;
 
     /* Prefill quantum policy: interrupt the engine's chunk loop only when
-     * resumption is bit-exact for this session (see gen_prefill_cancel_cb). */
+     * resumption is bit-exact for this session (see gen_prefill_cancel_cb). The
+     * cancel callback itself is armed per-sync in gen_step_prefill, NOT here: in
+     * pool mode every slot shares slots[0].sess, so a once-per-job set would be
+     * clobbered by the next job the worker binds before prefilling this one. */
     g->prefill_min_suffix = ds4_session_prefill_quantum_min_suffix(sl->sess);
-    ds4_session_set_cancel(sl->sess, gen_prefill_cancel_cb, g);
 
     if (s->kv.enabled &&
         g->cold_store_len >= s->kv.opt.min_tokens &&
@@ -1236,11 +1243,31 @@ static void gen_step_prefill(server *s, session_slot *sl) {
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const ds4_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
+    /* Arm the cancel callback on THIS slot's gen_state right before the sync.
+     * In pool mode every slot shares slots[0].sess, and the worker binds several
+     * jobs (each of which would set the callback) before prefilling any of them,
+     * so a once-per-job set in gen_begin leaves the LAST-bound slot's callback on
+     * the shared session. An earlier slot's prefill would then yield on ANOTHER
+     * slot's progress and, interrupted before its own first chunk, be misread as a
+     * fatal error ("interrupted", HTTP 500). The worker prefills serially, so
+     * setting it here binds the correct callback for this exact sync. */
+    ds4_session_set_cancel(sl->sess, gen_prefill_cancel_cb, g);
+
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
     g->prefill_total = 0;
     const int rc = ds4_session_sync(sl->sess, target, g->err, sizeof(g->err));
     if (rc == DS4_SESSION_SYNC_INTERRUPTED) {
+        if (gen_client_disconnected(g->j->fd)) {
+            /* Client cancelled mid-prefill: abandon rather than resume or fail, so
+             * a long deep-context prefill stops promptly on disconnect instead of
+             * running to completion (the decode loop already abandons this way). */
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: client disconnected during prefill, abandoning");
+            snprintf(g->err, sizeof(g->err), "client disconnected");
+            gen_prefill_fail(s, sl);
+            return;
+        }
         if (g->prefill_chunks_done > 0) return; /* voluntary yield; resume next quantum */
         /* Interrupted without progress cannot be our cancel callback; fail
          * rather than risk a live-lock re-issuing the same sync forever. */
@@ -2891,20 +2918,32 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
             *clobbers = false;
             return dst;
         }
-        /* No free/evictable bank: in-place continuation is the correct fallback
-         * (linear case optimal; branching loser degrades to cold later). */
+        /* No free/evictable bank for the fork: fall through to the divergent
+         * guard below (reuses in place only for a linear continuation; otherwise
+         * queues rather than clobber). */
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: warm-fork-%s wanted (bank %u common %d) but no free "
-                   "bank; in-place continuation",
+                   "ds4-server: warm-fork-%s wanted (bank %u common %d) but no free bank",
                    full ? "full" : "partial", best->bank, best_common);
-    } else if (warm_ok && best_common < frontier) {
-        /* Warm but the shared prefix is below warm_partial_min (a partial cut
-         * would reuse too little to beat cold): rewind-and-continue in place.
-         * Logged so "why no fork" is never silent. */
+    }
+    /* CROSS-WIRE ROOT FIX: in-place continuation is safe ONLY for a linear
+     * extension of THIS bank's own conversation (best_common == frontier). When
+     * best_common < frontier the bank holds a DIFFERENT conversation past the
+     * shared prefix (typically just the system-prompt header); continuing in place
+     * REWINDS-and-clobbers it. On the shared pool session that conversation is
+     * often still live under concurrency, so the two interleave and a request
+     * decodes another's KV (the cross-wire). Provision a FRESH bank instead (the
+     * shared prefix is cheap and prefix-cached); queue if the pool is full so a
+     * non-active bank can be evicted. Deep divergent matches (best_common >=
+     * warm_partial_min) already FORKED above and never reach here. */
+    if (best && best_common < frontier) {
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: warm partial match bank %u (common %d < min %d, "
-                   "frontier %d); in-place rewind (no fork)",
-                   best->bank, best_common, s->warm_partial_min, frontier);
+                   "ds4-server: divergent match bank %u (common %d < frontier %d): "
+                   "fresh bank, no in-place clobber",
+                   best->bank, best_common, frontier);
+        session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j), refusal);
+        if (fresh) { *clobbers = false; return fresh; }
+        if (*refusal == PROVISION_OK) *refusal = PROVISION_REFUSED_POOL_FULL;
+        return NULL;   /* pool full -> worker evicts an idle bank and retries */
     }
     *clobbers = best_clobbers_warm_state;
     return best;
