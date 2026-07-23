@@ -147,6 +147,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    opt(fp, c, "--served-model-id ID", "Model id in /v1/models(id,root),/version,/metrics (default deepseek-v4-flash). Set to an HF repo path so HF tools (llama-benchy tokenizer) resolve it.");
+    opt(fp, c, "--served-model-name NAME", "Human display name in /v1/models(name)/version (default: model shape name). Free-form; never used as a tokenizer id.");
     if (tool != DS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }

@@ -588,6 +588,10 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--served-model-id")) {
+            c.served_model_id = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--served-model-name")) {
+            c.served_model_name = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--dspark")) {
@@ -965,6 +969,8 @@ int main(int argc, char **argv) {
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
+    s.served_model_id = cfg.served_model_id;      /* --served-model-id override (id) */
+    s.served_model_name = cfg.served_model_name;  /* --served-model-name override (name) */
     s.started = time(NULL);          /* uptime origin reported by /health */
     /* Slot 0 is provisioned here at the configured --ctx-size. Tier-2: if the
      * created session is bank-pooled (DS4_MSEQ_BANKS>1), slot 0 IS the shared

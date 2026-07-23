@@ -116,6 +116,10 @@ void append_model_json_values(buf *b, const char *id, const char *name,
     buf_printf(b,
         "{\"id\":");
     json_escape(b, id);
+    /* vLLM convention: "root" is the model path HF-tooling resolves (e.g.
+     * llama-benchy uses it/the id as the tokenizer id). id == root here. */
+    buf_puts(b, ",\"root\":");
+    json_escape(b, id);
     buf_puts(b,
         ",\"object\":\"model\","
         "\"created\":1767225600,"
@@ -151,7 +155,7 @@ void append_model_json_values(buf *b, const char *id, const char *name,
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             server_served_model_name(s),
                              ds4_session_ctx(s->slots[0].sess),
                              s->default_tokens);
 }
@@ -174,7 +178,7 @@ static bool send_models(server *s, int fd) {
      * flash/pro aliases — the server serves one GGUF at a time. */
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    append_model_json(&b, s, server_served_model_id(s));
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -196,7 +200,7 @@ static bool send_liveness(server *s, int fd) {
  * balancer stops routing to it. Reads only the worker-published snapshot under
  * mu (same discipline as /metrics — no engine calls on the client thread). */
 static bool send_health(server *s, int fd) {
-    const char *model = server_model_id_from_engine(s->engine);
+    const char *model = server_served_model_id(s);
     bool draining;
     int n_slots, running, waiting;
     time_t started;
@@ -240,8 +244,8 @@ static bool send_version(server *s, int fd) {
         "{\"version\":\"%s\",\"engine\":\"ds4\",\"cuda_arch\":\"sm_120f\","
         "\"model\":\"%s\",\"model_name\":\"%s\",\"context\":%d}\n",
         DS4_VERSION_STR,
-        server_model_id_from_engine(s->engine),
-        ds4_engine_model_name(s->engine),
+        server_served_model_id(s),
+        server_served_model_name(s),
         ds4_session_ctx(s->slots[0].sess));
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -273,7 +277,7 @@ static bool send_metrics(server *s, int fd) {
      * snapshots the worker publishes under mu (m_spec/m_slot_pos/m_slot_ctx,
      * server_publish_metrics_snapshot — refreshed at bind time and once per
      * quantum, so gauges lag live state by at most one quantum). */
-    const char *model = server_model_id_from_engine(s->engine);
+    const char *model = server_served_model_id(s);
     ds4_spec_metrics m;
     int n_slots;
     double slot_kv[DS4_SESSION_POOL_CAP];
@@ -430,7 +434,7 @@ void *client_main(void *arg) {
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
         !strcmp(hr.path + model_path_prefix_len,
-                server_model_id_from_engine(s->engine)))
+                server_served_model_id(s)))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -466,7 +470,7 @@ void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_model_id_from_engine(s->engine));
+        req.model = xstrdup(server_served_model_id(s));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);

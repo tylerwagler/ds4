@@ -884,6 +884,12 @@ typedef struct {
 
 struct server {
     ds4_engine *engine;
+    /* Advertised id override (server_config.served_model_id); NULL => built-in
+     * server_model_id_from_engine. Read via server_served_model_id. */
+    const char *served_model_id;
+    /* Advertised display-name override (server_config.served_model_name); NULL
+     * => ds4_engine_model_name. Read via server_served_model_name. */
+    const char *served_model_name;
     /* Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
      * published under mu for readers on client threads). */
@@ -1076,6 +1082,16 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    /* Advertised model id (/v1/models "id"+"root", /version "model", /metrics
+     * label). NULL keeps the built-in "deepseek-v4-flash"/"deepseek-v4-pro".
+     * Set to an HF repo path so HF-convention tooling (llama-benchy: model id
+     * == tokenizer repo id) resolves the tokenizer. Does not affect KV cache
+     * keying (gguf path + numeric id) nor request acceptance (incoming model
+     * field is not validated). */
+    const char *served_model_id;
+    /* Advertised human display name (/v1/models "name", /version "model_name").
+     * NULL keeps the built-in shape name. Free-form; may contain spaces. */
+    const char *served_model_name;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -1128,6 +1144,12 @@ bool parse_output_config_effort(const char **p, ds4_think_mode *effort);
 bool model_alias_disables_thinking(const char *model);
 bool model_alias_enables_thinking(const char *model);
 const char *server_model_id_from_engine(ds4_engine *engine);
+/* Advertised model id ("id"/"root"/metrics): --served-model-id override if set,
+ * else the built-in id. Must be HF-resolvable for HF-convention tokenizer tools. */
+const char *server_served_model_id(const server *s);
+/* Advertised display name ("name"): --served-model-name override if set, else
+ * the built-in shape name. Free-form; never used as a tokenizer/repo id. */
+const char *server_served_model_name(const server *s);
 void stop_list_clear(stop_list *stops);
 void stop_list_push(stop_list *stops, char *s);
 bool parse_stop(const char **p, stop_list *out);
