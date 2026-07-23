@@ -236,7 +236,11 @@ static bool continue_after_invalid_dsml(server *s, session_slot *sl,
 bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
+    /* has_tools is NOT a disqualifier: a client can advertise tools and still
+     * strip reasoning on replay (openwebui).  prompt_preserves_reasoning now
+     * reflects the client's ACTUAL replay behavior, so it is the sole gate;
+     * remember_thinking_checkpoint renders the tool-context vs toolless form. */
     if (r->prompt_preserves_reasoning) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
@@ -463,7 +467,25 @@ char *build_toolless_thinking_visible_text(const request *r,
 static void remember_thinking_checkpoint(server *s, session_slot *sl,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
+    /* The key must byte-match what render_chat_prompt_text emits for this turn
+     * once it becomes historical on the next request.  With tools advertised
+     * (tool_context) a stripped historical assistant turn renders
+     * "<think></think>{content}<eos>", so keep prompt_text's trailing "<think>"
+     * and append the empty-reasoning, no-calls suffix.  Without tools the turn
+     * renders "</think>{content}<eos>" (no "<think>") — the toolless form. */
+    char *visible = NULL;
+    if (j->req.has_tools) {
+        if (!j->req.prompt_text || !ds4_think_mode_enabled(j->req.think_mode))
+            return;
+        char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", NULL);
+        buf b = {0};
+        buf_puts(&b, j->req.prompt_text);
+        buf_puts(&b, suffix);
+        free(suffix);
+        visible = buf_take(&b);
+    } else {
+        visible = build_toolless_thinking_visible_text(&j->req, content);
+    }
     if (!visible) return;
 
     thinking_live_remember(s, sl, visible);

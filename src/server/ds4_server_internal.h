@@ -1148,6 +1148,8 @@ void append_json_object_or_empty(buf *b, const char *json);
 void append_dsml_tool_calls_text(buf *b, const tool_calls *calls);
 bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas);
+bool chat_history_preserves_reasoning(const chat_msgs *msgs,
+                                             const char *tool_schemas);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode);
