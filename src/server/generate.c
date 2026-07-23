@@ -2936,14 +2936,31 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
      * non-active bank can be evicted. Deep divergent matches (best_common >=
      * warm_partial_min) already FORKED above and never reach here. */
     if (best && best_common < frontier) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: divergent match bank %u (common %d < frontier %d): "
-                   "fresh bank, no in-place clobber",
-                   best->bank, best_common, frontier);
         session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j), refusal);
-        if (fresh) { *clobbers = false; return fresh; }
-        if (*refusal == PROVISION_OK) *refusal = PROVISION_REFUSED_POOL_FULL;
-        return NULL;   /* pool full -> worker evicts an idle bank and retries */
+        if (fresh) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: divergent match bank %u (common %d < frontier %d): "
+                       "fresh bank %u, no in-place clobber",
+                       best->bank, best_common, frontier, fresh->bank);
+            *clobbers = false;
+            return fresh;
+        }
+        /* Provision failed (pool full). Queue to avoid an in-place clobber ONLY
+         * when an active job is running: then the queue drains as it finishes AND
+         * there is a live conversation on the pool worth protecting. When NOTHING
+         * is running, no bank will ever free (idle banks may all be protected), so
+         * queuing would LIVE-LOCK the worker — and with no live reader there is
+         * nothing to corrupt — so fall through to in-place continuation (progress
+         * over warmth). This is the safe half of the cross-wire guard: the
+         * corruption only ever happened while a concurrent conversation was live. */
+        bool any_active = false;
+        for (int i = 0; i < s->n_slots; i++)
+            if (s->slots[i].active_job) { any_active = true; break; }
+        if (any_active) {
+            if (*refusal == PROVISION_OK) *refusal = PROVISION_REFUSED_POOL_FULL;
+            return NULL;   /* an active job will free a bank; worker retries */
+        }
+        /* else: fall through to in-place (no live reader; queue would deadlock) */
     }
     *clobbers = best_clobbers_warm_state;
     return best;
