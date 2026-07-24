@@ -715,7 +715,7 @@ typedef struct {
  * conversation's warm KV) AND the packed-KV admission budget still has room.
  * A single client therefore always runs on slot 0, byte-identical to the
  * increment-2 single-session server. */
-#define DS4_SESSION_POOL_CAP 4
+#define DS4_SESSION_POOL_CAP 5
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
  * keep the default per-session context far below the lone-session maximum;
