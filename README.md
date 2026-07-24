@@ -69,9 +69,19 @@ measured-allocation DeepSeek-V4-Flash GGUF (the `v5mx` build) and the
 quantization, and speculative decoding are validated against the tests in this
 tree and the `tool-eval-bench` quality suite — a 4-seed run of the
 shipping build averages ~90/100 with hardmode included (range 87–92 across seeds).
-v0.3.0 was re-verified **quality-neutral** versus v0.2.3 on the full 84-scenario
+v0.3.1 was re-verified **quality-neutral** versus v0.2.3 on the full 84-scenario
 hardmode suite (every committed change — the f32→BF16 residual carrier included —
 within seed noise, no regression cluster).
+**v0.3.1** is the current release — the first shippable v0.3.x. It brings the v0.3
+engine work (Tier-2 batched multi-session decode, KV overcommit with proactive
+eviction, the head-grouped decode-attention kernel, and the f32→BF16 residual
+carrier) together with the pooled-routing and KV round-trip fixes that stabilized
+the line: a divergent prompt match now routes to a fresh bank instead of
+clobbering a live one (plus a live-lock follow-up), and two round-trip fixes
+eliminate deep cold re-prefills for agentic clients that replay reasoning
+(opencode) or strip it (openwebui). It also adds the
+`--served-model-id`/`--served-model-name` flags and a default bank-pool cap of 5
+(4 concurrent conversations plus the pinned base).
 Model serving is
 a large surface, so rough edges remain; we keep the project usable and are
 actively hardening it. If you hit a problem, run `ds4-server --trace
@@ -214,7 +224,7 @@ running the ~91 GB REAP-pruned Flash build. The artifact unifies every
 MXFP4 routed-expert layer onto the CUTLASS tensor-core **type-40 W4A8 path**
 (4-bit weights, E4M3 activations) and stores all MXFP8 workhorse weights in the
 **type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack) — both since v0.2.3.
-Numbers below are the **v0.3.0** build. Prefill is measured
+Numbers below are the **v0.3.1** build. Prefill is measured
 **cold** (`cache_prompt` off, unique-prefix probe — a warm cache reports
 arbitrarily high prompt-processing rates and is not a real prefill number);
 decode is measured with the merged DSpark speculative drafter, single stream, on
@@ -228,7 +238,7 @@ real depth-varying prompts.
 | ~9.3k | ~363 | ~25.9 s | ~21.8 | ~20.6 |
 
 Decode figures are the production speculative path (drafter on, thinking on),
-greedy (`temp:0`), single stream. Measured on the v0.3.0 build. Decode improved
+greedy (`temp:0`), single stream. Measured on the v0.3.1 build. Decode improved
 over v0.2.3: an under-occupied-kernel fix recovered ~+4.6% at shallow depth
 (bit-exact), and the recalibrated yield-quench no longer false-quenches, so the
 prose rows in particular sit a few percent higher than the prior build (which
@@ -237,7 +247,7 @@ read prose 18.1/20.7/19.6 at the same depths). Prefill is flat versus v0.2.3
 prefill slows as attention-at-depth grows, and speculative-decode acceptance
 falls, which is the physically expected shape. (The v0.2.3 table's "413 rising at
 9.3k" and a 9.3k structured cell above its 2.3k value were non-monotonic
-measurement artifacts; these v0.3.0 numbers are internally consistent across the
+measurement artifacts; these v0.3.1 numbers are internally consistent across the
 log estimator, the server `timings{}` block, and a unique-nonce cold probe.) The
 build is **fidelity-neutral to source** — the f32→BF16 residual carrier and all
 quant paths were re-verified quality-neutral on the full 84-scenario hardmode
@@ -283,9 +293,10 @@ stored in the type-41 **MXFP8_LT** swizzle and loaded zero-copy (no runtime
 repack cache), and the type-40 W4A8 expert path runs the rich layers on the
 tensor cores.
 
-**KV state, in v0.3.0, is overcommitted rather than fully charged.** The default
+**KV state, in v0.3.1, is overcommitted rather than fully charged.** The default
 context is **1M tokens** with **overcommit ON**: a small pool of banks (auto-sized,
-up to 4) comes up "grow-to-1M-capable," but only the *eager floor* (raw sliding
+up to 5 as of v0.3.1 — 4 concurrent conversations plus a pinned base bank) comes
+up "grow-to-1M-capable," but only the *eager floor* (raw sliding
 window + state lanes + drafter) is charged at admission — the ctx-scaled
 compressed-KV/indexer term is virtual-address-only, made physical on touch. A
 short session pays only for the KV it actually uses. Banks that genuinely grow
@@ -316,22 +327,22 @@ first-generation CUDA working set (~7.2 GiB). Warmup lets admission measure the
 boot log reads, for example:
 
 ```text
-Tier-2 pool fit table (budget 14.0 GiB, cap 4 banks):
-  ctx  131072: fits 4 bank(s) (1-bank 4.57 GiB, 4-bank 6.70 GiB)
+Tier-2 pool fit table (budget 14.0 GiB, cap 5 banks):
+  ctx  131072: fits 5 bank(s) (1-bank 4.57 GiB, 5-bank 7.41 GiB)
   ctx 1048576: fits 2 bank(s) (1-bank 9.59 GiB, 2-bank 13.89 GiB)
-Tier-2 OVERCOMMIT auto-sized to 4 bank(s) for --ctx 1048576: eager floor
+Tier-2 OVERCOMMIT auto-sized to 5 bank(s) for --ctx 1048576: eager floor
   0.20 GiB/bank charged; demand-paged VA 4.11 GiB/bank reserved (physical on
-  touch, NOT charged); shared 5.28 GiB; admission est 6.07 GiB (batching ON)
-warmup generation: 4160 prompt + 12 decode tokens in 12.3 s;
-  MemAvailable 16.84 -> 9.66 GiB (first-generation working set 7.18 GiB materialized)
-Tier-2 shared pool ACTIVE: 4 banks, spec_max_live=1, pool resident 22.50 GiB
-Tier-2 2b guard ENABLED: touched budget 7.88 GiB (kv budget 13.95 - eager 6.07),
+  touch, NOT charged); shared 5.28 GiB; admission est 6.26 GiB (batching ON)
+warmup generation: 4160 prompt + 12 decode tokens in 10.8 s;
+  MemAvailable 16.08 -> 12.13 GiB (first-generation working set materialized)
+Tier-2 shared pool ACTIVE: 5 banks, spec_max_live=1, pool resident 26.80 GiB
+Tier-2 2b guard ENABLED: touched budget 7.69 GiB (kv budget 13.95 - eager 6.26),
   spill dir ./ds4-spill
 ```
 
 Without overcommit the 1M context would admit a single session (the full-charge
 fit table shows only 2 banks fit even at the 1M ceiling); with overcommit the
-same box brings up all 4 banks at the eager floor and lets each grow into its
+same box brings up all 5 banks at the eager floor and lets each grow into its
 touched budget under the eviction guard. Admission is driven by this measured
 ledger, not a fixed slot count. (Prefill numbers are effectively post-warmup —
 the first real request already has its working set resident, which is why cold
@@ -420,13 +431,24 @@ Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
 so relative runtime paths such as the default `./ds4flash.gguf` model and
 `dir-steering/` data resolve from the project tree.
 
+Two flags (v0.3.1) control how the model is *named* to clients, independently:
+`--served-model-id ID` sets the id reported in `/v1/models` (`id` and `root`),
+`/version`, and the `/metrics` label — default `deepseek-v4-flash`. Point it at an
+HF repo path (e.g. `--served-model-id org/Model`) so HF-convention benchmark
+tooling that treats the model id as the tokenizer id (llama-benchy et al.)
+resolves the tokenizer with no extra config. `--served-model-name NAME` sets the
+human display name (`/v1/models` `name`, `/version` `model_name`) — free-form, may
+contain spaces, and is never used as a tokenizer id. Neither affects the KV cache
+(keyed by gguf path + numeric model id) or request acceptance (the incoming
+`model` field is not validated).
+
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads; inference runs on one graph
 worker. The server serves **multiple concurrent sessions** from a small pool of
-banks admitted against a measured KV/VRAM budget. As of **v0.3.0**, concurrently
+banks admitted against a measured KV/VRAM budget. As of **v0.3.1**, concurrently
 decoding banks share **one batched decode step** (Tier-2 batched multi-session
 decode), so aggregate decode throughput now *scales* with concurrency rather than
 being the single-stream rate divided across sessions; concurrent prefills overlap
@@ -443,7 +465,7 @@ GEMM tiling / reduction order). This is invisible under sampling (`temp` > 0) an
 distribution-preserving, but at **greedy `temp:0`** it can flip a near-tie argmax,
 so a request's greedy continuation can depend on what else is co-scheduled at the
 moment — the same class of numerical nondeterminism as batched inference in other
-engines. Likewise, v0.3.0's head-grouped decode-attention kernel is not
+engines. Likewise, v0.3.1's head-grouped decode-attention kernel is not
 bit-identical to v0.2.3 at depth, so a given greedy prompt's continuation may
 differ from the prior release (quality-verified neutral; set
 `DS4_CUDA_NO_INDEXED_DECODE_HEADS8=1` to restore the prior kernel).
