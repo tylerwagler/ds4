@@ -3,26 +3,62 @@
 
 
 
-__global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
+/* Plain (no-weight) RMSNorm. Input x is ALWAYS an HC residual carrier (the
+ * hc_dim-wide flatten before each sublayer / the output head) — every caller
+ * feeds cur_hc/after_attn_hc/batch_cur_hc etc. — so x loads through ds4_hc_load
+ * (BF16 storage promoted to f32). Output and the sum-of-squares stay f32. */
+/* BIT-EXACT ILP rewrite (2026-07-21).  The decode call sites launch this with
+ * grid==1 (one block, 256 threads, n == hc_dim == 16384) -- 1 of 48 SMs, 8
+ * warps, and a scalar strided load loop the compiler will not unroll because
+ * blockDim.x is a runtime value.  That leaves ~2 loads in flight per warp and
+ * makes the kernel pure memory LATENCY.  Templating the block width makes the
+ * stride a compile-time constant so the batch below issues UNROLL independent
+ * loads before the first FMA.
+ *
+ * REDUCTION ORDER IS UNCHANGED, WHICH IS THE WHOLE POINT.  Thread t still owns
+ * exactly {t, t+BLK, t+2*BLK, ...} and still accumulates them in increasing
+ * order; batching UNROLL of those into registers first only reorders the LOADS,
+ * never the adds.  The shared-memory pairwise tree is byte-for-byte the old one
+ * (no warp shuffles, no split-K): every float op happens in the same sequence,
+ * so this is bit-exact by construction, not by measurement. */
+template <uint32_t BLK, uint32_t UNROLL>
+__global__ static void rms_norm_plain_kernel(float *out, const ds4_hc_t *x, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
-    const float *xr = x + (uint64_t)row * n;
+    const ds4_hc_t *xr = x + (uint64_t)row * n;
     float *orow = out + (uint64_t)row * n;
+    const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = xr[i];
+    uint32_t i = tid;
+    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
+        float v[UNROLL];
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) v[u] = ds4_hc_load(xr, i + u * BLK);
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) sum += v[u] * v[u];
+    }
+    for (; i < n; i += BLK) {
+        float v = ds4_hc_load(xr, i);
         sum += v * v;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
+    __shared__ float partial[BLK];
+    partial[tid] = sum;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
         __syncthreads();
     }
     float scale = rsqrtf(partial[0] / (float)n + eps);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * scale;
+    i = tid;
+    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
+        float v[UNROLL];
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) v[u] = ds4_hc_load(xr, i + u * BLK);
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) orow[i + u * BLK] = v[u] * scale;
+    }
+    for (; i < n; i += BLK) {
+        orow[i] = ds4_hc_load(xr, i) * scale;
     }
 }
 
@@ -336,6 +372,53 @@ __device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
 __device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
     return exp2f((float)((int)byte - 127));
 }
+
+/* ===== INVARIANT: FRESH data -> fast path; RE-ENCODED data -> exact path =====
+ * The `exp2f(ceilf(log2f(amax/K)))` form used by the quantize kernels below is
+ * NOT safe on already-quantized input, and the split between the two forms in
+ * this file is DELIBERATE. Do not "simplify" it to one path.
+ *
+ * VERIFIED on GB10 (2026-07-21, SASS + full-binade sweeps): under
+ * --use_fast_math, `log2f` lowers to MUFU.LG2, whose error is one-sided HIGH.
+ * `lg2.approx(2^k)` is wrong for EVERY k in [-126,-1] — i.e. the entire range
+ * real block scales occupy — so at `amax == K*2^k` exactly, ceilf() rounds up
+ * one extra step and the scale comes out 2x TOO LARGE. (`ex2.approx` and
+ * `div.approx` were both verified EXACT here; MUFU.LG2 is the sole culprit.
+ * Host `-ffast-math` is unaffected: glibc log2f stays exact at pow2.)
+ *
+ * WHY THE FAST FORM IS FINE HERE: these kernels see FRESH f32 activations, so
+ * hitting `amax == K*2^k` is a 1-in-2^23 mantissa coincidence (~2.4e-7/block for
+ * K=448, ~1.2e-7 for K=6) — well under the noise floor of the quantization
+ * itself, and deterministic, so no bit-exactness gate destabilizes.
+ *
+ * WHY RE-ENCODING IS CATASTROPHIC: quantized values live on a dyadic LATTICE.
+ * After E2M1, block values are {0,.5,1,1.5,2,3,4,6}*scale, so a block whose max
+ * sits on the top code has `amax == 6*scale` EXACTLY — a guaranteed hit, and
+ * `v/scale` rounds to 6.0 for anything above 5.0, so ~1/3 of re-encoded FP4
+ * blocks land on it (~5% for E4M3's 448). A competing GB10 fork shipped exactly
+ * this bug and lost 10.5% of their fp4 indexer lanes to zero.
+ *
+ * SO: every re-encode path already routes through the EXACT helper below —
+ * `mxkv_pack_kernel`, `attn_pack_repack_kernel`/`attn_pack_exact_e8_dev` — and
+ * `gpu_decode.c:498` passes `quantize_fp8=false` under pack to avoid double-
+ * rounding. **If you ever feed already-quantized data into
+ * `fp8_kv_quantize*`, `attn_pack_store`, or `indexer_hadamard_fp4*`, the misround
+ * rate jumps from 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.** The plan-32
+ * evict/restore and plan-33 fork/restore work is precisely the kind of change
+ * that could do this: restore paths MUST keep using the exact repack entry
+ * points, never these fresh quantizers.
+ *
+ * KNOWN (benign, unfixed): `indexer_hadamard_fp4*_kernel`'s amax floor
+ * 7.052966104933725e-38f is bit-exactly `6.0f * 2^-126` — i.e. it sits ON a
+ * misround point, so an all-zero/all-subnormal indexer block takes e8=2 here
+ * where the exact path gives e8=1, 100% of the time. Value impact NIL (every
+ * lane encodes to nibble 0 either way), but the stored E8M0 BYTE differs from
+ * what mxkv_pack writes for the same row — a latent flake for any gate that
+ * byte-compares those two paths on an empty row. Left as-is because fixing it
+ * is bit-changing against current goldens for zero value gain; fold it in next
+ * time goldens are re-baselined anyway. (The E4M3 floor 1.0e-4f was checked and
+ * is NOT on a misround point.)
+ * ============================================================================ */
 
 /* Exact ceil-log2 E8M0 bucket computed from float bit patterns — no log2f/ceilf,
  * so no --use_fast_math misrounding at bucket boundaries. For a max_repr equal to
@@ -922,16 +1005,16 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
 
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
-        x->bytes < (uint64_t)n * sizeof(float)) return 0;
-    rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
+        x->bytes < (uint64_t)n * DS4_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
+    rms_norm_plain_kernel<256, 8><<<1, 256>>>((float *)out->ptr, (const ds4_hc_t *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 
 
 extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
-        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
-    rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
+        x->bytes < (uint64_t)n * rows * DS4_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
+    rms_norm_plain_kernel<256, 8><<<rows, 256>>>((float *)out->ptr, (const ds4_hc_t *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 
@@ -975,7 +1058,8 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                kv_n,
         uint32_t                rows,
         float                   eps) {
-    if (getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") == NULL) {
+    static const int disable_qkv_rms_fused = getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL;
+    if (!disable_qkv_rms_fused) {
         if (!q_out || !q || !kv_out || !kv || !model_map ||
             q_weight_offset > model_size ||
             kv_weight_offset > model_size ||
@@ -1208,12 +1292,13 @@ extern "C" int ds4_gpu_attn_pack_repack_tensor(const ds4_gpu_tensor *x,
  */
 __global__ static void mxkv_gather_dequant_kernel(const uint8_t *cache, float *out,
                                                   const int32_t *rows, uint32_t n_sel,
+                                                  uint32_t cap_rows,
                                                   uint32_t head_dim, uint32_t fmt,
                                                   uint32_t out_row_stride, uint32_t out_col_stride) {
     uint32_t i = blockIdx.x;
     if (i >= n_sel) return;
     int32_t r = rows[i];
-    if (r < 0) return;
+    if (r < 0 || (uint32_t)r >= cap_rows) return;
     const uint32_t nblk = head_dim / DS4_MXKV_BLOCK;
     const uint32_t data_bytes = (fmt == DS4_MXKV_FMT_FP4) ? (head_dim + 1u) / 2u : head_dim;
     const uint32_t rowbytes = data_bytes + nblk;
@@ -1247,7 +1332,8 @@ extern "C" int ds4_gpu_mxkv_gather_dequant_tensor(const ds4_gpu_tensor *cache, d
     const uint32_t out_row_stride = transpose ? 1u : head_dim;      /* stride between rows i */
     const uint32_t out_col_stride = transpose ? n_sel : 1u;         /* stride between dims d */
     mxkv_gather_dequant_kernel<<<n_sel, 256>>>((const uint8_t *)cache->ptr, (float *)out->ptr,
-                                               (const int32_t *)rows->ptr, n_sel, head_dim, fmt,
+                                               (const int32_t *)rows->ptr, n_sel, cap_rows,
+                                               head_dim, fmt,
                                                out_row_stride, out_col_stride);
     return cuda_ok(cudaGetLastError(), "mxkv_gather_dequant launch");
 }

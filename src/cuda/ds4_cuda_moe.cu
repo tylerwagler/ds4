@@ -2229,14 +2229,9 @@ static int routed_moe_launch_cutlass(
     }
 
     for (uint32_t e = 0; e < n_total_expert; e++) {
-        const uint32_t pair_offset = h_offsets[e];
-        const uint32_t count = h_offsets[e + 1] - pair_offset;
-        if (count == 0) continue;
-
-        moe_cutlass_gather_kernel<<<count, 256>>>(x_gathered, w_gathered,
-                (const float *)x->ptr, (const float *)weights->ptr,
-                sorted_pairs, pair_offset, count, n_expert, expert_in_dim);
-        if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass gather launch")) return 0;
+        const uint32_t e_offset = h_offsets[e];
+        const uint32_t e_count = h_offsets[e + 1] - e_offset;
+        if (e_count == 0) continue;
 
         const uint8_t *Wg_d = (const uint8_t *)gate_w + (uint64_t)e * gate_stride;
         const uint8_t *Wg_sf = Wg_d + gate_data_bytes;
@@ -2245,16 +2240,34 @@ static int routed_moe_launch_cutlass(
         const uint8_t *Wd_d = (const uint8_t *)down_w + (uint64_t)e * down_stride;
         const uint8_t *Wd_sf = Wd_d + down_data_bytes;
 
-        const int rc = ds4_cutlass_expert_ffn_scratch(ffn_out, x_gathered,
-                Wg_d, Wg_sf, Wu_d, Wu_sf, Wd_d, Wd_sf,
-                w_gathered, clamp,
-                (int)count, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                ffn_scratch, ffn_scratch_bytes);
-        if (rc != 0) return 0;
+        /* One expert can receive MORE than n_tokens pairs when routing carries
+         * duplicates (e.g. tid2eid -1 "dropped" entries all clamp to expert 0),
+         * but the gather/ffn scratch is sized for T_max = n_tokens rows -- so
+         * run the expert in <=T_max-row slices. Every row is computed
+         * independently (per-row GEMM dot products, per-row swiglu), so slicing
+         * is bit-identical to a single full-count pass; with well-formed
+         * routing (count <= n_tokens) this loop body runs exactly once with
+         * the same arguments as before. */
+        for (uint32_t done = 0; done < e_count; done += T_max) {
+            const uint32_t pair_offset = e_offset + done;
+            const uint32_t count = (e_count - done < T_max) ? (e_count - done) : T_max;
 
-        moe_cutlass_scatter_kernel<<<count, 256>>>((float *)down->ptr, ffn_out,
-                sorted_pairs, pair_offset, count, out_dim);
-        if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass scatter launch")) return 0;
+            moe_cutlass_gather_kernel<<<count, 256>>>(x_gathered, w_gathered,
+                    (const float *)x->ptr, (const float *)weights->ptr,
+                    sorted_pairs, pair_offset, count, n_expert, expert_in_dim);
+            if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass gather launch")) return 0;
+
+            const int rc = ds4_cutlass_expert_ffn_scratch(ffn_out, x_gathered,
+                    Wg_d, Wg_sf, Wu_d, Wu_sf, Wd_d, Wd_sf,
+                    w_gathered, clamp,
+                    (int)count, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
+                    ffn_scratch, ffn_scratch_bytes);
+            if (rc != 0) return 0;
+
+            moe_cutlass_scatter_kernel<<<count, 256>>>((float *)down->ptr, ffn_out,
+                    sorted_pairs, pair_offset, count, out_dim);
+            if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass scatter launch")) return 0;
+        }
     }
 
     const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
@@ -2597,7 +2610,15 @@ static int routed_moe_launch_mixed40(
      * 128-padded grouped buffer would be almost all padding (few tokens spread over many experts),
      * so its memset/pack/grouped-launch overhead dominates. Big batches (prefill) use the grouped,
      * no-host-sync path. `rows` sizes the gather/proj buffers for whichever path is active. */
-    const int use_grouped = (n_tokens > 4u);
+    /* plan-34 inc 2: a batched multiseq/mixed step forces the M-INDEPENDENT
+     * per-token (non-grouped) path across the whole row range (<=DS4_MSEQ_MAX=8):
+     * the grouped path's per-expert group sizes depend on the batch composition,
+     * so a co-scheduled decode bank's expert output would shift with the batch
+     * width. The non-grouped CUTLASS proj uses fixed compile-time tiles (per-row
+     * output independent of M); buffers are sized by n_tokens, so 5..8 are safe.
+     * Classic prefill (never armed) keeps the grouped, no-host-sync path at >4. */
+    const int use_grouped = ds4_gpu_matmul_batch_mneutral()
+            ? (n_tokens > 8u) : (n_tokens > 4u);
     const uint64_t rows = use_grouped ? padded_upper : (uint64_t)n_tokens;
     /* The dp4a side (iq2/q2k) must use the production SORTED-TILED kernels at prefill, not the slow
      * generic qwarp32 -- that (not the CUTLASS GEMM) is where the mixed-layer time went. Big-batch
@@ -3466,8 +3487,61 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 }
 
 
+/* plan-34 inc 4: row-offset sub-view of a per-token MoE tensor for the two-pass
+ * split (byte offset into a row-major [n_tokens x stride] buffer). Reads ptr/bytes
+ * only; owner=0 (never freed). NULL/empty tensors pass through as empty. */
+static inline ds4_gpu_tensor moe_subrow(const ds4_gpu_tensor *t, uint64_t off_bytes) {
+    ds4_gpu_tensor s; s.ptr = NULL; s.bytes = 0; s.owner = 0;
+    if (t && t->ptr) {
+        s.ptr = (char *)t->ptr + off_bytes;
+        s.bytes = t->bytes > off_bytes ? t->bytes - off_bytes : 0;
+    }
+    return s;
+}
+
 static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
+    /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
+     * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
+     * is strictly per-row (selected/weights/x/out addressed by token), so a decode
+     * row's expert output is invariant to co-scheduled rows ONLY if it takes the
+     * M-independent per-token path — but the grouped GEMM's per-expert group sizes
+     * depend on the whole batch. So: run the PER-TOKEN path over the decode prefix
+     * (n_tokens=n_dec<=8 keeps the GEMV/non-grouped dispatch) and the GROUPED path
+     * over the prefill suffix (K>8), offsetting every per-token buffer by n_dec rows.
+     *   - Pass 1 keeps the flag = n_dec (nonzero) so the cap-8 dispatch picks the
+     *     per-token path for n_dec<=8; n_tokens==n_dec => it does NOT re-split.
+     *   - Pass 2 clears the flag so it (a) does not re-split and (b) is BYTE-
+     *     IDENTICAL to an inc-3 pure-prefill MoE of the same K rows (grouped path,
+     *     which reads no flag). The flag is restored before returning so the rest of
+     *     the layer/step still splits its dense GEMMs. */
+    {
+        const uint32_t n_dec = (uint32_t)ds4_gpu_matmul_batch_mneutral();
+        if (n_dec > 0 && n_dec < n_tokens && x && selected && weights && out) {
+            const uint64_t f = sizeof(float), i4 = sizeof(int32_t);
+            ds4_gpu_tensor x_s    = moe_subrow(x,        (uint64_t)n_dec * expert_in_dim * f);
+            ds4_gpu_tensor sel_s  = moe_subrow(selected, (uint64_t)n_dec * n_expert * i4);
+            ds4_gpu_tensor w_s    = moe_subrow(weights,  (uint64_t)n_dec * n_expert * f);
+            ds4_gpu_tensor out_s  = moe_subrow(out,      (uint64_t)n_dec * out_dim * f);
+            ds4_gpu_tensor gate_s = moe_subrow(gate,     (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            ds4_gpu_tensor up_s   = moe_subrow(up,       (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            ds4_gpu_tensor mid_s  = moe_subrow(mid,      (uint64_t)n_dec * n_expert * expert_mid_dim * f);
+            ds4_gpu_tensor down_s = moe_subrow(down,     (uint64_t)n_dec * n_expert * out_dim * f);
+            const int r1 = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+                    gate_offset, up_offset, down_offset, gate_type, down_type,
+                    gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                    expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+                    n_total_expert, n_expert, clamp, x, layer_index, n_dec, mid_is_f16);
+            ds4_gpu_matmul_set_batch_mneutral(0);
+            const int r2 = routed_moe_batch_impl(&out_s, &gate_s, &up_s, &mid_s, &down_s,
+                    model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type,
+                    gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                    expert_in_dim, expert_mid_dim, out_dim, &sel_s, &w_s,
+                    n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec, mid_is_f16);
+            ds4_gpu_matmul_set_batch_mneutral((int)n_dec);
+            return (r1 && r2) ? 1 : 0;
+        }
+    }
     {
         static int entry_log = -1;
         if (entry_log < 0) entry_log = getenv("DS4_MOE_PATH_LOG") != NULL ? 200 : 0;
@@ -3504,7 +3578,20 @@ static int routed_moe_batch_impl(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_
                     (unsigned long long)(mid ? mid->bytes : 0),
                     (unsigned long long)((uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)));
         }
-        if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u &&
+        /* inc 2: raise the M-independent GEMV cap to DS4_MSEQ_MAX (8) for a batched
+         * step so 5..8 keep the per-token path instead of the grouped GEMM. */
+        /* 2026-07-21: the un-armed default was 4, so spec-verify at --dspark-draft 5
+         * (w=6) fell off the per-token GEMV onto the grouped expert GEMM with its
+         * blocking per-layer offsets readback. Both arms are 8 now; the 5..8 path
+         * is the same kernel already used under mneutral.
+         * VERIFIED bit-exact in isolation vs the cap-4 build at verify widths 6
+         * and 8 (byte-identical logits + token stream, 3 fresh loads per arm), and
+         * width 4 is untouched. Median verify: w=6 258.0 -> 180.7 ms (-30.0%),
+         * w=8 290.4 -> 213.9 ms (-26.4%); layers_encode 213 -> 130 ms. The three
+         * sibling caps in ds4_cuda_matmul.cu were tried alongside this and are NOT
+         * bit-exact -- they stay at 4; do not re-couple them to this one. */
+        const uint32_t moe_gemv_cap = 8u;
+        if (fp4_gemv && n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
             mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&

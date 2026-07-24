@@ -5,6 +5,12 @@ DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 
+# Version string reported by /version, /health and the startup banner. Derived
+# from git so it never goes stale (e.g. "v0.2.3-8-gec51fb2", "-dirty" if the
+# tree has uncommitted changes); falls back to "unknown" outside a git checkout.
+DS4_VERSION_STR := $(shell git describe --tags --dirty --always 2>/dev/null || echo unknown)
+CFLAGS += -DDS4_VERSION_STR='"$(DS4_VERSION_STR)"'
+
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
@@ -12,6 +18,19 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+
+# HC residual-carrier storage precision (task #62). HC_F32=1 restores f32
+# carriers (the fallback, and the control build for the byte-exact gate).
+# CRITICAL: this MUST reach BOTH the host (CFLAGS) and device (NVCCFLAGS) TUs.
+# Defining it on only one half compiles and links cleanly, the in-TU
+# static_assert does NOT fire, and every residual read/write silently strides
+# the wrong element size -> total activation corruption. Never pass
+# -DDS4_HC_F32 by hand; use HC_F32=1.
+HC_F32 ?= 0
+ifeq ($(HC_F32),1)
+CFLAGS += -DDS4_HC_F32
+NVCCFLAGS += -DDS4_HC_F32
+endif
 
 CUTLASS_DIR ?= $(CURDIR)/cutlass
 CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
@@ -35,7 +54,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate
+.PHONY: all help clean test cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
 
 all: help
 
@@ -106,6 +125,58 @@ cuda-multiseq-gate: tests/multiseq_decode_gate
 # Shorter (N=2, 64 steps): this is a config gate, not a throughput run.
 cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
 	DS4_MSEQ_BANKS=2 DS4_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
+
+# Tier-2 PATH A / Option F: fused DSpark speculation on a BANK (N=1 spec-on-
+# bank == classic, N=2 spec-time-slice with warm per-bank rings, mseq_dirty
+# cheap resume).  See tests/bank_spec_gate.c.  MODEL-DEPENDENT, drafter-merged
+# model, same memory discipline as the gates above; hold temp/gpu.lock.
+cuda-bank-spec-gate: tests/bank_spec_gate
+	DS4_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 128
+
+# Tier-2 overcommit accounting-exactness gate (task #55, increment 1): the
+# exact-frontier touched-KV number the eviction guard triggers on must track the
+# real cudaMemGetInfo physical delta of the demand-paged comp/index growth.  See
+# tests/accounting_gate.c.  MODEL-DEPENDENT, same memory discipline as the gates
+# above (hold temp/gpu.lock, drop_caches, no other ds4 process); fills stay
+# modest (peak ~64k tokens) and do not exercise eviction.
+cuda-accounting-gate: tests/accounting_gate
+	DS4_MSEQ_BANKS=2 ./tests/accounting_gate $(FRONTIER_MODEL)
+
+# Tier-2 increment 2b bank evict/restore bit-identity + reclaim gate (the
+# memory-safety core; no OOM risk). See tests/bank_evict_restore_gate.c.
+cuda-evict-restore-gate: tests/bank_evict_restore_gate tests/bank_fork_gate
+	DS4_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate $(FRONTIER_MODEL)
+
+# Tier-2 PATH-A full-prefix fork gate (plan-33 inc A): fork==cold oracle. See
+# tests/bank_fork_gate.c. MODEL-DEPENDENT, needs DS4_MSEQ_BANKS>=3.
+cuda-fork-gate: tests/bank_fork_gate
+	DS4_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
+
+# plan-34 phase-2 inc 2: cuBLASLt algo-stability. A decode bank's step logits must
+# be byte-identical across batched-step widths M (incl. the M=4->5 custom->cuBLASLt
+# boundary) so a co-scheduled big prefill (inc 4) cannot perturb it. MODEL-DEPENDENT,
+# needs DS4_MSEQ_BANKS>=8. Run pack on/off + idx-fp4 on/off under GPU discipline.
+cuda-algo-stability-gate: tests/algo_stability_gate
+	DS4_MSEQ_BANKS=8 ./tests/algo_stability_gate $(FRONTIER_MODEL)
+
+# plan-34 phase-2 inc 3: K-row single-bank prefill through the mixed entry —
+# coherence vs classic, K>ratio boundary, tensor-core speed. MODEL-DEPENDENT.
+cuda-mixed-prefill-gate: tests/mixed_prefill_gate
+	DS4_MSEQ_BANKS=2 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
+
+# plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
+# fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
+# a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
+cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
+	DS4_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
+
+# plan-33 inc B: 3-way output-equality harness (server-level; see the script).
+warm-fork-3way: ds4-server
+	bash tests/warm_fork_3way.sh $(FRONTIER_MODEL)
+
+# plan-33 inc D: partial-prefix fork 3-way output-equality harness (server-level).
+warm-partial-fork-3way: ds4-server
+	bash tests/warm_partial_fork_3way.sh $(FRONTIER_MODEL)
 
 # Prefill bit-exactness gate (the D2R acceptance gate; see the header of
 # tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,
@@ -216,6 +287,27 @@ tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.c src/engine/ds4_en
 tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
 	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.c
 
+tests/bank_spec_gate.o: tests/bank_spec_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_spec_gate.c
+
+tests/accounting_gate.o: tests/accounting_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/accounting_gate.c
+
+tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.c
+
+tests/bank_fork_gate.o: tests/bank_fork_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/bank_fork_gate.c
+
+tests/algo_stability_gate.o: tests/algo_stability_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.c
+
+tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_prefill_gate.c
+
+tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.c src/engine/ds4_engine_internal.h src/ds4.h src/ds4_gpu.h
+	$(CC) $(CFLAGS) $(DS4_INC) -Isrc/engine -c -o $@ tests/mixed_neutrality_gate.c
+
 # Public-API only (ds4.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
 # DS4_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
@@ -246,6 +338,27 @@ tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/ds4_help.o 
 tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/bank_spec_gate: tests/bank_spec_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/accounting_gate: tests/accounting_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/bank_evict_restore_gate: tests/bank_evict_restore_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/bank_fork_gate: tests/bank_fork_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/algo_stability_gate: tests/algo_stability_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/mixed_prefill_gate: tests/mixed_prefill_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/mixed_neutrality_gate: tests/mixed_neutrality_gate.o src/lib/ds4_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/ds4_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -262,5 +375,5 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate

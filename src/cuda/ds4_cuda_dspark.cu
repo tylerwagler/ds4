@@ -317,16 +317,18 @@ extern "C" int ds4_gpu_dspark_confidence_score_model(
 }
 
 
+/* after_ffn_hc is an HC residual CARRIER (BF16 storage; task #62) — load via
+ * ds4_hc_load, accumulate in f32. Output is a plain f32 embedding row. */
 __global__ static void dspark_hc_mean_reduce_kernel(
         float *out,
-        const float *after_ffn_hc,
+        const ds4_hc_t *after_ffn_hc,
         uint32_t n_embd,
         uint32_t n_hc) {
     for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
          d += blockDim.x * gridDim.x) {
         float sum = 0.0f;
         for (uint32_t hc = 0; hc < n_hc; hc++)
-            sum += after_ffn_hc[(uint64_t)hc * n_embd + d];
+            sum += ds4_hc_load(after_ffn_hc, (uint64_t)hc * n_embd + d);
         out[d] = sum / (float)n_hc;
     }
 }
@@ -338,14 +340,14 @@ extern "C" int ds4_gpu_dspark_hc_mean_reduce(
         uint32_t n_hc) {
     if (!out || !after_ffn_hc || n_embd == 0 || n_hc == 0) return 0;
     if (out->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
-    if (after_ffn_hc->bytes < (uint64_t)n_hc * n_embd * sizeof(float)) return 0;
+    if (after_ffn_hc->bytes < (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE) return 0;   /* carrier */
 
     const uint32_t block_dim = 256;
     const uint32_t grid_dim = (n_embd + block_dim - 1) / block_dim;
 
     dspark_hc_mean_reduce_kernel<<<grid_dim, block_dim>>>(
         (float *)out->ptr,
-        (const float *)after_ffn_hc->ptr,
+        (const ds4_hc_t *)after_ffn_hc->ptr,
         n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "dspark hc mean reduce");
 }
@@ -357,17 +359,17 @@ extern "C" int ds4_gpu_dspark_hc_mean_reduce(
  * hidden without replaying. */
 __global__ static void dspark_hc_mean_reduce_batch_kernel(
         float *out,
-        const float *hc_batch,
+        const ds4_hc_t *hc_batch,   /* HC residual carrier (BF16); task #62 */
         uint32_t n_embd,
         uint32_t n_hc) {
     const uint32_t p = blockIdx.y;
-    const float *in = hc_batch + (uint64_t)p * n_hc * n_embd;
+    const ds4_hc_t *in = hc_batch + (uint64_t)p * n_hc * n_embd;
     float *op = out + (uint64_t)p * n_embd;
     for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
          d += blockDim.x * gridDim.x) {
         float sum = 0.0f;
         for (uint32_t hc = 0; hc < n_hc; hc++)
-            sum += in[(uint64_t)hc * n_embd + d];
+            sum += ds4_hc_load(in, (uint64_t)hc * n_embd + d);
         op[d] = sum / (float)n_hc;
     }
 }
@@ -381,13 +383,13 @@ extern "C" int ds4_gpu_dspark_hc_mean_reduce_batch(
         uint32_t n_tokens) {
     if (!out || !hc_batch || n_embd == 0 || n_hc == 0 || n_tokens == 0) return 0;
     if (out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
-    if (hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * sizeof(float)) return 0;
+    if (hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE) return 0;   /* carrier */
 
     const uint32_t block_dim = 256;
     dim3 grid((n_embd + block_dim - 1) / block_dim, n_tokens, 1);
     dspark_hc_mean_reduce_batch_kernel<<<grid, block_dim>>>(
         (float *)out->ptr,
-        (const float *)hc_batch->ptr,
+        (const ds4_hc_t *)hc_batch->ptr,
         n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "dspark hc mean reduce batch");
 }

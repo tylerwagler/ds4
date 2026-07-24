@@ -116,6 +116,10 @@ void append_model_json_values(buf *b, const char *id, const char *name,
     buf_printf(b,
         "{\"id\":");
     json_escape(b, id);
+    /* vLLM convention: "root" is the model path HF-tooling resolves (e.g.
+     * llama-benchy uses it/the id as the tokenizer id). id == root here. */
+    buf_puts(b, ",\"root\":");
+    json_escape(b, id);
     buf_puts(b,
         ",\"object\":\"model\","
         "\"created\":1767225600,"
@@ -151,7 +155,7 @@ void append_model_json_values(buf *b, const char *id, const char *name,
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             server_served_model_name(s),
                              ds4_session_ctx(s->slots[0].sess),
                              s->default_tokens);
 }
@@ -174,8 +178,90 @@ static bool send_models(server *s, int fd) {
      * flash/pro aliases — the server serves one GGUF at a time. */
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    append_model_json(&b, s, server_served_model_id(s));
     buf_puts(&b, "]}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Liveness probe (/healthz, /ping): is the process alive at all? Always 200
+ * while the process runs — deliberately independent of readiness/drain state,
+ * so a k8s liveness probe never restarts a server that is merely draining.
+ * Lock-free, engine-free (safe on a client thread). */
+static bool send_liveness(server *s, int fd) {
+    return http_response(fd, s->enable_cors, 200, "application/json",
+                         "{\"status\":\"ok\"}\n");
+}
+
+/* Readiness + status (/health): is the server ready to accept work, and what
+ * is it doing right now? 200 {"status":"ok",...} when serving; 503
+ * {"status":"draining",...} once shutdown has been requested so a load
+ * balancer stops routing to it. Reads only the worker-published snapshot under
+ * mu (same discipline as /metrics — no engine calls on the client thread). */
+static bool send_health(server *s, int fd) {
+    const char *model = server_served_model_id(s);
+    bool draining;
+    int n_slots, running, waiting;
+    time_t started;
+    double kv = 0.0; /* max KV utilization across provisioned slots */
+    pthread_mutex_lock(&s->mu);
+    draining = s->stopping;
+    n_slots  = s->n_slots;
+    running  = s->n_generating;
+    waiting  = s->n_queued;
+    started  = s->started;
+    for (int i = 0; i < n_slots; i++) {
+        const int pos = s->m_slot_pos[i];
+        const int ctx = s->m_slot_ctx[i];
+        double u = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
+        if (u > 1.0) u = 1.0;
+        if (u > kv) kv = u;
+    }
+    pthread_mutex_unlock(&s->mu);
+    if (running < 0) running = 0;
+    if (waiting < 0) waiting = 0;
+    const long uptime = started ? (long)(time(NULL) - started) : 0;
+
+    buf b = {0};
+    buf_printf(&b,
+        "{\"status\":\"%s\",\"version\":\"%s\",\"model\":\"%s\","
+        "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d},"
+        "\"kv_cache_usage\":%.6f}\n",
+        draining ? "draining" : "ok", DS4_VERSION_STR, model,
+        uptime, n_slots, running, waiting, kv);
+    bool ok = http_response(fd, s->enable_cors, draining ? 503 : 200,
+                            "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Version + build identity (/version), vLLM/OpenAI convention. Version is the
+ * git-describe string baked in at build time (see Makefile). */
+static bool send_version(server *s, int fd) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"version\":\"%s\",\"engine\":\"ds4\",\"cuda_arch\":\"sm_120f\","
+        "\"model\":\"%s\",\"model_name\":\"%s\",\"context\":%d}\n",
+        DS4_VERSION_STR,
+        server_served_model_id(s),
+        server_served_model_name(s),
+        ds4_session_ctx(s->slots[0].sess));
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Root banner so a bare GET / (browsers, uptime probes) gets a 200 with the
+ * version and a pointer to the real endpoints instead of a 404. */
+static bool send_root(server *s, int fd) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"service\":\"ds4-server\",\"version\":\"%s\",\"status\":\"ok\","
+        "\"endpoints\":[\"/health\",\"/version\",\"/v1/models\","
+        "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
+        "\"/v1/responses\",\"/metrics\"]}\n",
+        DS4_VERSION_STR);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -191,7 +277,7 @@ static bool send_metrics(server *s, int fd) {
      * snapshots the worker publishes under mu (m_spec/m_slot_pos/m_slot_ctx,
      * server_publish_metrics_snapshot — refreshed at bind time and once per
      * quantum, so gauges lag live state by at most one quantum). */
-    const char *model = server_model_id_from_engine(s->engine);
+    const char *model = server_served_model_id(s);
     ds4_spec_metrics m;
     int n_slots;
     double slot_kv[DS4_SESSION_POOL_CAP];
@@ -312,6 +398,27 @@ void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        send_health(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/healthz") || !strcmp(hr.path, "/ping"))) {
+        send_liveness(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/version")) {
+        send_version(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/")) {
+        send_root(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -327,7 +434,7 @@ void *client_main(void *arg) {
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
         !strcmp(hr.path + model_path_prefix_len,
-                server_model_id_from_engine(s->engine)))
+                server_served_model_id(s)))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -363,7 +470,7 @@ void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_model_id_from_engine(s->engine));
+        req.model = xstrdup(server_served_model_id(s));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);

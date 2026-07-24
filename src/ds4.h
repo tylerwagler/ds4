@@ -177,6 +177,63 @@ ds4_context_memory ds4_context_memory_estimate_packed(
  * number admission control must use.  Returns 0 if no session could be
  * created (no graph backend / weights not loaded). */
 uint64_t ds4_engine_session_cost_bytes(ds4_engine *e, int ctx_size);
+/* Same, priced for an EXPLICIT bank-pool size (Tier-2 auto-sizing): the server
+ * evaluates the (banks, ctx) fit table before committing DS4_MSEQ_BANKS. n_banks
+ * >= 1; 1 is the classic single-session cost. */
+uint64_t ds4_engine_session_cost_bytes_banked(ds4_engine *e, int ctx_size,
+                                              int n_banks);
+/* Tier-2 overcommit (task #55): demand-paged comp+index bytes for ONE bank at a
+ * context — the physical-on-touch VA the overcommit auto-size reserves but does
+ * NOT charge at admission (only the eager floor is charged). 0 if no session
+ * could be priced. */
+uint64_t ds4_engine_demand_paged_bytes_per_bank(ds4_engine *e, int ctx_size);
+/* Tier-2 overcommit (task #55): EXACT touched (physically resident) demand-paged
+ * KV bytes across the pool, summed from the per-bank compressor frontier
+ * (deterministic; no MemAvailable). The eviction guard triggers on this; the
+ * accounting-exactness gate proves it matches the physical cudaMemGetInfo delta.
+ * For the current bank the live frontier is used; idle banks use their captured
+ * frontier — capture the current bank first if you need it fully current. */
+uint64_t ds4_session_touched_kv_bytes(const ds4_session *s);
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
+ * eviction guard. free_physical: DIRECT cudaFree of one idle bank's split comp/index
+ * (reclaims physical on GB10); caller must have snapshotted the bank's KV to DISK
+ * first (host RAM reclaims nothing on unified memory) and repointed away from it.
+ * alloc_physical: reallocate that bank's comp/index (VA; physical on touch) + rebuild
+ * the base-pointer table; caller then reloads KV H2D from the disk snapshot.
+ * is_evicted: whether a bank's physical is currently freed. bank_touched_kv_bytes:
+ * one bank's exact resident comp/index KV from its frontier (guard Δ + victim pick). */
+bool ds4_session_bank_free_physical(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_alloc_physical(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_is_evicted(const ds4_session *s, uint32_t bank);
+uint64_t ds4_session_bank_touched_kv_bytes(ds4_session *s, uint32_t bank);
+/* Raw per-bank comp/index KV disk snapshot (the eviction guard's bit-identical
+ * mechanism; the D2H staging is transient — freed before free_physical). save:
+ * precondition bank is installed (cur). load: reallocs physical + rebuilds the
+ * base table + reinstalls counters, leaving bank installed. Return 0 on success. */
+int ds4_session_bank_kv_save(ds4_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
+int ds4_session_bank_kv_load(ds4_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
+/* Conservative per-bank comp/index growth over one q-token decode quantum (the
+ * guard's Delta term; over-charges the index side so the guard fires early). */
+uint64_t ds4_session_quantum_growth_bytes_per_bank(ds4_session *s, uint32_t q);
+/* Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment A) — FULL-PREFIX fork.
+ * Clone bank `src`'s committed KV + host carry into bank `dst` (dst continues src's
+ * conversation; the caller re-prefills only the divergent suffix). VALIDATES the
+ * request tokens[0..n_cached) against src's committed history BEFORE any device
+ * write (mismatch/short history -> refuse, non-zero return -> caller cold-prefills);
+ * n_cached must equal src's committed length (full-prefix). Pins src against the
+ * eviction guard for the clone. Returns 0 on success. fork_pinned: whether a bank
+ * is currently mid-fork (the guard's victim picker must skip it). */
+int  ds4_session_bank_fork(ds4_session *s, uint32_t src, uint32_t dst,
+                           const int *tokens, int n_cached);
+bool ds4_session_bank_fork_pinned(const ds4_session *s, uint32_t bank);
+/* plan-33 increment C — PARTIAL-prefix fork: the request shares only
+ * tokens[0..n_cached) with src's history. Cuts at R = ((n_cached-4)/128)*128,
+ * validates tokens[0..R+4) vs src BEFORE any device write, clones [0,R) (+ the
+ * byte-stashed ratio-4 boundary row, emit-restored during the replay), and makes
+ * dst's committed history tokens[0..R) — the caller then re-prefills [R, ...).
+ * src==dst = in-place truncate-reuse. 0 on success; non-zero -> cold prefill. */
+int  ds4_session_bank_fork_partial(ds4_session *s, uint32_t src, uint32_t dst,
+                                   const int *tokens, int n_cached);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across ds4_session_create).  Reconcile against
  * ds4_engine_session_cost_bytes after each create; commit this actual to any
@@ -323,6 +380,75 @@ typedef struct {
 int ds4_session_decode_multiseq(ds4_session *s, const ds4_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen);
+/* plan-34 phase-2: mixed prefill+decode batched step. SAME contract, kernel path,
+ * and post-step invalidation as ds4_session_decode_multiseq, but the per-row
+ * descriptor scratch is HEAP-allocated (up to the session's prefill_cap rows)
+ * rather than the fixed DS4_MSEQ_MAX stack — the row representation the fused
+ * mixed-batch step grows into. INCREMENT 1 is a byte-identical refactor: for a
+ * decode-only batch (1 row per bank, n_rows == bank count) it produces the SAME
+ * per-row logits as ds4_session_decode_multiseq. n_rows must be <= prefill_cap;
+ * the underlying kernel still bounds the live row count to DS4_MSEQ_MAX this
+ * increment (later increments lift it). Returns 0 / 1 / -1 as decode_multiseq. */
+/* On success `logits` receives ONE row per per-bank RUN (the LAST row of each
+ * run — plan-34 inc 3), in run order (ascending first-appearance of the bank);
+ * *out_n_rows (may be NULL) is set to that count (== the number of distinct
+ * banks). For a decode-only batch (1 row per bank) that is n_rows rows in bank
+ * order — unchanged. For a K-row prefill run it is a single row (the K-th token's
+ * logits). Size `logits` for the run count, not n_rows. */
+/* max_head_runs (plan-34 inc 5, LEVER 1): emit head logits for only the FIRST
+ * max_head_runs runs (0 = ALL runs = inc-3/4 behavior). A fused mixed step whose
+ * trailing prefill run is on an INTERMEDIATE chunk passes n_dec (the decode banks
+ * only): the prefill run's intermediate logits are never consumed, so skipping them
+ * is unobservable AND lets the head take the single-block identity path (no
+ * two-block gather/resync, no wasted K-row prefill head GEMM). *out_n_rows is then
+ * the emitted count (== min(n_runs, max_head_runs), with 0 meaning n_runs). */
+int ds4_session_decode_mixed(ds4_session *s, const ds4_multiseq_req *reqs,
+                             uint32_t n_rows, float *logits, int logits_cap,
+                             uint32_t *out_n_rows, uint32_t max_head_runs,
+                             char *err, size_t errlen);
+/* Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
+ * hosts up to N co-scheduled conversations as banks; each server slot maps to a
+ * bank id.  The pool size is chosen at session create (DS4_MSEQ_BANKS today);
+ * ds4_session_bank_count reports it (1 when not pooled).
+ *
+ * A conversation lives in ONE bank for its lifetime.  To do classic/spec work
+ * on bank b the caller repoints the device views AND restores b's host carry;
+ * ds4_session_bank_restore does both (+ clears the multiseq poison cheaply, no
+ * re-prefill).  ds4_session_bank_save snapshots the live bank before switching
+ * away.  Typical server flow:
+ *   prefill:  ds4_session_bank_repoint(s,b); ds4_session_invalidate(s);
+ *             ds4_session_sync(s, prompt, ...); ds4_session_bank_save(s,b);
+ *   decode 1: ds4_session_bank_state_restore(s,b);
+ *             ds4_session_generate_speculative(...);
+ *             ds4_session_bank_state_save(s,b);
+ *   decode N: ds4_session_decode_multiseq(s, reqs, N, ...) over the live banks
+ *             (each captured via bank_state_save first); sample per row on host.
+ * repoint/save/restore must run only between fully synchronized forwards. */
+int  ds4_session_bank_count(ds4_session *s);
+int  ds4_session_bank_repoint(ds4_session *s, uint32_t bank);
+void ds4_session_bank_state_save(ds4_session *s, uint32_t bank);
+bool ds4_session_bank_state_restore(ds4_session *s, uint32_t bank);
+/* Per-bank frontier readers for a bank-pooled session: the committed length,
+ * token history, and common-prefix-with-prompt of ONE bank, correct even when
+ * that bank is not the currently-installed one (the live bank reads the live
+ * checkpoint; others read their saved host carry).  ds4_session_pos/_tokens/
+ * _common_prefix describe only the live bank, so server routing and /metrics
+ * must use these for non-active banks.  Pure host reads (no CUDA); the caller
+ * must keep idle banks' carries current (bank_state_save at job end). Return
+ * 0 / NULL for an out-of-range or never-populated bank. */
+int  ds4_session_bank_pos(ds4_session *s, uint32_t bank);
+const ds4_tokens *ds4_session_bank_tokens(ds4_session *s, uint32_t bank);
+int  ds4_session_bank_common_prefix(ds4_session *s, uint32_t bank,
+                                    const ds4_tokens *prompt);
+/* Tier-2: reconcile the host checkpoint after a run of ds4_session_decode_multiseq
+ * steps advanced the LIVE (just bank_state_restore'd) bank's device KV frontier
+ * without touching the host token history. Append the tokens multiseq committed,
+ * in order, so ds4_session_pos/_tokens/_common_prefix and any subsequent classic
+ * eval/sync/store see the true frontier. Pure host bookkeeping — no eval, no
+ * CUDA. The device per-bank counters are already correct (the multiseq driver
+ * maintained them and bank_state_restore installed them); this only catches the
+ * host checkpoint up to them. */
+void ds4_session_note_committed_tokens(ds4_session *s, const int *toks, int n);
 int ds4_session_generate_speculative(ds4_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens, int eos_token,

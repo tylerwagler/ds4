@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -102,6 +103,24 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+/* Hyper-connection residual-stream stored sample type (task #62; see the
+ * DS4_HC_ELT_SIZE note in ds4_gpu.h). ds4_hc_t is the on-device STORAGE type of
+ * the six swap-coupled HC residual carriers; loads promote to f32 and stores
+ * round from f32 so all in-kernel accumulation stays f32 (torch semantics:
+ * bf16 storage, f32 math). Only the carriers use this — flat_hc (RMSNorm out)
+ * and hc_mix/hc_split (Sinkhorn control weights) stay f32. sizeof(ds4_hc_t)
+ * MUST equal DS4_HC_ELT_SIZE. */
+#ifdef DS4_HC_F32
+typedef float ds4_hc_t;
+__device__ __forceinline__ static float ds4_hc_load(const ds4_hc_t *p, uint64_t i) { return p[i]; }
+__device__ __forceinline__ static void  ds4_hc_store(ds4_hc_t *p, uint64_t i, float v) { p[i] = v; }
+#else
+typedef __nv_bfloat16 ds4_hc_t;
+__device__ __forceinline__ static float ds4_hc_load(const ds4_hc_t *p, uint64_t i) { return __bfloat162float(p[i]); }
+__device__ __forceinline__ static void  ds4_hc_store(ds4_hc_t *p, uint64_t i, float v) { p[i] = __float2bfloat16(v); }
+#endif
+static_assert(sizeof(ds4_hc_t) == DS4_HC_ELT_SIZE, "ds4_hc_t size must match DS4_HC_ELT_SIZE");
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];
@@ -153,6 +172,7 @@ extern std::unordered_set<uint64_t> g_fp8_offsets;
 /* ---- shared host functions ---- */
 
 void *cuda_tmp_alloc(uint64_t bytes, const char *what);
+void cuda_fp8_weight_cache_clear(void);
 int cuda_attention_score_buffer_fits(uint32_t n_comp);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);

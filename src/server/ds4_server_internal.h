@@ -44,6 +44,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Build-time version string (Makefile passes -DDS4_VERSION_STR from
+ * `git describe`); fall back to "unknown" for non-Makefile/ad-hoc builds. */
+#ifndef DS4_VERSION_STR
+#define DS4_VERSION_STR "unknown"
+#endif
+
 /* ---- shared macros ---- */
 
 
@@ -709,7 +715,7 @@ typedef struct {
  * conversation's warm KV) AND the packed-KV admission budget still has room.
  * A single client therefore always runs on slot 0, byte-identical to the
  * increment-2 single-session server. */
-#define DS4_SESSION_POOL_CAP 4
+#define DS4_SESSION_POOL_CAP 5
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
  * keep the default per-session context far below the lone-session maximum;
@@ -833,7 +839,20 @@ typedef struct gen_state gen_state;
  * reusable hole (sess == NULL, state SLOT_EVICTED) below the n_slots
  * high-water mark. */
 typedef struct {
-    ds4_session *sess;                    /* live session; NULL until admitted */
+    ds4_session *sess;                    /* live session; NULL until admitted.
+                                             Tier-2: in bank-pool mode EVERY live
+                                             slot's sess points at the ONE pool
+                                             session (slots[0].sess); the slot is
+                                             distinguished by `bank` below. */
+    uint32_t     bank;                    /* Tier-2: this slot's bank id in the
+                                             shared pool (slot i -> bank i). 0 in
+                                             classic (non-pooled) mode. */
+    int          committed_pos;           /* Tier-2: this bank's committed KV
+                                             frontier length (== ds4_session_pos
+                                             when this bank is the live one).
+                                             Kept current at every op boundary so
+                                             routing/metrics can read a non-live
+                                             bank's position without a bank swap. */
     struct job  *active_job;              /* request bound to this slot, or NULL */
     gen_state   *gen;                     /* resumable state for active_job */
     slot_state   state;
@@ -848,6 +867,12 @@ typedef struct {
      * the shared ds4_kvstore keeps one continued_last_store_tokens field, but
      * the schedule it tracks belongs to this slot's conversation. */
     int          continued_last_store_tokens;
+    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
+     * bank's comp/index PHYSICAL was cudaFree'd (raw KV bit-identical on disk at
+     * <spill_dir>/spill-bank-<bank>.kv) while its conversation stays bound here; it
+     * is restored (alloc_physical + kv_load) before this slot next decodes. Distinct
+     * from SLOT_EVICTED (which frees the bank for a DIFFERENT conversation). */
+    bool         spilled;
     /* Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
@@ -859,13 +884,70 @@ typedef struct {
 
 struct server {
     ds4_engine *engine;
+    /* Advertised id override (server_config.served_model_id); NULL => built-in
+     * server_model_id_from_engine. Read via server_served_model_id. */
+    const char *served_model_id;
+    /* Advertised display-name override (server_config.served_model_name); NULL
+     * => ds4_engine_model_name. Read via server_served_model_name. */
+    const char *served_model_name;
     /* Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
      * published under mu for readers on client threads). */
     session_slot slots[DS4_SESSION_POOL_CAP];
     int          n_slots;            /* provisioned slots (worker-owned; published under mu) */
+    /* Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
+     * shared-pool flip is active: all live slots share slots[0].sess and each
+     * owns one bank; `live_bank` is the bank whose device views + host carry are
+     * currently installed on that session (server_bank_switch lazily saves the
+     * old and restores the new). `spec_max_live` is the three-way scheduler knob
+     * (generate.c worker_main): n_active decode banks <= spec_max_live take the
+     * per-bank spec/plain time-slice lane, n_active > spec_max_live take the
+     * batched multiseq lane. 0 in classic mode. */
+    int          pool_banks;
+    int          live_bank;
+    int          spec_max_live;
+    /* plan-34 phase-2 inc 5: fused mixed-batch lane (DS4_MIXED_BATCH, default OFF,
+     * read once at startup). When ON, the worker folds ONE prefilling slot's next
+     * chunk (a K-row prefill run) into the decode quantum's first mixed step
+     * (ds4_session_decode_mixed) instead of advancing it as a separate classic
+     * sweep — true continuous batching (P=1). OFF => today's exact decode-quantum +
+     * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
+     * pool mode (pool_banks>0). */
+    bool         mixed_batch_enabled;
+    /* Prefill rows folded into EACH decode step of a fused quantum (DS4_MIXED_CHUNK,
+     * read once; default 32). Spreading the prefill uniformly across the quantum's
+     * steps (vs one big chunk on one step) is what trades the time-slice's per-
+     * interval decode STALL for a small uniform per-token cost — the p99 lever. */
+    int          mixed_chunk_tokens;
+    /* plan-33 inc B: warm full-prefix FORK routing (DS4_WARM_FORK, default on;
+     * read once at startup). When a request's prompt token-extends an idle warm
+     * bank's committed history, the router forks that trunk into a FREE bank and
+     * continues there, leaving the trunk intact for siblings. */
+    bool         warm_fork_enabled;
+    /* plan-33 inc D: minimum shared-prefix TOKEN count for a PARTIAL fork-cut to
+     * be worth it (below this, reusing so few tokens loses to a plain cold
+     * prefill; a full-prefix match still forks regardless). DS4_WARM_PARTIAL_MIN,
+     * read once at startup; floored to the ratio-4 align (partial cuts below R
+     * reuse nothing). */
+    int          warm_partial_min;
+    uint64_t     bank_marginal_bytes; /* Tier-2: per-bank ledger charge in pooled
+                                         mode (even split of the admitted pool
+                                         cost; conservative, demand-paged reality
+                                         is smaller). 0 in classic mode. */
     uint64_t     kv_budget_bytes;    /* admission ceiling computed at startup */
     uint64_t     kv_committed_bytes; /* sum of est_cost_bytes over live slots (under mu) */
+    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
+     * gates the whole mechanism (on iff overcommit sized N>1 banks and a spill dir
+     * exists). `guard_touched_budget` is the resident-KV ceiling the guard keeps
+     * touched_kv under = kv_budget − eager_reserved (banks may grow to 1M but total
+     * physical is bounded); `guard_eager_bytes` the eager floor already resident.
+     * `guard_evictions` counts spills for metrics. `spill_dir` is a LOCAL fast-disk
+     * scratch (NOT the NAS; NOT tmpfs — either would defeat physical reclaim). */
+    bool         guard_enabled;
+    uint64_t     guard_touched_budget;
+    uint64_t     guard_eager_bytes;
+    uint64_t     guard_evictions;
+    char         spill_dir[512];
     /* Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
      * DS4_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.c; immutable after
@@ -883,6 +965,7 @@ struct server {
     job *head;
     job *tail;
     bool stopping;
+    time_t started;                  /* wall-clock when the listener came up (uptime for /health) */
     int clients;
     /* /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
      * enqueued not yet bound to a slot; n_generating = jobs bound to slots
@@ -999,6 +1082,16 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    /* Advertised model id (/v1/models "id"+"root", /version "model", /metrics
+     * label). NULL keeps the built-in "deepseek-v4-flash"/"deepseek-v4-pro".
+     * Set to an HF repo path so HF-convention tooling (llama-benchy: model id
+     * == tokenizer repo id) resolves the tokenizer. Does not affect KV cache
+     * keying (gguf path + numeric id) nor request acceptance (incoming model
+     * field is not validated). */
+    const char *served_model_id;
+    /* Advertised human display name (/v1/models "name", /version "model_name").
+     * NULL keeps the built-in shape name. Free-form; may contain spaces. */
+    const char *served_model_name;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -1051,6 +1144,12 @@ bool parse_output_config_effort(const char **p, ds4_think_mode *effort);
 bool model_alias_disables_thinking(const char *model);
 bool model_alias_enables_thinking(const char *model);
 const char *server_model_id_from_engine(ds4_engine *engine);
+/* Advertised model id ("id"/"root"/metrics): --served-model-id override if set,
+ * else the built-in id. Must be HF-resolvable for HF-convention tokenizer tools. */
+const char *server_served_model_id(const server *s);
+/* Advertised display name ("name"): --served-model-name override if set, else
+ * the built-in shape name. Free-form; never used as a tokenizer/repo id. */
+const char *server_served_model_name(const server *s);
 void stop_list_clear(stop_list *stops);
 void stop_list_push(stop_list *stops, char *s);
 bool parse_stop(const char **p, stop_list *out);
@@ -1071,6 +1170,8 @@ void append_json_object_or_empty(buf *b, const char *json);
 void append_dsml_tool_calls_text(buf *b, const tool_calls *calls);
 bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas);
+bool chat_history_preserves_reasoning(const chat_msgs *msgs,
+                                             const char *tool_schemas);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode);
@@ -1419,6 +1520,19 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * leaking budget forever) if the pairing ever underflows (defined in
  * generate.c; unit-tested in cli_main.c). */
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
+/* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
+ * is the currently-installed bank of the shared pool session (a non-live bank
+ * reads its saved host carry via ds4_session_bank_pos; the live bank reads the
+ * live checkpoint). In classic (non-pooled) mode == ds4_session_pos(sl->sess).
+ * Worker-thread scheduling reads AND the client/worker tool-id lookups use this
+ * instead of ds4_session_pos so a non-live bank's frontier is never misread as
+ * the pool's live cursor (defined in generate.c). */
+/* Install `bank` on the shared pool session: lazily saves the outgoing bank's
+ * carry, reloads a guard-spilled target from disk, and repoints the graph's
+ * views.  Returns false WITHOUT installing on any failure — callers must fail
+ * the request rather than run against a half-repointed view set. */
+bool server_bank_switch(server *s, int bank);
+int server_slot_frontier_pos(const server *s, const session_slot *sl);
 /* LRU eviction victim: least-recently-serviced idle provisioned slot,
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot

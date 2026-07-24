@@ -125,7 +125,7 @@ __global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, co
 
 
 
-__global__ static void hc_weighted_sum_kernel(float *out, const float *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
+__global__ static void hc_weighted_sum_kernel(float *out, const ds4_hc_t *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_tokens;
     if (gid >= n) return;
@@ -133,7 +133,7 @@ __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const 
     uint32_t t = gid / n_embd;
     float acc = 0.0f;
     for (uint32_t h = 0; h < n_hc; h++) {
-        acc += x[(uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d] *
+        acc += ds4_hc_load(x, (uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d) *
                w[(uint64_t)t * weight_stride_f32 + h];
     }
     out[(uint64_t)t * n_embd + d] = acc;
@@ -142,10 +142,10 @@ __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const 
 
 
 __global__ static void hc_expand_kernel(
-        float *out_hc,
+        ds4_hc_t *out_hc,
         const float *block_out,
         const float *block_add,
-        const float *residual_hc,
+        const ds4_hc_t *residual_hc,
         const float *post,
         const float *comb,
         uint32_t n_embd,
@@ -167,10 +167,10 @@ __global__ static void hc_expand_kernel(
     float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
     for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
         float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
-        float res_v = residual_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d];
+        float res_v = ds4_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
         acc += comb_v * res_v;
     }
-    out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
+    ds4_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
 }
 
 
@@ -179,7 +179,7 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
         float *out,
         float *split,
         const float *mix,
-        const float *residual_hc,
+        const ds4_hc_t *residual_hc,
         const float *scale,
         const float *base,
         uint32_t n_embd,
@@ -198,7 +198,7 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
-            acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
+            acc += ds4_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
         }
         out[(uint64_t)t * n_embd + col] = acc;
     }
@@ -206,12 +206,92 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
 
 
 
+/* BIT-EXACT register-staging rewrite (2026-07-21).  At decode n_rows==1, so this
+ * runs as ONE block on a 48-SM GPU and every stall is exposed.  The old shape
+ * wrote `acc` to global `out`, then -- after a full block barrier -- read the
+ * SAME value straight back to scale it, i.e. a read-after-write round trip
+ * through memory for a value that was already in a register.  With BLK a
+ * compile-time constant the per-thread column set {d, d+BLK, ...} is a
+ * compile-time-bounded VEC, so the accs live in registers across the barrier
+ * and the second pass loads nothing.
+ *
+ * BIT-EXACT: `v` reloaded from `out` was the f32 that `acc` already held (one
+ * store + one load of the same 32-bit pattern -- no rounding in between), the
+ * column order and the 256-partial pairwise tree are untouched, and `out` is
+ * still written with the same values.  Only the reload disappears.
+ *
+ * `residual_hc` is an HC CARRIER (BF16 storage under task #62) and is read
+ * through ds4_hc_load exactly as the generic kernel below does. */
+template <uint32_t BLK, uint32_t VEC>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
         float *split,
         const float *mix,
-        const float *residual_hc,
+        const ds4_hc_t *residual_hc,
+        const float *scale,
+        const float *base,
+        const float *norm_w,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_rows,
+        uint32_t sinkhorn_iters,
+        float epsv,
+        float norm_eps) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    if (t >= n_rows || n_hc != 4) return;
+    const uint32_t mix_hc = 24;
+    float *sp = split + (uint64_t)t * mix_hc;
+    __shared__ float hc4_c[16];
+    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
+    __syncthreads();
+
+    const uint64_t rbase = (uint64_t)t * 4u * n_embd;
+    const uint64_t obase = (uint64_t)t * n_embd;
+    float accs[VEC];
+    float sum = 0.0f;
+    #pragma unroll
+    for (uint32_t u = 0; u < VEC; u++) {
+        const uint32_t col = d + u * BLK;
+        if (col < n_embd) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (uint32_t h = 0; h < 4; h++) {
+                acc += ds4_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) * sp[h];
+            }
+            out[obase + col] = acc;
+            accs[u] = acc;
+            sum += acc * acc;
+        } else {
+            accs[u] = 0.0f;
+        }
+    }
+
+    __shared__ float partial[BLK];
+    partial[d] = sum;
+    __syncthreads();
+    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
+        if (d < stride) partial[d] += partial[d + stride];
+        __syncthreads();
+    }
+    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    #pragma unroll
+    for (uint32_t u = 0; u < VEC; u++) {
+        const uint32_t col = d + u * BLK;
+        if (col < n_embd) norm_out[obase + col] = accs[u] * norm_scale * norm_w[col];
+    }
+}
+
+
+/* Generic fallback for n_embd > BLK*VEC (byte-identical to the pre-2026-07-21
+ * kernel: same column order, same tree, same global round trip). */
+__global__ static void hc_split_weighted_sum_norm_fused_generic_kernel(
+        float *out,
+        float *norm_out,
+        float *split,
+        const float *mix,
+        const ds4_hc_t *residual_hc,
         const float *scale,
         const float *base,
         const float *norm_w,
@@ -234,7 +314,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
-            acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
+            acc += ds4_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
         }
         out[(uint64_t)t * n_embd + col] = acc;
         sum += acc * acc;
@@ -653,14 +733,16 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
         else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) ok = 0;
     }
+    /* Launch-path dispatch flags: read the environment once per process. */
+    static const int no_warp_select = getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
+    static const int no_parallel_select = getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
     if (ok) {
-        if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
-            getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+        if (!no_warp_select && !no_parallel_select) {
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                          has_bias && !hash_mode, hash_mode);
-        } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+        } else if (!no_parallel_select) {
             router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                       has_bias && !hash_mode, hash_mode);
@@ -698,8 +780,10 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
         hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) return 0;
     }
-    if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
-        getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+    /* Launch-path dispatch flags: read the environment once per process. */
+    static const int no_warp_select = getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
+    static const int no_parallel_select = getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
+    if (!no_warp_select && !no_parallel_select) {
         dim3 block(32, 4, 1);
         router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
                                                                         (float *)weights->ptr,
@@ -713,7 +797,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         n_tokens,
                                                                         has_bias && !hash_mode,
                                                                         hash_mode);
-    } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
+    } else if (!no_parallel_select) {
         router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
                                                          (float *)probs->ptr,
@@ -767,8 +851,13 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_g
 extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
+    /* n_tokens comes from the OUTPUT; bound the carrier input too, mirroring
+     * ds4_gpu_hc_split_weighted_sum_tensor. The BF16 narrowing removed the
+     * accidental 2x margin that made an over-read harmless (task #62). */
+    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE ||
+        weights->bytes < (uint64_t)n_tokens * n_hc * sizeof(float)) return 0;
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
-        (float *)out->ptr, (const float *)residual_hc->ptr, (const float *)weights->ptr,
+        (float *)out->ptr, (const ds4_hc_t *)residual_hc->ptr, (const float *)weights->ptr,
         n_embd, n_hc, n_tokens, n_hc);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum launch");
 }
@@ -778,8 +867,11 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const d
     if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
+    /* Bound the carrier input as well as the output (see the sibling above). */
+    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * DS4_HC_ELT_SIZE ||
+        split->bytes < (uint64_t)n_tokens * stride * sizeof(float)) return 0;
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
-        (float *)out->ptr, (const float *)residual_hc->ptr, (const float *)split->ptr,
+        (float *)out->ptr, (const ds4_hc_t *)residual_hc->ptr, (const float *)split->ptr,
         n_embd, n_hc, n_tokens, stride);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum_split launch");
 }
@@ -805,7 +897,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE;
     if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || mix_bytes > model_size - base_offset) {
@@ -824,7 +916,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
             (float *)out->ptr,
             (float *)split->ptr,
             (const float *)mix->ptr,
-            (const float *)residual_hc->ptr,
+            (const ds4_hc_t *)residual_hc->ptr,
             scale,
             base,
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
@@ -855,7 +947,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE;
     if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
         norm_out->bytes < out->bytes ||
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
@@ -877,12 +969,28 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
     const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
             (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
     if (!scale || !base || !norm_w) return 0;
-    hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256>>>(
+#define DS4_HCFUSED_BLK 256u
+#define DS4_HCFUSED_VEC 16u
+    if (n_embd <= DS4_HCFUSED_BLK * DS4_HCFUSED_VEC) {
+        hc_split_weighted_sum_norm_fused_kernel<DS4_HCFUSED_BLK, DS4_HCFUSED_VEC>
+                <<<(uint32_t)n_rows, DS4_HCFUSED_BLK>>>(
+                (float *)out->ptr,
+                (float *)norm_out->ptr,
+                (float *)split->ptr,
+                (const float *)mix->ptr,
+                (const ds4_hc_t *)residual_hc->ptr,
+                scale,
+                base,
+                norm_w,
+                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+        return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
+    }
+    hc_split_weighted_sum_norm_fused_generic_kernel<<<(uint32_t)n_rows, 256>>>(
             (float *)out->ptr,
             (float *)norm_out->ptr,
             (float *)split->ptr,
             (const float *)mix->ptr,
-            (const float *)residual_hc->ptr,
+            (const ds4_hc_t *)residual_hc->ptr,
             scale,
             base,
             norm_w,
@@ -927,12 +1035,12 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
 
 extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
+    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
-                                                    (const float *)residual_hc->ptr,
+                                                    (const ds4_hc_t *)residual_hc->ptr,
                                                     (const float *)post->ptr,
                                                     (const float *)comb->ptr,
                                                     n_embd, n_hc, n_tokens,
@@ -943,14 +1051,14 @@ extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
 
 extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
+    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
-                                                    (const float *)residual_hc->ptr,
+                                                    (const ds4_hc_t *)residual_hc->ptr,
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
@@ -962,14 +1070,14 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
 
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
+    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * DS4_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((ds4_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
-                                                    (const float *)residual_hc->ptr,
+                                                    (const ds4_hc_t *)residual_hc->ptr,
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
@@ -1015,7 +1123,8 @@ extern "C" int ds4_gpu_matmul_fp8_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_FP8_HC_EXPAND_FUSED") == NULL) {
+    static const int disable_fused = getenv("DS4_CUDA_DISABLE_FP8_HC_EXPAND_FUSED") != NULL;
+    if (!disable_fused) {
         return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -1033,3 +1142,129 @@ extern "C" int ds4_gpu_matmul_fp8_hc_expand_tensor(
                                             split, n_embd, n_hc);
 }
 
+
+
+/* ---------------------------------------------------------------------------
+ * Fused plain-RMSNorm + f16 HC-mix GEMV (2026-07-21, BIT-EXACT).
+ *
+ * The decode graph ran, three times per token per layer-pair:
+ *     rms_norm_plain_tensor(flat_hc, cur_hc, hc_dim)      // grid 1  x 256
+ *     matmul_f16_tensor(hc_mix, hc_attn_fn, flat_hc, 1)   // grid 24 x 256
+ * On a 48-SM GB10 that is one SM followed by 24 SMs, with a 64 KB f32 store and
+ * a 24-way re-read of it in between, for 24 (or 4, at the output head) dot
+ * products.  The nsys profile put the pair at ~5.4% of decode; the GEMV alone
+ * moved 786 KB in 28.3 us = 27.8 GB/s, ~12% of achievable -- i.e. it was never
+ * bandwidth, it was 8 warps on 24 SMs with no memory-level parallelism.
+ *
+ * This kernel keeps the SAME two reductions but runs the norm redundantly in
+ * each of the out_dim blocks, so the serial 1-block stage disappears, the
+ * 64 KB scratch round trip disappears (flat_hc has no other consumer -- every
+ * call site feeds it straight into this GEMV), one launch disappears, and both
+ * loops get compile-time strides so UNROLL loads are in flight per warp.
+ *
+ * `x` is an HC residual CARRIER (cur_hc / after_attn_hc), so it is read through
+ * ds4_hc_load -- BF16 storage promoted to f32 -- matching rms_norm_plain_kernel
+ * exactly (task #62).  Reading it as float* would be silent corruption.
+ *
+ * WHY IT IS BIT-EXACT, not merely close:
+ *   - The sum-of-squares keeps thread t on exactly {t, t+BLK, ...} in
+ *     increasing order and reuses the identical 256-entry pairwise tree, so
+ *     `scale` is the same float rsqrtf produced before.
+ *   - flat[i] was stored as f32 and reloaded; here x[i]*scale is consumed from
+ *     the register that held that same f32.  Store/load of an f32 is the
+ *     identity, so the multiplicand is bit-identical.
+ *   - The dot product keeps the same 256 partials over the same index subsets
+ *     in the same order and the same pairwise tree as matmul_f16_kernel.
+ * There is no split-K, no atomic, and no cross-thread re-association anywhere.
+ * ------------------------------------------------------------------------- */
+template <uint32_t BLK, uint32_t UNROLL>
+__global__ static void hc_norm_mix_f16_kernel(
+        float *out,
+        const __half *w,
+        const ds4_hc_t *x,
+        uint32_t n,
+        uint32_t out_dim,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= out_dim) return;
+    const uint32_t tid = threadIdx.x;
+    __shared__ float partial[BLK];
+
+    /* stage 1: plain RMSNorm scale over x -- same order as rms_norm_plain_kernel */
+    float sum = 0.0f;
+    uint32_t i = tid;
+    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
+        float v[UNROLL];
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) v[u] = ds4_hc_load(x, i + u * BLK);
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) sum += v[u] * v[u];
+    }
+    for (; i < n; i += BLK) {
+        float v = ds4_hc_load(x, i);
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    __syncthreads();   /* partial[] is reused below */
+
+    /* stage 2: dot(w[row], normed x) -- same order as matmul_f16_kernel */
+    const __half *wr = w + (uint64_t)row * n;
+    float dot = 0.0f;
+    i = tid;
+    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
+        float xv[UNROLL];
+        float wv[UNROLL];
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) xv[u] = ds4_hc_load(x, i + u * BLK);
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) wv[u] = __half2float(wr[i + u * BLK]);
+        /* pinned roundings: __fmul_rn reproduces the f32 that rms_norm_plain
+         * stored into flat_hc, __fmaf_rn reproduces matmul_f16_kernel's
+         * contracted `sum += w * x`.  Written explicitly so no future
+         * contraction/reassociation decision by nvcc can silently move this
+         * off byte-identical. */
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) dot = __fmaf_rn(wv[u], __fmul_rn(xv[u], scale), dot);
+    }
+    for (; i < n; i += BLK) {
+        dot = __fmaf_rn(__half2float(wr[i]), __fmul_rn(ds4_hc_load(x, i), scale), dot);
+    }
+    partial[tid] = dot;
+    __syncthreads();
+    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[row] = partial[0];
+}
+
+
+extern "C" int ds4_gpu_hc_norm_mix_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   eps) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    /* x is an HC residual carrier: DS4_HC_ELT_SIZE bytes per sample. */
+    if (x->bytes < in_dim * DS4_HC_ELT_SIZE || out->bytes < out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
+    if (!wptr) return 0;
+    hc_norm_mix_f16_kernel<256, 8><<<(uint32_t)out_dim, 256>>>(
+            (float *)out->ptr, (const __half *)wptr, (const ds4_hc_t *)x->ptr,
+            (uint32_t)in_dim, (uint32_t)out_dim, eps);
+    return cuda_ok(cudaGetLastError(), "hc norm mix f16 launch");
+}

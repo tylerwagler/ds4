@@ -177,7 +177,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     /* tool_choice="required": force a tool call by prefilling the assistant turn
@@ -415,7 +415,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
     anthropic_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     if (tool_choice_forced && r->has_tools && r->prompt_text) {
@@ -1368,7 +1368,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);

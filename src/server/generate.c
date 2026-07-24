@@ -5,6 +5,26 @@
 
 
 
+/* Tier-2 shared-pool bank switch (defined lower, near provision_slot). Installs
+ * `bank`'s device views + host carry on the pool session, saving the outgoing
+ * bank first. No-op in classic mode or when `bank` is already live. Called at
+ * the top of every per-slot worker op (gen_begin, generate_job_step,
+ * worker_evict_one) so all sl->sess touches inside that op are live-correct. */
+/* Returns false only when the target is a guard-spilled bank whose restore FAILED
+ * (KV unrecoverable): the bank is NOT installed and cur_bank is unchanged, so the
+ * caller MUST fail the request rather than sample/commit on the wrong bank's KV
+ * (review finding 1). True on success (or classic mode / no-op). */
+bool server_bank_switch(server *s, int bank);
+/* Bank-aware common-prefix of `sl` against `prompt` (scheduling reads). */
+static int server_slot_common_prefix(const server *s, const session_slot *sl,
+                                     const ds4_tokens *prompt);
+/* plan-33 inc D: evict ONE non-trunk victim (LRU-superseded preferred, else
+ * plain LRU) so a warm fork has a free bank — trunk always protected. Defined
+ * near worker_evict_one; forward-declared for the routing path above it. */
+static bool server_fork_make_room(server *s, const session_slot *trunk);
+
+
+
 static bool thinking_tail_ends_with(const thinking_state *st, const char *s) {
     int n = (int)strlen(s);
     return st->tail_len >= n && !memcmp(st->tail + st->tail_len - n, s, (size_t)n);
@@ -216,7 +236,11 @@ static bool continue_after_invalid_dsml(server *s, session_slot *sl,
 bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
+    /* has_tools is NOT a disqualifier: a client can advertise tools and still
+     * strip reasoning on replay (openwebui).  prompt_preserves_reasoning now
+     * reflects the client's ACTUAL replay behavior, so it is the sole gate;
+     * remember_thinking_checkpoint renders the tool-context vs toolless form. */
     if (r->prompt_preserves_reasoning) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
@@ -443,7 +467,25 @@ char *build_toolless_thinking_visible_text(const request *r,
 static void remember_thinking_checkpoint(server *s, session_slot *sl,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
+    /* The key must byte-match what render_chat_prompt_text emits for this turn
+     * once it becomes historical on the next request.  With tools advertised
+     * (tool_context) a stripped historical assistant turn renders
+     * "<think></think>{content}<eos>", so keep prompt_text's trailing "<think>"
+     * and append the empty-reasoning, no-calls suffix.  Without tools the turn
+     * renders "</think>{content}<eos>" (no "<think>") — the toolless form. */
+    char *visible = NULL;
+    if (j->req.has_tools) {
+        if (!j->req.prompt_text || !ds4_think_mode_enabled(j->req.think_mode))
+            return;
+        char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", NULL);
+        buf b = {0};
+        buf_puts(&b, j->req.prompt_text);
+        buf_puts(&b, suffix);
+        free(suffix);
+        visible = buf_take(&b);
+    } else {
+        visible = build_toolless_thinking_visible_text(&j->req, content);
+    }
     if (!visible) return;
 
     thinking_live_remember(s, sl, visible);
@@ -457,24 +499,39 @@ static void remember_thinking_checkpoint(server *s, session_slot *sl,
 }
 
 /* Tool-call finish WITH thinking on: the model emitted <think>reasoning</think>
- * before the DSML tool call, so the reasoning tokens sit in the live KV. The
- * client replays this turn with the reasoning stripped (<think></think>), so the
- * exact-DSML-replay shortcut no longer aligns and every follow-up re-prefills the
- * whole conversation. Fix it like the toolless thinking path: remember the
- * thinking-STRIPPED bytes the next request will render as a key, but keep the
- * live tokens (reasoning included) as the sampled frontier. The next request then
- * byte-matches the key and continues from live KV — no rewrite, no rebuild. */
+ * before the DSML tool call, so the reasoning tokens sit in the live KV.  We
+ * remember the exact bytes the NEXT request will render for this turn as a visible
+ * key, keeping the live tokens (reasoning included) as the sampled frontier.  The
+ * next request byte-matches the key and continues from live KV — no rewrite, no
+ * rebuild — and, critically, an evicted-then-reloaded checkpoint is keyed by that
+ * same visible transcript on disk (kv_cache_store_current).
+ *
+ * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
+ * for a tool-context turn (prompt_render.c: `tool_context || i > last_user_idx`),
+ * because agentic clients (opencode et al.) replay reasoning_content verbatim so
+ * the model keeps its chain of thought across tool rounds.  So the key MUST carry
+ * the reasoning too — an earlier version dropped it (<think></think>), which byte-
+ * diverges from every reasoning-preserving replay at the first reasoning byte and
+ * made the live alias AND the disk key miss, forcing a full cold re-prefill of the
+ * whole conversation on eviction (opencode's ~4-minute-per-message symptom).  The
+ * toolless thinking path (remember_thinking_checkpoint) still strips: it only fires
+ * for non-tool-context requests (should_remember_thinking_checkpoint bails when
+ * prompt_preserves_reasoning), i.e. clients that DO drop reasoning on replay. */
 static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
                                               const job *j, const char *ctx,
                                               uint64_t trace_id, const char *content,
+                                              const char *reasoning,
                                               const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
     if (!ds4_think_mode_enabled(j->req.think_mode)) return;
 
-    /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + empty-reasoning
-     * suffix "</think>{content}{DSML}<EOS>" — exactly what render_chat_prompt_text
-     * emits for this tool turn on the next request (reasoning dropped). */
-    char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", calls);
+    /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + reasoning-preserved
+     * suffix "{reasoning}</think>{content}{DSML}<EOS>" — byte-identical to what
+     * render_chat_prompt_text emits for this tool turn on the next request (DSML from
+     * the id-keyed raw sample via tool_memory, reasoning replayed verbatim) and to
+     * the sampled bytes already in the live KV. */
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content,
+                                                reasoning ? reasoning : "", calls);
     buf visible = {0};
     buf_puts(&visible, j->req.prompt_text);
     buf_puts(&visible, suffix);
@@ -788,6 +845,24 @@ struct gen_state {
     bool dspark_spec_enabled;
     dsml_decode_tracker dsml_tracker;
 
+    /* Tier-2 batched-decode lane state (worker_batched_decode_quantum). A slot
+     * becomes batch_active when it joins the shared multiseq lane; it stays
+     * there until it finishes (no mid-conversation batched->classic switch, so
+     * no stale-logits hazard). batch_feed_token is the next token to commit at
+     * batch_feed_pos (the bank's KV frontier); batch_pending holds the tokens
+     * committed via multiseq since the bank's last host-checkpoint save, to be
+     * reconciled onto the checkpoint when the slot returns to a classic op
+     * (finish/store). */
+    bool batch_active;
+    bool batch_feed_valid;
+    int  batch_feed_token;
+    int  batch_feed_pos;
+    ds4_tokens batch_pending;
+    /* plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
+     * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
+     * once by the fused quantum on giveup; the classic path handles it correctly. */
+    bool no_fuse;
+
     /* deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;
 };
@@ -817,8 +892,48 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
  * bit-exact resumption AND enough suffix remains that the resumed sync takes
  * the batched chunk path rather than the single-token tail path (see
  * ds4_session_prefill_quantum_min_suffix). */
+/* Has the client gone away?  A request whose peer has disconnected is pure
+ * waste: on this box a single stream is ~16 t/s, so an abandoned long generation
+ * burns minutes of EXCLUSIVE GPU that a live request could have used.  Streaming
+ * requests already notice via a failed write (send_all), but a NON-streaming
+ * request writes nothing until the very end, so nothing detected the disconnect
+ * at all — it ran to max_tokens for a socket no one was reading.
+ *
+ * Polled non-blocking, and only at coarse boundaries (once per decode quantum,
+ * ~1/s, and once before a queued job starts) — never per token.
+ *
+ * POLLRDHUP is the signal that matters: a client that times out or is Ctrl-C'd
+ * sends FIN, which shows up as POLLRDHUP and NOT as POLLHUP (POLLHUP needs a
+ * full teardown/RST).  The deliberate trade: a client that half-closes its write
+ * side while still reading the response would be treated as gone.  HTTP clients
+ * do not do that while awaiting a response, and the same assumption is standard
+ * in production servers — but DS4_ABORT_ON_DISCONNECT=0 restores the old
+ * run-to-completion behavior without a rebuild if some client ever misbehaves.
+ * The env is read ONCE (project rule: no per-token getenv). */
+static bool gen_client_disconnected(int fd) {
+    if (fd < 0) return false;
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_ABORT_ON_DISCONNECT");
+        enabled = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (!enabled) return false;
+    struct pollfd p;
+    p.fd = fd;
+    p.events = POLLRDHUP;
+    p.revents = 0;
+    if (poll(&p, 1, 0) <= 0) return false;   /* 0 = quiet = still connected */
+    return (p.revents & (POLLERR | POLLHUP | POLLNVAL | POLLRDHUP)) != 0;
+}
+
+
 static bool gen_prefill_cancel_cb(void *ud) {
     const gen_state *g = ud;
+    /* A client that cancelled or hung up during a long prefill must stop the
+     * engine — otherwise opencode's deep-context prefills run to completion after
+     * a cancel, burning the GPU and a bank. Polled between chunks (not per token);
+     * gen_step_prefill abandons on the resulting interrupt. */
+    if (gen_client_disconnected(g->j->fd)) return true;
     if (g->prefill_min_suffix == 0) return false;
     if (g->prefill_chunks_done < 1) return false;
     if (g->prefill_last_current < 0 || g->prefill_total <= g->prefill_last_current) return false;
@@ -863,6 +978,17 @@ static void gen_prefill_fail(server *s, session_slot *sl) {
 static void gen_begin(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
     job *j = g->j;
+    /* Tier-2: install this slot's bank before ANY sl->sess touch below (all the
+     * pos/common-prefix/tokens reads and the prefill sync run against the live
+     * bank). No-op in classic mode / when already live. Finding 1: a failed spill
+     * restore (KV unrecoverable) must fail the request, not run against another
+     * bank's KV. */
+    if (!server_bank_switch(s, sl->bank)) {
+        snprintf(g->err, sizeof g->err,
+                 "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        gen_prefill_fail(s, sl);
+        return;
+    }
     const int old_pos = ds4_session_pos(sl->sess);
     const int common = ds4_session_common_prefix(sl->sess, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -1112,9 +1238,11 @@ static void gen_begin(server *s, session_slot *sl) {
     g->thinking_live_continuation = thinking_live_continuation;
 
     /* Prefill quantum policy: interrupt the engine's chunk loop only when
-     * resumption is bit-exact for this session (see gen_prefill_cancel_cb). */
+     * resumption is bit-exact for this session (see gen_prefill_cancel_cb). The
+     * cancel callback itself is armed per-sync in gen_step_prefill, NOT here: in
+     * pool mode every slot shares slots[0].sess, so a once-per-job set would be
+     * clobbered by the next job the worker binds before prefilling this one. */
     g->prefill_min_suffix = ds4_session_prefill_quantum_min_suffix(sl->sess);
-    ds4_session_set_cancel(sl->sess, gen_prefill_cancel_cb, g);
 
     if (s->kv.enabled &&
         g->cold_store_len >= s->kv.opt.min_tokens &&
@@ -1137,11 +1265,31 @@ static void gen_step_prefill(server *s, session_slot *sl) {
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const ds4_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
+    /* Arm the cancel callback on THIS slot's gen_state right before the sync.
+     * In pool mode every slot shares slots[0].sess, and the worker binds several
+     * jobs (each of which would set the callback) before prefilling any of them,
+     * so a once-per-job set in gen_begin leaves the LAST-bound slot's callback on
+     * the shared session. An earlier slot's prefill would then yield on ANOTHER
+     * slot's progress and, interrupted before its own first chunk, be misread as a
+     * fatal error ("interrupted", HTTP 500). The worker prefills serially, so
+     * setting it here binds the correct callback for this exact sync. */
+    ds4_session_set_cancel(sl->sess, gen_prefill_cancel_cb, g);
+
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
     g->prefill_total = 0;
     const int rc = ds4_session_sync(sl->sess, target, g->err, sizeof(g->err));
     if (rc == DS4_SESSION_SYNC_INTERRUPTED) {
+        if (gen_client_disconnected(g->j->fd)) {
+            /* Client cancelled mid-prefill: abandon rather than resume or fail, so
+             * a long deep-context prefill stops promptly on disconnect instead of
+             * running to completion (the decode loop already abandons this way). */
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: client disconnected during prefill, abandoning");
+            snprintf(g->err, sizeof(g->err), "client disconnected");
+            gen_prefill_fail(s, sl);
+            return;
+        }
         if (g->prefill_chunks_done > 0) return; /* voluntary yield; resume next quantum */
         /* Interrupted without progress cannot be our cancel callback; fail
          * rather than risk a live-lock re-issuing the same sync forever. */
@@ -1361,6 +1509,205 @@ static void gen_resolve_sampling(const request *req, float *temperature,
 
 
 
+/* Emit one already-decoded token into the response stream: append it to the
+ * accumulated text, feed the thinking/DSML trackers, run stop-string and
+ * tool-marker detection, and drive every active protocol stream projection
+ * (plain SSE / OpenAI / Anthropic / Responses). Returns true when the decode
+ * loop must STOP after this token (EOS, a stop string, a completed tool_calls
+ * block, or a client write error), with g->finish (and g->err on error) set.
+ *
+ * Factored out of gen_step_decode's per-token inner loop (plan Tier-2 Step 5)
+ * so both drivers share ONE emit path: the classic spec/plain decode loop
+ * below AND the batched multi-session scatter (which samples each live bank's
+ * row on the host, then calls this to stream that bank's slot). It touches
+ * ONLY host state hung off sl->gen + j->req + the client fd — no engine/CUDA
+ * call except ds4_token_text and the tool-recovery sync (chat_think_tool_
+ * recovery, which the batched path never reaches because n>=2 is plain,
+ * tool-gated decode by contract). Behavior for the single-session path is
+ * byte-identical to the pre-factoring inner loop. */
+static bool gen_emit_token(server *s, session_slot *sl, int token) {
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    if (token == ds4_token_eos(s->engine)) {
+        g->finish = "stop";
+        return true;
+    }
+
+    size_t piece_len = 0;
+    char *piece = ds4_token_text(s->engine, token, &piece_len);
+    g->completion++;
+
+    trace_piece(s, g->trace_id, piece, piece_len);
+    buf_append(&g->text, piece, piece_len);
+    thinking_state_feed(&g->thinking, piece, piece_len);
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
+    }
+
+    size_t stop_pos = 0, stop_len = 0;
+    bool hit_stop = stop_list_find_from(&j->req.stops, g->text.ptr,
+                                        g->stop_scan_from,
+                                        &stop_pos, &stop_len);
+    size_t stream_len = hit_stop ?
+        stop_pos : stop_list_stream_safe_len(&j->req.stops, g->text.len);
+    if (stream_len > g->text.len) stream_len = g->text.len;
+    stream_len = utf8_stream_safe_len(g->text.ptr, g->plain_stream_pos,
+                                      stream_len, hit_stop);
+    if (!hit_stop && j->req.stops.max_len > 1) {
+        const size_t hold = j->req.stops.max_len - 1;
+        g->stop_scan_from = g->text.len > hold ? g->text.len - hold : 0;
+    }
+
+    if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
+        char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
+        bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
+        free(delta);
+        if (!ok) {
+            g->finish = "error";
+            snprintf(g->err, sizeof(g->err), "client stream write failed");
+            free(piece);
+            return true;
+        }
+        g->plain_stream_pos = stream_len;
+    }
+    if (j->req.stream && j->req.api == API_ANTHROPIC &&
+        !anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
+                                     &g->anthropic_live, g->text.ptr, stream_len,
+                                     false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return true;
+    }
+    if (g->openai_live_chat &&
+        !openai_sse_stream_update(j->fd, s, &j->req, g->id,
+                                  &g->openai_live, g->text.ptr, stream_len,
+                                  false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return true;
+    }
+    if (g->responses_live_chat &&
+        !responses_sse_stream_update(j->fd, &j->req,
+                                     &g->responses_live, g->text.ptr, stream_len,
+                                     false)) {
+        g->finish = "error";
+        snprintf(g->err, sizeof(g->err), "client stream write failed");
+        free(piece);
+        return true;
+    }
+    free(piece);
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        if (g->thinking_gates_tool_markers && g->thinking.inside) {
+            /* A DSML block inside reasoning is not executable.  This is
+             * the live guard: do not let a quoted or mistaken marker in
+             * <think> stop decoding as a real tool call.  A complete
+             * stanza opening, however, almost always means the model
+             * forgot to close its thinking; recover by forcing the
+             * close so the model restarts the call on the executable
+             * side. */
+            const int recovered = g->think_tool_recovery_enabled ?
+                chat_think_tool_recovery(s, sl, &g->text, &g->thinking,
+                                         &g->think_recovery_scan_from,
+                                         &g->completion, g->max_tokens,
+                                         g->err, sizeof(g->err)) : 0;
+            if (recovered < 0) {
+                g->finish = "error";
+                return true;
+            }
+            if (recovered) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
+                           "forced </think> after %d generated tokens",
+                           g->ctx_span,
+                           g->req_flags[0] ? " " : "",
+                           g->req_flags,
+                           g->completion);
+                trace_event(s, g->trace_id,
+                            "think tool recovery after %d generated tokens",
+                            g->completion);
+                dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
+                g->tool_scan_waiting_for_think_close = true;
+            } else {
+                g->tool_scan_waiting_for_think_close = true;
+                g->tool_scan_from = g->text.len;
+            }
+        } else {
+            if (g->tool_scan_waiting_for_think_close) {
+                const char *think_end = find_last_substr(g->text.ptr, "</think>");
+                g->tool_scan_from = think_end ? (size_t)((think_end + 8) - g->text.ptr) : g->text.len;
+                if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
+                g->tool_scan_waiting_for_think_close = false;
+            }
+            if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
+            const char *tool_scan = g->text.ptr ? g->text.ptr + g->tool_scan_from : "";
+            bool orphan_end = false;
+            bool old_start = g->saw_tool_start;
+            bool old_end = g->saw_tool_end;
+            observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
+            if (orphan_end && !g->saw_orphan_tool_end) {
+                g->saw_orphan_tool_end = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
+                           g->ctx_span,
+                           g->req_flags[0] ? " " : "",
+                           g->req_flags,
+                           g->completion);
+                trace_event(s, g->trace_id,
+                            "ignored orphan tool-call end marker after %d generated tokens",
+                            g->completion);
+            }
+            if (g->saw_tool_start && !old_start) {
+                trace_event(s, g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
+            }
+            if (g->saw_tool_end && !old_end) {
+                trace_event(s, g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
+            }
+            const size_t marker_hold = 80;
+            size_t hold_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
+            if (hold_from > g->tool_scan_from) g->tool_scan_from = hold_from;
+            if (s->trace && g->completion >= g->next_tool_progress) {
+                trace_event(s, g->trace_id,
+                            "progress gen=%d dsml_start=%d dsml_end=%d",
+                            g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
+                g->next_tool_progress += 128;
+            }
+        }
+    }
+
+    if (g->completion >= g->next_decode_log) {
+        log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
+                            g->responses_protocol,
+                            j->req.has_tools,
+                            g->thinking.inside,
+                            g->saw_tool_start,
+                            g->saw_tool_end,
+                            g->decode_t0,
+                            &g->last_decode_log_t,
+                            &g->last_decode_log_completion);
+        g->next_decode_log += 50;
+    }
+
+    if (hit_stop) {
+        (void)stop_len;
+        g->finish = "stop";
+        g->text.len = stop_pos;
+        g->text.ptr[g->text.len] = '\0';
+        ds4_session_invalidate(sl->sess);
+        return true;
+    }
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->saw_tool_end) {
+        g->finish = "tool_calls";
+        return true;
+    }
+    return false;
+}
+
+
+
 /* One decode quantum: run the sampling loop for at most
  * DS4_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
  * state parked in gen_state. The session is untouched between quanta, so
@@ -1370,6 +1717,18 @@ static void gen_step_decode(server *s, session_slot *sl) {
     job *j = g->j;
     const int quantum_start = g->completion;
     bool stop_decode = false;
+
+    /* Once per quantum (~1/s): stop generating for a client that has gone away.
+     * Falls through the normal GEN_FINISH epilogue so the slot, KV checkpoint and
+     * metrics are released exactly as on a natural stop; the final write simply
+     * fails harmlessly on the dead fd. */
+    if (gen_client_disconnected(j->fd)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: client disconnected, abandoning generation after %d tokens",
+                   g->completion);
+        g->phase = GEN_FINISH;
+        return;
+    }
 
     while (!g_stop_requested && g->completion < g->max_tokens &&
            ds4_session_pos(sl->sess) < ds4_session_ctx(sl->sess)) {
@@ -1428,187 +1787,7 @@ static void gen_step_decode(server *s, session_slot *sl) {
         if (g->first_token_t == 0.0 && ntok > 0) g->first_token_t = server_now_sec();
 
         for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
-            token = toks[ti];
-            if (token == ds4_token_eos(s->engine)) {
-                g->finish = "stop";
-                stop_decode = true;
-                break;
-            }
-
-            size_t piece_len = 0;
-            char *piece = ds4_token_text(s->engine, token, &piece_len);
-            g->completion++;
-
-            trace_piece(s, g->trace_id, piece, piece_len);
-            buf_append(&g->text, piece, piece_len);
-            thinking_state_feed(&g->thinking, piece, piece_len);
-            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-            }
-
-            size_t stop_pos = 0, stop_len = 0;
-            bool hit_stop = stop_list_find_from(&j->req.stops, g->text.ptr,
-                                                g->stop_scan_from,
-                                                &stop_pos, &stop_len);
-            size_t stream_len = hit_stop ?
-                stop_pos : stop_list_stream_safe_len(&j->req.stops, g->text.len);
-            if (stream_len > g->text.len) stream_len = g->text.len;
-            stream_len = utf8_stream_safe_len(g->text.ptr, g->plain_stream_pos,
-                                              stream_len, hit_stop);
-            if (!hit_stop && j->req.stops.max_len > 1) {
-                const size_t hold = j->req.stops.max_len - 1;
-                g->stop_scan_from = g->text.len > hold ? g->text.len - hold : 0;
-            }
-
-            if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
-                char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
-                bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
-                free(delta);
-                if (!ok) {
-                    g->finish = "error";
-                    snprintf(g->err, sizeof(g->err), "client stream write failed");
-                    free(piece);
-                    stop_decode = true;
-                    break;
-                }
-                g->plain_stream_pos = stream_len;
-            }
-            if (j->req.stream && j->req.api == API_ANTHROPIC &&
-                !anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
-                                             &g->anthropic_live, g->text.ptr, stream_len,
-                                             false)) {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            if (g->openai_live_chat &&
-                !openai_sse_stream_update(j->fd, s, &j->req, g->id,
-                                          &g->openai_live, g->text.ptr, stream_len,
-                                          false)) {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            if (g->responses_live_chat &&
-                !responses_sse_stream_update(j->fd, &j->req,
-                                             &g->responses_live, g->text.ptr, stream_len,
-                                             false)) {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            free(piece);
-
-            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                if (g->thinking_gates_tool_markers && g->thinking.inside) {
-                    /* A DSML block inside reasoning is not executable.  This is
-                     * the live guard: do not let a quoted or mistaken marker in
-                     * <think> stop decoding as a real tool call.  A complete
-                     * stanza opening, however, almost always means the model
-                     * forgot to close its thinking; recover by forcing the
-                     * close so the model restarts the call on the executable
-                     * side. */
-                    const int recovered = g->think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, sl, &g->text, &g->thinking,
-                                                 &g->think_recovery_scan_from,
-                                                 &g->completion, g->max_tokens,
-                                                 g->err, sizeof(g->err)) : 0;
-                    if (recovered < 0) {
-                        g->finish = "error";
-                        stop_decode = true;
-                        break;
-                    }
-                    if (recovered) {
-                        server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
-                                   "forced </think> after %d generated tokens",
-                                   g->ctx_span,
-                                   g->req_flags[0] ? " " : "",
-                                   g->req_flags,
-                                   g->completion);
-                        trace_event(s, g->trace_id,
-                                    "think tool recovery after %d generated tokens",
-                                    g->completion);
-                        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-                        g->tool_scan_waiting_for_think_close = true;
-                    } else {
-                        g->tool_scan_waiting_for_think_close = true;
-                        g->tool_scan_from = g->text.len;
-                    }
-                } else {
-                    if (g->tool_scan_waiting_for_think_close) {
-                        const char *think_end = find_last_substr(g->text.ptr, "</think>");
-                        g->tool_scan_from = think_end ? (size_t)((think_end + 8) - g->text.ptr) : g->text.len;
-                        if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-                        g->tool_scan_waiting_for_think_close = false;
-                    }
-                    if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-                    const char *tool_scan = g->text.ptr ? g->text.ptr + g->tool_scan_from : "";
-                    bool orphan_end = false;
-                    bool old_start = g->saw_tool_start;
-                    bool old_end = g->saw_tool_end;
-                    observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
-                    if (orphan_end && !g->saw_orphan_tool_end) {
-                        g->saw_orphan_tool_end = true;
-                        server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
-                                   g->ctx_span,
-                                   g->req_flags[0] ? " " : "",
-                                   g->req_flags,
-                                   g->completion);
-                        trace_event(s, g->trace_id,
-                                    "ignored orphan tool-call end marker after %d generated tokens",
-                                    g->completion);
-                    }
-                    if (g->saw_tool_start && !old_start) {
-                        trace_event(s, g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
-                    }
-                    if (g->saw_tool_end && !old_end) {
-                        trace_event(s, g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
-                    }
-                    const size_t marker_hold = 80;
-                    size_t hold_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
-                    if (hold_from > g->tool_scan_from) g->tool_scan_from = hold_from;
-                    if (s->trace && g->completion >= g->next_tool_progress) {
-                        trace_event(s, g->trace_id,
-                                    "progress gen=%d dsml_start=%d dsml_end=%d",
-                                    g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
-                        g->next_tool_progress += 128;
-                    }
-                }
-            }
-
-            if (g->completion >= g->next_decode_log) {
-                log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
-                                    g->responses_protocol,
-                                    j->req.has_tools,
-                                    g->thinking.inside,
-                                    g->saw_tool_start,
-                                    g->saw_tool_end,
-                                    g->decode_t0,
-                                    &g->last_decode_log_t,
-                                    &g->last_decode_log_completion);
-                g->next_decode_log += 50;
-            }
-
-            if (hit_stop) {
-                (void)stop_len;
-                g->finish = "stop";
-                g->text.len = stop_pos;
-                g->text.ptr[g->text.len] = '\0';
-                ds4_session_invalidate(sl->sess);
-                stop_decode = true;
-                break;
-            }
-
-            if (j->req.kind == REQ_CHAT && j->req.has_tools && g->saw_tool_end) {
-                g->finish = "tool_calls";
+            if (gen_emit_token(s, sl, toks[ti])) {
                 stop_decode = true;
                 break;
             }
@@ -1911,14 +2090,16 @@ static void gen_step_finish(server *s, session_slot *sl) {
         ds4_think_mode_enabled(j->req.think_mode) &&
         !j->req.force_tool_call)
     {
-        /* Tool call with thinking on: the reasoning is in the live KV but the
-         * client replays the turn stripped, so exact-DSML replay and
-         * canonicalization both fail (the latter can only re-prefill). Remember
-         * the stripped bytes as a key and keep the live tokens — the next
-         * request continues from live KV with no rebuild. */
+        /* Tool call with thinking on: the reasoning is in the live KV, and the
+         * client replays this turn with the reasoning preserved (agentic clients
+         * echo reasoning_content so the model keeps its chain of thought), so we
+         * remember the reasoning-PRESERVED bytes the next request will render as a
+         * key and keep the live tokens — the next request byte-matches the key and
+         * continues from live KV (or a disk-reloaded checkpoint keyed by the same
+         * visible transcript) with no rebuild. */
         remember_tool_thinking_checkpoint(s, sl, j, g->ctx_span, g->trace_id,
                                           parsed_content ? parsed_content : "",
-                                          &parsed_calls);
+                                          parsed_reasoning, &parsed_calls);
     } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
@@ -2087,6 +2268,7 @@ static void gen_state_free(server *s, session_slot *sl) {
     buf_free(&g->text);
     ds4_tokens_free(&g->effective_prompt);
     ds4_tokens_free(&g->cold_prefix);
+    ds4_tokens_free(&g->batch_pending);
     free(g->disk_cache_path);
     slot_writer_free(&g->writer);
     free(g);
@@ -2118,6 +2300,31 @@ static void generate_job_begin(server *s, session_slot *sl, job *j) {
 /* Advance the job by one quantum. */
 static void generate_job_step(server *s, session_slot *sl) {
     gen_state *g = sl->gen;
+    /* Tier-2: install this slot's bank before any engine work this quantum.
+     * After another slot (or a fresh bind) was serviced in between, the pool's
+     * live bank may be someone else's; switch back to ours. No-op in classic
+     * mode / when already live. Finding 1: fail the request on a failed spill
+     * restore rather than run engine work against the wrong bank's KV. */
+    if (!server_bank_switch(s, sl->bank)) {
+        snprintf(g->err, sizeof g->err,
+                 "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return;
+    }
+    /* Tier-2: a slot leaving the batched lane (now at GEN_FINISH) has its bank
+     * installed above (bank_state_restore cleared the multiseq poison and
+     * installed the driver-maintained device counters); catch the host
+     * checkpoint up to the tokens multiseq committed, so gen_step_finish's
+     * store/continuation see the true frontier. */
+    if (g->batch_active) {
+        if (g->batch_pending.len > 0)
+            ds4_session_note_committed_tokens(sl->sess, g->batch_pending.v,
+                                              g->batch_pending.len);
+        ds4_tokens_free(&g->batch_pending);
+        g->batch_active = false;
+        g->batch_feed_valid = false;
+    }
     /* The installed slot writer is worker-thread-local and shared across
      * slots; re-install this slot's writer so send_all() routes through the
      * right deferral queue after another slot (or a fresh bind) was serviced
@@ -2282,8 +2489,133 @@ typedef enum {
                                       chain on (same physical pressure) */
 } provision_refusal;
 
+/* ===== Tier-2 shared-pool bank plumbing =================================== */
+
+/* Lazy bank switch on the shared pool session. server_bank_switch(s, b) saves
+ * the currently-installed bank's host carry + frontier counters and installs
+ * bank b's (device views + carry). Idempotent when b is already live, and a
+ * no-op in classic mode. The switch-away save is what keeps every idle bank's
+ * carry current, so the per-bank frontier readers (ds4_session_bank_*) and
+ * server_slot_frontier_pos are always correct for non-live banks. */
+/* Tier-2 2b: restore a guard-spilled bank's physical + raw KV from disk before it
+ * is installed. Defined below (near the guard); forward-declared for the switch. */
+static bool server_bank_restore_spilled(server *s, int bank);
+
+bool server_bank_switch(server *s, int bank) {
+    if (s->pool_banks <= 0) return true;          /* classic mode */
+    if (bank < 0 || bank >= s->pool_banks) return true;
+    if (bank == s->live_bank && !s->slots[bank].spilled) return true; /* already installed */
+    ds4_session *pool = s->slots[0].sess;
+    /* Snapshot the outgoing bank so its carry stays readable while idle, and
+     * record its committed frontier for metrics/routing. live_bank < 0 is the
+     * post-batched-quantum sentinel: the pool holds no single bank's clean
+     * state (multiseq left a cross-bank superset), so there is nothing safe to
+     * save — just install the target (bank_state_restore clears the poison). */
+    if (s->live_bank >= 0 && s->live_bank != bank) {
+        s->slots[s->live_bank].committed_pos = ds4_session_pos(pool);
+        ds4_session_bank_state_save(pool, (uint32_t)s->live_bank);
+    }
+    /* Tier-2 2b: a guard-spilled target has no physical — reallocate + reload its
+     * KV bit-identically from disk before installing (the reload-stall cost). On
+     * restore failure the bank is NOT installed and cur_bank is unchanged; return
+     * false so the caller fails the request (finding 1). */
+    if (s->slots[bank].spilled) {
+        if (!server_bank_restore_spilled(s, bank)) return false;
+    }
+    /* The state restore can ALSO fail (gpu_graph_bank_repoint rejects a bank
+     * whose slabs are missing, e.g. after a partially-failed realloc).  Ignoring
+     * it published live_bank over a half-repointed view set with cur_bank
+     * unchanged, so the caller ran engine work against mixed banks instead of
+     * failing the request.  Fail loud here — this is the one check that catches
+     * a bad repoint before any token is generated. */
+    if (!ds4_session_bank_state_restore(pool, (uint32_t)bank)) return false;
+    s->live_bank = bank;
+    s->slots[bank].committed_pos = ds4_session_pos(pool);
+    return true;
+}
+
+int server_slot_frontier_pos(const server *s, const session_slot *sl) {
+    if (!sl || !sl->sess) return 0;
+    if (s->pool_banks > 0) return ds4_session_bank_pos(sl->sess, sl->bank);
+    return ds4_session_pos(sl->sess);
+}
+
+static int server_slot_common_prefix(const server *s, const session_slot *sl,
+                                     const ds4_tokens *prompt) {
+    if (!sl || !sl->sess) return 0;
+    if (s->pool_banks > 0)
+        return ds4_session_bank_common_prefix(sl->sess, sl->bank, prompt);
+    return ds4_session_common_prefix(sl->sess, prompt);
+}
+
+/* Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
+ * the whole n-bank pool was allocated and admitted ONCE at startup, so this is
+ * pure host bookkeeping — find a free bank slot, install it, reset it to an
+ * empty conversation (so gen_begin sees pos 0 / no stale prefix), and charge
+ * the even-split per-bank marginal to the ledger. The only runtime pressure is
+ * the demand-paged comp/index pages a bank touches as it fills; the belt-and-
+ * suspenders MemAvailable floor still guards each provision. Returns NULL with
+ * *refusal set on a full pool or a tight box (never on a create/admission
+ * failure — there is no runtime create). */
+static session_slot *provision_bank(server *s, provision_refusal *refusal) {
+    *refusal = PROVISION_OK;
+    int idx = -1;
+    for (int i = 1; i < s->pool_banks; i++) {     /* bank 0 == slot 0, pinned */
+        if (!s->slots[i].sess) { idx = i; break; }
+    }
+    if (idx < 0) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
+    /* Belt-and-suspenders: refuse if the box is physically tight (fail closed on
+     * an unreadable gauge), matching provision_slot. The marginal is what the
+     * bank may still demand-page as it fills. */
+    const uint64_t avail = server_mem_available_bytes();
+    if (avail == 0 || !server_mem_floor_admits(avail, s->bank_marginal_bytes)) {
+        static bool warned; /* single worker thread */
+        if (!warned) {
+            warned = true;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: bank provisioning refused: MemAvailable %.2f GiB "
+                       "below floor for marginal %.2f GiB (job queued)",
+                       (double)avail / (1024.0 * 1024.0 * 1024.0),
+                       (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+        *refusal = PROVISION_REFUSED_MEM_FLOOR;
+        return NULL;
+    }
+    session_slot *sl = &s->slots[idx];
+    ds4_session *pool = s->slots[0].sess;
+    /* Install and reset the bank to an empty conversation with a valid (empty)
+     * host carry, so routing/metrics read pos 0 and gen_begin cold-prefills. A
+     * free (SLOT_EVICTED) bank is never guard-spilled (spilled banks keep their
+     * sess), so this switch never restores — the result is unconditionally true. */
+    (void)server_bank_switch(s, idx);
+    ds4_session_invalidate(pool);
+    ds4_session_bank_state_save(pool, (uint32_t)idx);
+    sl->sess = pool;
+    sl->bank = (uint32_t)idx;
+    sl->committed_pos = 0;
+    sl->state = SLOT_IDLE;
+    sl->ctx_size = s->slots[0].ctx_size;          /* every bank shares pool ctx */
+    sl->est_cost_bytes = s->bank_marginal_bytes;
+    sl->tokens_emitted = 0;
+    sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+    sl->continued_last_store_tokens = 0;
+    pthread_mutex_lock(&s->mu);
+    s->kv_committed_bytes += s->bank_marginal_bytes;
+    if (idx >= s->n_slots) s->n_slots = idx + 1;
+    pthread_mutex_unlock(&s->mu);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: provisioned bank %d (pooled) marginal=%.2f GiB "
+               "total committed=%.2f GiB / %.2f GiB",
+               idx,
+               (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_committed_bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+    return sl;
+}
+
 static session_slot *provision_slot(server *s, int ctx,
                                     provision_refusal *refusal) {
+    if (s->pool_banks > 0) { (void)ctx; return provision_bank(s, refusal); }
     *refusal = PROVISION_OK;
     int idx = -1;
     for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) {
@@ -2508,12 +2840,12 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
         if (sl->ctx_size < needed) continue;
         const size_t visible =
             thinking_live_binds_prompt(s, sl, &j->req,
-                                       ds4_session_pos(sl->sess));
+                                       server_slot_frontier_pos(s, sl));
         if (visible > bound_visible) {
             bound_visible = visible;
             bound = sl;
         }
-        const int common = ds4_session_common_prefix(sl->sess, &j->req.prompt);
+        const int common = server_slot_common_prefix(s, sl, &j->req.prompt);
         if (common > best_common) {
             best_common = common;
             best = sl;
@@ -2522,19 +2854,135 @@ static session_slot *choose_slot_for_job(server *s, job *j, int *reject_ctx,
     if (bound) return bound;
     const bool best_clobbers_warm_state =
         best && server_slot_match_is_trivial(best_common,
-                                             ds4_session_pos(best->sess),
+                                             server_slot_frontier_pos(s, best),
                                              s->slot_trivial_common_tokens);
     if (!best || best_clobbers_warm_state) {
         if (best_clobbers_warm_state) {
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: slot routing: best match is trivial "
                        "(common=%d pos=%d threshold=%d); preferring a fresh slot",
-                       best_common, ds4_session_pos(best->sess),
+                       best_common, server_slot_frontier_pos(s, best),
                        s->slot_trivial_common_tokens);
         }
         session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j),
                                              refusal);
         if (fresh) return fresh;
+    }
+    /* plan-33 inc B/D: warm FORK routing. `best`'s committed history shares a
+     * token prefix `best_common` with the request (validated bit-for-bit inside
+     * the fork before any device write). Instead of continuing IN PLACE (which
+     * consumes the trunk — today's behavior), fork the trunk into another bank
+     * and continue there, leaving the trunk INTACT so a divergent sibling keeps
+     * matching it:
+     *   - inc B FULL fork   : best_common == trunk frontier  -> ds4_session_bank_fork
+     *                         (dst resumes at the exact frontier; re-prefill suffix).
+     *   - inc D PARTIAL cut : warm_partial_min <= best_common < frontier
+     *                         -> ds4_session_bank_fork_partial (engine aligns down
+     *                         to R, byte-stashes the ratio-4 boundary row; dst's
+     *                         committed history becomes tokens[0..R), re-prefill [R..).
+     * A free bank is used first; else one non-trunk victim is evicted (make_room,
+     * LRU-superseded preferred). Any refusal (history moved, evicted src, cut
+     * below R, no evictable bank) degrades to today's path — never a client error. */
+    const int frontier = best ? server_slot_frontier_pos(s, best) : 0;
+    const bool warm_ok = s->pool_banks > 0 && s->warm_fork_enabled && best &&
+                         !best_clobbers_warm_state && !best->active_job &&
+                         best_common > 0 && best_common < j->req.prompt.len;
+    const bool full    = warm_ok && best_common == frontier;                 /* inc B */
+    const bool partial = warm_ok && !full && best_common >= s->warm_partial_min &&
+                         best_common < frontier;                             /* inc D */
+    /* Always-on routing-decision inputs, so a 0-fork count is never silent (the
+     * verbose KVCACHE stream; one line per bind, not per token). Confirmed nuance:
+     * re-tokenized generated tail rarely reproduces the trunk's exact frontier, so
+     * best_common < frontier (the PARTIAL path) is the common case; full is the
+     * rare exact-continuation. */
+    if (s->pool_banks > 0 && s->warm_fork_enabled)
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: route: best bank %d common %d frontier %d prompt %d "
+                   "partial_min %d -> %s%s%s",
+                   best ? (int)best->bank : -1, best_common, frontier,
+                   j->req.prompt.len, s->warm_partial_min,
+                   full ? "FORK-full" : partial ? "FORK-partial" : "in-place/cold",
+                   best_clobbers_warm_state ? " [trivial]" : "",
+                   (best && best->active_job) ? " [busy]" : "");
+    if (full || partial) {
+        provision_refusal fr;
+        session_slot *dst = provision_slot(s, provision_ctx_for_job(s, j), &fr);
+        if (!dst && fr == PROVISION_REFUSED_POOL_FULL &&
+            server_fork_make_room(s, best)) {
+            /* Freed one non-trunk victim; the trunk was protected. Retry once. */
+            dst = provision_slot(s, provision_ctx_for_job(s, j), &fr);
+        }
+        if (dst && dst != best) {
+            ds4_session *pool = s->slots[0].sess;
+            const int rc = full
+                ? ds4_session_bank_fork(pool, best->bank, dst->bank,
+                                        j->req.prompt.v, best_common)
+                : ds4_session_bank_fork_partial(pool, best->bank, dst->bank,
+                                                j->req.prompt.v, best_common);
+            if (rc == 0) {
+                /* FULL resumes at best_common; PARTIAL resumes at the engine's
+                 * R-aligned cut (read it back rather than recompute the align). */
+                dst->committed_pos = full ? best_common
+                                          : ds4_session_bank_pos(pool, dst->bank);
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: warm-fork-%s: trunk bank %u (frontier %d, "
+                           "common %d) -> bank %u (resume %d); trunk preserved",
+                           full ? "full" : "partial", best->bank, frontier,
+                           best_common, dst->bank, dst->committed_pos);
+                *clobbers = false;
+                return dst;
+            }
+            /* Refused (history moved / evicted src / cut below R): dst stays a
+             * fresh empty bank — cold on it is safe and beats clobbering best. */
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: warm-fork-%s refused (bank %u); cold on bank %u",
+                       full ? "full" : "partial", best->bank, dst->bank);
+            *clobbers = false;
+            return dst;
+        }
+        /* No free/evictable bank for the fork: fall through to the divergent
+         * guard below (reuses in place only for a linear continuation; otherwise
+         * queues rather than clobber). */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: warm-fork-%s wanted (bank %u common %d) but no free bank",
+                   full ? "full" : "partial", best->bank, best_common);
+    }
+    /* CROSS-WIRE ROOT FIX: in-place continuation is safe ONLY for a linear
+     * extension of THIS bank's own conversation (best_common == frontier). When
+     * best_common < frontier the bank holds a DIFFERENT conversation past the
+     * shared prefix (typically just the system-prompt header); continuing in place
+     * REWINDS-and-clobbers it. On the shared pool session that conversation is
+     * often still live under concurrency, so the two interleave and a request
+     * decodes another's KV (the cross-wire). Provision a FRESH bank instead (the
+     * shared prefix is cheap and prefix-cached); queue if the pool is full so a
+     * non-active bank can be evicted. Deep divergent matches (best_common >=
+     * warm_partial_min) already FORKED above and never reach here. */
+    if (best && best_common < frontier) {
+        session_slot *fresh = provision_slot(s, provision_ctx_for_job(s, j), refusal);
+        if (fresh) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: divergent match bank %u (common %d < frontier %d): "
+                       "fresh bank %u, no in-place clobber",
+                       best->bank, best_common, frontier, fresh->bank);
+            *clobbers = false;
+            return fresh;
+        }
+        /* Provision failed (pool full). Queue to avoid an in-place clobber ONLY
+         * when an active job is running: then the queue drains as it finishes AND
+         * there is a live conversation on the pool worth protecting. When NOTHING
+         * is running, no bank will ever free (idle banks may all be protected), so
+         * queuing would LIVE-LOCK the worker — and with no live reader there is
+         * nothing to corrupt — so fall through to in-place continuation (progress
+         * over warmth). This is the safe half of the cross-wire guard: the
+         * corruption only ever happened while a concurrent conversation was live. */
+        bool any_active = false;
+        for (int i = 0; i < s->n_slots; i++)
+            if (s->slots[i].active_job) { any_active = true; break; }
+        if (any_active) {
+            if (*refusal == PROVISION_OK) *refusal = PROVISION_REFUSED_POOL_FULL;
+            return NULL;   /* an active job will free a bank; worker retries */
+        }
+        /* else: fall through to in-place (no live reader; queue would deadlock) */
     }
     *clobbers = best_clobbers_warm_state;
     return best;
@@ -2716,14 +3164,28 @@ static bool worker_eviction_could_help(server *s, const job *j,
  * conversation because the freed KV can never be read again. Returns false
  * when nothing is evictable. Worker thread only. */
 static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
+    /* plan-33: protect any bank that is a live fork SOURCE mid-clone from disk
+     * eviction (belt-and-suspenders — fork and evict are both worker-thread ops
+     * and never interleave, but the invariant "a pinned source is never freed"
+     * must hold for both eviction paths). */
+    if (s->pool_banks > 0 && s->slots[0].sess) {
+        for (int i = 1; i < s->n_slots && i < DS4_SESSION_POOL_CAP; i++) {
+            if (ds4_session_bank_fork_pinned(s->slots[0].sess, s->slots[i].bank)) protect[i] = true;
+        }
+    }
     const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect);
     if (vi < 0) return false;
     session_slot *sl = &s->slots[vi];
 
-    const ds4_tokens *tokens = ds4_session_tokens(sl->sess);
+    /* Tier-2: install the victim's bank so the snapshot store below reads its
+     * OWN frontier (not the pool's live cursor). server_bank_switch restores a
+     * guard-spilled victim first; if that restore fails we cannot snapshot its KV,
+     * so skip it (this path is discarding the conversation anyway). */
+    const bool switched = server_bank_switch(s, sl->bank);
+    const ds4_tokens *tokens = switched ? ds4_session_tokens(sl->sess) : NULL;
     const int live_tokens = tokens ? tokens->len : 0;
     bool stored = false;
-    if (s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
+    if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         stored = kv_cache_store_current(s, sl, "evict");
     }
     if (!stored && live_tokens > 0) {
@@ -2743,25 +3205,37 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
     anthropic_live_clear(s, sl);
     thinking_live_clear(s, sl);
 
-    /* Free the session and verify, against the allocator's ground-truth
-     * counter, that the bytes the ledger is about to release actually came
-     * back (the create-side twin of server_reconciled_session_cost). */
     const uint64_t committed = sl->est_cost_bytes;
-    const uint64_t alloc_before = ds4_gpu_tensor_alloc_bytes_current();
-    ds4_session_free(sl->sess);
-    const uint64_t alloc_after = ds4_gpu_tensor_alloc_bytes_current();
-    const uint64_t freed =
-        alloc_before > alloc_after ? alloc_before - alloc_after : 0;
-    if (committed > 0 &&
-        (freed > committed + committed / 10 ||
-         committed > freed + freed / 10))
-    {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: EVICTION FREED-BYTES DRIFT >10%%: ledger releases "
-                   "%.2f GiB but the allocator freed %.2f GiB — session teardown "
-                   "is leaking or freeing unaccounted allocations",
-                   (double)committed / (1024.0 * 1024.0 * 1024.0),
-                   (double)freed / (1024.0 * 1024.0 * 1024.0));
+    uint64_t freed = 0;
+    if (s->pool_banks > 0) {
+        /* Pooled mode: the pool session persists (it is slots[0].sess, shared by
+         * every bank). "Evicting" bank vi means reset it to an empty
+         * conversation and drop its host carry so a fresh conversation can reuse
+         * it — no ds4_session_free (that would tear down the whole pool). The
+         * demand-paged comp/index pages this bank touched stay resident; the
+         * ledger releases only this bank's even-split marginal. */
+        ds4_session_invalidate(sl->sess);
+        ds4_session_bank_state_save(sl->sess, (uint32_t)sl->bank);
+        freed = committed; /* logical release; no allocator delta to verify */
+    } else {
+        /* Classic mode: free the session and verify, against the allocator's
+         * ground-truth counter, that the bytes the ledger is about to release
+         * actually came back (create-side twin of server_reconciled_session_cost). */
+        const uint64_t alloc_before = ds4_gpu_tensor_alloc_bytes_current();
+        ds4_session_free(sl->sess);
+        const uint64_t alloc_after = ds4_gpu_tensor_alloc_bytes_current();
+        freed = alloc_before > alloc_after ? alloc_before - alloc_after : 0;
+        if (committed > 0 &&
+            (freed > committed + committed / 10 ||
+             committed > freed + freed / 10))
+        {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: EVICTION FREED-BYTES DRIFT >10%%: ledger releases "
+                       "%.2f GiB but the allocator freed %.2f GiB — session teardown "
+                       "is leaking or freeing unaccounted allocations",
+                       (double)committed / (1024.0 * 1024.0 * 1024.0),
+                       (double)freed / (1024.0 * 1024.0 * 1024.0));
+        }
     }
     const int evicted_ctx = sl->ctx_size;
     sl->sess = NULL;
@@ -2773,6 +3247,17 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
     sl->tokens_emitted = 0;
     sl->last_serviced_us = 0;
     sl->continued_last_store_tokens = 0;
+    /* Tier-2 2b: a slot being evicted for reuse must not carry a stale guard-spill
+     * flag or leave an orphan spill file (invariant: physical freed IFF spilled).
+     * server_bank_switch above restored a spilled victim (physical present, flag
+     * cleared); belt-and-suspenders in case that restore failed. */
+    if (s->pool_banks > 0 && sl->spilled) {
+        char spath[600];
+        snprintf(spath, sizeof spath, "%s/spill-bank-%u.kv", s->spill_dir, (unsigned)sl->bank);
+        remove(spath);
+        (void)ds4_session_bank_alloc_physical(s->slots[0].sess, sl->bank); /* empty physical for reuse */
+        sl->spilled = false;
+    }
     pthread_mutex_lock(&s->mu);
     s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
     const uint64_t committed_now = s->kv_committed_bytes;
@@ -2789,6 +3274,70 @@ static bool worker_evict_one(server *s, bool protect[DS4_SESSION_POOL_CAP]) {
                (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0),
                (double)server_mem_available_bytes() / (1024.0 * 1024.0 * 1024.0));
     return true;
+}
+
+
+
+/* plan-33 inc D victim policy: an idle bank is LRU-SUPERSEDED when its whole
+ * committed history is a token-prefix of ANOTHER live bank's history (a sibling
+ * that already extends past it) — its KV is redundant, so evicting it loses the
+ * least. Returns such a slot's index (the least-recently-served among them), or
+ * -1. Pure host reads (ds4_session_bank_tokens / _common_prefix are the same
+ * host-carry reads routing already uses on idle banks; no CUDA, no install). */
+static int server_pick_superseded_idle(server *s, const bool *protect) {
+    ds4_session *pool = s->slots[0].sess;
+    if (!pool) return -1;
+    int victim = -1;
+    for (int i = 1; i < s->n_slots; i++) {
+        session_slot *a = &s->slots[i];
+        if (!a->sess || a->active_job || (protect && protect[i])) continue;
+        if (ds4_session_bank_fork_pinned(pool, a->bank)) continue;
+        const ds4_tokens *at = ds4_session_bank_tokens(pool, a->bank);
+        if (!at || at->len == 0) continue;              /* empty: LRU handles it */
+        bool superseded = false;
+        for (int k = 1; k < s->n_slots && !superseded; k++) {
+            if (k == i) continue;
+            session_slot *b = &s->slots[k];
+            if (!b->sess) continue;
+            /* b supersedes a iff a's whole history is b's prefix AND b is strictly
+             * longer (b can reconstruct everything a holds). */
+            if (server_slot_frontier_pos(s, b) > at->len &&
+                ds4_session_bank_common_prefix(pool, b->bank, at) >= at->len) {
+                superseded = true;
+            }
+        }
+        if (!superseded) continue;
+        if (victim < 0 ||
+            a->last_serviced_us < s->slots[victim].last_serviced_us) {
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+/* Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is
+ * always protected (a sibling still matches it); LRU-superseded victims go
+ * first, else plain LRU (worker_evict_one's picker). Reuses the proven eviction
+ * body (snapshot + ledger release + bank reset). Worker thread only; returns
+ * true when a bank was freed. */
+static bool server_fork_make_room(server *s, const session_slot *trunk) {
+    if (s->pool_banks <= 0 || !trunk) return false;
+    bool protect[DS4_SESSION_POOL_CAP];
+    worker_protect_queued_owner_slots(s, protect);      /* live-tool owners */
+    const int ti = (int)(trunk - s->slots);
+    if (ti >= 0 && ti < DS4_SESSION_POOL_CAP) protect[ti] = true;  /* NEVER the trunk */
+    const int sup = server_pick_superseded_idle(s, protect);
+    if (sup >= 0) {
+        /* Force worker_evict_one onto the superseded pick by protecting all others. */
+        bool only[DS4_SESSION_POOL_CAP];
+        for (int i = 0; i < DS4_SESSION_POOL_CAP; i++) only[i] = (i != sup);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: warm-fork make-room: evicting LRU-superseded bank %u "
+                   "(trunk bank %u preserved)", s->slots[sup].bank, trunk->bank);
+        return worker_evict_one(s, only);
+    }
+    /* No superseded victim: plain LRU among unprotected idle, trunk still safe. */
+    return worker_evict_one(s, protect);
 }
 
 
@@ -2892,7 +3441,9 @@ void server_publish_metrics_snapshot(server *s) {
     ds4_engine_spec_metrics(s->engine, &m);
     pthread_mutex_lock(&s->mu);
     for (int i = 0; i < s->n_slots; i++) {
-        s->m_slot_pos[i] = s->slots[i].sess ? ds4_session_pos(s->slots[i].sess) : 0;
+        /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
+         * live cursor (server_slot_frontier_pos). Pure host read, no CUDA. */
+        s->m_slot_pos[i] = server_slot_frontier_pos(s, &s->slots[i]);
         s->m_slot_ctx[i] = s->slots[i].ctx_size;
     }
     s->m_spec = m;
@@ -2937,6 +3488,542 @@ static void worker_finish_slot(server *s, session_slot *sl) {
  * than the DSpark ≤17-token fused burst) and are deliberate single-thread
  * design: the CUDA-state audit (ds4_server_internal.h) rules out a second
  * GPU thread, and both happen only at a scheduling boundary. */
+/* A slot is eligible for the batched (plain multiseq) decode lane when it is in
+ * steady-state decode and is NOT a tool-call request. Tool requests keep the
+ * classic lane: their structured payload uses temperature-0 gating and the
+ * think/tool recovery paths, which are plain-decode-by-contract absent from the
+ * batched path. Prefill/init/finish slots are serviced per-slot as usual. */
+static bool slot_is_batchable_decode(const session_slot *sl) {
+    const gen_state *g = sl->gen;
+    return sl->active_job && g && g->phase == GEN_DECODE &&
+           !(g->j->req.kind == REQ_CHAT && g->j->req.has_tools);
+}
+
+/* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up
+ * to DS4_SERVER_DECODE_QUANTUM_TOKENS steps across every supplied decode slot.
+ * Each slot samples its OWN logits row with its OWN sampler/RNG and streams
+ * through gen_emit_token (the shared emit path), so per-request
+ * output/stop/streaming is byte-identical in shape to the classic lane; only the
+ * forward numerics differ (batched vs single-token path). NOTE: this is NOT
+ * co-scheduling-neutral for greedy (temp-0) output. The M>=2 co-batched forward's
+ * logits differ ~1 ULP from the M=1 single-sequence path (different GEMM tiling /
+ * reduction order); at greedy temp-0 that can flip a near-tie argmax, so a
+ * request's greedy continuation depends on what else is co-scheduled. This is
+ * distribution-preserving and INVISIBLE under sampling (temp>0) — same class as
+ * batched inference elsewhere (vLLM et al.) — but it is a real greedy-determinism
+ * property, characterized 2026-07-22. The multiseq gate proves N=2-vs-N=3
+ * neutrality (bank output invariant to OTHER banks), which is a WEAKER invariant
+ * than batched==solo and does NOT cover this ULP. Plain decode
+ * only. Slots that stop are set to GEN_FINISH and dropped; the worker finishes
+ * them via the per-slot path, which reconciles their host checkpoint against the
+ * tokens committed here. Leaves the pool multiseq-poisoned with live_bank = -1
+ * so the next server_bank_switch does a real bank restore. */
+/* ==== Tier-2 task #55 increment 2b: proactive-eviction guard =================
+ *
+ * At each decode-quantum boundary, if the live banks growing by one quantum would
+ * push total resident KV past the budget, SPILL the LRU-idle smallest-frontier
+ * bank: its comp/index KV -> local fast disk (raw, bit-identical), then cudaFree
+ * its physical (the only primitive that returns physical on GB10; 2a/2b gates).
+ * The conversation stays bound to the slot and is restored (alloc + reload) on its
+ * next decode via server_bank_switch. Decisions use the DETERMINISTIC touched
+ * accounting + MemAvailable floor backstop, never the coarse cudaMemGetInfo gauge.
+ * Worker thread only. */
+
+static bool server_bank_restore_spilled(server *s, int bank) {
+    ds4_session *pool = s->slots[0].sess;
+    char path[600];
+    snprintf(path, sizeof path, "%s/spill-bank-%d.kv", s->spill_dir, bank);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: restore open %s failed: %s",
+                   path, strerror(errno));
+        return false;
+    }
+    char err[128];
+    const double t0 = server_now_sec();
+    const int rc = ds4_session_bank_kv_load(pool, (uint32_t)bank, fp, err, sizeof err);
+    fclose(fp);
+    if (rc != 0) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: kv_load bank %d failed: %s", bank, err);
+        return false;
+    }
+    s->slots[bank].spilled = false;
+    remove(path);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: guard RESTORED bank %d from disk (%.1f ms reload stall)",
+               bank, (server_now_sec() - t0) * 1e3);
+    return true;
+}
+
+/* Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
+ * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical. */
+static bool server_spill_bank(server *s, session_slot *victim) {
+    ds4_session *pool = s->slots[0].sess;
+    const uint32_t vb = victim->bank;
+    (void)server_bank_switch(s, (int)vb);         /* victim never spilled (pick excludes) → true */
+    char path[600];
+    snprintf(path, sizeof path, "%s/spill-bank-%u.kv", s->spill_dir, vb);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: spill open %s failed: %s",
+                   path, strerror(errno));
+        return false;
+    }
+    char err[128];
+    const double t0 = server_now_sec();
+    const int rc = ds4_session_bank_kv_save(pool, vb, fp, err, sizeof err);
+    const int fc = fclose(fp);
+    if (rc != 0 || fc != 0) {
+        server_log(DS4_LOG_WARNING, "ds4-server: guard: kv_save bank %u failed: %s",
+                   vb, rc ? err : "close");
+        remove(path);
+        return false;
+    }
+    ds4_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
+    if (!ds4_session_bank_state_restore(pool, 0)) { remove(path); return false; }
+    s->live_bank = 0;
+    /* Finding 4: free_physical returns false ONLY on a precondition refusal (nothing
+     * freed, bank still live) — abort the spill and drop the unused disk snapshot.
+     * A true return means the bank IS evicted (slabs freed), so mark it spilled
+     * unconditionally — no half-evicted state (spilled=false over freed slabs). */
+    if (!ds4_session_bank_free_physical(pool, vb)) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: guard: free_physical bank %u refused (still cur?) — spill aborted", vb);
+        remove(path);
+        return false;
+    }
+    victim->spilled = true;
+    victim->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+    s->guard_evictions++;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: guard EVICTED bank %u -> disk (%.1f ms save, physical freed); "
+               "touched %.2f GiB / budget %.2f GiB, evictions %llu",
+               vb, (server_now_sec() - t0) * 1e3,
+               (double)ds4_session_touched_kv_bytes(pool) / gib,
+               (double)s->guard_touched_budget / gib,
+               (unsigned long long)s->guard_evictions);
+    return true;
+}
+
+/* LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
+ * set, no active job, not already spilled. -1 if none. */
+static int server_guard_pick_victim(server *s, session_slot **dec, int n) {
+    ds4_session *pool = s->slots[0].sess;
+    int best = -1;
+    uint64_t best_us = UINT64_MAX, best_touched = UINT64_MAX;
+    for (int i = 1; i < s->n_slots; i++) {         /* bank 0 pinned */
+        session_slot *sl = &s->slots[i];
+        if (!sl->sess || sl->spilled || sl->active_job) continue;
+        /* plan-33: never free a bank that is a live fork SOURCE mid-clone. */
+        if (ds4_session_bank_fork_pinned(pool, sl->bank)) continue;
+        bool live = false;
+        for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
+        if (live) continue;
+        const uint64_t t = ds4_session_bank_touched_kv_bytes(pool, sl->bank);
+        if (sl->last_serviced_us < best_us ||
+            (sl->last_serviced_us == best_us && t < best_touched)) {
+            best = i; best_us = sl->last_serviced_us; best_touched = t;
+        }
+    }
+    return best;
+}
+
+static void server_guard_maybe_evict(server *s, session_slot **dec, int n) {
+    if (!s->guard_enabled || s->pool_banks <= 0 || n <= 0) return;
+    ds4_session *pool = s->slots[0].sess;
+    const uint64_t dpb = ds4_session_quantum_growth_bytes_per_bank(
+            pool, (uint32_t)DS4_SERVER_DECODE_QUANTUM_TOKENS);
+    const uint64_t delta = (uint64_t)n * dpb;      /* all n live banks grow */
+    const uint64_t bound = s->guard_touched_budget;
+    /* Finding 2: free_physical zeroes a spilled bank's frontier so touched drops
+     * after each spill — the loop then re-evaluates and evicts exactly the minimum
+     * (usually ONE) per breach, NOT the whole idle set (the cascade bug). The
+     * per-quantum count log lets the smoke assert no cascade. */
+    int spilled_this_quantum = 0;
+    for (;;) {
+        const uint64_t projected = ds4_session_touched_kv_bytes(pool) + delta;
+        if (projected <= bound) break;             /* fits */
+        const int vi = server_guard_pick_victim(s, dec, n);
+        if (vi < 0) {
+            /* No idle victim: back-pressure — proceed and let the live floor guard.
+             * (Evicting a LIVE growing bank would thrash; the MemAvailable watchdog
+             * is the hard backstop.) */
+            static uint64_t last_warn_us;
+            const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+            if (now_us - last_warn_us > 5000000ull) {
+                last_warn_us = now_us;
+                const double gib = 1024.0 * 1024.0 * 1024.0;
+                server_log(DS4_LOG_WARNING,
+                    "ds4-server: guard: projected touched %.2f GiB > budget %.2f GiB but NO "
+                    "idle victim — back-pressure (MemAvailable floor is the backstop)",
+                    (double)projected / gib, (double)bound / gib);
+            }
+            break;
+        }
+        if (!server_spill_bank(s, &s->slots[vi])) break;   /* spill failed — stop */
+        spilled_this_quantum++;
+    }
+    if (spilled_this_quantum > 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: guard: spilled %d bank(s) this quantum (touched now %.2f GiB / %.2f GiB)",
+                   spilled_this_quantum,
+                   (double)ds4_session_touched_kv_bytes(pool) / (1024.0*1024.0*1024.0),
+                   (double)bound / (1024.0*1024.0*1024.0));
+    }
+}
+
+static void worker_batched_decode_quantum(server *s, session_slot **dec, int n) {
+    if (n <= 0) return;
+    ds4_session *pool = s->slots[0].sess;
+    const int vocab = ds4_engine_logits_width(s->engine);
+
+    /* Tier-2 2b: proactive-eviction guard — BEFORE the weight sweep grows the live
+     * banks, spill LRU-idle banks if this quantum's projected growth would breach
+     * the resident-KV budget. A dec bank that was spilled while idle is restored
+     * transparently by server_bank_switch in the ENTRY loop below. */
+    server_guard_maybe_evict(s, dec, n);
+
+    /* ENTRY: a slot not yet in the batch samples its first feed token from its
+     * bank's current classic logits while that bank is briefly live, then
+     * CAPTURES its per-bank frontier counters (ms_n_comp[bank]) that the
+     * multiseq driver's position-true check reads. The explicit save is
+     * essential: server_bank_switch only captures the OUTGOING bank, so a bank
+     * entering the batch while it is already the live bank (e.g. it just
+     * prefilled and was never switched away) would otherwise carry a STALE
+     * ms_n_comp and the driver would reject the step ("frontier not
+     * position-true"). Redundant when the bank was captured on a prior
+     * switch-away — but harmless (same value). */
+    for (int i = 0; i < n; i++) {
+        session_slot *sl = dec[i];
+        gen_state *g = sl->gen;
+        if (g->batch_feed_valid) continue;
+        /* Finding 1: a failed spill restore must NOT sample this slot's feed token
+         * on another bank's KV — fail the slot cleanly and drop it from the batch. */
+        if (!server_bank_switch(s, sl->bank)) {
+            snprintf(g->err, sizeof g->err,
+                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+            g->finish = "error";
+            g->batch_feed_valid = false;
+            g->phase = GEN_FINISH;
+            continue;
+        }
+        float temp, top_p, min_p; int top_k;
+        gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+        g->batch_feed_token =
+            ds4_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_pos = ds4_session_pos(pool);
+        ds4_session_bank_state_save(pool, (uint32_t)sl->bank);
+        g->batch_feed_valid = true;
+        g->batch_active = true;
+    }
+
+    float *logits = server_xmalloc((size_t)n * (size_t)vocab * sizeof(float));
+    ds4_multiseq_req reqs[DS4_SESSION_POOL_CAP];
+    int live_idx[DS4_SESSION_POOL_CAP];
+
+    for (int step = 0; step < DS4_SERVER_DECODE_QUANTUM_TOKENS; step++) {
+        int m = 0;
+        for (int i = 0; i < n && m < DS4_SESSION_POOL_CAP; i++) {
+            session_slot *sl = dec[i];
+            gen_state *g = sl->gen;
+            if (!g->batch_feed_valid) continue;            /* already stopped */
+            if (g_stop_requested || g->completion >= g->max_tokens) {
+                g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
+            }
+            if (g->batch_feed_pos >= ds4_session_ctx(pool)) {
+                g->batch_feed_valid = false; g->finish = "length";
+                g->phase = GEN_FINISH; continue;
+            }
+            reqs[m].bank = sl->bank;
+            reqs[m].pos = g->batch_feed_pos;
+            reqs[m].token = g->batch_feed_token;
+            live_idx[m] = i;
+            m++;
+        }
+        if (m == 0) break;
+
+        char err[96];
+        /* plan-34 inc 1: route the decode-only lane through the mixed entry
+         * (n_rows == n_dec, still exactly 1 row per bank — no prefill rows, no
+         * mixing yet). Byte-identical to ds4_session_decode_multiseq; the only
+         * change is the heap descriptor scratch. */
+        const int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m,
+                                                 logits, (uint32_t)m * vocab,
+                                                 NULL, 0u, err, sizeof(err));
+        s->live_bank = -1;   /* pool is multiseq-poisoned: no clean live bank */
+        if (rc != 0) {
+            for (int q = 0; q < m; q++) {
+                gen_state *g = dec[live_idx[q]]->gen;
+                g->finish = "error";
+                snprintf(g->err, sizeof(g->err), "batched decode failed: %s", err);
+                g->batch_feed_valid = false;
+                g->phase = GEN_FINISH;
+            }
+            break;
+        }
+
+        for (int q = 0; q < m; q++) {
+            session_slot *sl = dec[live_idx[q]];
+            gen_state *g = sl->gen;
+            const int committed = g->batch_feed_token; /* committed at batch_feed_pos */
+            g->batch_feed_pos++;
+            sl->committed_pos = g->batch_feed_pos;
+            ds4_tokens_push(&g->batch_pending, committed);
+            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+            /* Route THIS slot's stream writes through its own deferral queue
+             * (the worker-thread-local writer is shared across slots). */
+            slot_writer_install(&g->writer);
+            if (gen_emit_token(s, sl, committed)) {
+                g->batch_feed_valid = false;
+                g->phase = GEN_FINISH;
+                continue;
+            }
+            const float *row = logits + (size_t)q * (size_t)vocab;
+            float temp, top_p, min_p; int top_k;
+            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            g->batch_feed_token =
+                ds4_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+        }
+    }
+    free(logits);
+    const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+    for (int i = 0; i < n; i++) {
+        dec[i]->last_serviced_us = now_us;
+        if (dec[i]->gen) slot_writer_flush(&dec[i]->gen->writer);
+    }
+}
+
+/* plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
+ * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
+ * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
+ * classic), and with more than one fold-chunk of prompt still left (the FINAL tail
+ * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
+ * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
+ * when the flag is off, not in pool mode, or nothing qualifies. */
+static session_slot *worker_find_fuse_prefill(server *s) {
+    if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
+    ds4_session *pool = s->slots[0].sess;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *sl = &s->slots[i];
+        gen_state *g = sl->gen;
+        if (!sl->active_job || !g || g->phase != GEN_PREFILL_MAIN || !g->prompt_for_sync ||
+            g->no_fuse)
+            continue;
+        const int P = ds4_session_bank_pos(pool, sl->bank);
+        const int len = g->prompt_for_sync->len;
+        if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
+        return sl;                                              /* P=1: first qualifier */
+    }
+    return NULL;
+}
+
+/* plan-34 phase-2 inc 5 — FUSED mixed-batch quantum. One decode quantum whose EVERY
+ * step folds a small (s->mixed_chunk_tokens) prefill run for `pf` into the SAME
+ * ds4_session_decode_mixed sweep as the decode banks (true continuous batching,
+ * P=1). Decode banks advance exactly as worker_batched_decode_quantum — the inc-4
+ * neutrality gate proves a co-scheduled prefill does not perturb them — so their
+ * per-request output is unchanged in shape. The prefill advances up to
+ * QUANTUM*chunk tokens, SPREAD uniformly across the steps so no single decode step
+ * eats a whole chunk (the p99 lever vs the time-slice's per-interval decode stall).
+ * pf's FIRST chunk (pos 0) and FINAL tail (<= chunk) stay CLASSIC: the tail's
+ * ds4_session_sync carries the prefill->decode completion (kv-cache store,
+ * gen_stream_begin), so this never reimplements that handoff. Reconciliation of
+ * pf's bank is the exact recipe the decode lane uses (bank_state_restore +
+ * note_committed_tokens). */
+static void worker_mixed_batch_quantum(server *s, session_slot **dec, int n, session_slot *pf) {
+    if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
+    ds4_session *pool = s->slots[0].sess;
+    const int vocab = ds4_engine_logits_width(s->engine);
+    gen_state *pg = pf->gen;
+    const ds4_tokens *pp = pg->prompt_for_sync;
+
+    server_guard_maybe_evict(s, dec, n);
+
+    /* Decode-bank ENTRY — identical to worker_batched_decode_quantum. */
+    for (int i = 0; i < n; i++) {
+        session_slot *sl = dec[i];
+        gen_state *g = sl->gen;
+        if (g->batch_feed_valid) continue;
+        if (!server_bank_switch(s, sl->bank)) {
+            snprintf(g->err, sizeof g->err,
+                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+            g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
+            continue;
+        }
+        float temp, top_p, min_p; int top_k;
+        gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+        g->batch_feed_token = ds4_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        g->batch_feed_pos = ds4_session_pos(pool);
+        ds4_session_bank_state_save(pool, (uint32_t)sl->bank);
+        g->batch_feed_valid = true; g->batch_active = true;
+    }
+
+    /* Prefill-bank ENTRY: make pf live at its committed frontier P0 and capture its
+     * per-bank counters so the mixed driver reads pf's TRUE starting frontier. */
+    if (!server_bank_switch(s, pf->bank)) {
+        snprintf(pg->err, sizeof pg->err, "prefill bank %u restore failed", (unsigned)pf->bank);
+        pg->finish = "error"; pg->phase = GEN_FINISH; return;
+    }
+    const int P0 = ds4_session_pos(pool);
+    ds4_session_bank_state_save(pool, (uint32_t)pf->bank);
+    {   /* one-shot observability: confirm the fused lane actually engaged. */
+        static int logged = 0;
+        if (logged < 3) { logged++;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: FUSED mixed quantum engaged (prefill bank %u at pos %d/%d, "
+                       "%d decode banks, chunk %d/step)",
+                       (unsigned)pf->bank, P0, pp->len, n, s->mixed_chunk_tokens);
+        }
+    }
+
+    int kstep = s->mixed_chunk_tokens;
+    const int cap = ds4_session_prefill_cap(pool);   /* mixed-step row ceiling */
+    if (kstep > cap - DS4_SESSION_POOL_CAP) kstep = cap - DS4_SESSION_POOL_CAP;
+    if (kstep < 1) kstep = 1;
+    const int len = pp->len;
+    int pf_done = 0;
+    bool reached_end = false;                     /* prefill reached len this quantum */
+    bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
+
+    const size_t reqcap = (size_t)DS4_SESSION_POOL_CAP + (size_t)kstep;
+    ds4_multiseq_req *reqs = server_xmalloc(reqcap * sizeof(*reqs));
+    float *logits = server_xmalloc((size_t)(DS4_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    /* last-position (len-1) logits captured from the final fused prefill run — the
+     * decode seed for the prefill->decode handoff (byte-identical to classic per
+     * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
+    float *pf_last_logits = server_xmalloc((size_t)vocab * sizeof(float));
+    int live_idx[DS4_SESSION_POOL_CAP];
+
+    for (int step = 0; step < DS4_SERVER_DECODE_QUANTUM_TOKENS; step++) {
+        int m = 0;
+        for (int i = 0; i < n && m < DS4_SESSION_POOL_CAP; i++) {
+            session_slot *sl = dec[i];
+            gen_state *g = sl->gen;
+            if (!g->batch_feed_valid) continue;
+            if (g_stop_requested || g->completion >= g->max_tokens) {
+                g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
+            }
+            if (g->batch_feed_pos >= ds4_session_ctx(pool)) {
+                g->batch_feed_valid = false; g->finish = "length"; g->phase = GEN_FINISH; continue;
+            }
+            reqs[m].bank = sl->bank; reqs[m].pos = g->batch_feed_pos;
+            reqs[m].token = g->batch_feed_token; live_idx[m] = i; m++;
+        }
+        /* Fold this step's ascending prefill sub-chunk from P0+pf_done, all the way
+         * to len (the FINAL sub-chunk carries the last-position logits used for the
+         * prefill->decode handoff — no non-aligned classic tail resume, so the
+         * prefill output stays byte-identical to a cold prefill). */
+        const int pos_now = P0 + pf_done;
+        int kthis = 0;
+        if (!pf_giveup && pos_now < len) {
+            kthis = kstep;
+            if (pos_now + kthis > len) kthis = len - pos_now;
+        }
+        for (int j = 0; j < kthis; j++) {
+            reqs[m + j].bank = pf->bank;
+            reqs[m + j].pos = pos_now + j;
+            reqs[m + j].token = pp->v[pos_now + j];
+        }
+        const int nrows = m + kthis;
+        if (nrows == 0) break;
+
+        char err[96];
+        uint32_t n_runs = 0;
+        /* LEVER 1: on an INTERMEDIATE prefill sub-chunk (prefill does not reach len
+         * this step, and there are decode banks to head), emit ONLY the decode banks'
+         * logits (max_head_runs = m) — the prefill run's intermediate logits are
+         * unused, and the head takes the single-block identity path (no two-block
+         * resync, no wasted prefill head). On the FINAL sub-chunk (pos_now+kthis==len)
+         * OR a pure-decode step, pass 0 = all runs (the prefill head IS consumed). */
+        const uint32_t head_cap =
+            (kthis > 0 && m > 0 && pos_now + kthis < len) ? (uint32_t)m : 0u;
+        int rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
+                (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, head_cap, err, sizeof err);
+        if (rc == 1 && kthis > 0) {
+            /* RECOVERABLE reject (nothing committed) caused by the PREFILL run — e.g.
+             * its bank's frontier is not position-true (a cache-warm resume). Do NOT
+             * harm the co-scheduled decode banks: stop folding this prefill (route it
+             * classic via no_fuse) and retry this step DECODE-ONLY. */
+            pf_giveup = true; pg->no_fuse = true;
+            if (m > 0) {
+                rc = ds4_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
+                        (int)((size_t)m * (size_t)vocab), &n_runs, 0u, err, sizeof err);
+            } else { s->live_bank = -1; break; }   /* only prefill this step: just stop */
+            kthis = 0;                              /* prefill did not advance */
+        }
+        s->live_bank = -1;
+        if (rc != 0) {
+            for (int q = 0; q < m; q++) {
+                gen_state *g = dec[live_idx[q]]->gen;
+                g->finish = "error";
+                snprintf(g->err, sizeof g->err, "fused mixed decode failed: %s", err);
+                g->batch_feed_valid = false; g->phase = GEN_FINISH;
+            }
+            break;   /* real decode failure -> stop */
+        }
+        pf_done += kthis;
+        if (kthis > 0 && pos_now + kthis == len) {
+            /* final prefill sub-chunk: capture the len-1 logits (prefill run row =
+             * index m, last-of-run) as the decode seed for the handoff. */
+            memcpy(pf_last_logits, logits + (size_t)m * (size_t)vocab, (size_t)vocab * sizeof(float));
+            reached_end = true;
+        }
+
+        for (int q = 0; q < m; q++) {
+            session_slot *sl = dec[live_idx[q]];
+            gen_state *g = sl->gen;
+            const int committed = g->batch_feed_token;
+            g->batch_feed_pos++; sl->committed_pos = g->batch_feed_pos;
+            ds4_tokens_push(&g->batch_pending, committed);
+            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+            slot_writer_install(&g->writer);
+            if (gen_emit_token(s, sl, committed)) {
+                g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
+            }
+            const float *row = logits + (size_t)q * (size_t)vocab;
+            float temp, top_p, min_p; int top_k;
+            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            g->batch_feed_token = ds4_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+        }
+    }
+    free(reqs); free(logits);
+
+    /* Reconcile the prefill bank (same recipe as a decode bank leaving the lane):
+     * install its driver-maintained frontier (P0+pf_done) and advance the host
+     * checkpoint by exactly the committed prefill tokens, so its next chunk resumes
+     * correctly and any store sees the true frontier. */
+    if (pf_done > 0 && pg->phase == GEN_PREFILL_MAIN) {
+        if (ds4_session_bank_state_restore(pool, pf->bank)) {
+            ds4_session_note_committed_tokens(pool, &pp->v[P0], pf_done);
+            pf->committed_pos = P0 + pf_done;
+            s->live_bank = (int)pf->bank;
+            if (reached_end) {
+                /* Prefill complete: seed the decode with the fused last-position
+                 * logits (byte-identical to classic) and run the SAME prefill->
+                 * decode handoff the classic path uses (kv-cache store, SSE start,
+                 * GEN_DECODE_INIT). No non-aligned classic tail resume => the
+                 * request's decode is byte-identical to a cold classic prefill. */
+                ds4_session_set_logits(pool, pf_last_logits, vocab);
+                slot_writer_install(&pg->writer);
+                gen_stream_begin(s, pf);
+                slot_writer_flush(&pg->writer);
+            }
+        } else {
+            snprintf(pg->err, sizeof pg->err, "prefill bank %u reconcile failed", (unsigned)pf->bank);
+            pg->finish = "error"; pg->phase = GEN_FINISH;
+        }
+    }
+    free(pf_last_logits);
+
+    const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+    for (int i = 0; i < n; i++) {
+        dec[i]->last_serviced_us = now_us;
+        if (dec[i]->gen) slot_writer_flush(&dec[i]->gen->writer);
+    }
+    pf->last_serviced_us = now_us;
+}
+
 void *worker_main(void *arg) {
     server *s = arg;
     int rr = 0; /* round-robin cursor: first slot index to consider next */
@@ -2959,6 +4046,74 @@ void *worker_main(void *arg) {
             const bool quit = !s->head && s->stopping;
             pthread_mutex_unlock(&s->mu);
             if (quit) break;
+            continue;
+        }
+
+        /* Tier-2 three-way lane (§5). Gather steady-state batchable decode slots.
+         * n_batched > 0 means a batch is already in flight — those slots stay
+         * batched until they finish (no mid-conversation batched->classic switch,
+         * which would need stale-logits reconciliation). The batched lane engages
+         * when the batchable decode count exceeds spec_max_live, OR whenever a
+         * batch is already active. Otherwise the classic per-slot round-robin
+         * runs unchanged: n_active==1 -> spec (N=1 byte-identical), n<=spec_max_live
+         * -> spec time-slice. Env DS4_SERVER_SPEC_MAX_LIVE tunes the crossover. */
+        session_slot *dec[DS4_SESSION_POOL_CAP];
+        int n_dec = 0, n_batched = 0;
+        if (s->pool_banks > 0) {
+            for (int i = 0; i < s->n_slots; i++) {
+                if (slot_is_batchable_decode(&s->slots[i])) {
+                    dec[n_dec++] = &s->slots[i];
+                    if (s->slots[i].gen->batch_active) n_batched++;
+                }
+            }
+        }
+        const bool use_batched =
+            s->pool_banks > 0 && n_dec >= 1 &&
+            (n_dec > s->spec_max_live || n_batched > 0);
+
+        if (use_batched) {
+            /* plan-34 inc 5: when the fused lane is armed and a prefilling slot is
+             * admissible (P=1), FOLD its next chunk into the decode sweep instead of
+             * the separate classic prefill advance below. Flag OFF (or nothing
+             * admissible) => pf_fuse==NULL => today's exact decode-quantum +
+             * separate-prefill time-slice, byte-identical. */
+            session_slot *pf_fuse = worker_find_fuse_prefill(s);
+            if (pf_fuse) worker_mixed_batch_quantum(s, dec, n_dec, pf_fuse);
+            else         worker_batched_decode_quantum(s, dec, n_dec);
+            /* Finish any slot the batched quantum stopped (per-slot path
+             * reconciles its checkpoint). Then also advance ONE non-decode
+             * active slot (prefill/init/finish) so prompt ingest never starves
+             * behind a long batched decode. */
+            for (int i = 0; i < n_dec; i++) {
+                session_slot *d = dec[i];
+                if (d->gen && d->gen->phase != GEN_DECODE) {
+                    generate_job_step(s, d);
+                    if (d->gen) slot_writer_flush(&d->gen->writer);
+                    d->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+                    if (!d->gen || d->gen->phase == GEN_DONE)
+                        worker_finish_slot(s, d);
+                }
+            }
+            session_slot *other = NULL;
+            for (int k = 0; k < s->n_slots; k++) {
+                session_slot *c = &s->slots[(rr + k) % s->n_slots];
+                /* inc 5: skip the slot already advanced in-band by the fused
+                 * quantum (pf_fuse) so it does not also run a classic chunk. */
+                if (c->active_job && c != pf_fuse && !slot_is_batchable_decode(c) &&
+                    !(c->gen && c->gen->batch_active)) {
+                    other = c;
+                    rr = (int)(c - s->slots) + 1;
+                    break;
+                }
+            }
+            if (other && other->gen && other->gen->phase != GEN_DONE) {
+                generate_job_step(s, other);
+                if (other->gen) slot_writer_flush(&other->gen->writer);
+                other->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+                if (!other->gen || other->gen->phase == GEN_DONE)
+                    worker_finish_slot(s, other);
+            }
+            server_publish_metrics_snapshot(s);
             continue;
         }
 

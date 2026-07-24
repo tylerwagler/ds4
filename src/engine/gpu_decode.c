@@ -1,6 +1,63 @@
 #include "ds4_engine_internal.h"
 
 
+/* Read an HC residual CARRIER (BF16 storage under task #62) into an f32 host
+ * buffer, expanding each stored sample (BF16->f32 is an exact bit-extension:
+ * the stored 16 bits are the high half of the f32). Used ONLY by the dev-only
+ * layer-0 parity self-test (gpu_graph_decode_test) and the env-gated DSpark
+ * dumps — never the production decode path. In the DS4_HC_F32 fallback build the
+ * carrier is already f32, so it is a plain read. n is a sample count. */
+/* Host-side f32 -> HC carrier store (task #62). Round-to-nearest-even so a host
+ * staged write matches the GPU's __float2bfloat16 store path. NaN is
+ * CANONICALIZED to 0x7FFF, which is what cvt.rn.bf16.f32 emits on sm_80+ (and
+ * what CUDA's software path returns) — passing the payload through in the high
+ * half would NOT match. Inf needs no special case: it rounds exactly through
+ * the RNE path below. `dst` is raw carrier bytes, n a sample count. */
+void ds4_store_hc_carrier_f32(void *dst, const float *src, uint64_t n) {
+#ifdef DS4_HC_F32
+    memcpy(dst, src, (size_t)n * sizeof(float));
+#else
+    uint16_t *d = (uint16_t *)dst;
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t x;
+        memcpy(&x, &src[i], sizeof(x));
+        if ((x & 0x7FFFFFFFu) > 0x7F800000u) {       /* NaN -> canonical */
+            d[i] = 0x7FFFu;
+        } else {
+            const uint32_t bias = 0x7FFFu + ((x >> 16) & 1u);   /* RNE; Inf exact */
+            d[i] = (uint16_t)((x + bias) >> 16);
+        }
+    }
+#endif
+}
+
+
+int ds4_read_hc_carrier_f32(const ds4_gpu_tensor *t, uint64_t off_elems,
+                            float *out, uint64_t n) {
+#ifdef DS4_HC_F32
+    return ds4_gpu_tensor_read((ds4_gpu_tensor *)t, off_elems * sizeof(float),
+                               out, n * sizeof(float));
+#else
+    uint16_t *tmp = xmalloc((size_t)n * sizeof(uint16_t));
+    int rc = ds4_gpu_tensor_read((ds4_gpu_tensor *)t, off_elems * DS4_HC_ELT_SIZE,
+                                 tmp, n * DS4_HC_ELT_SIZE);
+    if (rc == 0) {
+        /* Read failed and left tmp uninitialized — do NOT convert it. Callers
+         * (the DSpark dumps at session.c) memset `out` to zero beforehand and
+         * ignore the return, relying on "zeros on failure"; converting garbage
+         * here would silently write heap noise into the dump, and the f32
+         * fallback build leaves `out` untouched in the same case. */
+        free(tmp);
+        return 0;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t bits = (uint32_t)tmp[i] << 16;
+        memcpy(&out[i], &bits, sizeof(float));
+    }
+    free(tmp);
+    return rc;
+#endif
+}
 
 
 
@@ -449,14 +506,22 @@ bool gpu_graph_commit_attn_comp_stage(
         if (first_row > g->layer_comp_cap[il] || rows > g->layer_comp_cap[il] - first_row) {
             return false;
         }
-        return ds4_gpu_attn_pack_quantize_store_tensor(g->attn_comp_stage,
-                                                       g->layer_attn_comp_cache[il],
-                                                       first_row, rows,
-                                                       DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+        if (ds4_gpu_attn_pack_quantize_store_tensor(g->attn_comp_stage,
+                                                    g->layer_attn_comp_cache[il],
+                                                    first_row, rows,
+                                                    DS4_N_HEAD_DIM, DS4_N_ROT) == 0) {
+            return false;
+        }
+        /* plan-33 inc C: byte-replace the ratio-4 boundary row after any commit
+         * below the fork keep threshold (no-op when ms_emit_keep is 0). */
+        return gpu_graph_emit_keep_restore(g, il,
+                g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
     }
     /* Classic f32 storage: the compressor wrote the persistent cache directly
-     * (gpu_graph_attn_comp_update_target returned it), nothing to commit. */
-    return true;
+     * (gpu_graph_attn_comp_update_target returned it), nothing to commit — but
+     * the fork boundary restore still applies to the rows it just wrote. */
+    return gpu_graph_emit_keep_restore(g, il,
+            g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
 }
 
 
@@ -484,7 +549,8 @@ bool gpu_graph_commit_attn_comp_stage_bank(
             g->attn_comp_stage, cache, first_row, rows,
             DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
     ds4_gpu_tensor_free(cache);
-    return ok;
+    /* plan-33 inc C: boundary-row restore for the explicit-bank commit path. */
+    return ok && gpu_graph_emit_keep_restore(g, il, bank, first_row, rows, false);
 }
 
 
@@ -566,6 +632,31 @@ bool gpu_graph_matmul_plain_tensor(
 
 
 
+/* Decode-only fused RMSNorm + HC-mix GEMV.  Byte-identical to the
+ * rms_norm_plain -> matmul_f16 pair it replaces (see ds4_cuda_hc_router.cu);
+ * it exists because that pair ran a 1-block kernel and then a 24-block kernel
+ * with a 64 KB f32 scratch round trip between them, for ~5.4% of decode.
+ * src_hc is an HC residual carrier (BF16 under task #62); the fused kernel
+ * reads it via ds4_hc_load, exactly as rms_norm_plain_tensor does.
+ * Non-F16 mix weights keep the original two-kernel path. */
+static bool gpu_graph_norm_mix_plain(
+        ds4_gpu_graph        *g,
+        const ds4_model      *model,
+        const ds4_tensor     *w,
+        uint64_t              hc_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *src_hc,
+        ds4_gpu_tensor       *out) {
+    if (w->type == DS4_TENSOR_F16) {
+        return ds4_gpu_hc_norm_mix_f16_tensor(out, model->map, model->size,
+                                              w->abs_offset, hc_dim, out_dim,
+                                              src_hc, DS4_RMS_EPS) != 0;
+    }
+    if (!ds4_gpu_rms_norm_plain_tensor(g->flat_hc, src_hc, (uint32_t)hc_dim, DS4_RMS_EPS)) return false;
+    return gpu_graph_matmul_plain_tensor(out, model, w, hc_dim, out_dim, g->flat_hc, 1);
+}
+
+
 bool gpu_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -610,9 +701,8 @@ bool gpu_graph_encode_decode_layer(
             ok = gpu_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_attn_fn,
+                                          hc_dim, mix_hc, g->cur_hc, g->hc_mix);
     const bool fuse_hc_norm =
         DS4_N_HC == 4 &&
         !gpu_graph_use_reference_hc_decode() &&
@@ -1015,6 +1105,9 @@ bool gpu_graph_encode_decode_layer(
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
                     ds4_gpu_tensor_free(index_row_view);
                 }
+                /* plan-33 inc C: boundary-row restore (decode-fallback site). */
+                if (ok) ok = gpu_graph_emit_keep_restore(g, il,
+                        g->banks.n_banks ? g->banks.cur_bank : 0u, index_row, 1, true);
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_sparse_threshold =
@@ -1095,6 +1188,7 @@ bool gpu_graph_encode_decode_layer(
                                                                 index_scale,
                                                                 g->descr_diag_pos,
                                                                 g->descr_diag_seq,
+                                                                NULL, /* n_banks==1 diag: installed bank view */
                                                                 g->layer_comp_cap[il],
                                                                 1) != 0;
                 } else if (ok) {
@@ -1212,6 +1306,7 @@ bool gpu_graph_encode_decode_layer(
                     raw_f16,
                     descr_diag ? g->descr_diag_pos : NULL,
                     descr_diag ? g->descr_diag_seq : NULL,
+                    NULL, /* n_banks==1 diag: installed bank view is the operand */
                     descr_diag ? g->layer_comp_cap[il] : 0,
                     1) != 0;
             if (ok && decode_index_stage_profile) {
@@ -1241,6 +1336,7 @@ bool gpu_graph_encode_decode_layer(
                     DS4_N_HEAD, DS4_N_HEAD_DIM,
                     0, raw_f16,
                     g->descr_diag_pos, g->descr_diag_seq,
+                    NULL, /* n_banks==1 diag: installed bank view is the operand */
                     g->layer_comp_cap[il], 1) != 0;
         } else {
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
@@ -1331,11 +1427,10 @@ bool gpu_graph_encode_decode_layer(
     }
     DS4_CUDA_PROFILE_DECODE_STAGE("attn_hc_post");
     if (ok) {
-        gpu_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
+        gpu_graph_debug_dump_hc_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_ffn_fn,
+                                          hc_dim, mix_hc, g->after_attn_hc, g->hc_mix);
     if (ok && fuse_hc_norm) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
                                                          g->ffn_norm,
@@ -1546,7 +1641,7 @@ bool gpu_graph_encode_decode_layer(
     DS4_CUDA_PROFILE_DECODE_STAGE("ffn_hc_post");
 #undef DS4_CUDA_PROFILE_DECODE_STAGE
     if (ok) {
-        gpu_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
+        gpu_graph_debug_dump_hc_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
     if (ok) gpu_graph_capture_dspark_target_hc(g, il);
     return ok;
@@ -1865,7 +1960,7 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) {
             ds4_gpu_tensor *after_attn_view = ds4_gpu_tensor_view(
                 g->batch_after_attn_hc, 0,
-                (uint64_t)n_draft * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+                (uint64_t)n_draft * DS4_N_HC * DS4_N_EMBD * DS4_HC_ELT_SIZE);   /* carrier */
             ok = after_attn_view &&
                  ds4_gpu_hc_expand_split_tensor(
                      after_attn_view, g->batch_attn_out,
@@ -1878,7 +1973,7 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) ok = gpu_graph_encode_layer_ffn_batch(
             g, dspark_model, layer, li, pos0, n_draft);
 
-        if (ok) gpu_graph_debug_dump_tensor("dsp_after_attn_hc", g->batch_after_attn_hc,
+        if (ok) gpu_graph_debug_dump_hc_tensor("dsp_after_attn_hc", g->batch_after_attn_hc,
                                              (uint64_t)n_draft * DS4_N_HC * DS4_N_EMBD, li, pos0);
         /* --- HC swap for next layer --- */
         if (ok) {
@@ -1886,7 +1981,7 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_cur_hc = g->batch_next_hc;
             g->batch_next_hc = tmp;
         }
-        if (ok) gpu_graph_debug_dump_tensor("dsp_block_out", g->batch_cur_hc,
+        if (ok) gpu_graph_debug_dump_hc_tensor("dsp_block_out", g->batch_cur_hc,
                                              (uint64_t)n_draft * DS4_N_HC * DS4_N_EMBD, li, pos0);
         /* Draft KV is transient; dspark_n_raw remains at the persistent count.
          * Committed positions are seeded via gpu_graph_dspark_seed_draft_kv(). */
@@ -1928,14 +2023,8 @@ bool gpu_graph_encode_output_head(
         const ds4_weights     *weights,
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(g->output_pre,
-                                                 (const ds4_model *)model,
-                                                 weights->output_hc_fn,
-                                                 hc_dim,
-                                                 DS4_N_HC,
-                                                 g->flat_hc,
-                                             1) != 0;
+    bool ok = gpu_graph_norm_mix_plain(g, (const ds4_model *)model, weights->output_hc_fn,
+                                       hc_dim, DS4_N_HC, g->cur_hc, g->output_pre);
     if (ok) {
         gpu_graph_debug_dump_tensor("result_hc_pre", g->output_pre, DS4_N_HC, DS4_N_LAYER, 0);
     }
@@ -2347,14 +2436,14 @@ int gpu_graph_decode_test(
     if (ok) ok = ds4_gpu_end_commands() != 0;
 
     if (ok) {
-        ok = ds4_gpu_tensor_read(g.after_ffn_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0 &&
+        ok = ds4_read_hc_carrier_f32(g.after_ffn_hc, 0, gpu_hc, hc_dim) != 0 &&
              ds4_gpu_tensor_read(g.attn_cur, 0, gpu_attn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.attn_norm, 0, gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.q, 0, gpu_q, q_dim * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.kv, 0, gpu_kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
              gpu_graph_read_raw_row_f32(&g, 0, 0, gpu_raw) != 0 &&
              ds4_gpu_tensor_read(g.attn_out, 0, gpu_attn_out, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(g.after_attn_hc, 0, gpu_after_attn_hc, hc_dim * sizeof(float)) != 0 &&
+             ds4_read_hc_carrier_f32(g.after_attn_hc, 0, gpu_after_attn_hc, hc_dim) != 0 &&
              ds4_gpu_tensor_read(g.ffn_cur, 0, gpu_ffn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.ffn_norm, 0, gpu_ffn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.shared_out, 0, gpu_shared, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
@@ -2362,7 +2451,7 @@ int gpu_graph_decode_test(
              ds4_gpu_tensor_read(g.router_weights, 0, gpu_expert_weight, sizeof(gpu_expert_weight)) != 0 &&
              ds4_gpu_tensor_read(g.routed_out, 0, gpu_routed, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.ffn_out, 0, gpu_ffn_out, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(g.cur_hc, 0, gpu_after_ffn_hc, hc_dim * sizeof(float)) != 0 &&
+             ds4_read_hc_carrier_f32(g.cur_hc, 0, gpu_after_ffn_hc, hc_dim) != 0 &&
              ds4_gpu_tensor_read(g.logits, 0, gpu_logits, vocab_dim * sizeof(float)) != 0;
     }
 

@@ -166,8 +166,14 @@ static bool solo_stream(int k, int steps, int *stream, double *secs) {
  * solo[k] is recorded in flip_step[k], and the LIVE logits row of that step
  * yields flip_gap[k] = logit(multi's pick) - logit(solo's pick) — measured in
  * the real run, at the real batch composition, with no re-decode. */
+/* use_mixed: route the batched step through ds4_session_decode_mixed (the plan-34
+ * heap-descriptor entry the server worker now uses) instead of
+ * ds4_session_decode_multiseq. Increment-1 refactor must be byte-identical.
+ * first_logits_out (optional, n*vocab floats): the STEP-1 logits, copied out for
+ * a byte-level cross-entry comparison. */
 static bool multi_run(int n, int steps, int **streams, int *const *solo,
-                      int *flip_step, float *flip_gap, double *secs) {
+                      int *flip_step, float *flip_gap, double *secs,
+                      bool use_mixed, float *first_logits_out) {
     ds4_session *s = NULL;
     if (ds4_session_create(&s, g_e, 4096) != 0) return false;
     ds4_gpu_graph *g = &s->graph;
@@ -210,14 +216,19 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
                 reqs[k].pos = g_prompt_len[k] + (j - 1);
                 reqs[k].token = streams[k][j - 1];
             }
-            const int rc = ds4_session_decode_multiseq(s, reqs, (uint32_t)n,
-                                                       logits, n * vocab,
-                                                       err, sizeof(err));
+            const int rc = use_mixed
+                ? ds4_session_decode_mixed(s, reqs, (uint32_t)n,
+                                           logits, n * vocab, NULL, 0u, err, sizeof(err))
+                : ds4_session_decode_multiseq(s, reqs, (uint32_t)n,
+                                              logits, n * vocab, err, sizeof(err));
             if (rc != 0) {
-                fprintf(stderr, "multiseq step %d failed (rc=%d): %s\n", j, rc, err);
+                fprintf(stderr, "%s step %d failed (rc=%d): %s\n",
+                        use_mixed ? "mixed" : "multiseq", j, rc, err);
                 ok = false;
                 break;
             }
+            if (j == 1 && first_logits_out)
+                memcpy(first_logits_out, logits, (size_t)n * vocab * sizeof(float));
             for (int k = 0; k < n; k++) {
                 const float *row = logits + (size_t)k * vocab;
                 streams[k][j] = (int)argmax_f32(row, (uint64_t)vocab);
@@ -354,6 +365,69 @@ static bool check_stale_classic_fails_loud(void) {
     return ok;
 }
 
+/* Tier-1 SPEC lane timing (the mode-switch crossover measurement — plan
+ * §2.2/§2.3: "MEASURE the N=2 boundary, do NOT hardcode 3").  This is the lane
+ * the scheduler picks at n<=2: n INDEPENDENT sessions (each its own graph — the
+ * Tier-1 time-slice model, NOT banks), fused DSpark speculation, round-robin
+ * one generate_speculative quantum per session until each has emitted >= steps
+ * tokens.  Timed apples-to-apples with multi_run's batched lane (aggregate =
+ * emitted/elapsed) so the crossover is measured on THIS v0.2.3 build rather
+ * than assumed.  Greedy (temp=0): exact-under-argmax spec, so each session's
+ * stream matches its solo reference.  Returns false (caller skips + reports)
+ * if the engine has no drafter — the DS4_GATE_NO_DSPARK / --no-dspark config,
+ * where the scheduler has no spec lane and batches at every width. */
+static bool spec_timeslice_run(int n, int steps, double *secs,
+                               uint64_t *out_emitted) {
+    if (!ds4_engine_has_dspark(g_e)) return false;
+    ds4_session *ss[GATE_MAX_N];
+    memset(ss, 0, sizeof(ss));
+    char err[256];
+    bool ok = true;
+    for (int k = 0; k < n && ok; k++) {
+        if (ds4_session_create(&ss[k], g_e, 4096) != 0) { ok = false; break; }
+        ds4_tokens p;
+        ok = make_prompt(k, &p);
+        if (ok && ds4_session_sync(ss[k], &p, err, sizeof(err)) != 0) {
+            fprintf(stderr, "spec populate %d failed: %s\n", k, err);
+            ok = false;
+        }
+        ds4_tokens_free(&p);
+    }
+    uint64_t emitted_total = 0;
+    if (ok) {
+        int emitted[GATE_MAX_N];
+        memset(emitted, 0, sizeof(emitted));
+        int acc[32];
+        uint64_t rng = 0x2545F4914F6CDD1Dull;
+        const int eos = ds4_token_eos(g_e);
+        const double t0 = now_s();
+        bool more = true;
+        while (ok && more) {
+            more = false;
+            for (int k = 0; k < n && ok; k++) {
+                if (emitted[k] >= steps) continue;
+                const int ntok = ds4_session_generate_speculative(
+                        ss[k], 0.0f, 0, 1.0f, 0.0f, &rng,
+                        steps - emitted[k], eos, acc,
+                        (int)(sizeof(acc) / sizeof(acc[0])), err, sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "spec %d failed: %s\n", k, err);
+                    ok = false;
+                    break;
+                }
+                if (ntok == 0) { emitted[k] = steps; continue; } /* eos/stall: retire */
+                emitted[k] += ntok;
+                emitted_total += (uint64_t)ntok;
+                if (emitted[k] < steps) more = true;
+            }
+        }
+        if (secs) *secs = now_s() - t0;
+    }
+    for (int k = 0; k < n; k++) if (ss[k]) ds4_session_free(ss[k]);
+    if (out_emitted) *out_emitted = emitted_total;
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL [MAXN] [STEPS]\n", argv[0]);
@@ -421,15 +495,20 @@ int main(int argc, char **argv) {
     /* Multi runs at N = 1..maxn; every stream is kept for the cross-N gate. */
     int *multi[GATE_MAX_N][GATE_MAX_N];   /* [n-1][bank] */
     bool have[GATE_MAX_N];
+    const int vocab_w = (int)DS4_N_VOCAB;
+    float *ref_l1[GATE_MAX_N];            /* [n-1] step-1 logits, multiseq entry */
     memset(multi, 0, sizeof(multi));
     memset(have, 0, sizeof(have));
+    memset(ref_l1, 0, sizeof(ref_l1));
     for (int n = 1; n <= maxn; n++) {
         int flip_step[GATE_MAX_N];
         float flip_gap[GATE_MAX_N];
         memset(flip_gap, 0, sizeof(flip_gap));
         for (int k = 0; k < n; k++) multi[n - 1][k] = malloc((size_t)(steps + 1) * sizeof(int));
+        ref_l1[n - 1] = malloc((size_t)n * vocab_w * sizeof(float));
         double secs = 0.0;
-        if (!multi_run(n, steps, multi[n - 1], solo, flip_step, flip_gap, &secs)) {
+        if (!multi_run(n, steps, multi[n - 1], solo, flip_step, flip_gap, &secs,
+                       false, ref_l1[n - 1])) {
             CHECK(0, "N=%d: multi run failed", n);
             continue;
         }
@@ -451,6 +530,68 @@ int main(int argc, char **argv) {
                        (double)flip_gap[k]);
             }
         }
+    }
+
+    /* Tier-1 SPEC lane vs the batched lane above: the mode-switch crossover,
+     * measured on this build (plan §2.2/§2.3 mandate — do NOT hardcode 3).
+     * Informational, like the batched throughput lines; compare SPEC N=k
+     * aggregate against the "N=k ... aggregate" batched line above.  Skipped
+     * with no drafter (the scheduler then batches at every width). */
+    if (ds4_engine_has_dspark(g_e)) {
+        for (int n = 1; n <= maxn; n++) {
+            double secs = 0.0;
+            uint64_t emitted = 0;
+            if (spec_timeslice_run(n, steps, &secs, &emitted) && secs > 0.0) {
+                printf("SPEC N=%d: %llu tokens (%d session(s) time-sliced) in "
+                       "%.1fs -> aggregate %.2f tok/s (%.2f tok/s/session)\n",
+                       n, (unsigned long long)emitted, n, secs,
+                       (double)emitted / secs, (double)emitted / secs / n);
+            } else {
+                printf("SPEC N=%d: spec lane run failed/unavailable\n", n);
+            }
+        }
+    } else {
+        printf("SPEC lane: skipped (no drafter — scheduler batches at every "
+               "width in this config)\n");
+    }
+
+    /* HARD GATE (plan-34 inc 1): the mixed-descriptor entry
+     * (ds4_session_decode_mixed, heap scratch) the server worker now routes
+     * through must be BYTE-IDENTICAL to ds4_session_decode_multiseq (fixed stack
+     * scratch) for a decode-only batch. Re-run each width through the mixed entry
+     * and assert (a) the full per-bank token STREAM is identical (all steps) and
+     * (b) the STEP-1 logits are byte-identical (memcmp of the float rows). A
+     * heap-scratch addressing/lifetime bug — the stated risk — surfaces here. */
+    for (int n = 1; n <= maxn; n++) {
+        if (!have[n - 1]) continue;
+        int *mix[GATE_MAX_N];
+        memset(mix, 0, sizeof(mix));
+        for (int k = 0; k < n; k++) mix[k] = malloc((size_t)(steps + 1) * sizeof(int));
+        float *mix_l1 = malloc((size_t)n * vocab_w * sizeof(float));
+        double secs = 0.0;
+        if (!multi_run(n, steps, mix, NULL, NULL, NULL, &secs, true, mix_l1)) {
+            CHECK(0, "N=%d: mixed-entry run failed", n);
+        } else {
+            int sdiff = -1;
+            for (int k = 0; k < n && sdiff < 0; k++)
+                for (int j = 0; j <= steps; j++)
+                    if (mix[k][j] != multi[n - 1][k][j]) { sdiff = j; break; }
+            CHECK(sdiff < 0,
+                  "MIXED ENTRY NOT byte-identical: N=%d token stream diverges from "
+                  "the multiseq entry at step %d — heap descriptor addressing is wrong",
+                  n, sdiff);
+            const size_t lb = (size_t)n * vocab_w * sizeof(float);
+            const int ldiff = memcmp(mix_l1, ref_l1[n - 1], lb);
+            CHECK(ldiff == 0,
+                  "MIXED ENTRY NOT byte-identical: N=%d STEP-1 logits differ from "
+                  "the multiseq entry (memcmp != 0)", n);
+            if (sdiff < 0 && ldiff == 0)
+                printf("MIXED-ENTRY EQUIV: N=%d decode_mixed == decode_multiseq "
+                       "(streams over %d tokens + step-1 logits byte-identical)\n",
+                       n, steps + 1);
+        }
+        for (int k = 0; k < n; k++) free(mix[k]);
+        free(mix_l1);
     }
 
     /* HARD GATE: co-scheduling neutrality — bank k's stream must not depend
@@ -480,6 +621,7 @@ int main(int argc, char **argv) {
     if (!check_stale_classic_fails_loud()) CHECK(0, "stale-classic guard check failed to run");
 
     for (int k = 0; k < maxn; k++) free(solo[k]);
+    for (int n = 0; n < GATE_MAX_N; n++) free(ref_l1[n]);
     for (int n = 0; n < GATE_MAX_N; n++)
         for (int k = 0; k < GATE_MAX_N; k++) free(multi[n][k]);
     ds4_engine_close(g_e);

@@ -401,6 +401,16 @@ const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
+const char *server_served_model_id(const server *s) {
+    return s->served_model_id ? s->served_model_id
+                              : server_model_id_from_engine(s->engine);
+}
+
+const char *server_served_model_name(const server *s) {
+    return s->served_model_name ? s->served_model_name
+                                : ds4_engine_model_name(s->engine);
+}
+
 
 
 void stop_list_clear(stop_list *stops) {

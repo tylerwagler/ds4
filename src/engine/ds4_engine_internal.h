@@ -791,30 +791,6 @@ typedef struct {
  * hot loop.
  */
 
-typedef struct {
-    float *raw_kv;
-    uint32_t n_raw;
-    uint32_t cap_raw;
-
-    uint32_t compress_ratio;
-    uint32_t comp_cap;
-    uint32_t n_comp;
-    float *attn_comp_kv;
-    float *attn_state_kv;
-    float *attn_state_score;
-
-    uint32_t n_index_comp;
-    float *index_comp_kv;
-    float *index_state_kv;
-    float *index_state_score;
-} ds4_layer_cache;
-
-typedef struct {
-    ds4_layer_cache layer[DS4_MAX_LAYER];
-    uint32_t head_dim;
-} ds4_kv_cache;
-
-
 /* =========================================================================
  * GPU Release Graph State.
  * =========================================================================
@@ -859,12 +835,35 @@ typedef struct {
     uint64_t astate_bank_bytes[DS4_MAX_LAYER];/* attn compressor frontier lane */
     uint64_t istate_bank_bytes[DS4_MAX_LAYER];/* indexer compressor frontier lane */
     ds4_gpu_tensor *raw[DS4_MAX_LAYER];
-    ds4_gpu_tensor *comp[DS4_MAX_LAYER];
-    ds4_gpu_tensor *index[DS4_MAX_LAYER];
+    /* Tier-2 task #55 (increment 2a): the ctx-scaled comp/index caches are now
+     * ONE cudaMallocManaged allocation PER BANK (comp[il][bank]) instead of one
+     * n_banks*bank_bytes slab — so the increment-2 eviction guard can cudaFree a
+     * single idle bank's physical directly (the only reclaim primitive that
+     * returns memory on GB10; Step-1). The stride stays UNIFORM 1M (comp_bank_bytes
+     * is per-layer, bank-independent) — this is NOT B-full (no variable caps). The
+     * seq_id-scattered batched-decode READ kernels can no longer address a bank as
+     * base + seq_id*comp_cap across one slab, so they take a per-bank BASE-POINTER
+     * table (comp_bases[il]/index_bases[il]): a device array of the n_banks
+     * comp[il][*]->ptr, indexed by seq_id[t]. NULL when the pool is disabled
+     * (single-session paths use the repointed view). */
+    ds4_gpu_tensor *comp[DS4_MAX_LAYER][DS4_MSEQ_MAX];
+    ds4_gpu_tensor *index[DS4_MAX_LAYER][DS4_MSEQ_MAX];
+    ds4_gpu_tensor *comp_bases[DS4_MAX_LAYER];  /* [n_banks] device ptr array: comp[il][b]->ptr */
+    ds4_gpu_tensor *index_bases[DS4_MAX_LAYER]; /* [n_banks] device ptr array: index[il][b]->ptr */
     ds4_gpu_tensor *askv[DS4_MAX_LAYER];
     ds4_gpu_tensor *assc[DS4_MAX_LAYER];
     ds4_gpu_tensor *iskv[DS4_MAX_LAYER];
     ds4_gpu_tensor *issc[DS4_MAX_LAYER];
+    /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
+     * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
+     * gpu_graph_init_dspark_target only when the pool is enabled AND the
+     * drafter is loaded; the graph's dspark_raw_cache[i]/dspark_prompt_h[i]
+     * become bank views into these, swapped by gpu_graph_bank_repoint so the
+     * spec path transparently uses the active bank's ring.  NULL otherwise. */
+    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * head_dim * f32 */
+    uint64_t dspark_prompt_bank_bytes;   /* DRAFT_WINDOW * n_embd  * f32 */
+    ds4_gpu_tensor *dspark_raw[3];       /* N * dspark_raw_bank_bytes */
+    ds4_gpu_tensor *dspark_prompt[3];    /* N * dspark_prompt_bank_bytes */
 } ds4_bank_slabs;
 
 typedef struct {
@@ -1130,6 +1129,30 @@ typedef struct {
      * multiseq step; NULL in production single-session serving. */
     uint32_t ms_n_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
     uint32_t ms_n_index_comp[DS4_MSEQ_MAX][DS4_MAX_LAYER];
+    /* Tier-2 Option F: per-bank DSpark drafter-ring frontier counters (the
+     * device rings themselves are banked slabs, ds4_bank_slabs.dspark_*).
+     * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
+     * window under N=2 spec-time-slice — the whole point of Option F. */
+    uint32_t ms_dspark_n_raw[DS4_MSEQ_MAX][3];
+    uint32_t ms_dspark_prompt_n[DS4_MSEQ_MAX];
+    uint32_t ms_dspark_prompt_lo[DS4_MSEQ_MAX];
+    /* Tier-2 PATH-A partial-prefix KV-reuse (plan-33). Net-new. ms_emit_keep[bank]
+     * is the ratio-4 boundary-row restore threshold: 0 = inactive (increment A
+     * full-prefix fork clears it; increment C's partial cut sets R/4+1 and the
+     * emit hook overwrites the recomputed boundary row with the packed stash while
+     * row0 < it). fork_pin[bank] is a transient eviction pin so the guard's victim
+     * picker cannot free_physical a source bank mid-clone (plan-33 anti-corruption
+     * guarantee). Both zero-initialised with the graph. */
+    uint32_t ms_emit_keep[DS4_MSEQ_MAX];
+    uint8_t  fork_pin[DS4_MSEQ_MAX];
+    /* Boundary-row stash (inc C): one PACKED row per (bank, layer) — the ratio-4
+     * comp row R/4 and index row R/4 copied byte-for-byte at fork_copy_cut, and
+     * byte-REPLACED over the replay's recomputed row by gpu_graph_emit_keep_restore
+     * (never re-encoded: bit-exact for MXFP8-pack AND the non-idempotent MXFP4 QAT
+     * alike). Sized n_banks * DS4_N_LAYER * row_bytes at slab alloc; NULL when the
+     * pool is disabled. */
+    ds4_gpu_tensor *emit_stash_comp;
+    ds4_gpu_tensor *emit_stash_index;
     int32_t *ms_positions;
     int32_t *ms_seq_id;
     ds4_gpu_tensor *batch_positions;
@@ -1284,39 +1307,20 @@ typedef struct {
 void ds4_sample_scratch_free(ds4_sample_scratch *s);
 
 
-struct ds4_session {
-    ds4_engine *engine;
-    ds4_gpu_graph graph;
-    token_vec checkpoint;
-    float *logits;
-    /* Reused working set for the sampled speculative acceptance walk's
-     * full-vocab distribution builds (one per accepted position). Per-session,
-     * never shared: concurrent sessions each run their own walk. */
-    ds4_sample_scratch sample_scratch;
-    ds4_session_progress_fn progress;
-    void *progress_ud;
-    ds4_session_progress_fn display_progress;
-    void *display_progress_ud;
-    ds4_session_cancel_fn cancel;
-    void *cancel_ud;
-    uint32_t prefill_cap;
-    int ctx_size;
-    bool checkpoint_valid;
-    /* A multiseq step has run and the graph's CLASSIC per-bank state is no
-     * longer re-establishable by bookkeeping alone: the scalar frontier
-     * counters (layer_n_comp / layer_n_index_comp) hold a cross-bank
-     * SUPERSET, not any single bank's truth.  Any classic entry that decodes
-     * against those scalars (ds4_session_eval) would emit its compressor row
-     * at the superset index and attend over the rows below it — a previous
-     * tenant's bytes — producing wrong logits SILENTLY.  checkpoint_valid
-     * does NOT cover this: ds4_session_eval never reads it.  Set on every
-     * decode_multiseq path that armed a step; cleared only where per-bank
-     * device state is legitimately re-established (ds4_session_sync's rebuild
-     * path, via gpu_graph_reset_prefill_state zeroing the counters). */
-    bool mseq_dirty;
-    /* GPU bytes this session's create actually allocated (tensor-allocator
-     * delta across ds4_session_create); the server ledger commits this. */
-    uint64_t resident_bytes;
+/* The per-conversation SPECULATIVE / DSpark host shadow, factored into one
+ * named aggregate so it can be saved and restored WHOLESALE.  It is embedded
+ * BY VALUE in both ds4_session (the live state) and ds4_bank_carry (the
+ * per-bank Tier-2 shadow), and ds4_session_bank_state_save/_restore copy it
+ * with a single struct assignment.  That is the whole point: the old
+ * field-by-field mirror meant every new field had to be added at three sites
+ * (struct, save, restore) and forgetting one silently handed a bank ANOTHER
+ * conversation's speculative state.  Add new spec/DSpark scalars HERE and
+ * both paths pick them up for free.
+ *
+ * Deliberately EXCLUDED: heap-backed state (checkpoint, logits,
+ * dspark_pending_qrows) — those need deep copies with per-side ownership, so
+ * they stay as explicit members of each struct. */
+typedef struct ds4_spec_carry_state {
     /* Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
      * position's hidden, pending verification in THIS step's single batched
      * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
@@ -1383,27 +1387,6 @@ struct ds4_session {
     bool dspark_pending_sampled;
     /* q(pend[i]) at draft time — the accept denominator. */
     float dspark_pending_q[16];
-    /* The refined-logits row each pending draft was sampled from, 16 rows of
-     * DS4_N_VOCAB floats, allocated lazily on first sampled draft. The residual
-     * needs the FULL q, but only for the single rejected position — unknown
-     * until verify — so every position's row is persisted and the one that
-     * rejects rebuilds its q via ds4_sample_dist_build.
-     *
-     * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
-     * q: dist_build is a pure function of (logits, params), and the rebuild is
-     * handed BOTH persisted halves — this row and dspark_pending_temp/top_k/
-     * top_p/min_p below. Feeding it either half from live state is the trap: the
-     * live drafter state has advanced, and the live REQUEST params may differ
-     * from the draft-time ones, which would leave the stored accept denominator
-     * dspark_pending_q[i] (computed under the draft-time params) and the
-     * residual's q describing two different proposals inside one rule.
-     *
-     * Device-first note (Item 2): storing the logits ROW + params rather than a
-     * materialized nucleus is deliberate — the GPU accept kernel wants exactly
-     * this, so it swaps this host pool for a resident device buffer instead of
-     * reshaping the format. */
-    float *dspark_pending_qrows;
-    uint32_t dspark_pending_qrows_cap;   /* floats reserved */
     /* The sampling params the pendings were sampled under. TWO consumers, and
      * they are different in kind:
      *   1) EXACTNESS (load-bearing): the verify walk rebuilds the rejecting
@@ -1451,6 +1434,107 @@ struct ds4_session {
     uint64_t spec_draft_tokens;
     uint64_t spec_num_drafts;
     uint64_t spec_gen_tokens;
+} ds4_spec_carry_state;
+
+/* Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
+ * pool-session's HOST per-conversation state (checkpoint token history, host
+ * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
+ * instance on ds4_session, so time-slicing classic/spec work across banks in
+ * one graph must save the leaving bank's carry and restore the entering bank's.
+ * gpu_graph_bank_repoint swaps the DEVICE views; this covers the HOST half the
+ * engine header (gpu_graph_bank_repoint contract) delegates to the caller.
+ * The three heap members are owned deep copies; every other field is a scalar
+ * mirror of the identically-named ds4_session field; the speculative/DSpark
+ * scalars are carried wholesale as one embedded ds4_spec_carry_state. */
+typedef struct ds4_bank_carry {
+    bool      valid;                 /* has this bank's state ever been saved */
+    /* heap-backed (owned): */
+    token_vec checkpoint;            /* deep copy of s->checkpoint */
+    float    *logits;                /* DS4_N_VOCAB floats, owned */
+    float    *dspark_pending_qrows;  /* dspark_pending_qrows_cap floats, owned */
+    uint32_t  dspark_pending_qrows_cap;
+    /* scalar mirrors: */
+    bool      checkpoint_valid;
+    /* Whole speculative/DSpark shadow, mirrored by value (single assignment in
+     * save/restore).  NOTE: ds4_session.mseq_dirty is deliberately NOT carried:
+     * it is a property of the GRAPH's scalar frontier counters, not of a bank's
+     * conversation, and _restore re-establishes per-bank frontier truth via
+     * gpu_graph_bank_counters_install and then clears it unconditionally.  The
+     * old mirror field was write-only (saved, never read) and has been dropped. */
+    ds4_spec_carry_state spec;
+} ds4_bank_carry;
+
+
+struct ds4_session {
+    ds4_engine *engine;
+    ds4_gpu_graph graph;
+    token_vec checkpoint;
+    float *logits;
+    /* Reused working set for the sampled speculative acceptance walk's
+     * full-vocab distribution builds (one per accepted position). Per-session,
+     * never shared: concurrent sessions each run their own walk. */
+    ds4_sample_scratch sample_scratch;
+    /* Reusable DS4_N_VOCAB-float staging row for the speculative paths'
+     * spec_logits readbacks.  ~517 KB, i.e. above glibc's mmap threshold, so a
+     * per-step malloc/free would mmap/munmap and re-fault it every accepted
+     * position — allocate once per session instead.  Deliberately NOT drawn
+     * from sample_scratch: sample_scratch_reserve frees the whole struct when
+     * it grows, which would dangle a row held across a ds4_sample_dist_build.
+     * Only ever live inside one speculative eval call (the fused and block
+     * paths never overlap: block tail-calls fused). */
+    float *spec_row_scratch;
+    ds4_session_progress_fn progress;
+    void *progress_ud;
+    ds4_session_progress_fn display_progress;
+    void *display_progress_ud;
+    ds4_session_cancel_fn cancel;
+    void *cancel_ud;
+    uint32_t prefill_cap;
+    int ctx_size;
+    bool checkpoint_valid;
+    /* A multiseq step has run and the graph's CLASSIC per-bank state is no
+     * longer re-establishable by bookkeeping alone: the scalar frontier
+     * counters (layer_n_comp / layer_n_index_comp) hold a cross-bank
+     * SUPERSET, not any single bank's truth.  Any classic entry that decodes
+     * against those scalars (ds4_session_eval) would emit its compressor row
+     * at the superset index and attend over the rows below it — a previous
+     * tenant's bytes — producing wrong logits SILENTLY.  checkpoint_valid
+     * does NOT cover this: ds4_session_eval never reads it.  Set on every
+     * decode_multiseq path that armed a step; cleared only where per-bank
+     * device state is legitimately re-established (ds4_session_sync's rebuild
+     * path, via gpu_graph_reset_prefill_state zeroing the counters). */
+    bool mseq_dirty;
+    /* GPU bytes this session's create actually allocated (tensor-allocator
+     * delta across ds4_session_create); the server ledger commits this. */
+    uint64_t resident_bytes;
+    /* Live speculative/DSpark shadow; see ds4_spec_carry_state. */
+    ds4_spec_carry_state spec;
+    /* The refined-logits row each pending draft was sampled from, 16 rows of
+     * DS4_N_VOCAB floats, allocated lazily on first sampled draft. The residual
+     * needs the FULL q, but only for the single rejected position — unknown
+     * until verify — so every position's row is persisted and the one that
+     * rejects rebuilds its q via ds4_sample_dist_build.
+     *
+     * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
+     * q: dist_build is a pure function of (logits, params), and the rebuild is
+     * handed BOTH persisted halves — this row and dspark_pending_temp/top_k/
+     * top_p/min_p below. Feeding it either half from live state is the trap: the
+     * live drafter state has advanced, and the live REQUEST params may differ
+     * from the draft-time ones, which would leave the stored accept denominator
+     * dspark_pending_q[i] (computed under the draft-time params) and the
+     * residual's q describing two different proposals inside one rule.
+     *
+     * Device-first note (Item 2): storing the logits ROW + params rather than a
+     * materialized nucleus is deliberate — the GPU accept kernel wants exactly
+     * this, so it swaps this host pool for a resident device buffer instead of
+     * reshaping the format. */
+    float *dspark_pending_qrows;
+    uint32_t dspark_pending_qrows_cap;   /* floats reserved */
+    /* Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
+     * allocated on the first ds4_session_bank_state_save; NULL / bank_carry_n==0
+     * when the pool is disabled (single-session use never touches it). */
+    ds4_bank_carry *bank_carry;
+    uint32_t bank_carry_n;
 };
 
 typedef struct {
@@ -1942,8 +2026,6 @@ void layer_ffn_tokens_parallel(
 uint32_t ds4_default_raw_cap(uint32_t ctx_size);
 uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
-void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap);
-void kv_cache_free(ds4_kv_cache *cache);
 void layer_forward_self_one(
         float                   * out_hc,
         const ds4_model         * model,
@@ -1986,7 +2068,16 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
         uint32_t  prefill_cap,
         uint64_t *kv_cache_bytes_out);
 ds4_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes);
+/* True when DS4_CUDA_GRAPH_DUMP_PREFIX is set (cached). Graph allocation
+ * uses this to skip buffers that exist only to be dumped. */
+bool gpu_graph_debug_dump_enabled(void);
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos);
+void gpu_graph_debug_dump_hc_tensor(
+        const char       *name,
+        ds4_gpu_tensor *t,
+        uint64_t          n_elems,
+        uint32_t          il,
+        uint32_t          pos);
 void gpu_graph_debug_dump_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -2031,12 +2122,40 @@ bool gpu_graph_bank_repoint(ds4_gpu_graph *g, uint32_t bank);
 /* Effective pool size for banked kernel launches: banks.n_banks, or 1 when
  * the pool is disabled (the classic tensors act as bank 0). */
 uint32_t gpu_graph_bank_pool_count(const ds4_gpu_graph *g);
+/* Tier-2 overcommit (task #55): demand-paged comp+index VA bytes for ONE bank at
+ * a context (the overcommit-reserved, physical-on-touch part); and the EXACT
+ * touched (physically resident) demand-paged KV summed over the whole pool from
+ * the per-bank compressor frontier. See the definitions in gpu_diag.c. */
+uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
+uint64_t gpu_graph_touched_kv_bytes(const ds4_gpu_graph *g);
+uint64_t gpu_graph_bank_touched_kv_bytes(const ds4_gpu_graph *g, uint32_t bank);
+uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q);
+/* Tier-2 task #55 increment 2b — per-bank physical evict/restore reclaim
+ * primitives (direct cudaFree / cudaMallocManaged of one bank's split comp/index
+ * + base-table rebuild). See gpu_diag.c. */
+bool gpu_graph_bank_free_physical(ds4_gpu_graph *g, uint32_t bank);
+bool gpu_graph_bank_alloc_physical(ds4_gpu_graph *g, uint32_t bank);
+bool gpu_graph_bank_is_evicted(const ds4_gpu_graph *g, uint32_t bank);
+/* Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
+ * KV into dst + mirror frontier counters. Caller validates + pins src first. */
+bool gpu_graph_bank_fork_copy(ds4_gpu_graph *g, uint32_t src, uint32_t dst);
+/* plan-33 inc C: partial-cut fork + boundary machinery (gpu_diag.c). */
+uint32_t ds4_partial_fork_base_align(void);
+bool gpu_graph_bank_fork_copy_cut(ds4_gpu_graph *g, uint32_t src, uint32_t dst,
+                                  uint32_t R, uint32_t src_len);
+bool gpu_graph_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t bank,
+                                 uint32_t row0, uint32_t rows, bool indexer);
 /* Whole-pool cache tensors for banked kernel operands: the bank slab when
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */
 ds4_gpu_tensor *gpu_graph_bank_raw_pool(ds4_gpu_graph *g, uint32_t il);
 ds4_gpu_tensor *gpu_graph_bank_attn_comp_pool(ds4_gpu_graph *g, uint32_t il);
 ds4_gpu_tensor *gpu_graph_bank_index_comp_pool(ds4_gpu_graph *g, uint32_t il);
+/* Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,
+ * indexed by seq_id) the batched READ kernels use in place of base +
+ * seq_id*comp_cap over one slab. NULL when the pool is disabled. */
+ds4_gpu_tensor *gpu_graph_bank_attn_comp_bases(ds4_gpu_graph *g, uint32_t il);
+ds4_gpu_tensor *gpu_graph_bank_index_comp_bases(ds4_gpu_graph *g, uint32_t il);
 /* Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */
@@ -2053,6 +2172,19 @@ ds4_gpu_tensor *gpu_graph_bank_index_state_score_view(ds4_gpu_graph *g, uint32_t
  * work so the scalars are that bank's counts again. */
 void gpu_graph_bank_counters_capture(ds4_gpu_graph *g, uint32_t bank);
 void gpu_graph_bank_counters_install(ds4_gpu_graph *g, uint32_t bank);
+/* Tier-2 PATH A host-carry primitive (see ds4_bank_carry).  save copies the
+ * session's live HOST per-conversation state into bank's shadow AND captures
+ * the graph frontier counters (gpu_graph_bank_counters_capture).  restore
+ * repoints the device views to bank, installs its frontier counters, copies
+ * the shadow back into the session, and clears mseq_dirty (the cheap
+ * no-re-prefill resume: counters_install re-establishes per-bank truth, which
+ * is exactly what mseq_dirty guards).  Call save on the leaving bank before,
+ * and restore on the entering bank after, a bank switch — both only between
+ * fully synchronized forwards (the gpu_graph_bank_repoint contract).  restore
+ * returns false only on a bad bank id or OOM growing an owned buffer. */
+/* ds4_session_bank_state_save/restore + ds4_session_bank_count/repoint are the
+ * public server-facing API (declared in ds4.h). */
+void ds4_session_bank_carry_free(ds4_session *s);
 /* Arm one banked multiseq batched step over n_rows packed rows: pos[t] is
  * row t's absolute position, seq[t] its TRUE bank id.  Writes the host
  * mirrors + device descriptor arrays (lazily allocated), verifies the
@@ -2087,7 +2219,9 @@ int gpu_graph_decode_multiseq_batch(
         const int32_t         *pos,
         const int32_t         *bank,
         uint32_t               n_active,
-        float                 *logits);
+        float                 *logits,
+        uint32_t              *out_n_rows,
+        uint32_t               max_head_runs);
 /* DS4_DECODE_DESCR=1 (env, read once): Tier-2 descriptor-vs-classic byte
  * diagnostic — see gpu_decode.c. */
 int gpu_graph_decode_descr_enabled(void);
@@ -2102,6 +2236,18 @@ uint64_t gpu_graph_session_bytes(
         uint32_t                 ctx_size,
         uint32_t                 prefill_cap,
         bool                     enable_spec);
+/* Same, but priced for an EXPLICIT bank-pool size instead of reading
+ * DS4_MSEQ_BANKS — the fit-table / auto-sizing path (cli_main) evaluates many
+ * (n_banks, ctx) candidates before the env is committed. n_banks == 0 or 1 is
+ * the classic single-session layout. */
+uint64_t gpu_graph_session_bytes_banked(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_spec,
+        uint32_t                 n_banks);
 bool gpu_graph_init_dspark_target(ds4_gpu_graph *g, const uint32_t target_layer_ids[3]);
 bool gpu_graph_alloc(
         ds4_gpu_graph *g,
@@ -2251,6 +2397,16 @@ ds4_gpu_tensor *gpu_graph_tensor_row_view(
         ds4_gpu_tensor *base,
         uint32_t          row,
         uint64_t          row_values);
+ds4_gpu_tensor *gpu_graph_hc_row_view(
+        ds4_gpu_tensor *base,
+        uint32_t          row,
+        uint64_t          row_values);
+/* Read an HC residual carrier (BF16 storage; task #62) into an f32 host buffer,
+ * expanding each sample. Dev-only (parity self-test + env-gated DSpark dumps). */
+int ds4_read_hc_carrier_f32(const ds4_gpu_tensor *t, uint64_t off_elems,
+                            float *out, uint64_t n);
+/* f32 -> HC carrier bytes (RNE, matches the GPU __float2bfloat16 store). */
+void ds4_store_hc_carrier_f32(void *dst, const float *src, uint64_t n);
 bool gpu_graph_upload_prompt_tokens(
         ds4_gpu_tensor *out_tokens,
         const token_vec  *prompt,

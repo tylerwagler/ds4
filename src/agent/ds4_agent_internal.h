@@ -464,7 +464,10 @@ struct agent_bash_job {
     pid_t pid;
     int pipe_fd;
     int tmp_fd;
-    char path[PATH_MAX];
+    /* Always the mkstemp template "/tmp/ds4_agent_output_XXXXXX" (27 chars +
+     * NUL) from agent_bash_start — mkstemp only substitutes the X's, so it can
+     * never lengthen.  Sized for exactly that, not PATH_MAX. */
+    char path[32];
     char *cmd;
     double start_time;
     double timeout_sec;

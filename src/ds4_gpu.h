@@ -5,6 +5,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Hyper-connection (HC) residual-stream storage precision (task #62).
+ * The source model runs a BF16 residual (config torch_dtype: bfloat16 — see
+ * ds4-source-numerics); our HC carriers were f32, i.e. 2x the precision AND
+ * bandwidth of the source with no fidelity gain. We narrow the STORAGE of the
+ * six swap-coupled HC residual carriers (cur_hc/after_attn_hc/after_ffn_hc and
+ * their batched twins) to BF16, while every kernel keeps accumulating in f32 —
+ * exactly what torch does (bf16 storage, f32 math). This macro is the element
+ * size of a stored HC residual sample, shared by the CUDA kernels (typed via
+ * ds4_hc_t in ds4_cuda_internal.h) and the C host stride/offset math.
+ *
+ * Define DS4_HC_F32 (compile flag) to restore f32 carriers — the fallback, and
+ * the intermediate used to prove the storage-narrowing plumbing is a pure
+ * no-op (f32 build must be byte-identical to the pre-change build) before the
+ * BF16 flip. One compile-time switch; NO per-token/per-layer runtime branch. */
+#ifdef DS4_HC_F32
+#define DS4_HC_ELT_SIZE 4u
+#else
+#define DS4_HC_ELT_SIZE 2u
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +59,8 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+/* Raw device pointer without a synchronize (for building device pointer tables). */
+void *ds4_gpu_tensor_device_ptr(const ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
@@ -154,6 +176,7 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         float                   scale,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
@@ -206,6 +229,20 @@ void ds4_gpu_register_fp8_weight(uint64_t weight_offset);
  * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
 void ds4_gpu_register_fp8_lt_weight(uint64_t weight_offset);
 
+/* Batched-prefill activation quantization cache.
+ *
+ * One normalized activation feeds several block-scaled MXFP8 projections per
+ * layer; the per-GEMM activation quantization is a pure function of the buffer
+ * and its shape, so it only has to run once.  Arm the cache immediately after
+ * the activation is written (arming invalidates any earlier contents, which is
+ * what makes a later hit safe even though the buffer pointer is reused every
+ * layer); disarm when the activation is dead.  A backend without the
+ * optimization may implement both as no-ops.  Purely a traffic optimization:
+ * results are bit-identical either way.
+ */
+void ds4_gpu_mxfp8_act_cache_arm(const ds4_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
+void ds4_gpu_mxfp8_act_cache_disarm(void);
+
 /* Optional fused GPU operations.
  *
  * These are acceleration hooks, not required backend primitives.  A backend
@@ -247,6 +284,18 @@ int ds4_gpu_matmul_f16_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
+ * ROW COUNT. `n` = the number of leading DECODE rows in the batched step; those
+ * rows run through the M-independent custom per-token kernels (byte-identical
+ * across batch width), while the trailing prefill rows [n..M) take the fast
+ * cuBLAS(Lt)/grouped tensor-core path. n==0 disarms (pure prefill / classic).
+ * n==M arms the whole batch (decode-only, == inc-2). Set once at
+ * multiseq_step_begin, cleared at step_end — never on a per-token path.
+ * The query returns the count (MoE two-pass reads it to place the split;
+ * inc-2/3 dense-GEMM callers treat nonzero as "armed"). */
+void ds4_gpu_matmul_set_batch_mneutral(int n);
+int  ds4_gpu_matmul_batch_mneutral(void);   /* query: decode-prefix row count (0 = disarmed) */
 
 int ds4_gpu_matmul_bf16_tensor(
         ds4_gpu_tensor       *out,
@@ -744,6 +793,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
@@ -773,6 +823,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
@@ -1161,6 +1212,20 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps);
+
+/* Fused plain-RMSNorm + f16 HC-mix GEMV (decode, n_tok == 1).  Byte-identical
+ * to rms_norm_plain_tensor() followed by matmul_f16_tensor(); see the kernel
+ * comment in ds4_cuda_hc_router.cu for the order argument.  `x` is an HC
+ * residual CARRIER (ds4_hc_t storage, DS4_HC_ELT_SIZE bytes/sample), not f32. */
+int ds4_gpu_hc_norm_mix_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   eps);
 
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
